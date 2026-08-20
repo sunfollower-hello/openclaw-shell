@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>openclaw-shell · 人设卡</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header>
+    <h1>🦞 openclaw-shell <span class="sub">人设卡管理台</span></h1>
+    <span id="health" class="health">连接中…</span>
+  </header>
+
+  <main>
+    <aside>
+      <div class="create-box">
+        <h2>新建人设卡</h2>
+        <input id="new-name" placeholder="名称（如：奶奶）" />
+        <input id="new-slug" placeholder="slug（留空自动生成）" />
+        <select id="new-role">
+          <option value="friend">朋友</option>
+          <option value="family">家人</option>
+          <option value="self">自己</option>
+          <option value="partner">前任/恋人</option>
+          <option value="colleague">同事</option>
+          <option value="public-figure">偶像/角色</option>
+        </select>
+        <button id="btn-create">创建</button>
+      </div>
+      <h2>卡库</h2>
+      <ul id="card-list" class="card-list"></ul>
+    </aside>
+
+    <section id="editor">
+      <div class="editor-head">
+        <h2 id="editor-title">选择左侧卡片开始编辑</h2>
+        <div class="editor-actions">
+          <button id="btn-validate">校验</button>
+          <button id="btn-save" class="primary">保存</button>
+          <button id="btn-del" class="danger">删除</button>
+        </div>
+      </div>
+      <textarea id="editor-json" spellcheck="false" placeholder="卡片 JSON（persona-card v1 格式）"></textarea>
+      <div id="status" class="status"></div>
+    </section>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>
