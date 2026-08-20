@@ -43,7 +43,7 @@
         <div class="editor-head">
           <h2 id="editor-title">选择左侧卡片开始编辑</h2>
           <div class="editor-actions">
-            <button id="btn-compile">编译到 OpenClaw</button>
+            <button id="btn-compile" title="编译后写入 OpenClaw workspace，当前生效人设 = 最后编译的卡片">编译到 OpenClaw</button>
             <button id="btn-validate">校验</button>
             <button id="btn-save" class="primary">保存</button>
             <button id="btn-del" class="danger">删除</button>
@@ -51,6 +51,17 @@
         </div>
         <textarea id="editor-json" spellcheck="false" placeholder="卡片 JSON（persona-card v1 格式）"></textarea>
         <div id="status" class="status"></div>
+        <div class="chat-test">
+          <div class="chat-head">
+            <h3>💬 聊天测试 <span class="hint">用当前卡片 + API 页模型试聊（改完先点保存）</span></h3>
+            <button id="btn-chat-clear" class="small-btn">清空</button>
+          </div>
+          <div id="chat-log" class="chat-log"></div>
+          <div class="row">
+            <input id="chat-input" placeholder="对这个人设说点什么…" />
+            <button id="btn-chat-send" class="primary">发送</button>
+          </div>
+        </div>
       </section>
     </section>
 
@@ -63,6 +74,7 @@
           <div class="form">
             <label>聊天记录文件（WeFlow 导出的 JSON）</label>
             <input id="distill-file" type="file" accept=".json" />
+            <div class="note" style="margin-top:0">📥 没有记录文件？先导出：下载 <a href="https://github.com/hicccc77/WeFlow" target="_blank">WeFlow</a>（本机导出工具，无需管理员）→ 选联系人/群 → 导出 JSON → 回到这里上传。</div>
             <label>卡片名称</label>
             <input id="distill-name" placeholder="如：奶奶" />
             <label>关系类型</label>

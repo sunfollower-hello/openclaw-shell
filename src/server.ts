@@ -18,6 +18,7 @@ import {
 import { getModelConfig, saveModelConfig, testModelEndpoint, getModelLLMConfig } from "./core/modelConfig.js";
 import { runDistill, saveDistilledCard } from "./distiller/pipeline.js";
 import { RELATION_ROLES } from "./core/schema.js";
+import { buildChatSystem } from "./core/chatPrompt.js";
 
 // 加载项目 .env（仅补环境变量空缺，如 OPENCLAW_SHELL_UI_USER/PASS）
 async function loadEnv(): Promise<void> {
@@ -297,6 +298,41 @@ app.post("/api/cards/import", async (req, res) => {
     if (!result.ok) return res.status(400).json({ error: result.errors.join("; ") });
     await store.save(card);
     res.json({ card });
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+// ---------- 聊天测试（网页试聊，用当前人设卡 + API 页模型） ----------
+app.post("/api/chat", async (req, res) => {
+  try {
+    const { slug, message, history } = req.body ?? {};
+    if (!slug || !message) return res.status(400).json({ error: "slug / message 不能为空" });
+    const llm = await getModelLLMConfig();
+    if (!llm || !llm.apiKey) {
+      return res.status(400).json({ error: "未配置模型 API。请先到「API」页添加提供商并设为默认" });
+    }
+    const card = await store.get(slug);
+    const messages = [
+      { role: "system", content: buildChatSystem(card) },
+      ...(Array.isArray(history) ? history.slice(-20) : []),
+      { role: "user", content: message },
+    ];
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 90000);
+    const r = await fetch(`${llm.baseUrl.replace(/\/+$/, "")}/chat/completions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${llm.apiKey}` },
+      body: JSON.stringify({ model: llm.model, messages, temperature: 0.7, max_tokens: 1024 }),
+      signal: ctrl.signal,
+    });
+    clearTimeout(timer);
+    if (!r.ok) {
+      const body = await r.text().catch(() => "");
+      return res.status(502).json({ error: `模型调用失败 ${r.status}: ${body.slice(0, 200)}` });
+    }
+    const data = await r.json();
+    res.json({ reply: data.choices?.[0]?.message?.content ?? "（空回复）" });
   } catch (e) {
     res.status(500).json({ error: String(e) });
   }

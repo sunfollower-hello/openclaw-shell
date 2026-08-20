@@ -408,6 +408,47 @@ async function loadDistillModel() {
   } catch { /* 忽略 */ }
 }
 
+// ================= 聊天测试 =================
+let chatHistory = [];
+
+function addChatBubble(role, text) {
+  const log = $("#chat-log");
+  const div = document.createElement("div");
+  div.className = "bubble " + (role === "user" ? "me" : "bot");
+  div.textContent = text;
+  log.appendChild(div);
+  log.scrollTop = log.scrollHeight;
+}
+
+async function sendChat() {
+  const input = $("#chat-input");
+  const message = input.value.trim();
+  if (!message) return;
+  if (!currentSlug) { addChatBubble("bot", "请先选择一张人设卡。"); return; }
+  addChatBubble("user", message);
+  input.value = "";
+  chatHistory.push({ role: "user", content: message });
+  const btn = $("#btn-chat-send");
+  btn.disabled = true;
+  try {
+    const r = await api.send("/api/chat", {
+      method: "POST",
+      body: JSON.stringify({ slug: currentSlug, message, history: chatHistory.slice(0, -1) }),
+    });
+    addChatBubble("bot", r.reply);
+    chatHistory.push({ role: "assistant", content: r.reply });
+  } catch (e) {
+    addChatBubble("bot", "⚠ " + e.message);
+    chatHistory.pop();
+  }
+  btn.disabled = false;
+}
+
+function clearChat() {
+  chatHistory = [];
+  $("#chat-log").innerHTML = "";
+}
+
 // ================= 事件绑定 =================
 $("#btn-create").addEventListener("click", createCard);
 $("#btn-save").addEventListener("click", saveCard);
@@ -426,6 +467,9 @@ $("#btn-model-test").addEventListener("click", testModel);
 $("#btn-model-save").addEventListener("click", saveModel);
 $("#btn-distill-run").addEventListener("click", runDistill);
 $("#btn-distill-save").addEventListener("click", saveDistilled);
+$("#btn-chat-send").addEventListener("click", sendChat);
+$("#btn-chat-clear").addEventListener("click", clearChat);
+$("#chat-input").addEventListener("keydown", (e) => { if (e.key === "Enter") sendChat(); });
 
 // ================= 启动 =================
 (async function init() {

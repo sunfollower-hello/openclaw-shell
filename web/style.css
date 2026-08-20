@@ -192,3 +192,41 @@ button.danger { background: transparent; border-color: var(--danger); color: var
 .provider-item.active { border-color: var(--accent); }
 .provider-item .meta { font-size: 11px; color: var(--muted); margin-top: 2px; }
 .muted { color: var(--muted); font-size: 13px; }
+
+/* ============ 聊天测试 ============ */
+.chat-test {
+  border-top: 1px solid var(--border);
+  padding-top: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 320px;
+}
+.chat-head { display: flex; justify-content: space-between; align-items: center; }
+.chat-head h3 { font-size: 13px; }
+.chat-head .hint { margin: 0; }
+.small-btn { padding: 3px 10px; font-size: 12px; }
+.chat-log {
+  flex: 1;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  background: var(--panel2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px;
+  min-height: 120px;
+  max-height: 220px;
+}
+.bubble {
+  max-width: 82%;
+  padding: 7px 10px;
+  border-radius: 10px;
+  font-size: 12.5px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.bubble.me { align-self: flex-end; background: var(--accent); color: #fff; }
+.bubble.bot { align-self: flex-start; background: var(--panel); border: 1px solid var(--border); }
