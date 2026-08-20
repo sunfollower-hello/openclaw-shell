@@ -4,6 +4,8 @@ import { CardStore, dataDir, newCardId, nowIso } from "./core/cardStore.js";
 import { defaultCard, RELATION_ROLES } from "./core/schema.js";
 import { validateCard } from "./core/validator.js";
 import { compileCard } from "./core/compiler.js";
+import { runDistill, saveDistilledCard } from "./distiller/pipeline.js";
+import { llmConfigFromEnv, llmConfigReady } from "./distiller/extract.js";
 import path from "node:path";
 
 function usage(): void {
@@ -15,6 +17,7 @@ function usage(): void {
   npm run cli -- view   <slug>
   npm run cli -- validate <slug | path.json>
   npm run cli -- compile <slug> [--workspace <目录>]
+  npm run cli -- distill --file <微信导出.json> --name <名字> --role <角色> [--target <昵称>] [--dry-run]
   npm run cli -- rm     <slug>
 
 角色: ${RELATION_ROLES.join(" | ")}
@@ -132,6 +135,64 @@ async function cmdCompile(args: string[]): Promise<void> {
   for (const w of result.warnings) console.log("  ⚠ " + w);
 }
 
+async function cmdDistill(args: string[]): Promise<void> {
+  const flags = parseFlags(args);
+  const name = flags.name;
+  if (!name) {
+    console.error("缺少 --name");
+    usage();
+    process.exit(1);
+  }
+  const role = (flags.role ?? "friend") as (typeof RELATION_ROLES)[number];
+  if (!RELATION_ROLES.includes(role)) {
+    console.error(`无效角色: ${role}，可选 ${RELATION_ROLES.join(" | ")}`);
+    process.exit(1);
+  }
+
+  const cfg = llmConfigFromEnv();
+  const dryRun = flags["dry-run"] !== undefined;
+  if (!dryRun && !llmConfigReady(cfg)) {
+    console.error(
+      "未配置 API。蒸馏需要 LLM，请先设置环境变量：\n" +
+        "  OPENCLAW_SHELL_API_BASE（默认 https://api.openai.com/v1，可填你的中转）\n" +
+        "  OPENCLAW_SHELL_API_KEY\n" +
+        "  OPENCLAW_SHELL_MODEL（可选）\n" +
+        "或加 --dry-run 离线试跑流水线。"
+    );
+    process.exit(1);
+  }
+
+  const result = await runDistill({
+    file: flags.file,
+    name,
+    role,
+    slug: flags.slug,
+    target: flags.target ?? "",
+    selfNames: flags["self-names"] ? flags["self-names"].split(",") : [],
+    dryRun,
+    maxMessages: flags["max-messages"] ? Number(flags["max-messages"]) : undefined,
+    blockedWords: flags["blocked-words"] ? flags["blocked-words"].split(",") : undefined,
+    llm: cfg,
+  });
+
+  console.log(`✓ 蒸馏完成: ${result.card.name} (${result.card.slug})`);
+  console.log(`  目标人物: ${result.card.identity.relation}`);
+  console.log(`  消息: 共 ${result.stats.totalMessages} 条 → 目标 ${result.stats.usedMessages} 条，脱敏替换 ${result.stats.redact.replaced} 处`);
+  for (const d of result.stats.redact.samples) console.log("  脱敏样例: " + d);
+  for (const [dim, s] of Object.entries(result.stats.dimensions)) {
+    console.log(`  ${dim}: ${s.items} 条（${s.via}）`);
+  }
+  for (const w of result.stats.redact.blockedWordsHit) {
+    console.log(`  ⚠ 屏蔽词命中，相关消息已剔除: ${w}`);
+  }
+  if (!result.card.source.consent.granted) {
+    console.log("  ⚠ 待办：确认授权（source.consent.granted）后再发布");
+  }
+
+  await saveDistilledCard(result.card);
+  console.log(`✓ 已保存到卡库，可编辑或编译`);
+}
+
 async function cmdRm(slug: string): Promise<void> {
   const store = new CardStore();
   await store.remove(slug);
@@ -155,6 +216,9 @@ async function main(): Promise<void> {
       break;
     case "compile":
       await cmdCompile(rest);
+      break;
+    case "distill":
+      await cmdDistill(rest);
       break;
     case "rm":
       await cmdRm(rest[0]);
