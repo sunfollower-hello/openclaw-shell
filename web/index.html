@@ -3,47 +3,130 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>openclaw-shell · 人设卡</title>
+  <title>openclaw-shell</title>
   <link rel="stylesheet" href="style.css" />
 </head>
 <body>
   <header>
-    <h1>🦞 openclaw-shell <span class="sub">人设卡管理台</span></h1>
+    <h1>🦞 openclaw-shell <span class="sub">人设卡 · 通道 · API</span></h1>
+    <nav class="tabs">
+      <button class="tab active" data-tab="cards">人设卡</button>
+      <button class="tab" data-tab="channels">通道</button>
+      <button class="tab" data-tab="api">API</button>
+    </nav>
     <span id="health" class="health">连接中…</span>
   </header>
 
   <main>
-    <aside>
-      <div class="create-box">
-        <h2>新建人设卡</h2>
-        <input id="new-name" placeholder="名称（如：奶奶）" />
-        <input id="new-slug" placeholder="slug（留空自动生成）" />
-        <select id="new-role">
-          <option value="friend">朋友</option>
-          <option value="family">家人</option>
-          <option value="self">自己</option>
-          <option value="partner">前任/恋人</option>
-          <option value="colleague">同事</option>
-          <option value="public-figure">偶像/角色</option>
-        </select>
-        <button id="btn-create">创建</button>
-      </div>
-      <h2>卡库</h2>
-      <ul id="card-list" class="card-list"></ul>
-    </aside>
+    <!-- ============ 人设卡 ============ -->
+    <section id="tab-cards" class="tab-panel active">
+      <aside>
+        <div class="create-box">
+          <h2>新建人设卡</h2>
+          <input id="new-name" placeholder="名称（如：奶奶）" />
+          <input id="new-slug" placeholder="slug（留空自动生成）" />
+          <select id="new-role">
+            <option value="friend">朋友</option>
+            <option value="family">家人</option>
+            <option value="self">自己</option>
+            <option value="partner">前任/恋人</option>
+            <option value="colleague">同事</option>
+            <option value="public-figure">偶像/角色</option>
+          </select>
+          <button id="btn-create">创建</button>
+        </div>
+        <h2>卡库</h2>
+        <ul id="card-list" class="card-list"></ul>
+      </aside>
+      <section id="editor">
+        <div class="editor-head">
+          <h2 id="editor-title">选择左侧卡片开始编辑</h2>
+          <div class="editor-actions">
+            <button id="btn-compile">编译到 OpenClaw</button>
+            <button id="btn-validate">校验</button>
+            <button id="btn-save" class="primary">保存</button>
+            <button id="btn-del" class="danger">删除</button>
+          </div>
+        </div>
+        <textarea id="editor-json" spellcheck="false" placeholder="卡片 JSON（persona-card v1 格式）"></textarea>
+        <div id="status" class="status"></div>
+      </section>
+    </section>
 
-    <section id="editor">
-      <div class="editor-head">
-        <h2 id="editor-title">选择左侧卡片开始编辑</h2>
-        <div class="editor-actions">
-          <button id="btn-compile">编译到 OpenClaw</button>
-          <button id="btn-validate">校验</button>
-          <button id="btn-save" class="primary">保存</button>
-          <button id="btn-del" class="danger">删除</button>
+    <!-- ============ 通道 ============ -->
+    <section id="tab-channels" class="tab-panel">
+      <div class="channel-grid">
+        <!-- 微信 -->
+        <div class="channel-card">
+          <h2>💬 微信 <span id="wx-status" class="chip">检测中…</span></h2>
+          <p class="hint">腾讯官方通道（openclaw-weixin），当前仅支持单聊。需微信有 ClawBot 入口（灰度）。</p>
+          <div class="channel-actions">
+            <button id="btn-wx-login">开始扫码绑定</button>
+            <button id="btn-wx-refresh">刷新状态</button>
+          </div>
+          <pre id="wx-qr" class="qr-box" style="display:none"></pre>
+          <div id="wx-login-msg" class="status"></div>
+          <hr />
+          <h3>新好友配对授权</h3>
+          <p class="hint">新联系人发消息后，这里会出现配对码；批准后该联系人才可对话。</p>
+          <div class="row">
+            <input id="pairing-code" placeholder="配对码（如 4 位字母数字）" />
+            <button id="btn-pair-approve">批准</button>
+          </div>
+          <pre id="pairing-list" class="small-out"></pre>
+          <div class="note">⚠️ 若微信里没有 ClawBot 入口，说明你的账号还在灰度外，扫码会失败——这是微信侧限制，不是本软件问题。</div>
+        </div>
+
+        <!-- QQ -->
+        <div class="channel-card">
+          <h2>🐧 QQ <span id="qq-status" class="chip">检测中…</span></h2>
+          <p class="hint">基于 NapCat（OneBot 11）协议端。需要：安装 NapCat → 登录 QQ → 配置 OneBot 连接。</p>
+          <div class="channel-actions">
+            <button id="btn-qq-refresh">刷新状态</button>
+            <button id="btn-qq-install">安装 napcat 插件</button>
+          </div>
+          <div id="qq-guide" class="guide">
+            <ol>
+              <li><b>安装 NapCat</b>：从 <a href="https://github.com/NapNeko/NapCatQQ/releases" target="_blank">NapCatQQ Releases</a> 下载并启动（Shell 版无需安装）</li>
+              <li><b>登录 QQ</b>：NapCat 会弹出 QQ 窗口，扫码登录机器人 QQ 号</li>
+              <li><b>配置连接</b>：打开 NapCat WebUI，添加 OneBot v11 反向 WebSocket，地址指向本软件（见下方提示）</li>
+              <li><b>刷新状态</b>：连接成功后本页状态变为绿色</li>
+            </ol>
+          </div>
+          <pre id="qq-out" class="small-out"></pre>
+          <div class="note">连接地址：<code>ws://127.0.0.1:18789/onebot/v11/ws</code>（端口与 OpenClaw 网关一致）</div>
         </div>
       </div>
-      <textarea id="editor-json" spellcheck="false" placeholder="卡片 JSON（persona-card v1 格式）"></textarea>
-      <div id="status" class="status"></div>
+    </section>
+
+    <!-- ============ API ============ -->
+    <section id="tab-api" class="tab-panel">
+      <div class="api-layout">
+        <div class="channel-card">
+          <h2>当前模型配置</h2>
+          <p class="hint">默认模型 <code id="cur-primary">—</code>（保存后需重启网关生效，可用桌面开关）</p>
+          <div id="provider-list" class="provider-list"></div>
+        </div>
+        <div class="channel-card">
+          <h2>添加 / 修改提供商</h2>
+          <div class="form">
+            <label>名称（如 agnes / myrelay）</label>
+            <input id="cfg-name" placeholder="agnes" />
+            <label>Base URL（OpenAI 兼容，以 /v1 结尾）</label>
+            <input id="cfg-baseurl" placeholder="https://apihub.agnes-ai.cn/v1" />
+            <label>API Key（留空保留原值）</label>
+            <input id="cfg-key" type="password" placeholder="sk-..." />
+            <label>模型 ID</label>
+            <input id="cfg-model" placeholder="agnes-2.0-flash" />
+            <label class="checkbox"><input id="cfg-default" type="checkbox" checked /> 设为默认模型</label>
+            <div class="row">
+              <button id="btn-model-test">测试连接</button>
+              <button id="btn-model-save" class="primary">保存</button>
+            </div>
+            <div id="model-msg" class="status"></div>
+          </div>
+        </div>
+      </div>
     </section>
   </main>
 

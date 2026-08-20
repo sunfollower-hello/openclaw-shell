@@ -1,21 +1,23 @@
-// 人设卡管理台前端（原生 JS，无构建步骤）
+// openclaw-shell 前端：人设卡 / 通道 / API 三 Tab
 const $ = (sel) => document.querySelector(sel);
 
 let currentSlug = null;
 let dirty = false;
+let wxPollTimer = null;
 
 const api = {
   async get(path) {
     const r = await fetch(path);
-    if (!r.ok) throw new Error((await r.json()).error || r.statusText);
-    return r.json();
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(data.error || r.statusText);
+    return data;
   },
   async send(path, options = {}) {
     const r = await fetch(path, {
       headers: { "Content-Type": "application/json" },
       ...options,
     });
-    const data = await r.json();
+    const data = await r.json().catch(() => ({}));
     if (!r.ok) throw new Error(data.error || r.statusText);
     return data;
   },
@@ -23,10 +25,30 @@ const api = {
 
 function setStatus(text, cls = "") {
   const el = $("#status");
+  if (!el) return;
   el.textContent = text;
   el.className = "status " + cls;
 }
 
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, (c) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+  }[c]));
+}
+
+// ================= Tab 切换 =================
+document.querySelectorAll(".tab").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    document.querySelectorAll(".tab").forEach((b) => b.classList.remove("active"));
+    document.querySelectorAll(".tab-panel").forEach((p) => p.classList.remove("active"));
+    btn.classList.add("active");
+    $("#tab-" + btn.dataset.tab).classList.add("active");
+    if (btn.dataset.tab === "channels") refreshChannels();
+    if (btn.dataset.tab === "api") loadModelConfig();
+  });
+});
+
+// ================= 人设卡 =================
 async function loadList() {
   const { cards } = await api.get("/api/cards");
   const ul = $("#card-list");
@@ -84,8 +106,7 @@ async function compileCard() {
     const res = await api.send(`/api/cards/${currentSlug}/compile`, { method: "POST" });
     setStatus(
       "✓ 已编译到 workspace，共 " + res.files.length + " 个文件\n" +
-      res.files.join("\n") +
-      (res.warnings?.length ? "\n⚠ " + res.warnings.join("\n⚠ ") : ""),
+      res.files.join("\n") + (res.warnings?.length ? "\n⚠ " + res.warnings.join("\n⚠ ") : ""),
       "ok"
     );
   } catch (e) {
@@ -102,7 +123,6 @@ async function validateCard() {
     setStatus("JSON 解析失败：" + e.message, "err");
     return;
   }
-  // 临时保存校验结果：把当前内容 PUT 到服务端校验（服务端会拒绝错误卡）
   try {
     const res = await api.send(`/api/cards/${currentSlug}`, {
       method: "PUT",
@@ -146,27 +166,210 @@ async function createCard() {
   }
 }
 
-function escapeHtml(s) {
-  return String(s).replace(/[&<>"']/g, (c) => ({
-    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
-  }[c]));
+// ================= 通道 =================
+function setChip(sel, text, ok) {
+  const el = $(sel);
+  if (!el) return;
+  el.textContent = text;
+  el.className = "chip " + (ok === null ? "" : ok ? "ok" : "bad");
 }
 
-// ---------- 事件 ----------
+async function refreshWechat() {
+  try {
+    const s = await api.get("/api/channels/wechat/status");
+    setChip("#wx-status", s.connected ? "已连接 ✓" : "未连接", s.connected);
+    if (!s.connected && s.raw) $("#pairing-list").textContent = s.raw.slice(-800);
+  } catch {
+    setChip("#wx-status", "检测失败", false);
+  }
+}
+
+async function startWxLogin() {
+  try {
+    await api.send("/api/channels/wechat/login", { method: "POST" });
+    $("#wx-qr").style.display = "block";
+    $("#wx-login-msg").textContent = "二维码生成中…";
+    startWxPoll();
+  } catch (e) {
+    $("#wx-login-msg").textContent = "启动失败：" + e.message;
+  }
+}
+
+function startWxPoll() {
+  if (wxPollTimer) clearInterval(wxPollTimer);
+  wxPollTimer = setInterval(async () => {
+    try {
+      const s = await api.get("/api/channels/wechat/login");
+      if (s.output) {
+        $("#wx-qr").textContent = s.output;
+        $("#wx-qr").style.display = "block";
+      }
+      if (!s.running && s.done) {
+        clearInterval(wxPollTimer);
+        wxPollTimer = null;
+        $("#wx-login-msg").textContent = s.ok ? "✓ 扫码成功，微信已绑定！" : "✗ 登录结束（未成功），检查微信是否有 ClawBot 入口后重试";
+        refreshWechat();
+        refreshPairing();
+      }
+    } catch { /* 服务暂时不可达，忽略 */ }
+  }, 2000);
+}
+
+async function refreshPairing() {
+  try {
+    const r = await api.get("/api/channels/wechat/pairing");
+    $("#pairing-list").textContent = r.raw || "（暂无待处理配对）";
+  } catch (e) {
+    $("#pairing-list").textContent = "读取失败：" + e.message;
+  }
+}
+
+async function approvePairing() {
+  const code = $("#pairing-code").value.trim();
+  if (!code) return;
+  try {
+    const r = await api.send("/api/channels/wechat/pairing/approve", {
+      method: "POST",
+      body: JSON.stringify({ code }),
+    });
+    $("#pairing-list").textContent = r.output || (r.ok ? "✓ 已批准" : "批准失败");
+    $("#pairing-code").value = "";
+    refreshPairing();
+  } catch (e) {
+    $("#pairing-list").textContent = "批准失败：" + e.message;
+  }
+}
+
+async function refreshQQ() {
+  try {
+    const s = await api.get("/api/channels/qq/status");
+    const parts = [
+      s.pluginInstalled ? "插件✓" : "插件✗",
+      s.napcatRunning ? "NapCat✓" : "NapCat✗",
+      s.onebotSeen ? "连接✓" : "连接✗",
+    ];
+    const allOk = s.pluginInstalled && s.napcatRunning && s.onebotSeen;
+    setChip("#qq-status", parts.join(" "), allOk);
+    if (!allOk) $("#qq-out").textContent = "完成 NapCat 安装与登录后，点「刷新状态」查看连接。";
+  } catch (e) {
+    setChip("#qq-status", "检测失败", false);
+  }
+}
+
+async function installQQPlugin() {
+  const btn = $("#btn-qq-install");
+  btn.disabled = true;
+  btn.textContent = "安装中…";
+  try {
+    const r = await api.send("/api/channels/qq/install-plugin", { method: "POST" });
+    $("#qq-out").textContent = (r.ok ? "✓ 插件安装成功\n" : "安装返回非零\n") + (r.output || "");
+  } catch (e) {
+    $("#qq-out").textContent = "安装失败：" + e.message;
+  }
+  btn.disabled = false;
+  btn.textContent = "安装 napcat 插件";
+  refreshQQ();
+}
+
+function refreshChannels() {
+  refreshWechat();
+  refreshPairing();
+  refreshQQ();
+}
+
+// ================= API =================
+async function loadModelConfig() {
+  try {
+    const cfg = await api.get("/api/config/model");
+    $("#cur-primary").textContent = cfg.primary || "（未设置）";
+    const box = $("#provider-list");
+    box.innerHTML = "";
+    if (cfg.providers.length === 0) {
+      box.innerHTML = '<div class="muted">还没有配置任何提供商</div>';
+      return;
+    }
+    for (const p of cfg.providers) {
+      const d = document.createElement("div");
+      d.className = "provider-item" + (cfg.primary.startsWith(p.name + "/") ? " active" : "");
+      d.innerHTML = `
+        <div><b>${escapeHtml(p.name)}</b> ${cfg.primary.startsWith(p.name + "/") ? "· 默认" : ""}</div>
+        <div class="meta">${escapeHtml(p.baseUrl)} · ${escapeHtml(p.models.join(", "))}</div>
+        <div class="meta">key: ${escapeHtml(p.apiKey)}</div>`;
+      box.appendChild(d);
+    }
+  } catch (e) {
+    $("#provider-list").innerHTML = `<div class="muted">读取失败：${escapeHtml(e.message)}</div>`;
+  }
+}
+
+async function testModel() {
+  const baseUrl = $("#cfg-baseurl").value.trim();
+  const apiKey = $("#cfg-key").value.trim();
+  const modelId = $("#cfg-model").value.trim();
+  if (!baseUrl || !apiKey || !modelId) {
+    $("#model-msg").textContent = "请先填 Base URL / Key / 模型 ID";
+    return;
+  }
+  $("#model-msg").textContent = "测试中…";
+  try {
+    const r = await api.send("/api/config/model/test", {
+      method: "POST",
+      body: JSON.stringify({ baseUrl, apiKey, modelId }),
+    });
+    $("#model-msg").textContent = r.ok ? "✓ 连接成功" : `✗ 失败（HTTP ${r.status ?? "-"}）：${r.error ?? ""}`;
+    $("#model-msg").className = "status " + (r.ok ? "ok" : "err");
+  } catch (e) {
+    $("#model-msg").textContent = "测试出错：" + e.message;
+  }
+}
+
+async function saveModel() {
+  try {
+    const r = await api.send("/api/config/model", {
+      method: "POST",
+      body: JSON.stringify({
+        name: $("#cfg-name").value.trim(),
+        baseUrl: $("#cfg-baseurl").value.trim(),
+        apiKey: $("#cfg-key").value.trim() || undefined,
+        modelId: $("#cfg-model").value.trim(),
+        setDefault: $("#cfg-default").checked,
+      }),
+    });
+    $("#model-msg").textContent = "✓ " + (r.hint || "已保存");
+    $("#model-msg").className = "status ok";
+    $("#cfg-key").value = "";
+    loadModelConfig();
+  } catch (e) {
+    $("#model-msg").textContent = "保存失败：" + e.message;
+    $("#model-msg").className = "status err";
+  }
+}
+
+// ================= 事件绑定 =================
 $("#btn-create").addEventListener("click", createCard);
-$("#btn-compile").addEventListener("click", compileCard);
 $("#btn-save").addEventListener("click", saveCard);
+$("#btn-compile").addEventListener("click", compileCard);
 $("#btn-validate").addEventListener("click", validateCard);
 $("#btn-del").addEventListener("click", deleteCard);
 $("#editor-json").addEventListener("input", () => { dirty = true; });
 
-// ---------- 启动 ----------
+$("#btn-wx-login").addEventListener("click", startWxLogin);
+$("#btn-wx-refresh").addEventListener("click", refreshWechat);
+$("#btn-pair-approve").addEventListener("click", approvePairing);
+$("#btn-qq-refresh").addEventListener("click", refreshQQ);
+$("#btn-qq-install").addEventListener("click", installQQPlugin);
+
+$("#btn-model-test").addEventListener("click", testModel);
+$("#btn-model-save").addEventListener("click", saveModel);
+
+// ================= 启动 =================
 (async function init() {
   try {
     const h = await api.get("/api/health");
     $("#health").textContent = "✓ 服务正常 · " + h.schema;
     await loadList();
+    refreshChannels();
   } catch {
-    $("#health").textContent = "✗ 无法连接服务，请先运行 npm run server";
+    $("#health").textContent = "✗ 无法连接服务，请先运行桌面开关启动";
   }
 })();
