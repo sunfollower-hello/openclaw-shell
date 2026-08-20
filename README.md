@@ -18,7 +18,7 @@ OpenClaw 图形化外壳：引导接入 QQ/微信、人设卡编辑、聊天记�
 - **工具**（全免 API key）：写代码并运行（**沙箱内**，Node 权限模型限文件访问）、沙箱文件读写/列表/搜索、联网搜索(DuckDuckGo)、天气(wttr.in)、时间、**长期记忆**（memory_save 记住用户事实，跨会话回忆）
 - **ask 审批**：危险工具（写代码/MCP）先问用户「执行/拒绝」，批准后才运行（人设卡 `tools.policy` 可强制全部审批）
 - **技能**：代码专家/翻译/写作/情感陪伴（内置，可多选叠加）
-- **思考深度**：低/中/高（reasoning_effort）
+- **思考深度**：关闭/自动(默认)/低/中/高/极高（对齐 rikkahub；极高→`reasoning_effort: xhigh`，中转不支持时自动降为 high）
 - **语音**：浏览器读回复（TTS）+ 语音输入（Web Speech，Chrome/Edge）
 - **MCP**：配置任意 MCP server（stdio），其工具并入工具循环（默认需审批）；参考 rikkahub 的 MCP 支持思路实现
 

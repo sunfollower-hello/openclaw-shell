@@ -430,29 +430,40 @@ async function chatCompletions(
   tools?: unknown[],
   reasoning?: string
 ): Promise<{ choices?: { message?: { content?: string; tool_calls?: unknown[] } }[] }> {
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), 90000);
-  try {
-    const r = await fetch(`${llm.baseUrl.replace(/\/+$/, "")}/chat/completions`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${llm.apiKey}` },
-      body: JSON.stringify({
-        model: llm.model,
-        messages,
-        temperature: 0.7,
-        max_tokens: 2048,
-        ...(tools && tools.length ? { tools } : {}),
-        ...(reasoning ? { reasoning_effort: reasoning } : {}),
-      }),
-      signal: ctrl.signal,
-    });
-    if (!r.ok) {
-      const body = await r.text().catch(() => "");
-      throw new Error(`模型调用失败 ${r.status}: ${body.slice(0, 200)}`);
+  const doCall = async (effort?: string) => {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 90000);
+    try {
+      const r = await fetch(`${llm.baseUrl.replace(/\/+$/, "")}/chat/completions`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${llm.apiKey}` },
+        body: JSON.stringify({
+          model: llm.model,
+          messages,
+          temperature: 0.7,
+          max_tokens: 2048,
+          ...(tools && tools.length ? { tools } : {}),
+          ...(effort ? { reasoning_effort: effort } : {}),
+        }),
+        signal: ctrl.signal,
+      });
+      if (!r.ok) {
+        const body = await r.text().catch(() => "");
+        throw new Error(`模型调用失败 ${r.status}: ${body.slice(0, 200)}`);
+      }
+      return await r.json();
+    } finally {
+      clearTimeout(timer);
     }
-    return await r.json();
-  } finally {
-    clearTimeout(timer);
+  };
+  try {
+    return await doCall(reasoning);
+  } catch (e) {
+    // 极高(xhigh)不被中转支持（如 Agnes 只收 low/medium/high）时自动降为 high
+    if (reasoning === "xhigh" && e instanceof Error && /reasoning_effort/i.test(e.message) && e.message.includes("400")) {
+      return await doCall("high");
+    }
+    throw e;
   }
 }
 
@@ -551,9 +562,18 @@ app.post("/api/chat", async (req, res) => {
       ? `\n\n【长期记忆（关于用户的事实，仅在相关时使用；要新增事实时调用 memory_save 工具）】\n- ${memories.slice(-30).join("\n- ")}`
       : "";
 
+    // 思考档位：关闭/自动 → 不传（由模型默认）；低/中/高/极高 → reasoning_effort（对齐 rikkahub：极高=xhigh）
     const level = String(thinking ?? card.chat?.thinking ?? "auto");
     const reasoning =
-      level === "low" ? "low" : level === "medium" ? "medium" : level === "high" || level === "extreme" ? "high" : undefined;
+      level === "low"
+        ? "low"
+        : level === "medium"
+          ? "medium"
+          : level === "high"
+            ? "high"
+            : level === "extreme"
+              ? "xhigh"
+              : undefined;
     const system =
       buildChatSystem(card) +
       (toolDefs.length
