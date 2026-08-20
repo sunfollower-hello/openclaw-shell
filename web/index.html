@@ -56,9 +56,16 @@
             <h3>💬 聊天测试 <span class="hint">用当前卡片 + API 页模型试聊（改完先点保存）</span></h3>
             <button id="btn-chat-clear" class="small-btn">清空</button>
           </div>
+          <div class="chat-tools">
+            <span class="hint">工具（勾选后机器人可写代码/搜索/查天气）：</span>
+            <label><input type="checkbox" id="tool-code" checked /> 写代码</label>
+            <label><input type="checkbox" id="tool-search" /> 联网搜索</label>
+            <label><input type="checkbox" id="tool-weather" /> 天气</label>
+            <label><input type="checkbox" id="tool-time" checked /> 时间</label>
+          </div>
           <div id="chat-log" class="chat-log"></div>
           <div class="row">
-            <input id="chat-input" placeholder="对这个人设说点什么…" />
+            <input id="chat-input" placeholder="试试：帮我写段代码算 1 加到 100…" />
             <button id="btn-chat-send" class="primary">发送</button>
           </div>
         </div>
@@ -75,6 +82,8 @@
             <label>聊天记录文件（WeFlow 导出的 JSON）</label>
             <input id="distill-file" type="file" accept=".json" />
             <div class="note" style="margin-top:0">📥 没有记录文件？先导出：下载 <a href="https://github.com/hicccc77/WeFlow" target="_blank">WeFlow</a>（本机导出工具，无需管理员）→ 选联系人/群 → 导出 JSON → 回到这里上传。</div>
+            <label>或直接粘贴聊天文本（每行一条：<code>昵称: 内容</code>）</label>
+            <textarea id="distill-paste" rows="4" placeholder="奶奶: 多喝水，别又熬夜&#10;我: 知道了奶奶"></textarea>
             <label>卡片名称</label>
             <input id="distill-name" placeholder="如：奶奶" />
             <label>关系类型</label>
@@ -97,6 +106,19 @@
             </div>
             <div id="distill-msg" class="status"></div>
           </div>
+          <hr style="border-color:var(--border)" />
+          <h3>🔌 直连 WeFlow 导入（本机 5031）</h3>
+          <p class="hint">WeFlow 正在运行时可免导出直接拉取：在 WeFlow 界面找到 access_token 填入，点「探测」确认连接，再填 talker 导入。</p>
+          <div class="row">
+            <input id="wf-token" placeholder="WeFlow access_token" />
+            <button id="btn-wf-probe" class="small-btn">探测</button>
+          </div>
+          <div class="row">
+            <input id="wf-talker" placeholder="talker（如 xxx@chatroom / wxid_xxx）" />
+            <input id="wf-limit" type="number" value="500" style="max-width:80px" />
+            <button id="btn-wf-distill" class="primary">导入并蒸馏</button>
+          </div>
+          <pre id="wf-out" class="small-out"></pre>
           <div class="note">首次使用：先到「API」页确认模型已配置并设为默认（当前默认 <code id="distill-model">—</code>）。</div>
         </div>
         <div class="channel-card">

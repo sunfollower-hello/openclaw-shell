@@ -341,10 +341,11 @@ let lastDistilledCard = null;
 
 async function runDistill() {
   const file = $("#distill-file").files[0];
-  if (!file) { $("#distill-msg").textContent = "请先选择聊天记录 JSON 文件"; return; }
+  const paste = $("#distill-paste").value.trim();
+  if (!file && !paste) { $("#distill-msg").textContent = "请选择聊天记录文件，或粘贴「昵称: 内容」文本"; return; }
   const name = $("#distill-name").value.trim();
   if (!name) { $("#distill-msg").textContent = "请填写卡片名称"; return; }
-  const text = await file.text();
+  const text = file ? await file.text() : paste;
   $("#distill-msg").textContent = "蒸馏中…（会调用模型 3 次，需要一点时间）";
   $("#btn-distill-run").disabled = true;
   try {
@@ -408,6 +409,47 @@ async function loadDistillModel() {
   } catch { /* 忽略 */ }
 }
 
+// ---- WeFlow 直连 ----
+async function probeWeFlow() {
+  const token = $("#wf-token").value.trim();
+  if (!token) { $("#wf-out").textContent = "请先填 access_token"; return; }
+  $("#wf-out").textContent = "探测中…";
+  try {
+    const r = await api.send("/api/weflow/probe", { method: "POST", body: JSON.stringify({ token }) });
+    $("#wf-out").textContent = r.results.map((x) => `${x.path} → HTTP ${x.status}${x.hint ? " " + x.hint : ""}`).join("\n");
+  } catch (e) {
+    $("#wf-out").textContent = "探测失败：" + e.message;
+  }
+}
+
+async function distillFromWeFlow() {
+  const token = $("#wf-token").value.trim();
+  const talker = $("#wf-talker").value.trim();
+  const name = $("#distill-name").value.trim();
+  if (!token || !talker || !name) { $("#wf-out").textContent = "请填 token / talker / 卡片名称"; return; }
+  $("#wf-out").textContent = "从 WeFlow 拉取并蒸馏中…";
+  $("#btn-wf-distill").disabled = true;
+  try {
+    const r = await api.send("/api/distill/weflow", {
+      method: "POST",
+      body: JSON.stringify({
+        token, talker, limit: Number($("#wf-limit").value) || 500,
+        name, role: $("#distill-role").value,
+        target: $("#distill-target").value.trim() || undefined,
+        selfNames: $("#distill-self").value.split(",").map((s) => s.trim()).filter(Boolean),
+        blockedWords: $("#distill-blocked").value.split(",").map((s) => s.trim()).filter(Boolean),
+      }),
+    });
+    lastDistilledCard = r.card;
+    $("#wf-out").textContent = `✓ 蒸馏完成：${r.card.name}（${r.card.slug}）\n消息 ${r.stats.totalMessages} 条 → 目标 ${r.stats.usedMessages} 条\n点上方「保存到卡库」后去「人设卡」页编辑/编译`;
+    $("#distill-msg").textContent = "完成（WeFlow 导入）";
+    $("#distill-msg").className = "status ok";
+  } catch (e) {
+    $("#wf-out").textContent = "失败：" + e.message;
+  }
+  $("#btn-wf-distill").disabled = false;
+}
+
 // ================= 聊天测试 =================
 let chatHistory = [];
 
@@ -430,10 +472,15 @@ async function sendChat() {
   chatHistory.push({ role: "user", content: message });
   const btn = $("#btn-chat-send");
   btn.disabled = true;
+  const tools = [];
+  if ($("#tool-code").checked) tools.push("code_exec");
+  if ($("#tool-search").checked) tools.push("web_search");
+  if ($("#tool-weather").checked) tools.push("weather");
+  if ($("#tool-time").checked) tools.push("datetime");
   try {
     const r = await api.send("/api/chat", {
       method: "POST",
-      body: JSON.stringify({ slug: currentSlug, message, history: chatHistory.slice(0, -1) }),
+      body: JSON.stringify({ slug: currentSlug, message, history: chatHistory.slice(0, -1), tools }),
     });
     addChatBubble("bot", r.reply);
     chatHistory.push({ role: "assistant", content: r.reply });
@@ -467,6 +514,8 @@ $("#btn-model-test").addEventListener("click", testModel);
 $("#btn-model-save").addEventListener("click", saveModel);
 $("#btn-distill-run").addEventListener("click", runDistill);
 $("#btn-distill-save").addEventListener("click", saveDistilled);
+$("#btn-wf-probe").addEventListener("click", probeWeFlow);
+$("#btn-wf-distill").addEventListener("click", distillFromWeFlow);
 $("#btn-chat-send").addEventListener("click", sendChat);
 $("#btn-chat-clear").addEventListener("click", clearChat);
 $("#chat-input").addEventListener("keydown", (e) => { if (e.key === "Enter") sendChat(); });

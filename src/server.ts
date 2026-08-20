@@ -17,8 +17,10 @@ import {
 } from "./core/openclawCli.js";
 import { getModelConfig, saveModelConfig, testModelEndpoint, getModelLLMConfig } from "./core/modelConfig.js";
 import { runDistill, saveDistilledCard } from "./distiller/pipeline.js";
+import { parsePlainText } from "./distiller/parser.js";
 import { RELATION_ROLES } from "./core/schema.js";
 import { buildChatSystem } from "./core/chatPrompt.js";
+import { TOOL_REGISTRY, toolsToOpenAI } from "./tools/registry.js";
 
 // 加载项目 .env（仅补环境变量空缺，如 OPENCLAW_SHELL_UI_USER/PASS）
 async function loadEnv(): Promise<void> {
@@ -274,8 +276,21 @@ app.post("/api/distill", async (req, res) => {
     if (!llm || !llm.apiKey) {
       return res.status(400).json({ error: "未配置模型 API。请先到「API」页添加提供商并设为默认" });
     }
+    // fileContent 支持 WeFlow JSON 或「昵称: 内容」纯文本
+    let rawJson: unknown;
+    try {
+      rawJson = JSON.parse(fileContent);
+    } catch {
+      const msgs = parsePlainText(fileContent);
+      if (msgs.length === 0) {
+        return res.status(400).json({ error: "无法解析：既不是 JSON，也不是「昵称: 内容」格式的文本" });
+      }
+      rawJson = {
+        messages: msgs.map((m) => ({ sender: m.sender, accountName: m.senderName, timestamp: m.ts, type: 0, content: m.text })),
+      };
+    }
     const result = await runDistill({
-      rawJson: JSON.parse(fileContent),
+      rawJson,
       file: fileName,
       name,
       role,
@@ -303,36 +318,131 @@ app.post("/api/cards/import", async (req, res) => {
   }
 });
 
-// ---------- 聊天测试（网页试聊，用当前人设卡 + API 页模型） ----------
+// ---------- WeFlow 本机直连（尽力集成，失败则用指引） ----------
+const WEFLOW_BASE = "http://127.0.0.1:5031";
+
+app.post("/api/weflow/probe", async (req, res) => {
+  const token = req.body?.token ?? "";
+  const candidates = ["/api/v1/talkers", "/api/v1/conversations", "/api/v1/chats", "/api/v1/contacts"];
+  const results: { path: string; status: number; hint: string }[] = [];
+  for (const p of candidates) {
+    try {
+      const r = await fetch(`${WEFLOW_BASE}${p}?access_token=${encodeURIComponent(token)}`, {
+        signal: AbortSignal.timeout(5000),
+      });
+      const body = await r.text().catch(() => "");
+      results.push({ path: p, status: r.status, hint: body.slice(0, 120) });
+    } catch (e) {
+      results.push({ path: p, status: 0, hint: String(e).slice(0, 120) });
+    }
+  }
+  res.json({ base: WEFLOW_BASE, results });
+});
+
+app.post("/api/distill/weflow", async (req, res) => {
+  try {
+    const { token, talker, limit, name, role, target, selfNames, blockedWords } = req.body ?? {};
+    if (!token || !talker || !name || !role) {
+      return res.status(400).json({ error: "token / talker / name / role 不能为空" });
+    }
+    const llm = await getModelLLMConfig();
+    if (!llm || !llm.apiKey) return res.status(400).json({ error: "未配置模型 API（API 页）" });
+    const url = `${WEFLOW_BASE}/api/v1/messages?access_token=${encodeURIComponent(token)}&talker=${encodeURIComponent(talker)}&limit=${Number(limit) || 500}`;
+    const r = await fetch(url, { signal: AbortSignal.timeout(30000) });
+    if (!r.ok) return res.status(502).json({ error: `WeFlow 返回 ${r.status}，请确认 WeFlow 已启动且 token 正确` });
+    const data = await r.json();
+    const result = await runDistill({
+      rawJson: data,
+      file: `weflow:${talker}`,
+      name,
+      role,
+      target: target ?? "",
+      selfNames: Array.isArray(selfNames) ? selfNames : [],
+      blockedWords: Array.isArray(blockedWords) ? blockedWords : [],
+      llm,
+    });
+    res.json({ card: result.card, talkers: result.talkers, stats: result.stats });
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+// ---------- 聊天测试（网页试聊，用当前人设卡 + API 页模型，可选工具） ----------
+async function chatCompletions(
+  llm: { baseUrl: string; apiKey: string; model: string },
+  messages: unknown[],
+  tools?: unknown[]
+): Promise<{ choices?: { message?: { content?: string; tool_calls?: unknown[] } }[] }> {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 90000);
+  try {
+    const r = await fetch(`${llm.baseUrl.replace(/\/+$/, "")}/chat/completions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${llm.apiKey}` },
+      body: JSON.stringify({
+        model: llm.model,
+        messages,
+        temperature: 0.7,
+        max_tokens: 2048,
+        ...(tools && tools.length ? { tools } : {}),
+      }),
+      signal: ctrl.signal,
+    });
+    if (!r.ok) {
+      const body = await r.text().catch(() => "");
+      throw new Error(`模型调用失败 ${r.status}: ${body.slice(0, 200)}`);
+    }
+    return await r.json();
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 app.post("/api/chat", async (req, res) => {
   try {
-    const { slug, message, history } = req.body ?? {};
+    const { slug, message, history, tools } = req.body ?? {};
     if (!slug || !message) return res.status(400).json({ error: "slug / message 不能为空" });
     const llm = await getModelLLMConfig();
     if (!llm || !llm.apiKey) {
       return res.status(400).json({ error: "未配置模型 API。请先到「API」页添加提供商并设为默认" });
     }
     const card = await store.get(slug);
-    const messages = [
-      { role: "system", content: buildChatSystem(card) },
+    const enabledTools = Array.isArray(tools) ? (tools as string[]) : [];
+    const toolDefs = TOOL_REGISTRY.filter((t) => enabledTools.includes(t.id));
+
+    const system = buildChatSystem(card) + (toolDefs.length
+      ? `\n\n你可以使用以下工具完成任务（如写代码、搜索、查天气、看时间）。当用户请求适合用工具完成时，调用工具而不是凭空编造结果。`
+      : "");
+    const messages: unknown[] = [
+      { role: "system", content: system },
       ...(Array.isArray(history) ? history.slice(-20) : []),
       { role: "user", content: message },
     ];
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), 90000);
-    const r = await fetch(`${llm.baseUrl.replace(/\/+$/, "")}/chat/completions`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${llm.apiKey}` },
-      body: JSON.stringify({ model: llm.model, messages, temperature: 0.7, max_tokens: 1024 }),
-      signal: ctrl.signal,
-    });
-    clearTimeout(timer);
-    if (!r.ok) {
-      const body = await r.text().catch(() => "");
-      return res.status(502).json({ error: `模型调用失败 ${r.status}: ${body.slice(0, 200)}` });
+
+    let reply = "（无回复）";
+    for (let i = 0; i < 4; i++) {
+      const data = await chatCompletions(llm, messages, toolDefs.length ? toolsToOpenAI(toolDefs) : undefined);
+      const msg = data.choices?.[0]?.message;
+      const toolCalls = (msg?.tool_calls ?? []) as { id?: string; function?: { name?: string; arguments?: string } }[];
+      if (toolCalls.length === 0) {
+        reply = msg?.content ?? "（空回复）";
+        break;
+      }
+      messages.push({ role: "assistant", content: msg?.content ?? "", tool_calls: toolCalls });
+      for (const tc of toolCalls) {
+        const def = toolDefs.find((t) => t.id === tc.function?.name);
+        let result = `未知工具: ${tc.function?.name ?? "?"}`;
+        if (def) {
+          try {
+            result = await def.run(JSON.parse(tc.function?.arguments || "{}"));
+          } catch (e) {
+            result = `工具执行出错: ${String(e)}`;
+          }
+        }
+        messages.push({ role: "tool", tool_call_id: tc.id ?? "", content: result });
+      }
     }
-    const data = await r.json();
-    res.json({ reply: data.choices?.[0]?.message?.content ?? "（空回复）" });
+    res.json({ reply });
   } catch (e) {
     res.status(500).json({ error: String(e) });
   }

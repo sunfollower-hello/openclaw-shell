@@ -196,6 +196,17 @@ const ethicsSchema = z.object({
   no_raw_quotes_in_prompt: z.boolean().default(true),
 });
 
+// ---------- 工具（能力层，让机器人不只是聊天） ----------
+export const TOOL_IDS = ["code_exec", "web_search", "weather", "datetime"] as const;
+
+const toolsSchema = z
+  .object({
+    enabled: z.array(z.enum(TOOL_IDS)).default([]),
+    policy: z.enum(["auto", "ask"]).default("auto"),
+    deny: z.array(z.string()).default([]),
+  })
+  .default({});
+
 // ---------- 卡片主体 ----------
 export const personaCardSchema = z.object({
   schema: z.literal(SCHEMA_VERSION).default(SCHEMA_VERSION),
@@ -218,6 +229,7 @@ export const personaCardSchema = z.object({
   variants: variantsSchema,
   chat: chatSchema.default({}),
   presets: presetsSchema.default({}),
+  tools: toolsSchema,
   sillytavern_v2: sillytavernSchema.optional(),
   ethics: ethicsSchema.default({}),
 });

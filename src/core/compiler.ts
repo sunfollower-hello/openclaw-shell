@@ -204,6 +204,16 @@ function renderSkill(card: PersonaCard): string {
   lines.push(`- 拟真延迟：约 ${chat.delay.base_ms}ms ± ${Math.round(chat.delay.variance * 100)}%（实现层控制）`);
   if (chat.delay.merge_burst) lines.push("- 连发消息先合并再回复");
   lines.push(`- 触发：私聊 ${chat.trigger.dm}，群聊 ${chat.trigger.group === "@" ? "仅 @ 机器人" : chat.trigger.group}`);
+
+  const tools = card.tools?.enabled ?? [];
+  if (tools.length > 0) {
+    lines.push("");
+    lines.push("## 可用工具");
+    lines.push(`- 允许：${tools.join("、")}`);
+    lines.push(`- 使用策略：${card.tools?.policy === "ask" ? "调用前先征得用户同意" : "自动调用（适合时直接使用）"}`);
+    if (card.tools?.deny?.length) lines.push(`- 禁止：${card.tools.deny.join("、")}`);
+    lines.push("- 用户请求适合用工具完成时（写代码、搜索、查天气等），调用工具而不是凭空编造结果");
+  }
   return lines.join("\n") + "\n";
 }
 

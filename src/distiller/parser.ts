@@ -39,7 +39,7 @@ function normalizeMessage(raw: Record<string, unknown>): NormalizedMessage | nul
   if (!clean || /^\[(图片|视频|语音|文件|表情)\]$/.test(clean)) return null;
 
   const sender = pick(raw, ["sender", "senderUsername", "fromUser", "from"]) ?? "unknown";
-  const senderName = pick(raw, ["accountName", "nickname", "name", "remark"]) ?? sender;
+  const senderName = pick(raw, ["accountName", "senderName", "nickname", "name", "remark"]) ?? sender;
   const ts = normalizeTs(toNumber(raw.createTime ?? raw.timestamp ?? raw.time ?? 0));
 
   return { sender, senderName, ts, text: clean };
@@ -73,4 +73,17 @@ export function parseWeFlowJson(input: unknown): ParseResult {
 
   const talkers = [...new Set(messages.map((m) => m.senderName))];
   return { messages, talkers, skipped };
+}
+
+/** 解析「昵称: 内容」每行一条的纯文本聊天记录（用户粘贴导入用） */
+export function parsePlainText(text: string): NormalizedMessage[] {
+  const msgs: NormalizedMessage[] = [];
+  const nameRe = /^\s*([^:：]{1,24})\s*[：:]\s*(.+)$/;
+  for (const line of text.split(/\r?\n/)) {
+    const m = line.match(nameRe);
+    if (m && m[2].trim()) {
+      msgs.push({ sender: m[1].trim(), senderName: m[1].trim(), ts: 0, text: m[2].trim() });
+    }
+  }
+  return msgs;
 }

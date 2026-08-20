@@ -230,3 +230,13 @@ button.danger { background: transparent; border-color: var(--danger); color: var
 }
 .bubble.me { align-self: flex-end; background: var(--accent); color: #fff; }
 .bubble.bot { align-self: flex-start; background: var(--panel); border: 1px solid var(--border); }
+
+/* ============ 工具勾选 ============ */
+.chat-tools {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  font-size: 12px;
+}
+.chat-tools label { display: flex; align-items: center; gap: 4px; color: var(--text); cursor: pointer; }
