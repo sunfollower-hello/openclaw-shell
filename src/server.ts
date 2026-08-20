@@ -15,6 +15,25 @@ const app = express();
 app.use(express.json({ limit: "2mb" }));
 const store = new CardStore();
 
+// 公网暴露时启用 Basic 认证（设置 OPENCLAW_SHELL_UI_USER / OPENCLAW_SHELL_UI_PASS）
+const UI_USER = process.env.OPENCLAW_SHELL_UI_USER;
+const UI_PASS = process.env.OPENCLAW_SHELL_UI_PASS;
+if (UI_USER && UI_PASS) {
+  app.use((req, res, next) => {
+    const auth = req.headers.authorization ?? "";
+    const [type, token] = auth.split(" ");
+    if (type === "Basic" && token) {
+      const decoded = Buffer.from(token, "base64").toString("utf8");
+      const idx = decoded.indexOf(":");
+      const user = idx >= 0 ? decoded.slice(0, idx) : "";
+      const pass = idx >= 0 ? decoded.slice(idx + 1) : "";
+      if (user === UI_USER && pass === UI_PASS) return next();
+    }
+    res.setHeader("WWW-Authenticate", 'Basic realm="openclaw-shell"');
+    res.status(401).json({ error: "需要认证（OPENCLAW_SHELL_UI_USER / PASS）" });
+  });
+}
+
 const projectRoot = findProjectRoot();
 app.use(express.static(path.join(projectRoot, "web")));
 

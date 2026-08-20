@@ -70,6 +70,18 @@ openclaw channels login --channel openclaw-weixin
 - OpenClaw 全局安装在 `%APPDATA%\npm`（已加入用户 PATH；npm 全局前缀已从 Program Files 改到用户目录，装全局包不再需要管理员权限）
 - 网关配置：`gateway.mode=local`、`gateway.auth.token`、`agents.defaults.workspace` 指向 `<项目>/data/workspace`
 - 微信通道是腾讯官方插件（@tencent-weixin/openclaw-weixin），当前仅支持单聊；部分账号灰度未开放 ClawBot 入口
+- 模型：Agnes 中转（`models.providers.agnes`，模型 `agnes-2.0-flash`），密钥在 `~/.openclaw/openclaw.json`，不入库
+
+## 公网访问（Cloudflare Tunnel）
+
+管理台页面经 Cloudflare 隧道挂在域名下（本机 `~/.cloudflared/config.yml` 已加路由）：
+
+```
+https://fwq.319274.xyz/openclaw-shell/   →  http://127.0.0.1:17880
+```
+
+- 页面启用 Basic 认证：账号密码在项目根 `.env`（`OPENCLAW_SHELL_UI_USER/PASS`，已 gitignore）
+- 修改隧道配置后需管理员权限重启服务：`Restart-Service Cloudflared -Force`
 
 ## 许可
 
