@@ -72,6 +72,19 @@ openclaw channels login --channel openclaw-weixin
 - 微信通道是腾讯官方插件（@tencent-weixin/openclaw-weixin），当前仅支持单聊；部分账号灰度未开放 ClawBot 入口
 - 模型：Agnes 中转（`models.providers.agnes`，模型 `agnes-2.0-flash`），密钥在 `~/.openclaw/openclaw.json`，不入库
 
+## 开机自启 + 桌面开关
+
+三个组件（管理台 / OpenClaw 网关 / Cloudflare 隧道）由 `scripts/start-stack.ps1` 统一托管，PID 记录在 `data/stack-pids.json`：
+
+- **桌面开关**：`桌面/openclaw-shell 开关.bat`（双击：在跑就停，没跑就启）
+- **开机自启**：`scripts/autostart.bat` 已放入启动文件夹（登录时自动启动）
+- 手动命令：
+  ```powershell
+  powershell -File D:\ai_workspace\openclaw-shell\scripts\start-stack.ps1
+  powershell -File D:\ai_workspace\openclaw-shell\scripts\stop-stack.ps1
+  ```
+- 停止只回收记录在案的 PID，绝不触碰其他进程（如 fwq 隧道系统服务）
+
 ## 公网访问（Cloudflare Tunnel）
 
 管理台经独立 Cloudflare 隧道（`openclaw`）挂在子域名：

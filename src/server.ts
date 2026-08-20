@@ -2,11 +2,27 @@
 // 启动: npm run server  →  http://127.0.0.1:17880
 import express from "express";
 import path from "node:path";
+import { promises as fs } from "node:fs";
 import { CardStore, dataDir, newCardId, nowIso } from "./core/cardStore.js";
 import { defaultCard, SCHEMA_VERSION } from "./core/schema.js";
 import { validateCard } from "./core/validator.js";
 import { compileCard } from "./core/compiler.js";
 import { findProjectRoot } from "./core/cardStore.js";
+
+// 加载项目 .env（仅补环境变量空缺，如 OPENCLAW_SHELL_UI_USER/PASS）
+async function loadEnv(): Promise<void> {
+  try {
+    const text = await fs.readFile(path.join(findProjectRoot(), ".env"), "utf8");
+    for (const line of text.split(/\r?\n/)) {
+      const m = line.match(/^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)\s*$/);
+      if (m && process.env[m[1]] === undefined) process.env[m[1]] = m[2];
+    }
+  } catch {
+    // .env 不存在则跳过
+  }
+}
+
+await loadEnv();
 
 const PORT = Number(process.env.PORT ?? 17880);
 const HOST = process.env.HOST ?? "127.0.0.1";
