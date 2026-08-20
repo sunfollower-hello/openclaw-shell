@@ -9,7 +9,7 @@ OpenClaw 图形化外壳：引导接入 QQ/微信、人设卡编辑、聊天记�
 | Tab | 功能 |
 |---|---|
 | 人设卡 | 创建/编辑/校验/编译人设卡，卡库管理 |
-| 通道 | 微信扫码绑定向导（网页出二维码、轮询登录、配对授权）；QQ(NapCat) 接入指引与状态检测 |
+| 通道 | 微信扫码绑定向导（网页出二维码、轮询登录、配对授权）；QQ 官方开放平台机器人绑定向导（腾讯官方插件，网页扫码） |
 | API | 模型提供商管理（baseUrl/key/模型），默认模型设置，连接测试 |
 
 ## 技术栈
@@ -79,6 +79,8 @@ openclaw channels login --channel openclaw-weixin
 - 网关配置：`gateway.mode=local`、`gateway.auth.token`、`agents.defaults.workspace` 指向 `<项目>/data/workspace`
 - 微信通道是腾讯官方插件（@tencent-weixin/openclaw-weixin），当前仅支持单聊；部分账号灰度未开放 ClawBot 入口
 - 模型：Agnes 中转（`models.providers.agnes`，模型 `agnes-2.0-flash`），密钥在 `~/.openclaw/openclaw.json`，不入库
+- 通道：微信走腾讯官方插件 `openclaw-weixin`（单聊，部分账号灰度）；QQ 走腾讯官方插件 `@tencent-connect/openclaw-qqbot`（单聊/群聊@/频道，q.qq.com 创建机器人后网页扫码绑定）
+- 已知限制：NapCat（用自己的 QQ 号当机器人）方案未就绪——官方 napcat 插件 npm 包无编译产物且源码版与新 SDK 不兼容
 
 ## 开机自启 + 桌面开关
 

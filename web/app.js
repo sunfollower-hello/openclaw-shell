@@ -3,7 +3,6 @@ const $ = (sel) => document.querySelector(sel);
 
 let currentSlug = null;
 let dirty = false;
-let wxPollTimer = null;
 
 const api = {
   async get(path) {
@@ -184,35 +183,41 @@ async function refreshWechat() {
   }
 }
 
-async function startWxLogin() {
+// ================= 通道：通用扫码登录 =================
+const loginTimers = {};
+
+async function startLogin(channelPath, qrSel, msgSel, refreshCb) {
   try {
-    await api.send("/api/channels/wechat/login", { method: "POST" });
-    $("#wx-qr").style.display = "block";
-    $("#wx-login-msg").textContent = "二维码生成中…";
-    startWxPoll();
+    await api.send(channelPath, { method: "POST" });
+    $(qrSel).style.display = "block";
+    $(msgSel).textContent = "二维码生成中…";
+    if (loginTimers[channelPath]) clearInterval(loginTimers[channelPath]);
+    loginTimers[channelPath] = setInterval(async () => {
+      try {
+        const s = await api.get(channelPath);
+        if (s.output) {
+          $(qrSel).textContent = s.output;
+          $(qrSel).style.display = "block";
+        }
+        if (!s.running && s.done) {
+          clearInterval(loginTimers[channelPath]);
+          loginTimers[channelPath] = null;
+          $(msgSel).textContent = s.ok ? "✓ 扫码成功，已绑定！" : "✗ 登录结束（未成功），检查平台侧配置后重试";
+          refreshCb && refreshCb();
+        }
+      } catch { /* 忽略瞬时错误 */ }
+    }, 2000);
   } catch (e) {
-    $("#wx-login-msg").textContent = "启动失败：" + e.message;
+    $(msgSel).textContent = "启动失败：" + e.message;
   }
 }
 
-function startWxPoll() {
-  if (wxPollTimer) clearInterval(wxPollTimer);
-  wxPollTimer = setInterval(async () => {
-    try {
-      const s = await api.get("/api/channels/wechat/login");
-      if (s.output) {
-        $("#wx-qr").textContent = s.output;
-        $("#wx-qr").style.display = "block";
-      }
-      if (!s.running && s.done) {
-        clearInterval(wxPollTimer);
-        wxPollTimer = null;
-        $("#wx-login-msg").textContent = s.ok ? "✓ 扫码成功，微信已绑定！" : "✗ 登录结束（未成功），检查微信是否有 ClawBot 入口后重试";
-        refreshWechat();
-        refreshPairing();
-      }
-    } catch { /* 服务暂时不可达，忽略 */ }
-  }, 2000);
+function startWxLogin() {
+  startLogin("/api/channels/wechat/login", "#wx-qr", "#wx-login-msg", () => { refreshWechat(); refreshPairing(); });
+}
+
+function startQqLogin() {
+  startLogin("/api/channels/qq/login", "#qq-qr", "#qq-login-msg", refreshQQ);
 }
 
 async function refreshPairing() {
@@ -250,25 +255,10 @@ async function refreshQQ() {
     ];
     const allOk = s.pluginInstalled && s.napcatRunning && s.onebotSeen;
     setChip("#qq-status", parts.join(" "), allOk);
-    if (!allOk) $("#qq-out").textContent = "完成 NapCat 安装与登录后，点「刷新状态」查看连接。";
+    if (!allOk) $("#qq-out").textContent = "官方 QQ Bot 插件已安装（若状态显示插件✓），按上方四步完成绑定即可。";
   } catch (e) {
     setChip("#qq-status", "检测失败", false);
   }
-}
-
-async function installQQPlugin() {
-  const btn = $("#btn-qq-install");
-  btn.disabled = true;
-  btn.textContent = "安装中…";
-  try {
-    const r = await api.send("/api/channels/qq/install-plugin", { method: "POST" });
-    $("#qq-out").textContent = (r.ok ? "✓ 插件安装成功\n" : "安装返回非零\n") + (r.output || "");
-  } catch (e) {
-    $("#qq-out").textContent = "安装失败：" + e.message;
-  }
-  btn.disabled = false;
-  btn.textContent = "安装 napcat 插件";
-  refreshQQ();
 }
 
 function refreshChannels() {
@@ -356,8 +346,8 @@ $("#editor-json").addEventListener("input", () => { dirty = true; });
 $("#btn-wx-login").addEventListener("click", startWxLogin);
 $("#btn-wx-refresh").addEventListener("click", refreshWechat);
 $("#btn-pair-approve").addEventListener("click", approvePairing);
+$("#btn-qq-login").addEventListener("click", startQqLogin);
 $("#btn-qq-refresh").addEventListener("click", refreshQQ);
-$("#btn-qq-install").addEventListener("click", installQQPlugin);
 
 $("#btn-model-test").addEventListener("click", testModel);
 $("#btn-model-save").addEventListener("click", saveModel);

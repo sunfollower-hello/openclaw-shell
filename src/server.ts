@@ -11,8 +11,8 @@ import { findProjectRoot } from "./core/cardStore.js";
 import {
   runOpenclaw,
   stripAnsi,
-  startWechatLogin,
-  getWechatLoginState,
+  startChannelLogin,
+  getChannelLoginState,
   portListening,
 } from "./core/openclawCli.js";
 import { getModelConfig, saveModelConfig, testModelEndpoint } from "./core/modelConfig.js";
@@ -158,12 +158,11 @@ app.get("/api/channels/wechat/status", async (_req, res) => {
 });
 
 app.post("/api/channels/wechat/login", (_req, res) => {
-  const state = startWechatLogin();
-  res.json(state);
+  res.json(startChannelLogin("openclaw-weixin"));
 });
 
 app.get("/api/channels/wechat/login", (_req, res) => {
-  res.json(getWechatLoginState());
+  res.json(getChannelLoginState("openclaw-weixin"));
 });
 
 app.get("/api/channels/wechat/pairing", async (_req, res) => {
@@ -186,12 +185,12 @@ app.post("/api/channels/wechat/pairing/approve", async (req, res) => {
   }
 });
 
-// ---------- 通道：QQ (napcat) ----------
+// ---------- 通道：QQ (官方开放平台 qqbot) ----------
 app.get("/api/channels/qq/status", async (_req, res) => {
   try {
     const plugin = await runOpenclaw(["plugins", "list"], { timeoutMs: 25000 });
-    const hasPlugin = /napcat/i.test(plugin.stdout + plugin.stderr);
-    const napcatRunning = await portListening(6099); // NapCat WebUI 默认端口
+    const hasPlugin = /qqbot|napcat/i.test(plugin.stdout + plugin.stderr);
+    const napcatRunning = await portListening(6099); // NapCat WebUI 默认端口（仅 napcat 方案用）
     const onebot = await runOpenclaw(["channels", "status", "--probe"], { timeoutMs: 25000 });
     const onebotText = stripAnsi(onebot.stdout + onebot.stderr);
     res.json({
@@ -202,6 +201,14 @@ app.get("/api/channels/qq/status", async (_req, res) => {
   } catch (e) {
     res.status(500).json({ error: String(e) });
   }
+});
+
+app.post("/api/channels/qq/login", (_req, res) => {
+  res.json(startChannelLogin("qqbot"));
+});
+
+app.get("/api/channels/qq/login", (_req, res) => {
+  res.json(getChannelLoginState("qqbot"));
 });
 
 app.post("/api/channels/qq/install-plugin", async (_req, res) => {

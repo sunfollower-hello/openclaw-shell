@@ -40,48 +40,58 @@ export function runOpenclaw(args: string[], opts: { timeoutMs?: number } = {}): 
   });
 }
 
-// ---------- 微信扫码登录（长驻进程，输出轮询） ----------
-export interface WechatLoginState {
+// ---------- 通道扫码登录（长驻进程，输出轮询；channel 如 openclaw-weixin / qqbot） ----------
+export interface ChannelLoginState {
   running: boolean;
   done: boolean;
   ok: boolean;
   output: string;
 }
 
-const loginState: WechatLoginState = { running: false, done: false, ok: false, output: "" };
-let loginProc: ChildProcess | null = null;
+const logins: Record<string, ChannelLoginState> = {};
+const loginProcs: Record<string, ChildProcess | null> = {};
 
-export function startWechatLogin(): WechatLoginState {
-  if (loginProc && !loginProc.killed) return { ...loginState };
-  loginState.running = true;
-  loginState.done = false;
-  loginState.ok = false;
-  loginState.output = "";
-  loginProc = spawn("node", [openclawEntry(), "channels", "login", "--channel", "openclaw-weixin"], {
+export function startChannelLogin(channel: string): ChannelLoginState {
+  const proc = loginProcs[channel];
+  if (proc && !proc.killed) return { ...logins[channel] };
+  logins[channel] = { running: true, done: false, ok: false, output: "" };
+  loginProcs[channel] = spawn("node", [openclawEntry(), "channels", "login", "--channel", channel], {
     windowsHide: true,
   });
   const append = (d: Buffer | string) => {
-    loginState.output = (loginState.output + stripAnsi(d.toString())).slice(-16000);
+    const s = logins[channel];
+    s.output = (s.output + stripAnsi(d.toString())).slice(-16000);
   };
-  loginProc.stdout?.on("data", append);
-  loginProc.stderr?.on("data", append);
-  loginProc.on("close", (code) => {
-    loginState.running = false;
-    loginState.done = true;
-    loginState.ok = code === 0;
-    loginProc = null;
+  loginProcs[channel]?.stdout?.on("data", append);
+  loginProcs[channel]?.stderr?.on("data", append);
+  loginProcs[channel]?.on("close", (code) => {
+    const s = logins[channel];
+    s.running = false;
+    s.done = true;
+    s.ok = code === 0;
+    loginProcs[channel] = null;
   });
-  loginProc.on("error", () => {
-    loginState.running = false;
-    loginState.done = true;
-    loginState.ok = false;
-    loginProc = null;
+  loginProcs[channel]?.on("error", () => {
+    const s = logins[channel];
+    s.running = false;
+    s.done = true;
+    s.ok = false;
+    loginProcs[channel] = null;
   });
-  return { ...loginState };
+  return { ...logins[channel] };
 }
 
-export function getWechatLoginState(): WechatLoginState {
-  return { ...loginState };
+export function getChannelLoginState(channel: string): ChannelLoginState {
+  const s = logins[channel];
+  return s ? { ...s } : { running: false, done: false, ok: false, output: "" };
+}
+
+/** 兼容旧名：微信登录 */
+export function startWechatLogin(): ChannelLoginState {
+  return startChannelLogin("openclaw-weixin");
+}
+export function getWechatLoginState(): ChannelLoginState {
+  return getChannelLoginState("openclaw-weixin");
 }
 
 // ---------- 进程/端口检测 ----------

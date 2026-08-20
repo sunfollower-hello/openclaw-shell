@@ -80,21 +80,23 @@
         <!-- QQ -->
         <div class="channel-card">
           <h2>🐧 QQ <span id="qq-status" class="chip">检测中…</span></h2>
-          <p class="hint">基于 NapCat（OneBot 11）协议端。需要：安装 NapCat → 登录 QQ → 配置 OneBot 连接。</p>
+          <p class="hint">官方 QQ 开放平台机器人（腾讯官方插件，合规无封号风险）。支持单聊 / 群聊@ / 频道，富媒体。</p>
           <div class="channel-actions">
+            <button id="btn-qq-login">开始扫码绑定</button>
             <button id="btn-qq-refresh">刷新状态</button>
-            <button id="btn-qq-install">安装 napcat 插件</button>
           </div>
+          <pre id="qq-qr" class="qr-box" style="display:none"></pre>
+          <div id="qq-login-msg" class="status"></div>
           <div id="qq-guide" class="guide">
             <ol>
-              <li><b>安装 NapCat</b>：从 <a href="https://github.com/NapNeko/NapCatQQ/releases" target="_blank">NapCatQQ Releases</a> 下载并启动（Shell 版无需安装）</li>
-              <li><b>登录 QQ</b>：NapCat 会弹出 QQ 窗口，扫码登录机器人 QQ 号</li>
-              <li><b>配置连接</b>：打开 NapCat WebUI，添加 OneBot v11 反向 WebSocket，地址指向本软件（见下方提示）</li>
-              <li><b>刷新状态</b>：连接成功后本页状态变为绿色</li>
+              <li><b>创建机器人</b>：打开 <a href="https://q.qq.com/" target="_blank">QQ 开放平台</a>，手机 QQ 扫码登录开发者账号，点「创建机器人」（机器人会自动出现在你的 QQ 消息列表）</li>
+              <li><b>扫码绑定</b>：点上方「开始扫码绑定」，用手机 QQ 扫网页二维码完成授权</li>
+              <li><b>开始对话</b>：在 QQ 消息列表找到机器人发消息测试（未配置完成前机器人会回「已去火星」）</li>
+              <li><b>正式上线</b>：开发调试用沙箱环境即可；正式发布需在平台提交审核</li>
             </ol>
           </div>
           <pre id="qq-out" class="small-out"></pre>
-          <div class="note">连接地址：<code>ws://127.0.0.1:18789/onebot/v11/ws</code>（端口与 OpenClaw 网关一致）</div>
+          <div class="note">说明：官方机器人是「消息列表里的机器人」而非你的 QQ 号；若想用「自己的 QQ 号」当机器人（NapCat 方案），需要另行适配，暂未就绪。</div>
         </div>
       </div>
     </section>
