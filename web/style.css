@@ -240,3 +240,19 @@ button.danger { background: transparent; border-color: var(--danger); color: var
   font-size: 12px;
 }
 .chat-tools label { display: flex; align-items: center; gap: 4px; color: var(--text); cursor: pointer; }
+
+/* ============ 聊天选项（工具/技能/深度/语音） ============ */
+.chat-opts {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+  padding: 8px;
+  background: var(--panel2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+.opt-group { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; color: var(--muted); }
+.opt-group label { display: flex; align-items: center; gap: 3px; color: var(--text); cursor: pointer; }
+.opt-group select { padding: 2px 6px; font-size: 12px; }
+.approve-row { display: flex; gap: 8px; align-self: flex-start; margin-top: 2px; }

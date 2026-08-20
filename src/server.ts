@@ -20,7 +20,9 @@ import { runDistill, saveDistilledCard } from "./distiller/pipeline.js";
 import { parsePlainText } from "./distiller/parser.js";
 import { RELATION_ROLES } from "./core/schema.js";
 import { buildChatSystem } from "./core/chatPrompt.js";
-import { TOOL_REGISTRY, toolsToOpenAI } from "./tools/registry.js";
+import { TOOL_REGISTRY, toolsToOpenAI, type ToolDef, type ToolCtx } from "./tools/registry.js";
+import { SKILL_LIBRARY } from "./core/skills.js";
+import { getMCPTools, loadMCPConfig, saveMCPConfig, reloadMCP } from "./tools/mcp.js";
 
 // 加载项目 .env（仅补环境变量空缺，如 OPENCLAW_SHELL_UI_USER/PASS）
 async function loadEnv(): Promise<void> {
@@ -367,11 +369,12 @@ app.post("/api/distill/weflow", async (req, res) => {
   }
 });
 
-// ---------- 聊天测试（网页试聊，用当前人设卡 + API 页模型，可选工具） ----------
+// ---------- 聊天测试（人设 + 工具 + 技能 + 记忆 + 思考深度 + ask 审批） ----------
 async function chatCompletions(
   llm: { baseUrl: string; apiKey: string; model: string },
   messages: unknown[],
-  tools?: unknown[]
+  tools?: unknown[],
+  reasoning?: string
 ): Promise<{ choices?: { message?: { content?: string; tool_calls?: unknown[] } }[] }> {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), 90000);
@@ -385,6 +388,7 @@ async function chatCompletions(
         temperature: 0.7,
         max_tokens: 2048,
         ...(tools && tools.length ? { tools } : {}),
+        ...(reasoning ? { reasoning_effort: reasoning } : {}),
       }),
       signal: ctrl.signal,
     });
@@ -398,51 +402,168 @@ async function chatCompletions(
   }
 }
 
+interface ToolCallMsg {
+  id?: string;
+  function?: { name?: string; arguments?: string };
+}
+
+async function executeToolCalls(tools: ToolDef[], toolCalls: ToolCallMsg[], messages: unknown[], ctx: ToolCtx): Promise<void> {
+  for (const tc of toolCalls) {
+    const def = tools.find((t) => t.id === tc.function?.name);
+    let result = `未知工具: ${tc.function?.name ?? "?"}`;
+    if (def) {
+      try {
+        result = await def.run(JSON.parse(tc.function?.arguments || "{}"), ctx);
+      } catch (e) {
+        result = `工具执行出错: ${String(e)}`;
+      }
+    }
+    messages.push({ role: "tool", tool_call_id: tc.id ?? "", content: result });
+  }
+}
+
+type LoopResult =
+  | { type: "reply"; reply: string }
+  | { type: "pending"; pending: { id: string; name: string; args: string }[]; messages: unknown[] };
+
+async function runToolLoop(
+  llm: { baseUrl: string; apiKey: string; model: string },
+  messages: unknown[],
+  tools: ToolDef[],
+  ctx: ToolCtx,
+  askAll: boolean,
+  reasoning?: string
+): Promise<LoopResult> {
+  for (let i = 0; i < 4; i++) {
+    const data = await chatCompletions(llm, messages, tools.length ? toolsToOpenAI(tools) : undefined, reasoning);
+    const msg = data.choices?.[0]?.message;
+    const toolCalls = ((msg?.tool_calls ?? []) as ToolCallMsg[]).filter((tc) => tc.function?.name);
+    if (toolCalls.length === 0) return { type: "reply", reply: msg?.content ?? "（空回复）" };
+    messages.push({ role: "assistant", content: msg?.content ?? "", tool_calls: toolCalls });
+    const hasDangerous = toolCalls.some((tc) => tools.find((t) => t.id === tc.function?.name)?.dangerous);
+    if (askAll || hasDangerous) {
+      return {
+        type: "pending",
+        pending: toolCalls.map((tc) => ({
+          id: tc.id ?? "",
+          name: tc.function?.name ?? "",
+          args: tc.function?.arguments ?? "{}",
+        })),
+        messages,
+      };
+    }
+    await executeToolCalls(tools, toolCalls, messages, ctx);
+  }
+  return { type: "reply", reply: "（达到工具轮次上限）" };
+}
+
+async function resolveChatTools(enabledTools: string[], useMCP: boolean): Promise<{ defs: ToolDef[]; mcpErrors: string[] }> {
+  const defs = TOOL_REGISTRY.filter((t) => enabledTools.includes(t.id));
+  let mcpErrors: string[] = [];
+  if (useMCP) {
+    const m = await getMCPTools();
+    defs.push(...m.tools);
+    mcpErrors = m.errors;
+  }
+  return { defs, mcpErrors };
+}
+
+function chatCtx(slug: string): ToolCtx {
+  return {
+    sandboxDir: path.join(dataDir(), "sandbox", slug),
+    memoryPath: path.join(dataDir(), "memory", `${slug}.mem`),
+  };
+}
+
 app.post("/api/chat", async (req, res) => {
   try {
-    const { slug, message, history, tools } = req.body ?? {};
+    const { slug, message, history, tools, skills, thinking, useMCP } = req.body ?? {};
     if (!slug || !message) return res.status(400).json({ error: "slug / message 不能为空" });
     const llm = await getModelLLMConfig();
-    if (!llm || !llm.apiKey) {
-      return res.status(400).json({ error: "未配置模型 API。请先到「API」页添加提供商并设为默认" });
-    }
+    if (!llm || !llm.apiKey) return res.status(400).json({ error: "未配置模型 API（API 页）" });
     const card = await store.get(slug);
     const enabledTools = Array.isArray(tools) ? (tools as string[]) : [];
-    const toolDefs = TOOL_REGISTRY.filter((t) => enabledTools.includes(t.id));
+    const { defs: toolDefs, mcpErrors } = await resolveChatTools(enabledTools, useMCP === true);
 
-    const system = buildChatSystem(card) + (toolDefs.length
-      ? `\n\n你可以使用以下工具完成任务（如写代码、搜索、查天气、看时间）。当用户请求适合用工具完成时，调用工具而不是凭空编造结果。`
-      : "");
+    const skillPrompts = (Array.isArray(skills) ? (skills as string[]) : [])
+      .map((id) => SKILL_LIBRARY.find((s) => s.id === id)?.prompt)
+      .filter(Boolean) as string[];
+
+    const memories = await fs
+      .readFile(chatCtx(slug).memoryPath, "utf8")
+      .then((t) => t.split("\n").filter(Boolean))
+      .catch(() => []);
+    const memoryBlock = memories.length
+      ? `\n\n【长期记忆（关于用户的事实，仅在相关时使用；要新增事实时调用 memory_save 工具）】\n- ${memories.slice(-30).join("\n- ")}`
+      : "";
+
+    const level = String(thinking ?? card.chat?.thinking ?? "low");
+    const reasoning = level === "medium" ? "medium" : level === "high" ? "high" : undefined;
+    const system =
+      buildChatSystem(card) +
+      (toolDefs.length
+        ? "\n\n你可以使用工具完成任务（写代码/沙箱文件/搜索/天气/时间/记忆）。用户请求适合用工具完成时，调用工具而不是凭空编造；危险工具会先征得用户同意。"
+        : "") +
+      skillPrompts.map((p) => "\n" + p).join("") +
+      memoryBlock +
+      (mcpErrors.length ? `\n\n（MCP 连接提示：${mcpErrors.join("；")}）` : "");
+
     const messages: unknown[] = [
       { role: "system", content: system },
       ...(Array.isArray(history) ? history.slice(-20) : []),
       { role: "user", content: message },
     ];
+    const result = await runToolLoop(llm, messages, toolDefs, chatCtx(slug), card.tools?.policy === "ask", reasoning);
+    res.json(result);
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
 
-    let reply = "（无回复）";
-    for (let i = 0; i < 4; i++) {
-      const data = await chatCompletions(llm, messages, toolDefs.length ? toolsToOpenAI(toolDefs) : undefined);
-      const msg = data.choices?.[0]?.message;
-      const toolCalls = (msg?.tool_calls ?? []) as { id?: string; function?: { name?: string; arguments?: string } }[];
-      if (toolCalls.length === 0) {
-        reply = msg?.content ?? "（空回复）";
-        break;
-      }
-      messages.push({ role: "assistant", content: msg?.content ?? "", tool_calls: toolCalls });
+app.post("/api/chat/approve", async (req, res) => {
+  try {
+    const { slug, messages, approve, tools, useMCP } = req.body ?? {};
+    if (!slug || !Array.isArray(messages)) return res.status(400).json({ error: "slug / messages 不能为空" });
+    const llm = await getModelLLMConfig();
+    if (!llm || !llm.apiKey) return res.status(400).json({ error: "未配置模型 API（API 页）" });
+    const card = await store.get(slug);
+    const enabledTools = Array.isArray(tools) ? (tools as string[]) : [];
+    const { defs: toolDefs } = await resolveChatTools(enabledTools, useMCP === true);
+    const last = messages[messages.length - 1] as { tool_calls?: ToolCallMsg[] };
+    const toolCalls = (last?.tool_calls ?? []).filter((tc) => tc.function?.name);
+    if (approve) {
+      await executeToolCalls(toolDefs, toolCalls, messages, chatCtx(slug));
+    } else {
       for (const tc of toolCalls) {
-        const def = toolDefs.find((t) => t.id === tc.function?.name);
-        let result = `未知工具: ${tc.function?.name ?? "?"}`;
-        if (def) {
-          try {
-            result = await def.run(JSON.parse(tc.function?.arguments || "{}"));
-          } catch (e) {
-            result = `工具执行出错: ${String(e)}`;
-          }
-        }
-        messages.push({ role: "tool", tool_call_id: tc.id ?? "", content: result });
+        messages.push({ role: "tool", tool_call_id: tc.id ?? "", content: "用户拒绝执行此工具调用" });
       }
     }
-    res.json({ reply });
+    const result = await runToolLoop(llm, messages, toolDefs, chatCtx(slug), card.tools?.policy === "ask");
+    res.json(result);
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+// ---------- MCP 配置 ----------
+app.get("/api/mcp/config", async (_req, res) => {
+  try {
+    res.json(await loadMCPConfig());
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+app.post("/api/mcp/config", async (req, res) => {
+  try {
+    const servers = req.body?.servers;
+    if (!Array.isArray(servers)) return res.status(400).json({ error: "servers 必须是数组" });
+    const clean = servers
+      .filter((s) => s && typeof s.name === "string" && typeof s.command === "string")
+      .map((s) => ({ name: s.name, command: s.command, args: Array.isArray(s.args) ? s.args : [] }));
+    await saveMCPConfig({ servers: clean });
+    await reloadMCP();
+    res.json({ ok: true, servers: clean.length });
   } catch (e) {
     res.status(500).json({ error: String(e) });
   }

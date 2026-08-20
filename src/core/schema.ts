@@ -148,6 +148,7 @@ const variantsSchema = z
 // ---------- 聊天行为配置 ----------
 const chatSchema = z.object({
   quote_style: z.enum(["reuse", "original"]).default("reuse"),
+  thinking: z.enum(["low", "medium", "high"]).default("low"),
   delay: z
     .object({
       base_ms: z.number().int().nonnegative().default(1500),

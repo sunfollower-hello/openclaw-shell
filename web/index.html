@@ -56,12 +56,29 @@
             <h3>💬 聊天测试 <span class="hint">用当前卡片 + API 页模型试聊（改完先点保存）</span></h3>
             <button id="btn-chat-clear" class="small-btn">清空</button>
           </div>
-          <div class="chat-tools">
-            <span class="hint">工具（勾选后机器人可写代码/搜索/查天气）：</span>
-            <label><input type="checkbox" id="tool-code" checked /> 写代码</label>
-            <label><input type="checkbox" id="tool-search" /> 联网搜索</label>
-            <label><input type="checkbox" id="tool-weather" /> 天气</label>
-            <label><input type="checkbox" id="tool-time" checked /> 时间</label>
+          <div class="chat-opts">
+            <span class="opt-group">工具：
+              <label title="危险工具，会先问你是否执行"><input type="checkbox" id="tool-code" checked /> 写代码*</label>
+              <label><input type="checkbox" id="tool-file" /> 沙箱文件</label>
+              <label><input type="checkbox" id="tool-search" /> 搜索</label>
+              <label><input type="checkbox" id="tool-weather" /> 天气</label>
+              <label><input type="checkbox" id="tool-time" checked /> 时间</label>
+              <label><input type="checkbox" id="tool-memory" /> 记忆</label>
+              <label><input type="checkbox" id="tool-mcp" /> MCP</label>
+            </span>
+            <span class="opt-group">技能：
+              <label><input type="checkbox" id="skill-code" /> 代码专家</label>
+              <label><input type="checkbox" id="skill-trans" /> 翻译</label>
+              <label><input type="checkbox" id="skill-write" /> 写作</label>
+              <label><input type="checkbox" id="skill-companion" /> 陪伴</label>
+            </span>
+            <span class="opt-group">深度：
+              <select id="chat-thinking"><option value="low">低</option><option value="medium">中</option><option value="high">高</option></select>
+            </span>
+            <span class="opt-group">语音：
+              <label><input type="checkbox" id="chat-voice-reply" /> 读回复</label>
+              <button id="btn-mic" class="small-btn" title="语音输入（Chrome/Edge）">🎤</button>
+            </span>
           </div>
           <div id="chat-log" class="chat-log"></div>
           <div class="row">
@@ -205,6 +222,15 @@
             </div>
             <div id="model-msg" class="status"></div>
           </div>
+        </div>
+        <div class="channel-card">
+          <h2>🔌 MCP 服务器</h2>
+          <p class="hint">JSON 数组，每项 <code>{"name":"服务名","command":"命令","args":[]}</code>。保存后聊天测试勾选「MCP」即可用其工具（MCP 工具默认需审批）。</p>
+          <textarea id="mcp-config" rows="6" spellcheck="false"></textarea>
+          <div class="row" style="margin-top:8px">
+            <button id="btn-mcp-save" class="primary">保存并重连</button>
+          </div>
+          <div id="mcp-msg" class="status"></div>
         </div>
       </div>
     </section>

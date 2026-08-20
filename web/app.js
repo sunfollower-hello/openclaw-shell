@@ -43,7 +43,7 @@ document.querySelectorAll(".tab").forEach((btn) => {
     btn.classList.add("active");
     $("#tab-" + btn.dataset.tab).classList.add("active");
     if (btn.dataset.tab === "channels") refreshChannels();
-    if (btn.dataset.tab === "api") loadModelConfig();
+    if (btn.dataset.tab === "api") { loadModelConfig(); loadMCPConfig(); }
     if (btn.dataset.tab === "distill") loadDistillModel();
   });
 });
@@ -452,6 +452,7 @@ async function distillFromWeFlow() {
 
 // ================= 聊天测试 =================
 let chatHistory = [];
+let pendingData = null;
 
 function addChatBubble(role, text) {
   const log = $("#chat-log");
@@ -460,6 +461,82 @@ function addChatBubble(role, text) {
   div.textContent = text;
   log.appendChild(div);
   log.scrollTop = log.scrollHeight;
+  return div;
+}
+
+function speak(text) {
+  try {
+    const u = new SpeechSynthesisUtterance(text.replace(/[`*#_]/g, ""));
+    u.lang = "zh-CN";
+    speechSynthesis.cancel();
+    speechSynthesis.speak(u);
+  } catch { /* 语音不可用时忽略 */ }
+}
+
+function gatherChatOptions() {
+  const tools = [];
+  if ($("#tool-code").checked) tools.push("code_exec");
+  if ($("#tool-file").checked) tools.push("sandbox_list", "sandbox_read", "sandbox_write", "sandbox_grep");
+  if ($("#tool-search").checked) tools.push("web_search");
+  if ($("#tool-weather").checked) tools.push("weather");
+  if ($("#tool-time").checked) tools.push("datetime");
+  if ($("#tool-memory").checked) tools.push("memory_save");
+  const useMCP = $("#tool-mcp").checked;
+  const skills = [];
+  if ($("#skill-code").checked) skills.push("code_expert");
+  if ($("#skill-trans").checked) skills.push("translator");
+  if ($("#skill-write").checked) skills.push("writing");
+  if ($("#skill-companion").checked) skills.push("companion");
+  return { tools, useMCP, skills, thinking: $("#chat-thinking").value };
+}
+
+async function finishTurn(r) {
+  if (r.type === "reply") {
+    addChatBubble("bot", r.reply);
+    chatHistory.push({ role: "assistant", content: r.reply });
+    if ($("#chat-voice-reply").checked) speak(r.reply);
+  } else if (r.type === "pending") {
+    const bubble = addChatBubble("bot", "🛡️ 需要你确认：机器人想调用以下工具\n" +
+      r.pending.map((p) => `· ${p.name}`).join("\n"));
+    const row = document.createElement("div");
+    row.className = "approve-row";
+    const btnOk = document.createElement("button");
+    btnOk.className = "small-btn primary";
+    btnOk.textContent = "✅ 执行";
+    const btnNo = document.createElement("button");
+    btnNo.className = "small-btn danger";
+    btnNo.textContent = "🚫 拒绝";
+    pendingData = { slug: currentSlug, messages: r.messages, tools: gatherChatOptions().tools, useMCP: gatherChatOptions().useMCP, approve: false };
+    btnOk.addEventListener("click", async () => {
+      row.remove();
+      pendingData.approve = true;
+      await sendApprove();
+    });
+    btnNo.addEventListener("click", async () => {
+      row.remove();
+      pendingData.approve = false;
+      await sendApprove();
+    });
+    row.appendChild(btnOk);
+    row.appendChild(btnNo);
+    bubble.parentNode.appendChild(row);
+  }
+}
+
+async function sendApprove() {
+  const btn = $("#btn-chat-send");
+  btn.disabled = true;
+  try {
+    const r = await api.send("/api/chat/approve", {
+      method: "POST",
+      body: JSON.stringify(pendingData),
+    });
+    pendingData = null;
+    await finishTurn(r);
+  } catch (e) {
+    addChatBubble("bot", "⚠ " + e.message);
+  }
+  btn.disabled = false;
 }
 
 async function sendChat() {
@@ -472,28 +549,67 @@ async function sendChat() {
   chatHistory.push({ role: "user", content: message });
   const btn = $("#btn-chat-send");
   btn.disabled = true;
-  const tools = [];
-  if ($("#tool-code").checked) tools.push("code_exec");
-  if ($("#tool-search").checked) tools.push("web_search");
-  if ($("#tool-weather").checked) tools.push("weather");
-  if ($("#tool-time").checked) tools.push("datetime");
+  const opts = gatherChatOptions();
   try {
     const r = await api.send("/api/chat", {
       method: "POST",
-      body: JSON.stringify({ slug: currentSlug, message, history: chatHistory.slice(0, -1), tools }),
+      body: JSON.stringify({
+        slug: currentSlug,
+        message,
+        history: chatHistory.slice(0, -1),
+        tools: opts.tools,
+        useMCP: opts.useMCP,
+        skills: opts.skills,
+        thinking: opts.thinking,
+      }),
     });
-    addChatBubble("bot", r.reply);
-    chatHistory.push({ role: "assistant", content: r.reply });
+    await finishTurn(r);
   } catch (e) {
-    addChatBubble("bot", "⚠ " + e.message);
     chatHistory.pop();
+    addChatBubble("bot", "⚠ " + e.message);
   }
   btn.disabled = false;
 }
 
 function clearChat() {
   chatHistory = [];
+  pendingData = null;
   $("#chat-log").innerHTML = "";
+}
+
+// 语音输入（Chrome/Edge 的 Web Speech API）
+function startMic() {
+  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (!SR) { alert("当前浏览器不支持语音输入，请用 Chrome 或 Edge"); return; }
+  const rec = new SR();
+  rec.lang = "zh-CN";
+  rec.onresult = (e) => {
+    $("#chat-input").value = e.results[0][0].transcript;
+  };
+  rec.onerror = () => { /* 忽略 */ };
+  rec.start();
+}
+
+// ================= MCP =================
+async function loadMCPConfig() {
+  try {
+    const cfg = await api.get("/api/mcp/config");
+    $("#mcp-config").value = JSON.stringify(cfg.servers, null, 2);
+  } catch (e) {
+    $("#mcp-msg").textContent = "读取失败：" + e.message;
+  }
+}
+
+async function saveMCP() {
+  try {
+    const servers = JSON.parse($("#mcp-config").value);
+    const r = await api.send("/api/mcp/config", { method: "POST", body: JSON.stringify({ servers }) });
+    $("#mcp-msg").textContent = "✓ 已保存并重连，" + r.servers + " 个服务器";
+    $("#mcp-msg").className = "status ok";
+  } catch (e) {
+    $("#mcp-msg").textContent = "保存失败：" + e.message;
+    $("#mcp-msg").className = "status err";
+  }
 }
 
 // ================= 事件绑定 =================
@@ -518,7 +634,9 @@ $("#btn-wf-probe").addEventListener("click", probeWeFlow);
 $("#btn-wf-distill").addEventListener("click", distillFromWeFlow);
 $("#btn-chat-send").addEventListener("click", sendChat);
 $("#btn-chat-clear").addEventListener("click", clearChat);
+$("#btn-mic").addEventListener("click", startMic);
 $("#chat-input").addEventListener("keydown", (e) => { if (e.key === "Enter") sendChat(); });
+$("#btn-mcp-save").addEventListener("click", saveMCP);
 
 // ================= 启动 =================
 (async function init() {

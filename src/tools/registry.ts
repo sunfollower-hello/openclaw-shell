@@ -1,24 +1,30 @@
-// 工具注册表：全部免 API key（本机运行 / DuckDuckGo / wttr.in）
-// 由 /api/chat 的 function calling 循环调用
+// 工具注册表：全部免 API key；沙箱化（参考 rikkahub 的 workspace 隔离思路，Windows 实现）
+// 运行上下文 ctx：sandboxDir = 该人设卡的工作区沙箱目录，memoryPath = 长期记忆文件
 import { execFile } from "node:child_process";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+
+export interface ToolCtx {
+  sandboxDir: string;
+  memoryPath: string;
+}
 
 export interface ToolDef {
   id: string;
   name: string;
   description: string;
   parameters: Record<string, unknown>;
-  run: (args: Record<string, unknown>) => Promise<string>;
+  dangerous?: boolean; // 危险工具 → 默认走 ask 审批
+  run: (args: Record<string, unknown>, ctx: ToolCtx) => Promise<string>;
 }
 
-function execAsync(cmd: string, args: string[], timeoutMs: number): Promise<string> {
+function execAsync(cmd: string, args: string[], opts: { timeoutMs: number; cwd?: string }): Promise<string> {
   return new Promise((resolve) => {
     execFile(
       cmd,
       args,
-      { timeout: timeoutMs, maxBuffer: 2 * 1024 * 1024, windowsHide: true },
+      { timeout: opts.timeoutMs, cwd: opts.cwd, maxBuffer: 2 * 1024 * 1024, windowsHide: true },
       (err, stdout, stderr) => {
         const out = String(stdout || "") || String(stderr || "");
         resolve(out ? out.slice(0, 6000) : err ? `（退出码 ${(err as NodeJS.ErrnoException).code ?? "?"}，无输出）` : "（无输出）");
@@ -27,40 +33,136 @@ function execAsync(cmd: string, args: string[], timeoutMs: number): Promise<stri
   });
 }
 
+/** 沙箱路径解析：任何越界访问一律拒绝 */
+export function resolveInSandbox(sandboxDir: string, p: string): string | null {
+  const abs = path.resolve(sandboxDir, p || ".");
+  if (abs === sandboxDir || abs.startsWith(sandboxDir + path.sep)) return abs;
+  return null;
+}
+
+// ---------- 写代码并运行（沙箱内，Node 权限模型限制文件访问） ----------
 const codeExec: ToolDef = {
   id: "code_exec",
-  name: "写代码并运行（JavaScript/Node.js）",
+  name: "写代码并运行（沙箱内）",
   description:
-    "编写并执行 JavaScript/Node.js 代码（在本机运行，15 秒超时，输出最多 6000 字符）。适合计算、数据处理、生成脚本。用 console.log 输出结果；支持 async/await；也可以使用 require 引入内置模块。",
+    "编写并执行 JavaScript/Node.js 代码。运行在「工作区沙箱」目录内：只能读写沙箱目录里的文件，内存上限 256MB，15 秒超时。用 console.log 输出；支持 async/await 和 require 内置模块。",
   parameters: {
     type: "object",
     properties: { code: { type: "string", description: "要执行的完整 JavaScript 代码" } },
     required: ["code"],
   },
-  async run(args) {
+  dangerous: true,
+  async run(args, ctx) {
     const code = String(args.code ?? "");
     if (!code.trim()) return "错误：代码为空";
-    const file = path.join(os.tmpdir(), `ocs-exec-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.mjs`);
+    await fs.mkdir(ctx.sandboxDir, { recursive: true });
+    const file = path.join(ctx.sandboxDir, `_exec_${Date.now()}.mjs`);
     await fs.writeFile(file, code, "utf8");
     try {
-      return await execAsync(process.execPath, [file], 15000);
-    } catch (e) {
-      return `执行失败: ${String(e)}`;
+      // 第一优先：Node 权限模型（仅允许读写沙箱目录）
+      const permArgs = [
+        "--experimental-permission",
+        `--allow-fs-read=${ctx.sandboxDir}`,
+        `--allow-fs-write=${ctx.sandboxDir}`,
+        "--max-old-space-size=256",
+        file,
+      ];
+      const out = await execAsync(process.execPath, permArgs, { timeoutMs: 15000, cwd: ctx.sandboxDir });
+      return out;
+    } catch {
+      // 权限模型在个别环境不兼容时的降级：普通运行（仍在沙箱目录内，有超时/内存限制）
+      const out = await execAsync(process.execPath, ["--max-old-space-size=256", file], {
+        timeoutMs: 15000,
+        cwd: ctx.sandboxDir,
+      });
+      return out + "\n（注：当前环境未启用文件权限限制）";
     } finally {
       fs.unlink(file).catch(() => {});
     }
   },
 };
 
+// ---------- 沙箱文件工具集（参考 rikkahub workspace 文件工具思路） ----------
+const sandboxList: ToolDef = {
+  id: "sandbox_list",
+  name: "列出沙箱文件",
+  description: "列出工作区沙箱目录下的文件（相对路径）。参数 dir 为相对目录，空为根目录。",
+  parameters: { type: "object", properties: { dir: { type: "string", description: "相对目录，默认空（根）" } } },
+  async run(args, ctx) {
+    const dir = resolveInSandbox(ctx.sandboxDir, String(args.dir ?? ""));
+    if (!dir) return "拒绝访问沙箱外路径";
+    const items = await fs.readdir(dir, { withFileTypes: true }).catch(() => []);
+    if (!items.length) return "（空目录）";
+    return items
+      .map((i) => `${i.isDirectory() ? "[目录]" : "[文件]"} ${i.name}`)
+      .sort()
+      .join("\n");
+  },
+};
+
+const sandboxRead: ToolDef = {
+  id: "sandbox_read",
+  name: "读取沙箱文件",
+  description: "读取工作区沙箱目录里的文件内容（最多 8000 字符）。参数 file 为相对路径。",
+  parameters: { type: "object", properties: { file: { type: "string" } }, required: ["file"] },
+  async run(args, ctx) {
+    const f = resolveInSandbox(ctx.sandboxDir, String(args.file ?? ""));
+    if (!f) return "拒绝访问沙箱外路径";
+    const content = await fs.readFile(f, "utf8").catch((e) => `读取失败: ${e.message}`);
+    return content.slice(0, 8000);
+  },
+};
+
+const sandboxWrite: ToolDef = {
+  id: "sandbox_write",
+  name: "写入沙箱文件",
+  description: "在工作区沙箱目录里创建/覆盖文件（自动创建父目录）。参数 file 为相对路径，content 为内容。",
+  parameters: {
+    type: "object",
+    properties: { file: { type: "string" }, content: { type: "string" } },
+    required: ["file", "content"],
+  },
+  async run(args, ctx) {
+    const f = resolveInSandbox(ctx.sandboxDir, String(args.file ?? ""));
+    if (!f) return "拒绝访问沙箱外路径";
+    await fs.mkdir(path.dirname(f), { recursive: true });
+    await fs.writeFile(f, String(args.content ?? ""), "utf8");
+    return `已写入 ${args.file}（${String(args.content ?? "").length} 字符）`;
+  },
+};
+
+const sandboxGrep: ToolDef = {
+  id: "sandbox_grep",
+  name: "搜索沙箱文件",
+  description: "在沙箱目录文件里搜索关键词，返回匹配的文件和行（最多 20 条）。参数 keyword 为关键词。",
+  parameters: { type: "object", properties: { keyword: { type: "string" } }, required: ["keyword"] },
+  async run(args, ctx) {
+    const keyword = String(args.keyword ?? "");
+    const hits: string[] = [];
+    const walk = async (dir: string, rel: string) => {
+      const items = await fs.readdir(dir, { withFileTypes: true }).catch(() => []);
+      for (const it of items) {
+        if (hits.length >= 20) return;
+        const abs = path.join(dir, it.name);
+        const relPath = rel ? `${rel}/${it.name}` : it.name;
+        if (it.isDirectory()) await walk(abs, relPath);
+        else {
+          const text = await fs.readFile(abs, "utf8").catch(() => "");
+          if (text.includes(keyword)) hits.push(`${relPath}: ${text.split("\n").find((l) => l.includes(keyword))?.slice(0, 80)}`);
+        }
+      }
+    };
+    await walk(ctx.sandboxDir, "");
+    return hits.length ? hits.join("\n") : "没有匹配";
+  },
+};
+
+// ---------- 联网搜索 / 天气 / 时间（同前，非危险） ----------
 const webSearch: ToolDef = {
   id: "web_search",
   name: "联网搜索",
-  description: "搜索互联网并返回前 5 条结果的标题、摘要和链接（DuckDuckGo，无需 API key）。适合查新闻、资料、实时信息。",
-  parameters: {
-    type: "object",
-    properties: { query: { type: "string", description: "搜索关键词" } },
-    required: ["query"],
-  },
+  description: "搜索互联网并返回前 5 条结果的标题、摘要和链接（DuckDuckGo，无需 API key）。",
+  parameters: { type: "object", properties: { query: { type: "string" } }, required: ["query"] },
   async run(args) {
     const query = String(args.query ?? "");
     try {
@@ -72,13 +174,7 @@ const webSearch: ToolDef = {
       const results: string[] = [];
       const re = /<a[^>]*class="result__a"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>[\s\S]*?<a[^>]*class="result__snippet"[^>]*>([\s\S]*?)<\/a>/g;
       const clean = (s: string) =>
-        s
-          .replace(/<[^>]+>/g, "")
-          .replace(/&amp;/g, "&")
-          .replace(/&quot;/g, '"')
-          .replace(/&#x27;/g, "'")
-          .replace(/&#39;/g, "'")
-          .trim();
+        s.replace(/<[^>]+>/g, "").replace(/&amp;/g, "&").replace(/&quot;/g, '"').replace(/&#x27;/g, "'").trim();
       let m: RegExpExecArray | null;
       let count = 0;
       while ((m = re.exec(html)) !== null && count < 5) {
@@ -96,18 +192,12 @@ const webSearch: ToolDef = {
 const weather: ToolDef = {
   id: "weather",
   name: "查天气",
-  description: "查询某个城市的当前天气（wttr.in，无需 API key）。参数 city 为城市名（中文或拼音）。",
-  parameters: {
-    type: "object",
-    properties: { city: { type: "string", description: "城市名，如 北京 / beijing" } },
-    required: ["city"],
-  },
+  description: "查询某个城市的当前天气（wttr.in，无需 API key）。",
+  parameters: { type: "object", properties: { city: { type: "string" } }, required: ["city"] },
   async run(args) {
     const city = String(args.city ?? "");
     try {
-      const r = await fetch(`https://wttr.in/${encodeURIComponent(city)}?format=j1`, {
-        signal: AbortSignal.timeout(20000),
-      });
+      const r = await fetch(`https://wttr.in/${encodeURIComponent(city)}?format=j1`, { signal: AbortSignal.timeout(20000) });
       const data = (await r.json()) as {
         current_condition?: { temp_C?: string; FeelsLikeC?: string; humidity?: string; windspeedKmph?: string; lang_zh?: { value?: string }[] }[];
         nearest_area?: { areaName?: { value?: string }[] }[];
@@ -134,7 +224,33 @@ const datetime: ToolDef = {
   },
 };
 
-export const TOOL_REGISTRY: ToolDef[] = [codeExec, webSearch, weather, datetime];
+// ---------- 长期记忆（保存关于用户的事实） ----------
+const memorySave: ToolDef = {
+  id: "memory_save",
+  name: "记住事实（长期记忆）",
+  description:
+    "把关于用户的重要事实保存到长期记忆（例如：用户住在上海、用户养了一只叫旺财的狗、用户下周三过生日）。只保存值得长期记住的事实，不要保存一次性对话内容。",
+  parameters: { type: "object", properties: { fact: { type: "string", description: "要记住的事实" } }, required: ["fact"] },
+  async run(args, ctx) {
+    const fact = String(args.fact ?? "").trim();
+    if (!fact) return "错误：事实为空";
+    await fs.mkdir(path.dirname(ctx.memoryPath), { recursive: true });
+    await fs.appendFile(ctx.memoryPath, fact + "\n", "utf8");
+    return `已记住：${fact}`;
+  },
+};
+
+export const TOOL_REGISTRY: ToolDef[] = [
+  codeExec,
+  sandboxList,
+  sandboxRead,
+  sandboxWrite,
+  sandboxGrep,
+  webSearch,
+  weather,
+  datetime,
+  memorySave,
+];
 
 export function toolsToOpenAI(tools: ToolDef[]): unknown[] {
   return tools.map((t) => ({
