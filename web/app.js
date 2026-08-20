@@ -77,6 +77,22 @@ async function saveCard() {
   }
 }
 
+async function compileCard() {
+  if (!currentSlug) return;
+  try {
+    await saveCard();
+    const res = await api.send(`/api/cards/${currentSlug}/compile`, { method: "POST" });
+    setStatus(
+      "✓ 已编译到 workspace，共 " + res.files.length + " 个文件\n" +
+      res.files.join("\n") +
+      (res.warnings?.length ? "\n⚠ " + res.warnings.join("\n⚠ ") : ""),
+      "ok"
+    );
+  } catch (e) {
+    setStatus("编译失败：" + e.message, "err");
+  }
+}
+
 async function validateCard() {
   if (!currentSlug) return;
   let card;
@@ -138,6 +154,7 @@ function escapeHtml(s) {
 
 // ---------- 事件 ----------
 $("#btn-create").addEventListener("click", createCard);
+$("#btn-compile").addEventListener("click", compileCard);
 $("#btn-save").addEventListener("click", saveCard);
 $("#btn-validate").addEventListener("click", validateCard);
 $("#btn-del").addEventListener("click", deleteCard);

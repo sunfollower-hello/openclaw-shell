@@ -2,9 +2,10 @@
 // 启动: npm run server  →  http://127.0.0.1:17880
 import express from "express";
 import path from "node:path";
-import { CardStore, newCardId, nowIso } from "./core/cardStore.js";
+import { CardStore, dataDir, newCardId, nowIso } from "./core/cardStore.js";
 import { defaultCard, SCHEMA_VERSION } from "./core/schema.js";
 import { validateCard } from "./core/validator.js";
+import { compileCard } from "./core/compiler.js";
 import { findProjectRoot } from "./core/cardStore.js";
 
 const PORT = Number(process.env.PORT ?? 17880);
@@ -84,6 +85,18 @@ app.delete("/api/cards/:slug", async (req, res) => {
   try {
     await store.remove(req.params.slug);
     res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+app.post("/api/cards/:slug/compile", async (req, res) => {
+  try {
+    const card = await store.get(req.params.slug);
+    const result = validateCard(card);
+    if (!result.ok) return res.status(400).json({ error: result.errors.join("; ") });
+    const out = await compileCard(card, path.join(dataDir(), "workspace"));
+    res.json({ workspace: out.workspace, files: out.files, warnings: result.warnings });
   } catch (e) {
     res.status(500).json({ error: String(e) });
   }

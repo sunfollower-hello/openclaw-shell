@@ -1,8 +1,10 @@
 // CLI 入口：openclaw-shell 卡库管理
 // 用法: npm run cli -- <command> [options]
-import { CardStore, newCardId, nowIso } from "./core/cardStore.js";
+import { CardStore, dataDir, newCardId, nowIso } from "./core/cardStore.js";
 import { defaultCard, RELATION_ROLES } from "./core/schema.js";
 import { validateCard } from "./core/validator.js";
+import { compileCard } from "./core/compiler.js";
+import path from "node:path";
 
 function usage(): void {
   console.log(`openclaw-shell CLI (v0.1)
@@ -12,6 +14,7 @@ function usage(): void {
   npm run cli -- list
   npm run cli -- view   <slug>
   npm run cli -- validate <slug | path.json>
+  npm run cli -- compile <slug> [--workspace <目录>]
   npm run cli -- rm     <slug>
 
 角色: ${RELATION_ROLES.join(" | ")}
@@ -106,6 +109,29 @@ async function cmdValidate(target: string): Promise<void> {
   if (!result.ok) process.exitCode = 1;
 }
 
+async function cmdCompile(args: string[]): Promise<void> {
+  const slug = args[0];
+  const flags = parseFlags(args);
+  if (!slug) {
+    console.error("缺少 slug");
+    usage();
+    process.exit(1);
+  }
+  const store = new CardStore();
+  const card = await store.get(slug);
+  const workspace = flags.workspace ?? path.join(dataDir(), "workspace");
+  const result = validateCard(card);
+  if (!result.ok) {
+    console.error("卡片未通过校验，拒绝编译:");
+    for (const e of result.errors) console.error("  ✗ " + e);
+    process.exit(1);
+  }
+  const out = await compileCard(card, workspace);
+  console.log(`✓ 已编译 ${slug} → ${out.workspace}`);
+  for (const f of out.files) console.log("  " + f);
+  for (const w of result.warnings) console.log("  ⚠ " + w);
+}
+
 async function cmdRm(slug: string): Promise<void> {
   const store = new CardStore();
   await store.remove(slug);
@@ -126,6 +152,9 @@ async function main(): Promise<void> {
       break;
     case "validate":
       await cmdValidate(rest[0]);
+      break;
+    case "compile":
+      await cmdCompile(rest);
       break;
     case "rm":
       await cmdRm(rest[0]);

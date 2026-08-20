@@ -44,7 +44,7 @@ data/cards/             # 卡库（gitignored）
 ## 路线图
 
 - [x] M1 人设卡内核：schema + 校验器 + 卡库 + CLI + Web 编辑器
-- [ ] M2 编译器：persona.json → OpenClaw SOUL.md / skill / memory
+- [x] M2 编译器：persona.json → OpenClaw SOUL.md / skill / memory（CLI `compile` + 管理台"编译到 OpenClaw"按钮）
 - [ ] M3 蒸馏流水线：WeFlow 微信导入 → 脱敏 → 四维蒸馏 → 试聊纠错
 - [ ] M4 通道接入：openclaw-weixin（微信官方插件）+ napcat（QQ）
 - [ ] M5 商业化：API 中转预填 + 计费
