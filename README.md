@@ -74,14 +74,16 @@ openclaw channels login --channel openclaw-weixin
 
 ## 公网访问（Cloudflare Tunnel）
 
-管理台页面经 Cloudflare 隧道挂在域名下（本机 `~/.cloudflared/config.yml` 已加路由）：
+管理台经独立 Cloudflare 隧道（`openclaw`）挂在子域名：
 
 ```
-https://fwq.319274.xyz/openclaw-shell/   →  http://127.0.0.1:17880
+https://openclaw.319274.xyz   →  http://127.0.0.1:17880
 ```
 
 - 页面启用 Basic 认证：账号密码在项目根 `.env`（`OPENCLAW_SHELL_UI_USER/PASS`，已 gitignore）
-- 修改隧道配置后需管理员权限重启服务：`Restart-Service Cloudflared -Force`
+- 隧道配置：`C:\Users\followsun\.cloudflared\config-openclaw.yml`（隧道 74975232...，用户账户运行，无需管理员）
+- 注意：openclaw 隧道目前由 nohup 进程托管，重启电脑后需重新启动（后续可做成开机自启）
+- 历史遗留：`shell.319274.xyz` 有一条指向旧隧道的 DNS 记录（访问 404，无害），可在 Cloudflare 面板顺手删除
 
 ## 许可
 
