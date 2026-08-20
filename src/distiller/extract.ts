@@ -64,21 +64,31 @@ const FALLBACK: Record<Dimension, DistillItem[]> = {
 
 /** 调用 OpenAI 兼容 chat completions，返回解析后的 JSON 数组 */
 export async function callLLM(cfg: LLMConfig, system: string, user: string): Promise<DistillItem[]> {
-  const res = await fetch(`${cfg.baseUrl.replace(/\/$/, "")}/chat/completions`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${cfg.apiKey}`,
-    },
-    body: JSON.stringify({
-      model: cfg.model,
-      messages: [
-        { role: "system", content: system },
-        { role: "user", content: user },
-      ],
-      temperature: 0.3,
-    }),
-  });
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 60000);
+  let res: Response;
+  try {
+    res = await fetch(`${cfg.baseUrl.replace(/\/$/, "")}/chat/completions`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${cfg.apiKey}`,
+      },
+      body: JSON.stringify({
+        model: cfg.model,
+        messages: [
+          { role: "system", content: system },
+          { role: "user", content: user },
+        ],
+        temperature: 0.3,
+      }),
+      signal: ctrl.signal,
+    });
+  } catch (e) {
+    clearTimeout(timer);
+    throw new Error(`LLM 调用失败: ${e instanceof Error && e.name === "AbortError" ? "超时(60s)" : String(e)}`);
+  }
+  clearTimeout(timer);
   if (!res.ok) {
     const body = await res.text().catch(() => "");
     throw new Error(`LLM 调用失败 ${res.status}: ${body.slice(0, 200)}`);

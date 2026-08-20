@@ -15,7 +15,9 @@ import {
   getChannelLoginState,
   portListening,
 } from "./core/openclawCli.js";
-import { getModelConfig, saveModelConfig, testModelEndpoint } from "./core/modelConfig.js";
+import { getModelConfig, saveModelConfig, testModelEndpoint, getModelLLMConfig } from "./core/modelConfig.js";
+import { runDistill, saveDistilledCard } from "./distiller/pipeline.js";
+import { RELATION_ROLES } from "./core/schema.js";
 
 // 加载项目 .env（仅补环境变量空缺，如 OPENCLAW_SHELL_UI_USER/PASS）
 async function loadEnv(): Promise<void> {
@@ -252,6 +254,49 @@ app.post("/api/config/model/test", async (req, res) => {
       return res.status(400).json({ error: "baseUrl / apiKey / modelId 不能为空" });
     }
     res.json(await testModelEndpoint(baseUrl, apiKey, modelId));
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+// ---------- 蒸馏工厂 ----------
+app.post("/api/distill", async (req, res) => {
+  try {
+    const { fileContent, fileName, name, role, target, selfNames, blockedWords } = req.body ?? {};
+    if (!fileContent || !name || !role) {
+      return res.status(400).json({ error: "fileContent / name / role 不能为空" });
+    }
+    if (!RELATION_ROLES.includes(role)) {
+      return res.status(400).json({ error: `无效角色: ${role}` });
+    }
+    const llm = await getModelLLMConfig();
+    if (!llm || !llm.apiKey) {
+      return res.status(400).json({ error: "未配置模型 API。请先到「API」页添加提供商并设为默认" });
+    }
+    const result = await runDistill({
+      rawJson: JSON.parse(fileContent),
+      file: fileName,
+      name,
+      role,
+      target: target ?? "",
+      selfNames: Array.isArray(selfNames) ? selfNames : [],
+      blockedWords: Array.isArray(blockedWords) ? blockedWords : [],
+      llm,
+    });
+    res.json({ card: result.card, talkers: result.talkers, stats: result.stats });
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+app.post("/api/cards/import", async (req, res) => {
+  try {
+    const card = req.body?.card;
+    if (!card) return res.status(400).json({ error: "缺少 card" });
+    const result = validateCard(card);
+    if (!result.ok) return res.status(400).json({ error: result.errors.join("; ") });
+    await store.save(card);
+    res.json({ card });
   } catch (e) {
     res.status(500).json({ error: String(e) });
   }

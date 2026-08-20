@@ -44,6 +44,7 @@ document.querySelectorAll(".tab").forEach((btn) => {
     $("#tab-" + btn.dataset.tab).classList.add("active");
     if (btn.dataset.tab === "channels") refreshChannels();
     if (btn.dataset.tab === "api") loadModelConfig();
+    if (btn.dataset.tab === "distill") loadDistillModel();
   });
 });
 
@@ -335,6 +336,78 @@ async function saveModel() {
   }
 }
 
+// ================= 蒸馏 =================
+let lastDistilledCard = null;
+
+async function runDistill() {
+  const file = $("#distill-file").files[0];
+  if (!file) { $("#distill-msg").textContent = "请先选择聊天记录 JSON 文件"; return; }
+  const name = $("#distill-name").value.trim();
+  if (!name) { $("#distill-msg").textContent = "请填写卡片名称"; return; }
+  const text = await file.text();
+  $("#distill-msg").textContent = "蒸馏中…（会调用模型 3 次，需要一点时间）";
+  $("#btn-distill-run").disabled = true;
+  try {
+    const r = await api.send("/api/distill", {
+      method: "POST",
+      body: JSON.stringify({
+        fileContent: text,
+        fileName: file.name,
+        name,
+        role: $("#distill-role").value,
+        target: $("#distill-target").value.trim() || undefined,
+        selfNames: $("#distill-self").value.split(",").map((s) => s.trim()).filter(Boolean),
+        blockedWords: $("#distill-blocked").value.split(",").map((s) => s.trim()).filter(Boolean),
+      }),
+    });
+    lastDistilledCard = r.card;
+    const lines = [
+      `✓ 蒸馏完成：${r.card.name} (${r.card.slug})`,
+      `目标人物：${r.card.identity.relation ?? "—"}`,
+      `消息：共 ${r.stats.totalMessages} 条 → 目标 ${r.stats.usedMessages} 条`,
+      `脱敏替换：${r.stats.redact.replaced} 处${r.stats.redact.blockedWordsHit.length ? "（屏蔽词剔除 " + r.stats.redact.blockedWordsHit.join(",") + "）" : ""}`,
+      "",
+    ];
+    for (const [dim, s] of Object.entries(r.stats.dimensions)) {
+      lines.push(`${dim}: ${s.items} 条（${s.via}）`);
+    }
+    lines.push("", "人格（traits）:", ...(r.card.personality.traits ?? []).map((t) => "  - " + t));
+    lines.push("", "记忆（facts）:", ...(r.card.memory.facts ?? []).slice(0, 8).map((f) => "  - " + f.fact));
+    lines.push("", "⚠ 保存前请确认授权：source.consent.granted 目前为 false，发布前需在卡片里改为 true");
+    $("#distill-result").textContent = lines.join("\n");
+    $("#distill-msg").textContent = "完成。点「保存到卡库」后到「人设卡」页可继续编辑/编译。";
+    $("#distill-msg").className = "status ok";
+  } catch (e) {
+    $("#distill-msg").textContent = "蒸馏失败：" + e.message;
+    $("#distill-msg").className = "status err";
+  }
+  $("#btn-distill-run").disabled = false;
+}
+
+async function saveDistilled() {
+  if (!lastDistilledCard) { $("#distill-msg").textContent = "还没有蒸馏结果"; return; }
+  try {
+    await api.send("/api/cards/import", {
+      method: "POST",
+      body: JSON.stringify({ card: lastDistilledCard }),
+    });
+    $("#distill-msg").textContent = "✓ 已保存到卡库，去「人设卡」页查看编辑";
+    $("#distill-msg").className = "status ok";
+    lastDistilledCard = null;
+    loadList();
+  } catch (e) {
+    $("#distill-msg").textContent = "保存失败：" + e.message;
+    $("#distill-msg").className = "status err";
+  }
+}
+
+async function loadDistillModel() {
+  try {
+    const cfg = await api.get("/api/config/model");
+    $("#distill-model").textContent = cfg.primary || "（未设置，先到 API 页配置）";
+  } catch { /* 忽略 */ }
+}
+
 // ================= 事件绑定 =================
 $("#btn-create").addEventListener("click", createCard);
 $("#btn-save").addEventListener("click", saveCard);
@@ -351,6 +424,8 @@ $("#btn-qq-refresh").addEventListener("click", refreshQQ);
 
 $("#btn-model-test").addEventListener("click", testModel);
 $("#btn-model-save").addEventListener("click", saveModel);
+$("#btn-distill-run").addEventListener("click", runDistill);
+$("#btn-distill-save").addEventListener("click", saveDistilled);
 
 // ================= 启动 =================
 (async function init() {

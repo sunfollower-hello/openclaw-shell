@@ -11,6 +11,7 @@
     <h1>🦞 openclaw-shell <span class="sub">人设卡 · 通道 · API</span></h1>
     <nav class="tabs">
       <button class="tab active" data-tab="cards">人设卡</button>
+      <button class="tab" data-tab="distill">蒸馏</button>
       <button class="tab" data-tab="channels">通道</button>
       <button class="tab" data-tab="api">API</button>
     </nav>
@@ -51,6 +52,49 @@
         <textarea id="editor-json" spellcheck="false" placeholder="卡片 JSON（persona-card v1 格式）"></textarea>
         <div id="status" class="status"></div>
       </section>
+    </section>
+
+    <!-- ============ 蒸馏 ============ -->
+    <section id="tab-distill" class="tab-panel">
+      <div class="api-layout">
+        <div class="channel-card">
+          <h2>🧪 聊天记录蒸馏（数字分身）</h2>
+          <p class="hint">导入微信聊天记录导出（WeFlow JSON），自动脱敏 → 四维蒸馏（互动风格/人格/记忆）→ 生成人设卡。蒸馏调用「API」页配置的模型（走你的中转）。</p>
+          <div class="form">
+            <label>聊天记录文件（WeFlow 导出的 JSON）</label>
+            <input id="distill-file" type="file" accept=".json" />
+            <label>卡片名称</label>
+            <input id="distill-name" placeholder="如：奶奶" />
+            <label>关系类型</label>
+            <select id="distill-role">
+              <option value="friend">朋友</option>
+              <option value="family">家人</option>
+              <option value="self">自己</option>
+              <option value="partner">前任/恋人</option>
+              <option value="colleague">同事</option>
+              <option value="public-figure">偶像/角色</option>
+            </select>
+            <label>目标人物昵称（留空自动取最活跃的对方）</label>
+            <input id="distill-target" placeholder="如：奶奶" />
+            <label>我方昵称（逗号分隔，用于排除自己）</label>
+            <input id="distill-self" placeholder="如：我,本人" />
+            <label>屏蔽词（逗号分隔，命中的消息整条剔除）</label>
+            <input id="distill-blocked" placeholder="如：工资,某敏感词" />
+            <div class="row">
+              <button id="btn-distill-run" class="primary">开始蒸馏</button>
+            </div>
+            <div id="distill-msg" class="status"></div>
+          </div>
+          <div class="note">首次使用：先到「API」页确认模型已配置并设为默认（当前默认 <code id="distill-model">—</code>）。</div>
+        </div>
+        <div class="channel-card">
+          <h2>蒸馏结果</h2>
+          <div class="editor-actions" style="margin-bottom:8px">
+            <button id="btn-distill-save" class="primary">保存到卡库</button>
+          </div>
+          <pre id="distill-result" class="small-out tall">（结果会显示在这里）</pre>
+        </div>
+      </div>
     </section>
 
     <!-- ============ 通道 ============ -->

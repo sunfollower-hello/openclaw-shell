@@ -85,3 +85,31 @@ export async function testModelEndpoint(
     return { ok: false, error: String(e) };
   }
 }
+
+/** 取默认模型提供商的完整凭证（蒸馏等后台任务用；apiKey 为明文） */
+export interface ModelLLMConfig {
+  baseUrl: string;
+  apiKey: string;
+  model: string;
+}
+
+export async function getModelLLMConfig(): Promise<ModelLLMConfig | null> {
+  try {
+    const cfg = JSON.parse(await fs.readFile(configPath(), "utf8"));
+    const providers = cfg.models?.providers ?? {};
+    const primary: unknown = cfg.agents?.defaults?.model?.primary ?? "";
+    const primaryStr = typeof primary === "string" ? primary : "";
+    const [provName, modelId] = primaryStr.split("/");
+    const p = providers[provName] ?? Object.values(providers)[0];
+    if (!p) return null;
+    const list = (p.models ?? []) as { id?: string }[];
+    const m = list.find((x) => x.id === modelId) ?? list[0];
+    return {
+      baseUrl: p.baseUrl ?? "",
+      apiKey: p.apiKey ?? "",
+      model: m?.id ?? modelId ?? "",
+    };
+  } catch {
+    return null;
+  }
+}
