@@ -23,6 +23,8 @@ import { buildChatSystem } from "./core/chatPrompt.js";
 import { TOOL_REGISTRY, toolsToOpenAI, type ToolDef, type ToolCtx } from "./tools/registry.js";
 import { SKILL_LIBRARY } from "./core/skills.js";
 import { getMCPTools, loadMCPConfig, saveMCPConfig, reloadMCP } from "./tools/mcp.js";
+import { cardToCCv2, ccv2ToCard } from "./core/cardConvert.js";
+import { solidPng, pngWithText, extractCardJson } from "./core/png.js";
 
 // 加载项目 .env（仅补环境变量空缺，如 OPENCLAW_SHELL_UI_USER/PASS）
 async function loadEnv(): Promise<void> {
@@ -320,6 +322,58 @@ app.post("/api/cards/import", async (req, res) => {
   }
 });
 
+// ---------- 角色卡导出 / 导入（PNG / JSON，CCv2 标准） ----------
+app.post("/api/cards/:slug/export", async (req, res) => {
+  try {
+    const card = await store.get(req.params.slug);
+    const format = req.body?.format === "json" ? "json" : "png";
+    const cc = cardToCCv2(card);
+    const json = JSON.stringify(cc, null, 2);
+    if (format === "json") {
+      res.json({
+        format: "json",
+        filename: `${card.slug}.json`,
+        dataUrl: "data:application/json;charset=utf-8," + encodeURIComponent(json),
+      });
+      return;
+    }
+    let png: Buffer;
+    const avatar = card.identity.avatar;
+    if (typeof avatar === "string" && avatar.startsWith("data:image/png;base64,")) {
+      png = Buffer.from(avatar.split(",")[1], "base64");
+    } else {
+      png = solidPng(512, 512, [24, 26, 36, 255]);
+    }
+    const out = pngWithText(png, "chara", Buffer.from(json, "utf8").toString("base64"));
+    res.json({ format: "png", filename: `${card.slug}.png`, dataUrl: "data:image/png;base64," + out.toString("base64") });
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+app.post("/api/cards/import-card", async (req, res) => {
+  try {
+    const { fileBase64, fileName } = req.body ?? {};
+    if (!fileBase64) return res.status(400).json({ error: "缺少文件内容" });
+    const buf = Buffer.from(fileBase64, "base64");
+    let cc: unknown;
+    if (/\.png$/i.test(String(fileName ?? ""))) {
+      cc = extractCardJson(buf);
+      if (!cc) return res.status(400).json({ error: "PNG 里未找到角色卡数据（chara 块）" });
+    } else {
+      cc = JSON.parse(buf.toString("utf8"));
+    }
+    const avatar = /\.png$/i.test(String(fileName ?? "")) ? "data:image/png;base64," + buf.toString("base64") : undefined;
+    const card = ccv2ToCard(cc, avatar);
+    const result = validateCard(card);
+    if (!result.ok) return res.status(400).json({ error: result.errors.join("; ") });
+    await store.save(card);
+    res.json({ card });
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
+
 // ---------- WeFlow 本机直连（尽力集成，失败则用指引） ----------
 const WEFLOW_BASE = "http://127.0.0.1:5031";
 
@@ -497,8 +551,9 @@ app.post("/api/chat", async (req, res) => {
       ? `\n\n【长期记忆（关于用户的事实，仅在相关时使用；要新增事实时调用 memory_save 工具）】\n- ${memories.slice(-30).join("\n- ")}`
       : "";
 
-    const level = String(thinking ?? card.chat?.thinking ?? "low");
-    const reasoning = level === "medium" ? "medium" : level === "high" ? "high" : undefined;
+    const level = String(thinking ?? card.chat?.thinking ?? "auto");
+    const reasoning =
+      level === "low" ? "low" : level === "medium" ? "medium" : level === "high" || level === "extreme" ? "high" : undefined;
     const system =
       buildChatSystem(card) +
       (toolDefs.length

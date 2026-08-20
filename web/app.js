@@ -70,6 +70,7 @@ async function openCard(slug) {
   if (dirty && !confirm("当前卡片有未保存修改，确定放弃？")) return;
   const card = await api.get(`/api/cards/${slug}`);
   currentSlug = slug;
+  currentCardSt = card.sillytavern_v2 || null;
   $("#editor-title").textContent = `编辑：${card.name} (${card.slug})`;
   $("#editor-json").value = JSON.stringify(card, null, 2);
   dirty = false;
@@ -453,6 +454,18 @@ async function distillFromWeFlow() {
 // ================= 聊天测试 =================
 let chatHistory = [];
 let pendingData = null;
+let workMode = false;
+
+function toggleWorkMode() {
+  workMode = !workMode;
+  const btn = $("#btn-work-mode");
+  btn.textContent = workMode ? "💬 返回聊天模式" : "🔧 进入工作模式";
+  btn.classList.toggle("active", workMode);
+  $(".chat-opts").style.display = workMode ? "flex" : "none";
+  $("#chat-head-hint").textContent = workMode
+    ? "工作模式：开放全部功能（工具/技能/MCP/深度/语音）"
+    : "普通聊天：纯人设对话";
+}
 
 function addChatBubble(role, text) {
   const log = $("#chat-log");
@@ -549,7 +562,9 @@ async function sendChat() {
   chatHistory.push({ role: "user", content: message });
   const btn = $("#btn-chat-send");
   btn.disabled = true;
-  const opts = gatherChatOptions();
+  const opts = workMode
+    ? gatherChatOptions()
+    : { tools: [], useMCP: false, skills: [], thinking: "auto" };
   try {
     const r = await api.send("/api/chat", {
       method: "POST",
@@ -612,6 +627,162 @@ async function saveMCP() {
   }
 }
 
+// ================= 角色卡导出 / 导入 =================
+function downloadDataUrl(dataUrl, filename) {
+  const a = document.createElement("a");
+  a.href = dataUrl;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+}
+
+async function exportCard(format) {
+  if (!currentSlug) { setStatus("请先选择一张卡片", "err"); return; }
+  try {
+    const r = await api.send(`/api/cards/${currentSlug}/export`, {
+      method: "POST",
+      body: JSON.stringify({ format }),
+    });
+    downloadDataUrl(r.dataUrl, r.filename);
+    setStatus(`✓ 已导出 ${r.filename}（CCv2 格式，可被 SillyTavern 等读取）`, "ok");
+  } catch (e) {
+    setStatus("导出失败：" + e.message, "err");
+  }
+}
+
+function fileToBase64(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result).split(",")[1]);
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
+}
+
+async function importCard() {
+  const f = $("#import-file").files[0];
+  if (!f) return;
+  try {
+    const b64 = await fileToBase64(f);
+    const r = await api.send("/api/cards/import-card", {
+      method: "POST",
+      body: JSON.stringify({ fileBase64: b64, fileName: f.name }),
+    });
+    $("#import-file").value = "";
+    setStatus(`✓ 已导入：${r.card.name}`, "ok");
+    await loadList();
+    await openCard(r.card.slug);
+  } catch (e) {
+    setStatus("导入失败：" + e.message, "err");
+  }
+}
+
+// ================= 做卡向导 =================
+function wizardBookRow(entry, fixed) {
+  const row = document.createElement("div");
+  row.className = "wz-row";
+  const key = document.createElement("input");
+  key.placeholder = "关键词";
+  key.value = entry?.keys?.[0] ?? "";
+  key.disabled = !!fixed;
+  const content = document.createElement("textarea");
+  content.rows = 1;
+  content.placeholder = "内容（触发时注入）";
+  content.value = entry?.content ?? "";
+  const del = document.createElement("button");
+  del.className = "small-btn danger";
+  del.textContent = "✕";
+  del.addEventListener("click", () => row.remove());
+  row.append(key, content, del);
+  return { row, key, content };
+}
+
+function wizardRegexRow(script) {
+  const row = document.createElement("div");
+  row.className = "wz-row";
+  const name = document.createElement("input");
+  name.placeholder = "名称";
+  name.value = script?.scriptName ?? "";
+  const re = document.createElement("input");
+  re.placeholder = "匹配（正则）";
+  re.value = script?.findRegex ?? "";
+  const rep = document.createElement("input");
+  rep.placeholder = "替换为";
+  rep.value = script?.replaceString ?? "";
+  const del = document.createElement("button");
+  del.className = "small-btn danger";
+  del.textContent = "✕";
+  del.addEventListener("click", () => row.remove());
+  row.append(name, re, rep, del);
+  return { row, name, re, rep };
+}
+
+function openWizard() {
+  const st = currentCardSt ? currentCardSt : { description: "", first_mes: "", regex_scripts: [], character_book: { entries: [{ keys: ["人物形象"], content: "（请填写外貌、穿着、气质等形象描述）", constant: true }] } };
+  $("#wz-desc").value = st.description ?? "";
+  $("#wz-first").value = st.first_mes ?? "";
+  const book = $("#wz-book");
+  book.innerHTML = "";
+  const entries = st.character_book?.entries?.length ? st.character_book.entries : [{ keys: ["人物形象"], content: "" }];
+  entries.forEach((e, i) => {
+    const { row } = wizardBookRow(e, i === 0);
+    book.appendChild(row);
+  });
+  const rx = $("#wz-regex");
+  rx.innerHTML = "";
+  (st.regex_scripts ?? []).forEach((s) => rx.appendChild(wizardRegexRow(s).row));
+  $("#card-wizard").style.display = "block";
+}
+
+function closeWizard() {
+  $("#card-wizard").style.display = "none";
+}
+
+function applyWizard() {
+  if (!currentSlug) { setStatus("请先选择一张卡片", "err"); return; }
+  let card;
+  try {
+    card = JSON.parse($("#editor-json").value);
+  } catch (e) {
+    setStatus("当前 JSON 解析失败：" + e.message, "err");
+    return;
+  }
+  card.sillytavern_v2 = card.sillytavern_v2 || {};
+  card.sillytavern_v2.description = $("#wz-desc").value.trim();
+  card.sillytavern_v2.first_mes = $("#wz-first").value.trim();
+  if (!$("#wz-desc").value.trim() && card.identity?.bio) card.sillytavern_v2.description = card.identity.bio;
+  const entries = [...$("#wz-book").querySelectorAll(".wz-row")].map((r) => {
+    const [k, c] = r.querySelectorAll("input, textarea");
+    return { keys: [k.value.trim()].filter(Boolean), content: c.value, enabled: true };
+  }).filter((e) => e.keys.length && e.content);
+  card.sillytavern_v2.character_book = { entries };
+  card.sillytavern_v2.regex_scripts = [...$("#wz-regex").querySelectorAll(".wz-row")].map((r) => {
+    const [n, re, rep] = r.querySelectorAll("input");
+    return { scriptName: n.value, findRegex: re.value, replaceString: rep.value, enabled: true };
+  }).filter((s) => s.findRegex);
+  const avatarFile = $("#wz-avatar").files[0];
+  if (avatarFile) {
+    fileToBase64(avatarFile).then((b64) => {
+      card.identity = card.identity || {};
+      card.identity.avatar = "data:image/png;base64," + b64;
+      finishApply();
+    });
+  } else {
+    finishApply();
+  }
+  function finishApply() {
+    $("#editor-json").value = JSON.stringify(card, null, 2);
+    dirty = true;
+    setStatus("✓ 已应用到卡片，点「保存」生效", "ok");
+  }
+}
+
+let currentCardSt = null;
+function setCardStForWizard(st) {
+  currentCardSt = st;
+}
+
 // ================= 事件绑定 =================
 $("#btn-create").addEventListener("click", createCard);
 $("#btn-save").addEventListener("click", saveCard);
@@ -635,8 +806,18 @@ $("#btn-wf-distill").addEventListener("click", distillFromWeFlow);
 $("#btn-chat-send").addEventListener("click", sendChat);
 $("#btn-chat-clear").addEventListener("click", clearChat);
 $("#btn-mic").addEventListener("click", startMic);
+$("#btn-work-mode").addEventListener("click", toggleWorkMode);
 $("#chat-input").addEventListener("keydown", (e) => { if (e.key === "Enter") sendChat(); });
 $("#btn-mcp-save").addEventListener("click", saveMCP);
+$("#btn-export-png").addEventListener("click", () => exportCard("png"));
+$("#btn-export-json").addEventListener("click", () => exportCard("json"));
+$("#btn-import-card").addEventListener("click", () => $("#import-file").click());
+$("#import-file").addEventListener("change", importCard);
+$("#btn-card-wizard").addEventListener("click", openWizard);
+$("#btn-wz-close").addEventListener("click", closeWizard);
+$("#btn-wz-apply").addEventListener("click", applyWizard);
+$("#btn-wz-add-entry").addEventListener("click", () => $("#wz-book").appendChild(wizardBookRow({}).row));
+$("#btn-wz-add-regex").addEventListener("click", () => $("#wz-regex").appendChild(wizardRegexRow({}).row));
 
 // ================= 启动 =================
 (async function init() {

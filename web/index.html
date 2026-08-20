@@ -22,27 +22,53 @@
     <!-- ============ 人设卡 ============ -->
     <section id="tab-cards" class="tab-panel active">
       <aside>
-        <div class="create-box">
-          <h2>新建人设卡</h2>
-          <input id="new-name" placeholder="名称（如：奶奶）" />
-          <input id="new-slug" placeholder="slug（留空自动生成）" />
-          <select id="new-role">
-            <option value="friend">朋友</option>
-            <option value="family">家人</option>
-            <option value="self">自己</option>
-            <option value="partner">前任/恋人</option>
-            <option value="colleague">同事</option>
-            <option value="public-figure">偶像/角色</option>
-          </select>
-          <button id="btn-create">创建</button>
-        </div>
+          <div class="create-box">
+            <h2>新建人设卡</h2>
+            <input id="new-name" placeholder="名称（如：奶奶）" />
+            <input id="new-slug" placeholder="slug（留空自动生成）" />
+            <select id="new-role">
+              <option value="friend">朋友</option>
+              <option value="family">家人</option>
+              <option value="self">自己</option>
+              <option value="partner">前任/恋人</option>
+              <option value="colleague">同事</option>
+              <option value="public-figure">偶像/角色</option>
+            </select>
+            <button id="btn-create">创建</button>
+            <div class="row">
+              <button id="btn-card-wizard" class="small-btn" title="可视化做卡：简介/开场白/世界书/正则">🃏 做卡向导</button>
+              <button id="btn-import-card" class="small-btn" title="导入 PNG 或 JSON 角色卡">📥 导入卡</button>
+              <input type="file" id="import-file" accept=".png,.json" style="display:none" />
+            </div>
+          </div>
         <h2>卡库</h2>
         <ul id="card-list" class="card-list"></ul>
       </aside>
       <section id="editor">
+        <div id="card-wizard" class="wizard" style="display:none">
+          <h3>🃏 做卡向导 <span class="hint">填好后点「应用到卡片」，再点「保存」</span></h3>
+          <label>简介（description，一句话介绍角色）</label>
+          <textarea id="wz-desc" rows="2" placeholder="如：80 岁的北方奶奶，说话直接但心软"></textarea>
+          <label>开场白（first_mes，对话开始时的第一句话）</label>
+          <textarea id="wz-first" rows="2" placeholder="如：哎，你可算回来了，快坐下，饭给你热着呢"></textarea>
+          <label>世界书（关键词触发背景设定；第一行固定「人物形象」）</label>
+          <div id="wz-book"></div>
+          <button id="btn-wz-add-entry" class="small-btn">+ 添加世界书条目</button>
+          <label>正则替换（名称 / 匹配 / 替换，可留空）</label>
+          <div id="wz-regex"></div>
+          <button id="btn-wz-add-regex" class="small-btn">+ 添加正则</button>
+          <label>头像（PNG，可选）</label>
+          <input type="file" id="wz-avatar" accept=".png" />
+          <div class="row">
+            <button id="btn-wz-apply" class="primary">应用到卡片</button>
+            <button id="btn-wz-close" class="small-btn">关闭</button>
+          </div>
+        </div>
         <div class="editor-head">
           <h2 id="editor-title">选择左侧卡片开始编辑</h2>
           <div class="editor-actions">
+            <button id="btn-export-png" title="导出 PNG 角色卡（嵌入 CCv2 数据）">导出 PNG</button>
+            <button id="btn-export-json" title="导出 JSON 角色卡">导出 JSON</button>
             <button id="btn-compile" title="编译后写入 OpenClaw workspace，当前生效人设 = 最后编译的卡片">编译到 OpenClaw</button>
             <button id="btn-validate">校验</button>
             <button id="btn-save" class="primary">保存</button>
@@ -53,10 +79,13 @@
         <div id="status" class="status"></div>
         <div class="chat-test">
           <div class="chat-head">
-            <h3>💬 聊天测试 <span class="hint">用当前卡片 + API 页模型试聊（改完先点保存）</span></h3>
-            <button id="btn-chat-clear" class="small-btn">清空</button>
+            <h3>💬 聊天测试 <span id="chat-head-hint" class="hint">普通聊天：纯人设对话</span></h3>
+            <div>
+              <button id="btn-work-mode" class="small-btn" title="工作模式开放全部功能：工具/技能/MCP/深度/语音">🔧 进入工作模式</button>
+              <button id="btn-chat-clear" class="small-btn">清空</button>
+            </div>
           </div>
-          <div class="chat-opts">
+          <div class="chat-opts" style="display:none">
             <span class="opt-group">工具：
               <label title="危险工具，会先问你是否执行"><input type="checkbox" id="tool-code" checked /> 写代码*</label>
               <label><input type="checkbox" id="tool-file" /> 沙箱文件</label>
@@ -73,7 +102,14 @@
               <label><input type="checkbox" id="skill-companion" /> 陪伴</label>
             </span>
             <span class="opt-group">深度：
-              <select id="chat-thinking"><option value="low">低</option><option value="medium">中</option><option value="high">高</option></select>
+              <select id="chat-thinking">
+                <option value="off">关闭</option>
+                <option value="auto" selected>自动（默认）</option>
+                <option value="low">低</option>
+                <option value="medium">中</option>
+                <option value="high">高</option>
+                <option value="extreme">极高</option>
+              </select>
             </span>
             <span class="opt-group">语音：
               <label><input type="checkbox" id="chat-voice-reply" /> 读回复</label>

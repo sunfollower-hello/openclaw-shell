@@ -256,3 +256,22 @@ button.danger { background: transparent; border-color: var(--danger); color: var
 .opt-group label { display: flex; align-items: center; gap: 3px; color: var(--text); cursor: pointer; }
 .opt-group select { padding: 2px 6px; font-size: 12px; }
 .approve-row { display: flex; gap: 8px; align-self: flex-start; margin-top: 2px; }
+
+/* ============ 做卡向导 ============ */
+.wizard {
+  background: var(--panel2);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+.wizard h3 { font-size: 14px; }
+.wizard label { font-size: 12px; color: var(--muted); }
+.wizard textarea { font-family: inherit; font-size: 12px; }
+.wz-row { display: flex; gap: 6px; align-items: flex-start; }
+.wz-row input { flex: 1; min-width: 0; }
+.wz-row textarea { flex: 2; min-width: 0; }
+.work-btn.active { background: var(--accent); border-color: var(--accent); color: #fff; }

@@ -148,7 +148,7 @@ const variantsSchema = z
 // ---------- 聊天行为配置 ----------
 const chatSchema = z.object({
   quote_style: z.enum(["reuse", "original"]).default("reuse"),
-  thinking: z.enum(["low", "medium", "high"]).default("low"),
+  thinking: z.enum(["off", "auto", "low", "medium", "high", "extreme"]).default("auto"),
   delay: z
     .object({
       base_ms: z.number().int().nonnegative().default(1500),
@@ -177,7 +177,20 @@ const presetsSchema = z.object({
     .default([]),
 });
 
-// ---------- SillyTavern Spec V2 兼容段 ----------
+// ---------- SillyTavern Spec V2 兼容段（世界书/正则/简介/开场白） ----------
+const worldbookEntry = z.object({
+  keys: z.array(z.string()).default([]),
+  content: z.string().default(""),
+  name: z.string().optional(),
+  comment: z.string().optional(),
+  enabled: z.boolean().default(true),
+  selective: z.boolean().default(false),
+  constant: z.boolean().default(false),
+  insertion_order: z.number().default(100),
+  priority: z.number().default(10),
+  id: z.number().optional(),
+});
+
 const sillytavernSchema = z.object({
   chara_card_v2: z.literal("0.0.1").default("0.0.1"),
   description: z.string().default(""),
@@ -185,8 +198,9 @@ const sillytavernSchema = z.object({
   scenario: z.string().default(""),
   first_mes: z.string().default(""),
   mes_example: z.string().default(""),
+  regex_scripts: z.array(z.record(z.string(), z.unknown())).default([]),
   character_book: z
-    .object({ entries: z.array(z.unknown()).default([]) })
+    .object({ entries: z.array(worldbookEntry).default([]) })
     .default({ entries: [] }),
 });
 
@@ -241,4 +255,19 @@ export const defaultCard = (name: string, slug: string): PersonaCard =>
   personaCardSchema.parse({
     name,
     slug,
+    // 空白卡：世界书第一条固定为「人物形象」
+    sillytavern_v2: {
+      chara_card_v2: "0.0.1",
+      character_book: {
+        entries: [
+          {
+            keys: ["人物形象"],
+            content: "（请填写外貌、穿着、气质等形象描述）",
+            name: "人物形象",
+            constant: true,
+            insertion_order: 0,
+          },
+        ],
+      },
+    },
   });
