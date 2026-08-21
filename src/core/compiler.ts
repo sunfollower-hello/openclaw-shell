@@ -214,6 +214,25 @@ function renderSkill(card: PersonaCard): string {
     if (card.tools?.deny?.length) lines.push(`- 禁止：${card.tools.deny.join("、")}`);
     lines.push("- 用户请求适合用工具完成时（写代码、搜索、查天气等），调用工具而不是凭空编造结果");
   }
+
+  // 世界书：关键词触发的背景设定（编译进 skill，通道对话同样生效）
+  const book = card.sillytavern_v2?.character_book?.entries ?? [];
+  if (book.length > 0) {
+    lines.push("");
+    lines.push("## 世界书（背景设定，出现关键词时注入相关内容）");
+    for (const e of book) {
+      const keys = Array.isArray(e.keys) && e.keys.length ? e.keys.join(" / ") : "常驻";
+      const enabled = e.enabled !== false;
+      if (!enabled) continue;
+      lines.push(`- [${keys}] ${String(e.content ?? "").trim()}`);
+    }
+  }
+  const firstMes = card.sillytavern_v2?.first_mes;
+  if (firstMes) {
+    lines.push("");
+    lines.push("## 开场白（新对话开始时使用）");
+    lines.push(firstMes);
+  }
   return lines.join("\n") + "\n";
 }
 

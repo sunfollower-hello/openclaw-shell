@@ -65,7 +65,7 @@
           </div>
         </div>
         <div class="editor-head">
-          <h2 id="editor-title">选择左侧卡片开始编辑</h2>
+          <h2 id="editor-title">选择左侧卡片开始编辑 <span id="active-persona" class="chip" style="display:none"></span></h2>
           <div class="editor-actions">
             <button id="btn-export-png" title="导出 PNG 角色卡（嵌入 CCv2 数据）">导出 PNG</button>
             <button id="btn-export-json" title="导出 JSON 角色卡">导出 JSON</button>
@@ -178,6 +178,8 @@
           <h2>蒸馏结果</h2>
           <div class="editor-actions" style="margin-bottom:8px">
             <button id="btn-distill-save" class="primary">保存到卡库</button>
+            <button id="btn-distill-export-png">导出 PNG</button>
+            <button id="btn-distill-export-json">导出 JSON</button>
           </div>
           <pre id="distill-result" class="small-out tall">（结果会显示在这里）</pre>
         </div>
@@ -265,6 +267,7 @@
           <textarea id="mcp-config" rows="6" spellcheck="false"></textarea>
           <div class="row" style="margin-top:8px">
             <button id="btn-mcp-save" class="primary">保存并重连</button>
+            <button id="btn-backup">📦 备份数据</button>
           </div>
           <div id="mcp-msg" class="status"></div>
         </div>

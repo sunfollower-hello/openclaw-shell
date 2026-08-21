@@ -4,7 +4,7 @@ import express from "express";
 import path from "node:path";
 import { promises as fs } from "node:fs";
 import { CardStore, dataDir, newCardId, nowIso } from "./core/cardStore.js";
-import { defaultCard, SCHEMA_VERSION } from "./core/schema.js";
+import { defaultCard, SCHEMA_VERSION, type PersonaCard } from "./core/schema.js";
 import { validateCard } from "./core/validator.js";
 import { compileCard } from "./core/compiler.js";
 import { findProjectRoot } from "./core/cardStore.js";
@@ -323,29 +323,45 @@ app.post("/api/cards/import", async (req, res) => {
 });
 
 // ---------- 角色卡导出 / 导入（PNG / JSON，CCv2 标准） ----------
+async function buildCardExport(card: PersonaCard, format: string): Promise<{ filename: string; dataUrl: string }> {
+  const cc = cardToCCv2(card);
+  const json = JSON.stringify(cc, null, 2);
+  if (format === "json") {
+    return {
+      filename: `${card.slug}.json`,
+      dataUrl: "data:application/json;charset=utf-8," + encodeURIComponent(json),
+    };
+  }
+  let png: Buffer;
+  const avatar = card.identity.avatar;
+  if (typeof avatar === "string" && avatar.startsWith("data:image/png;base64,")) {
+    png = Buffer.from(avatar.split(",")[1], "base64");
+  } else {
+    png = solidPng(512, 512, [24, 26, 36, 255]);
+  }
+  const out = pngWithText(png, "chara", Buffer.from(json, "utf8").toString("base64"));
+  return { filename: `${card.slug}.png`, dataUrl: "data:image/png;base64," + out.toString("base64") };
+}
+
 app.post("/api/cards/:slug/export", async (req, res) => {
   try {
     const card = await store.get(req.params.slug);
-    const format = req.body?.format === "json" ? "json" : "png";
-    const cc = cardToCCv2(card);
-    const json = JSON.stringify(cc, null, 2);
-    if (format === "json") {
-      res.json({
-        format: "json",
-        filename: `${card.slug}.json`,
-        dataUrl: "data:application/json;charset=utf-8," + encodeURIComponent(json),
-      });
-      return;
-    }
-    let png: Buffer;
-    const avatar = card.identity.avatar;
-    if (typeof avatar === "string" && avatar.startsWith("data:image/png;base64,")) {
-      png = Buffer.from(avatar.split(",")[1], "base64");
-    } else {
-      png = solidPng(512, 512, [24, 26, 36, 255]);
-    }
-    const out = pngWithText(png, "chara", Buffer.from(json, "utf8").toString("base64"));
-    res.json({ format: "png", filename: `${card.slug}.png`, dataUrl: "data:image/png;base64," + out.toString("base64") });
+    const out = await buildCardExport(card, req.body?.format === "json" ? "json" : "png");
+    res.json({ format: req.body?.format === "json" ? "json" : "png", ...out });
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+// 未入库的卡片直接导出（蒸馏结果一键出卡）
+app.post("/api/cards/export-card", async (req, res) => {
+  try {
+    const card = req.body?.card;
+    if (!card) return res.status(400).json({ error: "缺少 card" });
+    const validated = validateCard(card);
+    if (!validated.ok) return res.status(400).json({ error: validated.errors.join("; ") });
+    const out = await buildCardExport(card as PersonaCard, req.body?.format === "json" ? "json" : "png");
+    res.json({ format: req.body?.format === "json" ? "json" : "png", ...out });
   } catch (e) {
     res.status(500).json({ error: String(e) });
   }
@@ -639,6 +655,44 @@ app.post("/api/mcp/config", async (req, res) => {
     await saveMCPConfig({ servers: clean });
     await reloadMCP();
     res.json({ ok: true, servers: clean.length });
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+// ---------- 当前生效人设（最后编译进 workspace 的卡片） ----------
+app.get("/api/active-persona", async (_req, res) => {
+  try {
+    const soul = await fs.readFile(path.join(dataDir(), "workspace", "SOUL.md"), "utf8").catch(() => "");
+    const m = soul.match(/^# SOUL\.md\s*[—-]\s*(.+)$/m);
+    res.json({ active: m ? m[1].trim() : null });
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+// ---------- 数据备份（卡片 + 长期记忆 + MCP 配置 → 单个 JSON） ----------
+app.get("/api/backup", async (_req, res) => {
+  try {
+    const cards: Record<string, unknown> = {};
+    for (const meta of await store.list()) cards[meta.slug] = await store.get(meta.slug);
+    const memory: Record<string, string> = {};
+    const memDir = path.join(dataDir(), "memory");
+    for (const f of await fs.readdir(memDir).catch(() => [])) {
+      memory[f] = await fs.readFile(path.join(memDir, f), "utf8").catch(() => "");
+    }
+    const bundle = {
+      app: "openclaw-shell",
+      version: 1,
+      exported_at: new Date().toISOString(),
+      cards,
+      memory,
+      mcp: await loadMCPConfig(),
+    };
+    res.json({
+      filename: `openclaw-shell-backup-${new Date().toISOString().slice(0, 10)}.json`,
+      dataUrl: "data:application/json;charset=utf-8," + encodeURIComponent(JSON.stringify(bundle, null, 2)),
+    });
   } catch (e) {
     res.status(500).json({ error: String(e) });
   }

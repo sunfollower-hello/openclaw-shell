@@ -110,8 +110,48 @@ async function compileCard() {
       res.files.join("\n") + (res.warnings?.length ? "\n⚠ " + res.warnings.join("\n⚠ ") : ""),
       "ok"
     );
+    loadActivePersona();
   } catch (e) {
     setStatus("编译失败：" + e.message, "err");
+  }
+}
+
+async function loadActivePersona() {
+  try {
+    const r = await api.get("/api/active-persona");
+    const el = $("#active-persona");
+    if (r.active) {
+      el.textContent = "⚡ 当前生效人设：" + r.active;
+      el.style.display = "inline-block";
+    } else {
+      el.style.display = "none";
+    }
+  } catch { /* 忽略 */ }
+}
+
+async function backupData() {
+  try {
+    const r = await api.get("/api/backup");
+    downloadDataUrl(r.dataUrl, r.filename);
+    setStatus("✓ 备份已下载：" + r.filename, "ok");
+  } catch (e) {
+    setStatus("备份失败：" + e.message, "err");
+  }
+}
+
+async function exportDistillCard(format) {
+  if (!lastDistilledCard) { $("#distill-msg").textContent = "还没有蒸馏结果"; return; }
+  try {
+    const r = await api.send("/api/cards/export-card", {
+      method: "POST",
+      body: JSON.stringify({ card: lastDistilledCard, format }),
+    });
+    downloadDataUrl(r.dataUrl, r.filename);
+    $("#distill-msg").textContent = "✓ 已导出 " + r.filename + "（CCv2 角色卡）";
+    $("#distill-msg").className = "status ok";
+  } catch (e) {
+    $("#distill-msg").textContent = "导出失败：" + e.message;
+    $("#distill-msg").className = "status err";
   }
 }
 
@@ -809,6 +849,9 @@ $("#btn-mic").addEventListener("click", startMic);
 $("#btn-work-mode").addEventListener("click", toggleWorkMode);
 $("#chat-input").addEventListener("keydown", (e) => { if (e.key === "Enter") sendChat(); });
 $("#btn-mcp-save").addEventListener("click", saveMCP);
+$("#btn-backup").addEventListener("click", backupData);
+$("#btn-distill-export-png").addEventListener("click", () => exportDistillCard("png"));
+$("#btn-distill-export-json").addEventListener("click", () => exportDistillCard("json"));
 $("#btn-export-png").addEventListener("click", () => exportCard("png"));
 $("#btn-export-json").addEventListener("click", () => exportCard("json"));
 $("#btn-import-card").addEventListener("click", () => $("#import-file").click());
@@ -826,6 +869,7 @@ $("#btn-wz-add-regex").addEventListener("click", () => $("#wz-regex").appendChil
     $("#health").textContent = "✓ 服务正常 · " + h.schema;
     await loadList();
     refreshChannels();
+    loadActivePersona();
   } catch {
     $("#health").textContent = "✗ 无法连接服务，请先运行桌面开关启动";
   }
