@@ -67,6 +67,7 @@ let pendingData = null;
 let workMode = false;
 let lastDistilledCard = null;
 let currentCardSt = null;
+let emojiMap = {};
 let health = null;
 
 function setStatus(text, cls = "") {
@@ -276,6 +277,18 @@ function renderCards() {
           <button id="btn-wz-close" class="small-btn">关闭</button>
         </div>
       </div>
+      <div class="emoji-panel">
+        <h3>😊 表情包 <span id="emoji-count" class="hint"></span></h3>
+        <p class="hint">最多 120 个，每个带解释让 AI 理解；聊天时 AI 会按人设语气用 [表情:名字] 标记引用。</p>
+        <div id="emoji-grid" class="emoji-grid"></div>
+        <div class="row">
+          <input id="emoji-name" placeholder="表情名（如：撒娇）" />
+          <input id="emoji-explain" placeholder="解释（让 AI 理解用法）" />
+          <input type="file" id="emoji-file" accept="image/*" style="display:none" />
+          <button id="btn-emoji-pick" class="small-btn">选图</button>
+          <button id="btn-emoji-add" class="primary small-btn">添加</button>
+        </div>
+      </div>
       <div class="editor-head">
         <h2 id="editor-title">选择左侧卡片开始编辑 <span id="active-persona" class="chip" style="display:none"></span></h2>
         <div class="editor-actions">
@@ -305,6 +318,7 @@ function renderCards() {
             <label><input type="checkbox" id="tool-weather" /> 天气</label>
             <label><input type="checkbox" id="tool-time" /> 时间</label>
             <label><input type="checkbox" id="tool-memory" /> 记忆</label>
+            <label><input type="checkbox" id="tool-image" /> 生图</label>
             <label><input type="checkbox" id="tool-mcp" /> MCP</label>
           </span>
           <span class="opt-group">技能：
@@ -343,6 +357,7 @@ function initCards() {
   $("#tool-weather").checked = def.tools?.includes("weather") ?? false;
   $("#tool-time").checked = def.tools?.includes("datetime") ?? false;
   $("#tool-memory").checked = def.tools?.includes("memory_save") ?? false;
+  $("#tool-image").checked = def.tools?.includes("image_gen") ?? false;
   $("#skill-code").checked = def.skills?.includes("code_expert") ?? false;
   $("#skill-trans").checked = def.skills?.includes("translator") ?? false;
   $("#skill-write").checked = def.skills?.includes("writing") ?? false;
@@ -370,6 +385,9 @@ function initCards() {
   $("#btn-mic").addEventListener("click", startMic);
   $("#btn-work-mode").addEventListener("click", toggleWorkMode);
   $("#chat-input").addEventListener("keydown", (e) => { if (e.key === "Enter") sendChat(); });
+  $("#btn-emoji-pick").addEventListener("click", () => $("#emoji-file").click());
+  $("#emoji-file").addEventListener("change", addEmoji);
+  $("#btn-emoji-add").addEventListener("click", () => $("#emoji-file").click());
 
   loadList();
   loadActivePersona();
@@ -397,6 +415,9 @@ async function openCard(slug) {
   const card = await api.get(`/api/cards/${slug}`);
   currentSlug = slug;
   currentCardSt = card.sillytavern_v2 || null;
+  emojiMap = {};
+  (card.emojis ?? []).forEach((e) => { emojiMap[e.name] = e; });
+  renderEmojiGrid(card);
   $("#editor-title").firstChild.textContent = `编辑：${card.name} (${card.slug}) `;
   $("#editor-json").value = JSON.stringify(card, null, 2);
   dirty = false;
@@ -520,6 +541,7 @@ function gatherChatOptions() {
   if ($("#tool-weather").checked) tools.push("weather");
   if ($("#tool-time").checked) tools.push("datetime");
   if ($("#tool-memory").checked) tools.push("memory_save");
+  if ($("#tool-image").checked) tools.push("image_gen");
   const skills = [];
   if ($("#skill-code").checked) skills.push("code_expert");
   if ($("#skill-trans").checked) skills.push("translator");
@@ -563,7 +585,9 @@ async function sendChat() {
 
 async function finishTurn(r) {
   if (r.type === "reply") {
-    addChatBubble("bot", r.reply);
+    const log = $("#chat-log");
+    log.appendChild(renderBotReply(r.reply));
+    log.scrollTop = log.scrollHeight;
     chatHistory.push({ role: "assistant", content: r.reply });
     if ($("#chat-voice-reply")?.checked) speak(r.reply);
   } else if (r.type === "pending") {
@@ -724,6 +748,150 @@ async function importCard() {
     await openCard(r.card.slug);
   } catch (e) {
     setStatus("导入失败：" + e.message, "err");
+  }
+}
+
+// ---- 表情包 ----
+function renderEmojiGrid(card) {
+  const box = $("#emoji-grid");
+  const count = $("#emoji-count");
+  if (!box) return;
+  const emojis = card?.emojis ?? [];
+  if (count) count.textContent = `（${emojis.length}/120）`;
+  box.innerHTML = "";
+  if (!emojis.length) {
+    box.innerHTML = '<div class="muted">还没有表情包，选一张图 + 填名字和解释添加</div>';
+    return;
+  }
+  for (const e of emojis) {
+    const d = document.createElement("div");
+    d.className = "emoji-item";
+    d.innerHTML = `<img src="/emojis/${encodeURIComponent(card.slug)}/${encodeURIComponent(e.file)}" alt="${escapeHtml(e.name)}" />
+      <div class="emoji-name">${escapeHtml(e.name)}</div>
+      <div class="emoji-exp">${escapeHtml(e.explanation || "")}</div>
+      <button class="small-btn danger" data-id="${e.id}">删除</button>`;
+    d.querySelector("button").addEventListener("click", () => deleteEmoji(card.slug, e.id));
+    box.appendChild(d);
+  }
+}
+
+async function addEmoji() {
+  const f = $("#emoji-file").files[0];
+  const name = $("#emoji-name").value.trim();
+  if (!f || !name) { setStatus("请先填表情名并选图", "err"); return; }
+  if (!currentSlug) { setStatus("请先选择一张卡片", "err"); return; }
+  const ext = (f.name.split(".").pop() || "png").toLowerCase();
+  const b64 = await fileToBase64(f);
+  try {
+    const r = await api.send(`/api/cards/${currentSlug}/emoji`, {
+      method: "POST",
+      body: JSON.stringify({ name, explanation: $("#emoji-explain").value.trim(), imageBase64: b64, ext }),
+    });
+    $("#emoji-file").value = "";
+    $("#emoji-name").value = "";
+    $("#emoji-explain").value = "";
+    setStatus(`✓ 已添加表情包（${r.card.emojis.length}/120）`, "ok");
+    emojiMap = {};
+    (r.card.emojis ?? []).forEach((e) => { emojiMap[e.name] = e; });
+    renderEmojiGrid(r.card);
+    loadList();
+  } catch (e) {
+    setStatus("添加失败：" + e.message, "err");
+  }
+}
+
+async function deleteEmoji(slug, id) {
+  try {
+    const r = await api.send(`/api/cards/${slug}/emoji/${id}`, { method: "DELETE" });
+    emojiMap = {};
+    (r.card.emojis ?? []).forEach((e) => { emojiMap[e.name] = e; });
+    renderEmojiGrid(r.card);
+    setStatus("已删除表情", "ok");
+    loadList();
+  } catch (e) {
+    setStatus("删除失败：" + e.message, "err");
+  }
+}
+
+// ---- 聊天渲染（表情包 / 生图图片） ----
+function renderBotReply(text) {
+  let html = escapeHtml(text);
+  html = html.replace(/\[表情:([^\]]+)\]/g, (m, name) => {
+    const e = emojiMap[name.trim()];
+    return e
+      ? `<img class="chat-emoji" src="/emojis/${encodeURIComponent(currentSlug)}/${encodeURIComponent(e.file)}" alt="${escapeHtml(e.name)}" title="${escapeHtml(e.explanation || "")}" />`
+      : m;
+  });
+  html = html.replace(/!\[([^\]]*)\]\((https?:\/\/[^)\s]+|\/img\/[^)\s]+)\)/g, (m, alt, url) => {
+    if (url.startsWith("/img/")) url = encodeURI(url);
+    return `<img class="chat-img" src="${escapeHtml(url)}" alt="${escapeHtml(alt)}" />`;
+  });
+  html = html.replace(/(^|\s)(\/img\/[^\s)\]]+)/g, (m, pre, url) => `${pre}<img class="chat-img" src="${escapeHtml(encodeURI(url))}" />`);
+  const div = document.createElement("div");
+  div.className = "bubble bot";
+  div.innerHTML = html;
+  return div;
+}
+
+// ---- 生图配置 ----
+async function loadImageConfig() {
+  try {
+    const cfg = await api.get("/api/image/config");
+    $("#img-provider").value = cfg.provider;
+    $("#img-nai-key").placeholder = cfg.novelai.key || "pst_xxx";
+    $("#img-nai-model").value = cfg.novelai.model;
+    $("#img-oa-base").value = cfg.openai.baseUrl;
+    $("#img-oa-key").placeholder = cfg.openai.key || "sk-...";
+    $("#img-oa-model").value = cfg.openai.model;
+    toggleImgProvider();
+  } catch { /* 忽略 */ }
+}
+
+function toggleImgProvider() {
+  const p = $("#img-provider")?.value;
+  if (!p) return;
+  $("#img-novelai").style.display = p === "novelai" ? "flex" : "none";
+  $("#img-openai").style.display = p === "openai" ? "flex" : "none";
+}
+
+async function testImage() {
+  const provider = $("#img-provider").value;
+  const body = { provider };
+  if (provider === "novelai") body.novelai = { key: $("#img-nai-key").value.trim() || undefined, model: $("#img-nai-model").value.trim() };
+  if (provider === "openai") body.openai = { baseUrl: $("#img-oa-base").value.trim(), key: $("#img-oa-key").value.trim() || undefined, model: $("#img-oa-model").value.trim() };
+  $("#img-msg").textContent = "测试中…";
+  try {
+    const r = await api.send("/api/image/test", { method: "POST", body: JSON.stringify(body) });
+    $("#img-msg").textContent = (r.ok ? "✓ " : "✗ ") + r.info;
+    $("#img-msg").className = "status " + (r.ok ? "ok" : "err");
+  } catch (e) {
+    $("#img-msg").textContent = "测试出错：" + e.message;
+    $("#img-msg").className = "status err";
+  }
+}
+
+async function saveImage() {
+  try {
+    const r = await api.send("/api/image/config", {
+      method: "POST",
+      body: JSON.stringify({
+        provider: $("#img-provider").value,
+        novelai: { key: $("#img-nai-key").value.trim() || undefined, model: $("#img-nai-model").value.trim() },
+        openai: {
+          baseUrl: $("#img-oa-base").value.trim(),
+          key: $("#img-oa-key").value.trim() || undefined,
+          model: $("#img-oa-model").value.trim(),
+        },
+      }),
+    });
+    $("#img-msg").textContent = "✓ " + (r.hint || "已保存");
+    $("#img-msg").className = "status ok";
+    $("#img-nai-key").value = "";
+    $("#img-oa-key").value = "";
+    loadImageConfig();
+  } catch (e) {
+    $("#img-msg").textContent = "保存失败：" + e.message;
+    $("#img-msg").className = "status err";
   }
 }
 
@@ -1074,6 +1242,37 @@ function renderApi() {
           <div id="model-msg" class="status"></div>
         </div>
       </div>
+      <div class="channel-card">
+        <h2>🎨 生图（AI 绘画）</h2>
+        <p class="hint">工作模式勾选「生图」工具即可让 AI 生成图片。来源：NovelAI / OpenAI 兼容 API / 本地（规划中）。</p>
+        <div class="form">
+          <label>来源</label>
+          <select id="img-provider">
+            <option value="novelai">NovelAI</option>
+            <option value="openai">API（OpenAI 兼容）</option>
+            <option value="local">电脑本地（规划中）</option>
+          </select>
+          <div id="img-novelai" class="form">
+            <label>NovelAI Key（pst_...，任何有效账号 key 均可）</label>
+            <input id="img-nai-key" type="password" placeholder="pst_xxx" />
+            <label>模型</label>
+            <input id="img-nai-model" placeholder="nai-diffusion-4-5-full" />
+          </div>
+          <div id="img-openai" class="form" style="display:none">
+            <label>Base URL（OpenAI 兼容，/v1）</label>
+            <input id="img-oa-base" placeholder="https://apihub.agnes-ai.cn/v1" />
+            <label>Key</label>
+            <input id="img-oa-key" type="password" />
+            <label>模型（如 agnes-image-2.0-flash / gpt-image-1）</label>
+            <input id="img-oa-model" placeholder="agnes-image-2.0-flash" />
+          </div>
+          <div class="row">
+            <button id="btn-img-test">测试</button>
+            <button id="btn-img-save" class="primary">保存</button>
+          </div>
+          <div id="img-msg" class="status"></div>
+        </div>
+      </div>
     </div>
   </div>`;
 }
@@ -1081,7 +1280,11 @@ function renderApi() {
 function initApi() {
   $("#btn-model-test").addEventListener("click", testModel);
   $("#btn-model-save").addEventListener("click", saveModel);
+  $("#img-provider").addEventListener("change", toggleImgProvider);
+  $("#btn-img-test").addEventListener("click", testImage);
+  $("#btn-img-save").addEventListener("click", saveImage);
   loadModelConfig();
+  loadImageConfig();
 }
 
 async function loadModelConfig() {
@@ -1164,6 +1367,7 @@ function renderCapabilities() {
             <label><input type="checkbox" id="cap-weather" /> 天气</label>
             <label><input type="checkbox" id="cap-time" /> 时间</label>
             <label><input type="checkbox" id="cap-memory" /> 记忆</label>
+            <label><input type="checkbox" id="cap-image" /> 生图</label>
           </div>
           <label>技能（默认）</label>
           <div class="cap-checks">
@@ -1207,6 +1411,7 @@ function initCapabilities() {
   $("#cap-weather").checked = tools.includes("weather");
   $("#cap-time").checked = tools.includes("datetime");
   $("#cap-memory").checked = tools.includes("memory_save");
+  $("#cap-image").checked = tools.includes("image_gen");
   const skills = def.skills ?? [];
   $("#cap-skill-code").checked = skills.includes("code_expert");
   $("#cap-skill-trans").checked = skills.includes("translator");
@@ -1222,6 +1427,7 @@ function initCapabilities() {
     if ($("#cap-weather").checked) toolsArr.push("weather");
     if ($("#cap-time").checked) toolsArr.push("datetime");
     if ($("#cap-memory").checked) toolsArr.push("memory_save");
+    if ($("#cap-image").checked) toolsArr.push("image_gen");
     const skillsArr = [];
     if ($("#cap-skill-code").checked) skillsArr.push("code_expert");
     if ($("#cap-skill-trans").checked) skillsArr.push("translator");

@@ -222,6 +222,14 @@ const toolsSchema = z
   })
   .default({});
 
+// ---------- 表情包（最多 120 个，每个带解释供 AI 理解） ----------
+const emojiSchema = z.object({
+  id: z.string(),
+  name: z.string().min(1, "表情名不能为空"),
+  file: z.string(),
+  explanation: z.string().default(""),
+});
+
 // ---------- 卡片主体 ----------
 export const personaCardSchema = z.object({
   schema: z.literal(SCHEMA_VERSION).default(SCHEMA_VERSION),
@@ -245,6 +253,7 @@ export const personaCardSchema = z.object({
   chat: chatSchema.default({}),
   presets: presetsSchema.default({}),
   tools: toolsSchema,
+  emojis: z.array(emojiSchema).max(120).default([]),
   sillytavern_v2: sillytavernSchema.optional(),
   ethics: ethicsSchema.default({}),
 });

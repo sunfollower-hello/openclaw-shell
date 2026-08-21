@@ -8,6 +8,7 @@ import path from "node:path";
 export interface ToolCtx {
   sandboxDir: string;
   memoryPath: string;
+  imagesDir: string;
 }
 
 export interface ToolDef {
@@ -240,6 +241,99 @@ const memorySave: ToolDef = {
   },
 };
 
+// ---------- 生图（NovelAI / OpenAI 兼容 / 本地占位） ----------
+function aspectSize(aspect: string): [number, number] {
+  switch (aspect) {
+    case "portrait": return [832, 1216];
+    case "landscape": return [1216, 832];
+    case "tall": return [768, 1344];
+    case "wide": return [1344, 768];
+    default: return [1024, 1024];
+  }
+}
+
+const imageGen: ToolDef = {
+  id: "image_gen",
+  name: "生图（AI 绘画）",
+  description:
+    "根据文字描述生成图片（NovelAI 或 OpenAI 兼容 API，需先在「API 与模型」页配置生图）。参数 prompt 为英文/中文绘画提示词，negative 为负面词（可选），aspect 为比例（square/portrait/landscape/tall/wide，可选）。",
+  parameters: {
+    type: "object",
+    properties: {
+      prompt: { type: "string", description: "绘画提示词" },
+      negative: { type: "string", description: "负面提示词（可选）" },
+      aspect: { type: "string", description: "square/portrait/landscape/tall/wide" },
+    },
+    required: ["prompt"],
+  },
+  async run(args, ctx) {
+    const { getImageConfig } = await import("../core/imageConfig.js");
+    const cfg = await getImageConfig();
+    const prompt = String(args.prompt ?? "");
+    if (!prompt.trim()) return "错误：提示词为空";
+    const [w, h] = aspectSize(String(args.aspect ?? "square"));
+    try {
+      let buf: Buffer | null = null;
+      if (cfg.provider === "novelai" && cfg.novelai.key) {
+        const r = await fetch("https://image.novelai.net/ai/generate-image", {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${cfg.novelai.key}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            input: prompt,
+            model: cfg.novelai.model || "nai-diffusion-4-5-full",
+            action: "generate",
+            parameters: {
+              width: w,
+              height: h,
+              scale: cfg.novelai.scale || 6,
+              negative_prompt: String(args.negative ?? cfg.novelai.negative ?? ""),
+              steps: cfg.novelai.steps || 28,
+              sampler: "k_dpmpp_2m_sde",
+              seed: 0,
+              n_samples: 1,
+              noise_schedule: "karras",
+            },
+          }),
+          signal: AbortSignal.timeout(120000),
+        });
+        if (!r.ok) return `NovelAI 生成失败 HTTP ${r.status}: ${(await r.text()).slice(0, 200)}`;
+        buf = Buffer.from(await r.arrayBuffer());
+      } else if (cfg.provider === "openai" && cfg.openai.key) {
+        const r = await fetch(`${cfg.openai.baseUrl.replace(/\/+$/, "")}/images/generations`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${cfg.openai.key}` },
+          body: JSON.stringify({
+            model: cfg.openai.model,
+            prompt,
+            n: 1,
+            size: cfg.openai.size || "1024x1024",
+            response_format: "b64_json",
+          }),
+          signal: AbortSignal.timeout(120000),
+        });
+        if (!r.ok) return `生图 API 失败 HTTP ${r.status}: ${(await r.text()).slice(0, 200)}`;
+        const j = (await r.json()) as { data?: { b64_json?: string }[] };
+        const b64 = j.data?.[0]?.b64_json;
+        if (!b64) return "生图 API 返回里没有图片数据";
+        buf = Buffer.from(b64, "base64");
+      } else if (cfg.provider === "local") {
+        return "本地生图未启用（方案见未来规划书：ComfyUI / Forge 待接入）";
+      } else {
+        return "未配置生图（请到「API 与模型」页配置 NovelAI 或 API Key）";
+      }
+      const file = `gen-${Date.now()}.png`;
+      await fs.mkdir(ctx.imagesDir, { recursive: true });
+      await fs.writeFile(path.join(ctx.imagesDir, file), buf);
+      return `已生成图片：/img/${path.basename(ctx.imagesDir)}/${file}`;
+    } catch (e) {
+      return `生图失败: ${String(e)}`;
+    }
+  },
+};
+
 export const TOOL_REGISTRY: ToolDef[] = [
   codeExec,
   sandboxList,
@@ -250,6 +344,7 @@ export const TOOL_REGISTRY: ToolDef[] = [
   weather,
   datetime,
   memorySave,
+  imageGen,
 ];
 
 export function toolsToOpenAI(tools: ToolDef[]): unknown[] {

@@ -25,6 +25,7 @@ import { SKILL_LIBRARY } from "./core/skills.js";
 import { getMCPTools, loadMCPConfig, saveMCPConfig, reloadMCP } from "./tools/mcp.js";
 import { cardToCCv2, ccv2ToCard } from "./core/cardConvert.js";
 import { solidPng, pngWithText, extractCardJson } from "./core/png.js";
+import { getImageConfig, saveImageConfig, maskKey, testNovelaiKey, testOpenAIImageKey } from "./core/imageConfig.js";
 
 // 加载项目 .env（仅补环境变量空缺，如 OPENCLAW_SHELL_UI_USER/PASS）
 async function loadEnv(): Promise<void> {
@@ -69,6 +70,9 @@ if (UI_USER && UI_PASS) {
 
 const projectRoot = findProjectRoot();
 app.use(express.static(path.join(projectRoot, "web")));
+// 表情包与生图产物（挂在认证之后，公网同样受 Basic 保护）
+app.use("/emojis", express.static(path.join(dataDir(), "emojis")));
+app.use("/img", express.static(path.join(dataDir(), "images")));
 
 // ---------- API ----------
 app.get("/api/health", (_req, res) => {
@@ -553,6 +557,7 @@ function chatCtx(slug: string): ToolCtx {
   return {
     sandboxDir: path.join(dataDir(), "sandbox", slug),
     memoryPath: path.join(dataDir(), "memory", `${slug}.mem`),
+    imagesDir: path.join(dataDir(), "images", slug),
   };
 }
 
@@ -590,14 +595,29 @@ app.post("/api/chat", async (req, res) => {
             : level === "extreme"
               ? "xhigh"
               : undefined;
-    const system =
+    let system =
       buildChatSystem(card) +
       (toolDefs.length
-        ? "\n\n你可以使用工具完成任务（写代码/沙箱文件/搜索/天气/时间/记忆）。用户请求适合用工具完成时，调用工具而不是凭空编造；危险工具会先征得用户同意。"
+        ? "\n\n你可以使用工具完成任务（写代码/沙箱文件/搜索/天气/时间/记忆/生图）。用户请求适合用工具完成时，调用工具而不是凭空编造；危险工具会先征得用户同意。"
         : "") +
       skillPrompts.map((p) => "\n" + p).join("") +
       memoryBlock +
       (mcpErrors.length ? `\n\n（MCP 连接提示：${mcpErrors.join("；")}）` : "");
+
+    // 表情包注入（关闭档不注入）
+    const emojis = card.emojis ?? [];
+    const emojiLevel = card.voice?.message_style?.emoji ?? "克制";
+    if (emojis.length > 0 && emojiLevel !== "关闭") {
+      const emojiLines = emojis
+        .slice(0, 120)
+        .map((e) => `- ${e.name}：${e.explanation || "（无解释）"}`)
+        .join("\n");
+      const usage =
+        emojiLevel === "贴近原始" ? "尽量在合适位置使用" : emojiLevel === "克制" ? "偶尔在合适位置使用" : "少量使用";
+      system +=
+        `\n\n【表情包】你可以使用以下自定义表情包，${usage}。在回复中插入 [表情:名字] 标记（前端会渲染成图片），不要编造不存在的表情名字：\n` +
+        emojiLines;
+    }
 
     const messages: unknown[] = [
       { role: "system", content: system },
@@ -720,6 +740,104 @@ app.post("/api/memory/clear", async (_req, res) => {
       await fs.rm(path.join(memDir, f), { force: true }).catch(() => {});
     }
     res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+// ---------- 表情包（每人设卡最多 120 个，带解释） ----------
+app.post("/api/cards/:slug/emoji", async (req, res) => {
+  try {
+    const { name, explanation, imageBase64, ext } = req.body ?? {};
+    if (!name || !imageBase64) return res.status(400).json({ error: "name / imageBase64 不能为空" });
+    const card = await store.get(req.params.slug);
+    const emojis = card.emojis ?? [];
+    if (emojis.length >= 120) return res.status(400).json({ error: "最多 120 个自定义表情包" });
+    const id = `e${Date.now().toString(36)}${Math.random().toString(36).slice(2, 5)}`;
+    const extName = /^[a-z0-9]{2,5}$/i.test(String(ext ?? "")) ? String(ext) : "png";
+    const dir = path.join(dataDir(), "emojis", req.params.slug);
+    await fs.mkdir(dir, { recursive: true });
+    const file = `${id}.${extName}`;
+    await fs.writeFile(path.join(dir, file), Buffer.from(imageBase64, "base64"));
+    card.emojis = [...emojis, { id, name: String(name).slice(0, 40), file, explanation: String(explanation ?? "").slice(0, 200) }];
+    await store.save(card);
+    res.json({ card });
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+app.delete("/api/cards/:slug/emoji/:id", async (req, res) => {
+  try {
+    const card = await store.get(req.params.slug);
+    const target = (card.emojis ?? []).find((e) => e.id === req.params.id);
+    card.emojis = (card.emojis ?? []).filter((e) => e.id !== req.params.id);
+    await store.save(card);
+    if (target) await fs.unlink(path.join(dataDir(), "emojis", req.params.slug, target.file)).catch(() => {});
+    res.json({ card });
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+// ---------- 生图配置（NovelAI / OpenAI 兼容 / 本地占位） ----------
+app.get("/api/image/config", async (_req, res) => {
+  try {
+    const cfg = await getImageConfig();
+    res.json({
+      provider: cfg.provider,
+      novelai: { key: maskKey(cfg.novelai.key), model: cfg.novelai.model, steps: cfg.novelai.steps, scale: cfg.novelai.scale, negative: cfg.novelai.negative },
+      openai: { baseUrl: cfg.openai.baseUrl, key: maskKey(cfg.openai.key), model: cfg.openai.model, size: cfg.openai.size },
+    });
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+app.post("/api/image/config", async (req, res) => {
+  try {
+    const { provider, novelai, openai } = req.body ?? {};
+    const cur = await getImageConfig();
+    const next = {
+      provider: ["novelai", "openai", "local"].includes(provider) ? provider : cur.provider,
+      novelai: {
+        key: novelai?.key ? String(novelai.key) : cur.novelai.key,
+        model: novelai?.model ?? cur.novelai.model,
+        steps: Number(novelai?.steps) || cur.novelai.steps,
+        scale: Number(novelai?.scale) || cur.novelai.scale,
+        negative: novelai?.negative ?? cur.novelai.negative,
+      },
+      openai: {
+        baseUrl: openai?.baseUrl ?? cur.openai.baseUrl,
+        key: openai?.key ? String(openai.key) : cur.openai.key,
+        model: openai?.model ?? cur.openai.model,
+        size: openai?.size ?? cur.openai.size,
+      },
+    };
+    await saveImageConfig(next);
+    res.json({ ok: true, hint: "已保存。工作模式勾选「生图」工具即可让 AI 生成图片" });
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+app.post("/api/image/test", async (req, res) => {
+  try {
+    const { provider, novelai, openai } = req.body ?? {};
+    if (provider === "novelai") {
+      const key = novelai?.key ?? (await getImageConfig()).novelai.key;
+      if (!key) return res.json({ ok: false, info: "未填 NovelAI Key" });
+      res.json(await testNovelaiKey(String(key)));
+      return;
+    }
+    if (provider === "openai") {
+      const baseUrl = openai?.baseUrl ?? (await getImageConfig()).openai.baseUrl;
+      const key = openai?.key ?? (await getImageConfig()).openai.key;
+      if (!baseUrl || !key) return res.json({ ok: false, info: "未填 Base URL / Key" });
+      res.json(await testOpenAIImageKey(String(baseUrl), String(key)));
+      return;
+    }
+    res.json({ ok: false, info: "本地生图未启用（方案见未来规划书）" });
   } catch (e) {
     res.status(500).json({ error: String(e) });
   }
