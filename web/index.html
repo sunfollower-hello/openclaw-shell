@@ -7,273 +7,51 @@
   <link rel="stylesheet" href="style.css" />
 </head>
 <body>
-  <header>
-    <h1>🦞 openclaw-shell <span class="sub">人设卡 · 通道 · API</span></h1>
-    <nav class="tabs">
-      <button class="tab active" data-tab="cards">人设卡</button>
-      <button class="tab" data-tab="distill">蒸馏</button>
-      <button class="tab" data-tab="channels">通道</button>
-      <button class="tab" data-tab="api">API</button>
+  <div id="app">
+    <!-- 顶栏 -->
+    <header class="topbar">
+      <button id="btn-menu" class="menu-btn" title="菜单">🦞</button>
+      <div class="brand">openclaw-shell <span class="sub">AI 角色机器人工作室</span></div>
+      <div class="top-status">
+        <span class="chip" id="ts-model" title="模型">模型…</span>
+        <span class="chip" id="ts-wx" title="微信">微信…</span>
+        <span class="chip" id="ts-qq" title="QQ">QQ…</span>
+      </div>
+    </header>
+
+    <!-- 抽屉 -->
+    <div id="drawer-overlay" class="drawer-overlay" hidden></div>
+    <aside id="drawer" class="drawer">
+      <div class="drawer-user">
+        <div class="avatar">🦞</div>
+        <div class="drawer-user-info">
+          <div class="uname">本地用户</div>
+          <div class="umeta" id="drawer-meta">openclaw-shell</div>
+        </div>
+      </div>
+      <nav class="drawer-nav">
+        <a href="#/home" data-route="home">🏠 首页</a>
+        <a href="#/cards" data-route="cards">🎴 人设卡库</a>
+        <a href="#/distill" data-route="distill">🧪 蒸馏工厂</a>
+        <a href="#/channels" data-route="channels">💬 通道连接</a>
+        <a href="#/api" data-route="api">⚡ API 与模型</a>
+        <a href="#/capabilities" data-route="capabilities">🛠 能力中心</a>
+        <a href="#/data" data-route="data">📦 数据</a>
+        <a href="#/settings" data-route="settings">⚙ 设置</a>
+      </nav>
+      <div class="drawer-foot">数据保存在本机，不上传</div>
+    </aside>
+
+    <!-- 视图容器 -->
+    <main id="view" class="view-main"></main>
+
+    <!-- 底部快捷栏（窄屏） -->
+    <nav class="bottom-nav">
+      <a href="#/home" data-route="home">🏠 首页</a>
+      <a href="#/cards" data-route="cards">🎴 卡库</a>
+      <a href="#/channels" data-route="channels">💬 通道</a>
     </nav>
-    <span id="health" class="health">连接中…</span>
-  </header>
-
-  <main>
-    <!-- ============ 人设卡 ============ -->
-    <section id="tab-cards" class="tab-panel active">
-      <aside>
-          <div class="create-box">
-            <h2>新建人设卡</h2>
-            <input id="new-name" placeholder="名称（如：奶奶）" />
-            <input id="new-slug" placeholder="slug（留空自动生成）" />
-            <select id="new-role">
-              <option value="friend">朋友</option>
-              <option value="family">家人</option>
-              <option value="self">自己</option>
-              <option value="partner">前任/恋人</option>
-              <option value="colleague">同事</option>
-              <option value="public-figure">偶像/角色</option>
-            </select>
-            <button id="btn-create">创建</button>
-            <div class="row">
-              <button id="btn-card-wizard" class="small-btn" title="可视化做卡：简介/开场白/世界书/正则">🃏 做卡向导</button>
-              <button id="btn-import-card" class="small-btn" title="导入 PNG 或 JSON 角色卡">📥 导入卡</button>
-              <input type="file" id="import-file" accept=".png,.json" style="display:none" />
-            </div>
-          </div>
-        <h2>卡库</h2>
-        <ul id="card-list" class="card-list"></ul>
-      </aside>
-      <section id="editor">
-        <div id="card-wizard" class="wizard" style="display:none">
-          <h3>🃏 做卡向导 <span class="hint">填好后点「应用到卡片」，再点「保存」</span></h3>
-          <label>简介（description，一句话介绍角色）</label>
-          <textarea id="wz-desc" rows="2" placeholder="如：80 岁的北方奶奶，说话直接但心软"></textarea>
-          <label>开场白（first_mes，对话开始时的第一句话）</label>
-          <textarea id="wz-first" rows="2" placeholder="如：哎，你可算回来了，快坐下，饭给你热着呢"></textarea>
-          <label>世界书（关键词触发背景设定；第一行固定「人物形象」）</label>
-          <div id="wz-book"></div>
-          <button id="btn-wz-add-entry" class="small-btn">+ 添加世界书条目</button>
-          <label>正则替换（名称 / 匹配 / 替换，可留空）</label>
-          <div id="wz-regex"></div>
-          <button id="btn-wz-add-regex" class="small-btn">+ 添加正则</button>
-          <label>头像（PNG，可选）</label>
-          <input type="file" id="wz-avatar" accept=".png" />
-          <div class="row">
-            <button id="btn-wz-apply" class="primary">应用到卡片</button>
-            <button id="btn-wz-close" class="small-btn">关闭</button>
-          </div>
-        </div>
-        <div class="editor-head">
-          <h2 id="editor-title">选择左侧卡片开始编辑 <span id="active-persona" class="chip" style="display:none"></span></h2>
-          <div class="editor-actions">
-            <button id="btn-export-png" title="导出 PNG 角色卡（嵌入 CCv2 数据）">导出 PNG</button>
-            <button id="btn-export-json" title="导出 JSON 角色卡">导出 JSON</button>
-            <button id="btn-compile" title="编译后写入 OpenClaw workspace，当前生效人设 = 最后编译的卡片">编译到 OpenClaw</button>
-            <button id="btn-validate">校验</button>
-            <button id="btn-save" class="primary">保存</button>
-            <button id="btn-del" class="danger">删除</button>
-          </div>
-        </div>
-        <textarea id="editor-json" spellcheck="false" placeholder="卡片 JSON（persona-card v1 格式）"></textarea>
-        <div id="status" class="status"></div>
-        <div class="chat-test">
-          <div class="chat-head">
-            <h3>💬 聊天测试 <span id="chat-head-hint" class="hint">普通聊天：纯人设对话</span></h3>
-            <div>
-              <button id="btn-work-mode" class="small-btn" title="工作模式开放全部功能：工具/技能/MCP/深度/语音">🔧 进入工作模式</button>
-              <button id="btn-chat-clear" class="small-btn">清空</button>
-            </div>
-          </div>
-          <div class="chat-opts" style="display:none">
-            <span class="opt-group">工具：
-              <label title="危险工具，会先问你是否执行"><input type="checkbox" id="tool-code" checked /> 写代码*</label>
-              <label><input type="checkbox" id="tool-file" /> 沙箱文件</label>
-              <label><input type="checkbox" id="tool-search" /> 搜索</label>
-              <label><input type="checkbox" id="tool-weather" /> 天气</label>
-              <label><input type="checkbox" id="tool-time" checked /> 时间</label>
-              <label><input type="checkbox" id="tool-memory" /> 记忆</label>
-              <label><input type="checkbox" id="tool-mcp" /> MCP</label>
-            </span>
-            <span class="opt-group">技能：
-              <label><input type="checkbox" id="skill-code" /> 代码专家</label>
-              <label><input type="checkbox" id="skill-trans" /> 翻译</label>
-              <label><input type="checkbox" id="skill-write" /> 写作</label>
-              <label><input type="checkbox" id="skill-companion" /> 陪伴</label>
-            </span>
-            <span class="opt-group">深度：
-              <select id="chat-thinking">
-                <option value="off">关闭</option>
-                <option value="auto" selected>自动（默认）</option>
-                <option value="low">低</option>
-                <option value="medium">中</option>
-                <option value="high">高</option>
-                <option value="extreme">极高</option>
-              </select>
-            </span>
-            <span class="opt-group">语音：
-              <label><input type="checkbox" id="chat-voice-reply" /> 读回复</label>
-              <button id="btn-mic" class="small-btn" title="语音输入（Chrome/Edge）">🎤</button>
-            </span>
-          </div>
-          <div id="chat-log" class="chat-log"></div>
-          <div class="row">
-            <input id="chat-input" placeholder="试试：帮我写段代码算 1 加到 100…" />
-            <button id="btn-chat-send" class="primary">发送</button>
-          </div>
-        </div>
-      </section>
-    </section>
-
-    <!-- ============ 蒸馏 ============ -->
-    <section id="tab-distill" class="tab-panel">
-      <div class="api-layout">
-        <div class="channel-card">
-          <h2>🧪 聊天记录蒸馏（数字分身）</h2>
-          <p class="hint">导入微信聊天记录导出（WeFlow JSON），自动脱敏 → 四维蒸馏（互动风格/人格/记忆）→ 生成人设卡。蒸馏调用「API」页配置的模型（走你的中转）。</p>
-          <div class="form">
-            <label>聊天记录文件（WeFlow 导出的 JSON）</label>
-            <input id="distill-file" type="file" accept=".json" />
-            <div class="note" style="margin-top:0">📥 没有记录文件？先导出：下载 <a href="https://github.com/hicccc77/WeFlow" target="_blank">WeFlow</a>（本机导出工具，无需管理员）→ 选联系人/群 → 导出 JSON → 回到这里上传。</div>
-            <label>或直接粘贴聊天文本（每行一条：<code>昵称: 内容</code>）</label>
-            <textarea id="distill-paste" rows="4" placeholder="奶奶: 多喝水，别又熬夜&#10;我: 知道了奶奶"></textarea>
-            <label>卡片名称</label>
-            <input id="distill-name" placeholder="如：奶奶" />
-            <label>关系类型</label>
-            <select id="distill-role">
-              <option value="friend">朋友</option>
-              <option value="family">家人</option>
-              <option value="self">自己</option>
-              <option value="partner">前任/恋人</option>
-              <option value="colleague">同事</option>
-              <option value="public-figure">偶像/角色</option>
-            </select>
-            <label>目标人物昵称（留空自动取最活跃的对方）</label>
-            <input id="distill-target" placeholder="如：奶奶" />
-            <label>我方昵称（逗号分隔，用于排除自己）</label>
-            <input id="distill-self" placeholder="如：我,本人" />
-            <label>屏蔽词（逗号分隔，命中的消息整条剔除）</label>
-            <input id="distill-blocked" placeholder="如：工资,某敏感词" />
-            <div class="row">
-              <button id="btn-distill-run" class="primary">开始蒸馏</button>
-            </div>
-            <div id="distill-msg" class="status"></div>
-          </div>
-          <hr style="border-color:var(--border)" />
-          <h3>🔌 直连 WeFlow 导入（本机 5031）</h3>
-          <p class="hint">WeFlow 正在运行时可免导出直接拉取：在 WeFlow 界面找到 access_token 填入，点「探测」确认连接，再填 talker 导入。</p>
-          <div class="row">
-            <input id="wf-token" placeholder="WeFlow access_token" />
-            <button id="btn-wf-probe" class="small-btn">探测</button>
-          </div>
-          <div class="row">
-            <input id="wf-talker" placeholder="talker（如 xxx@chatroom / wxid_xxx）" />
-            <input id="wf-limit" type="number" value="500" style="max-width:80px" />
-            <button id="btn-wf-distill" class="primary">导入并蒸馏</button>
-          </div>
-          <pre id="wf-out" class="small-out"></pre>
-          <div class="note">首次使用：先到「API」页确认模型已配置并设为默认（当前默认 <code id="distill-model">—</code>）。</div>
-        </div>
-        <div class="channel-card">
-          <h2>蒸馏结果</h2>
-          <div class="editor-actions" style="margin-bottom:8px">
-            <button id="btn-distill-save" class="primary">保存到卡库</button>
-            <button id="btn-distill-export-png">导出 PNG</button>
-            <button id="btn-distill-export-json">导出 JSON</button>
-          </div>
-          <pre id="distill-result" class="small-out tall">（结果会显示在这里）</pre>
-        </div>
-      </div>
-    </section>
-
-    <!-- ============ 通道 ============ -->
-    <section id="tab-channels" class="tab-panel">
-      <div class="channel-grid">
-        <!-- 微信 -->
-        <div class="channel-card">
-          <h2>💬 微信 <span id="wx-status" class="chip">检测中…</span></h2>
-          <p class="hint">腾讯官方通道（openclaw-weixin），当前仅支持单聊。需微信有 ClawBot 入口（灰度）。</p>
-          <div class="channel-actions">
-            <button id="btn-wx-login">开始扫码绑定</button>
-            <button id="btn-wx-refresh">刷新状态</button>
-          </div>
-          <pre id="wx-qr" class="qr-box" style="display:none"></pre>
-          <div id="wx-login-msg" class="status"></div>
-          <hr />
-          <h3>新好友配对授权</h3>
-          <p class="hint">新联系人发消息后，这里会出现配对码；批准后该联系人才可对话。</p>
-          <div class="row">
-            <input id="pairing-code" placeholder="配对码（如 4 位字母数字）" />
-            <button id="btn-pair-approve">批准</button>
-          </div>
-          <pre id="pairing-list" class="small-out"></pre>
-          <div class="note">⚠️ 若微信里没有 ClawBot 入口，说明你的账号还在灰度外，扫码会失败——这是微信侧限制，不是本软件问题。</div>
-        </div>
-
-        <!-- QQ -->
-        <div class="channel-card">
-          <h2>🐧 QQ <span id="qq-status" class="chip">检测中…</span></h2>
-          <p class="hint">官方 QQ 开放平台机器人（腾讯官方插件，合规无封号风险）。支持单聊 / 群聊@ / 频道，富媒体。</p>
-          <div class="channel-actions">
-            <button id="btn-qq-login">开始扫码绑定</button>
-            <button id="btn-qq-refresh">刷新状态</button>
-          </div>
-          <pre id="qq-qr" class="qr-box" style="display:none"></pre>
-          <div id="qq-login-msg" class="status"></div>
-          <div id="qq-guide" class="guide">
-            <ol>
-              <li><b>创建机器人</b>：打开 <a href="https://q.qq.com/" target="_blank">QQ 开放平台</a>，手机 QQ 扫码登录开发者账号，点「创建机器人」（机器人会自动出现在你的 QQ 消息列表）</li>
-              <li><b>扫码绑定</b>：点上方「开始扫码绑定」，用手机 QQ 扫网页二维码完成授权</li>
-              <li><b>开始对话</b>：在 QQ 消息列表找到机器人发消息测试（未配置完成前机器人会回「已去火星」）</li>
-              <li><b>正式上线</b>：开发调试用沙箱环境即可；正式发布需在平台提交审核</li>
-            </ol>
-          </div>
-          <pre id="qq-out" class="small-out"></pre>
-          <div class="note">说明：官方机器人是「消息列表里的机器人」而非你的 QQ 号；若想用「自己的 QQ 号」当机器人（NapCat 方案），需要另行适配，暂未就绪。</div>
-        </div>
-      </div>
-    </section>
-
-    <!-- ============ API ============ -->
-    <section id="tab-api" class="tab-panel">
-      <div class="api-layout">
-        <div class="channel-card">
-          <h2>当前模型配置</h2>
-          <p class="hint">默认模型 <code id="cur-primary">—</code>（保存后需重启网关生效，可用桌面开关）</p>
-          <div id="provider-list" class="provider-list"></div>
-        </div>
-        <div class="channel-card">
-          <h2>添加 / 修改提供商</h2>
-          <div class="form">
-            <label>名称（如 agnes / myrelay）</label>
-            <input id="cfg-name" placeholder="agnes" />
-            <label>Base URL（OpenAI 兼容，以 /v1 结尾）</label>
-            <input id="cfg-baseurl" placeholder="https://apihub.agnes-ai.cn/v1" />
-            <label>API Key（留空保留原值）</label>
-            <input id="cfg-key" type="password" placeholder="sk-..." />
-            <label>模型 ID</label>
-            <input id="cfg-model" placeholder="agnes-2.0-flash" />
-            <label class="checkbox"><input id="cfg-default" type="checkbox" checked /> 设为默认模型</label>
-            <div class="row">
-              <button id="btn-model-test">测试连接</button>
-              <button id="btn-model-save" class="primary">保存</button>
-            </div>
-            <div id="model-msg" class="status"></div>
-          </div>
-        </div>
-        <div class="channel-card">
-          <h2>🔌 MCP 服务器</h2>
-          <p class="hint">JSON 数组，每项 <code>{"name":"服务名","command":"命令","args":[]}</code>。保存后聊天测试勾选「MCP」即可用其工具（MCP 工具默认需审批）。</p>
-          <textarea id="mcp-config" rows="6" spellcheck="false"></textarea>
-          <div class="row" style="margin-top:8px">
-            <button id="btn-mcp-save" class="primary">保存并重连</button>
-            <button id="btn-backup">📦 备份数据</button>
-          </div>
-          <div id="mcp-msg" class="status"></div>
-        </div>
-      </div>
-    </section>
-  </main>
+  </div>
 
   <script src="app.js"></script>
 </body>

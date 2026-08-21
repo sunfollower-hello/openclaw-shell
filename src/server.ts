@@ -72,7 +72,7 @@ app.use(express.static(path.join(projectRoot, "web")));
 
 // ---------- API ----------
 app.get("/api/health", (_req, res) => {
-  res.json({ ok: true, service: "openclaw-shell", schema: SCHEMA_VERSION });
+  res.json({ ok: true, service: "openclaw-shell", schema: SCHEMA_VERSION, port: PORT, dataDir: dataDir() });
 });
 
 app.get("/api/cards", async (_req, res) => {
@@ -693,6 +693,33 @@ app.get("/api/backup", async (_req, res) => {
       filename: `openclaw-shell-backup-${new Date().toISOString().slice(0, 10)}.json`,
       dataUrl: "data:application/json;charset=utf-8," + encodeURIComponent(JSON.stringify(bundle, null, 2)),
     });
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+// ---------- 长期记忆查看 / 清空 ----------
+app.get("/api/memory", async (_req, res) => {
+  try {
+    const memDir = path.join(dataDir(), "memory");
+    const out: Record<string, string[]> = {};
+    for (const f of await fs.readdir(memDir).catch(() => [])) {
+      const text = await fs.readFile(path.join(memDir, f), "utf8").catch(() => "");
+      out[f.replace(/\.mem$/, "")] = text.split("\n").filter(Boolean);
+    }
+    res.json({ memory: out });
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+app.post("/api/memory/clear", async (_req, res) => {
+  try {
+    const memDir = path.join(dataDir(), "memory");
+    for (const f of await fs.readdir(memDir).catch(() => [])) {
+      await fs.rm(path.join(memDir, f), { force: true }).catch(() => {});
+    }
+    res.json({ ok: true });
   } catch (e) {
     res.status(500).json({ error: String(e) });
   }
