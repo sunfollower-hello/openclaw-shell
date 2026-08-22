@@ -1,8 +1,8 @@
-// openclaw-shell 前端 v2：抽屉导航 + 首页操作台 + 视图路由
+// openclaw-shell 前端 v3：白色主题 · 抽屉导航 · 表单化卡片 · 多提供商 · 每卡模型/记忆
 const $ = (sel) => document.querySelector(sel);
 const $$ = (sel) => document.querySelectorAll(sel);
 
-// ================= 基础工具 =================
+// ================= 基础 =================
 const api = {
   async get(path) {
     const r = await fetch(path);
@@ -23,98 +23,281 @@ function escapeHtml(s) {
     "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
   }[c]));
 }
-
 function downloadDataUrl(dataUrl, filename) {
   const a = document.createElement("a");
-  a.href = dataUrl;
-  a.download = filename;
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
+  a.href = dataUrl; a.download = filename;
+  document.body.appendChild(a); a.click(); a.remove();
 }
-
 function fileToBase64(file) {
   return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(String(reader.result).split(",")[1]);
-    reader.onerror = reject;
-    reader.readAsDataURL(file);
+    const r = new FileReader();
+    r.onload = () => resolve(String(r.result).split(",")[1]);
+    r.onerror = reject;
+    r.readAsDataURL(file);
   });
 }
-
-function setChip(el, text, ok) {
-  if (!el) return;
-  el.textContent = text;
-  el.className = "chip " + (ok === null ? "" : ok ? "ok" : "bad");
+function toast(msg, ok = true) {
+  let t = $("#toast");
+  if (!t) {
+    t = document.createElement("div");
+    t.id = "toast";
+    document.body.appendChild(t);
+  }
+  t.textContent = msg;
+  t.className = "toast show " + (ok ? "ok" : "err");
+  clearTimeout(t._timer);
+  t._timer = setTimeout(() => t.classList.remove("show"), 2600);
 }
 
-// 能力默认值（本地持久化，聊天测试可临时覆盖）
 const DEFAULTS_KEY = "ocs_cap_defaults";
 function capDefaults() {
-  try {
-    return JSON.parse(localStorage.getItem(DEFAULTS_KEY) || "{}");
-  } catch { return {}; }
+  try { return JSON.parse(localStorage.getItem(DEFAULTS_KEY) || "{}"); } catch { return {}; }
 }
-function saveCapDefaults(d) {
-  localStorage.setItem(DEFAULTS_KEY, JSON.stringify(d));
-}
+function saveCapDefaults(d) { localStorage.setItem(DEFAULTS_KEY, JSON.stringify(d)); }
 
 // ================= 全局状态 =================
-let currentSlug = null;
-let dirty = false;
+let editingCard = null;
 let chatHistory = [];
 let pendingData = null;
 let workMode = false;
 let lastDistilledCard = null;
-let currentCardSt = null;
-let emojiMap = {};
-let health = null;
+let providersCache = null;
 
-function setStatus(text, cls = "") {
-  const el = $("#status");
-  if (!el) return;
-  el.textContent = text;
-  el.className = "status " + cls;
+function blankCard(name, slug, role) {
+  return {
+    schema: "persona-card/1",
+    name,
+    slug,
+    identity: { role: role || "friend", relation: name, bio: "", tags: [], avatar: "" },
+    voice: { tone_rules: [], catchphrases: [], message_style: { length: "medium", multi_send: false, emoji: "克制" }, quotes: [] },
+    personality: { traits: [], values: [], emotion_patterns: [], boundaries: [] },
+    memory: { facts: [], timeline: [], relationships: [] },
+    knowledge: { known: [], unknown: [], no_evidence_policy: "降低确定性或追问，不编造" },
+    chat: { quote_style: "reuse", thinking: "auto", trigger: { dm: "any", group: "@" } },
+    model: { provider: "", model: "" },
+    memoryConfig: { auto_rounds: 20 },
+    sillytavern_v2: {
+      chara_card_v2: "0.0.1",
+      description: "", personality: "", scenario: "",
+      first_mes: "", mes_example: "",
+      regex_scripts: [],
+      character_book: { entries: [{ keys: ["人物形象"], content: "", name: "人物形象", constant: true, enabled: true }] },
+    },
+  };
 }
 
-// ================= 抽屉 =================
-function openDrawer() {
-  $("#drawer").classList.add("open");
-  $("#drawer-overlay").hidden = false;
-}
-function closeDrawer() {
-  $("#drawer").classList.remove("open");
-  $("#drawer-overlay").hidden = true;
-}
+// ================= 抽屉 / 路由 =================
+function openDrawer() { $("#drawer").classList.add("open"); $("#drawer-overlay").hidden = false; }
+function closeDrawer() { $("#drawer").classList.remove("open"); $("#drawer-overlay").hidden = true; }
 
-// ================= 路由 =================
 function router() {
   const hash = (location.hash || "").replace(/^#\/?/, "") || "home";
   const route = routes[hash] || routes.home;
-  const view = $("#view");
-  view.innerHTML = route.render();
+  $("#view").innerHTML = route.render();
   closeDrawer();
-  view.scrollTop = 0;
-  document.querySelectorAll(".bottom-nav a, .drawer-nav a").forEach((a) => {
-    a.classList.toggle("active", a.dataset.route === hash);
-  });
+  $("#view").scrollTop = 0;
+  document.querySelectorAll(".bottom-nav a, .drawer-nav a").forEach((a) =>
+    a.classList.toggle("active", a.dataset.route === hash)
+  );
   route.init();
 }
 window.addEventListener("hashchange", router);
 
-// ================= 顶栏状态 =================
-async function refreshTopStatus() {
+// ============================================================
+//  卡片表单（做卡 / 编辑共用）
+// ============================================================
+function wbRowHTML(e, locked) {
+  return `<div class="wb-row">
+    <input class="wb-key" placeholder="关键词" value="${escapeHtml(e?.keys?.[0] ?? "")}" ${locked ? "disabled" : ""}>
+    <textarea class="wb-content" rows="1" placeholder="内容（触发时注入）">${escapeHtml(e?.content ?? "")}</textarea>
+    <button class="wb-del danger small-btn" type="button">✕</button>
+  </div>`;
+}
+function rxRowHTML(s) {
+  return `<div class="wb-row rx">
+    <input class="rx-name" placeholder="名称" value="${escapeHtml(s?.scriptName ?? "")}">
+    <input class="rx-find" placeholder="匹配（正则）" value="${escapeHtml(s?.findRegex ?? "")}">
+    <input class="rx-rep" placeholder="替换为" value="${escapeHtml(s?.replaceString ?? "")}">
+    <button class="wb-del danger small-btn" type="button">✕</button>
+  </div>`;
+}
+
+function cardFormHTML(mode) {
+  return `
+  <div class="cf-section"><h3>📋 基本信息</h3>
+    <div class="cf-grid">
+      <div><label>名称</label><input id="cf-name" placeholder="如：奶奶"></div>
+      ${mode === "create" ? `<div><label>slug（留空自动）</label><input id="cf-slug" placeholder="nainai"></div>` : ""}
+      ${mode === "create" ? `<div><label>关系类型</label>
+        <select id="cf-role">
+          <option value="friend">朋友</option><option value="family">家人</option>
+          <option value="self">自己</option><option value="partner">前任/恋人</option>
+          <option value="colleague">同事</option><option value="public-figure">偶像/角色</option>
+        </select></div>` : ""}
+    </div>
+    <label>简介（一句话介绍角色）</label>
+    <textarea id="cf-bio" rows="2" placeholder="如：80 岁的北方奶奶，说话直接但心软"></textarea>
+    <label>头像（PNG，可选）</label>
+    <div class="cf-avatar-row">
+      <img id="cf-avatar-img" class="cf-avatar" style="display:none" alt="头像">
+      <input type="file" id="cf-avatar" accept=".png">
+    </div>
+  </div>
+  <div class="cf-section"><h3>👋 开场白</h3>
+    <textarea id="cf-first" rows="2" placeholder="对话开始时的第一句话，如：哎，你可算回来了，快坐下"></textarea>
+  </div>
+  <div class="cf-section"><h3>📚 世界书 <span class="hint">（关键词触发背景设定，第一条固定「人物形象」）</span></h3>
+    <div id="cf-book"></div>
+    <button id="cf-book-add" class="ghost small-btn" type="button">＋ 添加条目</button>
+  </div>
+  <div class="cf-section"><h3>🔀 正则替换 <span class="hint">（可留空）</span></h3>
+    <div id="cf-regex"></div>
+    <button id="cf-regex-add" class="ghost small-btn" type="button">＋ 添加正则</button>
+  </div>
+  <div class="cf-section"><h3>🎭 人格与语气</h3>
+    <div class="cf-grid2">
+      <div><label>性格特质（一行一条）</label><textarea id="cf-traits" rows="3"></textarea></div>
+      <div><label>口头禅（一行一条）</label><textarea id="cf-catch" rows="3"></textarea></div>
+      <div><label>说话方式（一行一条）</label><textarea id="cf-tone" rows="3"></textarea></div>
+      <div><label>边界禁区（一行一条）</label><textarea id="cf-bound" rows="3"></textarea></div>
+    </div>
+  </div>
+  <div class="cf-section"><h3>⚡ 模型（此卡专用，留空跟随默认 API）</h3>
+    <div class="cf-grid2">
+      <div><label>API 提供商</label><select id="cf-provider"><option value="">（跟随默认）</option></select></div>
+      <div><label>模型</label><select id="cf-model"><option value="">（跟随默认）</option></select></div>
+    </div>
+  </div>
+  <div class="cf-section"><h3>🧠 记忆</h3>
+    <label>每 <input id="cf-rounds" type="number" min="1" max="50" value="20" style="width:64px;display:inline-block;text-align:center"> 轮对话自动总结一次（1-50，默认 20；内容在「记忆」页管理）</label>
+  </div>
+  <div class="cf-section"><h3>🔧 高级（JSON）<button id="cf-json-toggle" class="ghost small-btn" type="button">展开</button></h3>
+    <textarea id="cf-json" rows="10" style="display:none" spellcheck="false"></textarea>
+    <div class="row" style="margin-top:6px"><button id="cf-json-load" class="ghost small-btn" type="button">从 JSON 载入表单</button></div>
+  </div>`;
+}
+
+function bindCardForm(card, mode) {
+  fillFormFromCard(card, mode);
+  $("#cf-book-add").addEventListener("click", () => $("#cf-book").insertAdjacentHTML("beforeend", wbRowHTML({})));
+  $("#cf-regex-add").addEventListener("click", () => $("#cf-regex").insertAdjacentHTML("beforeend", rxRowHTML({})));
+  document.addEventListener("click", cardFormDelHandler);
+  $("#cf-avatar").addEventListener("change", async (e) => {
+    const f = e.target.files[0];
+    if (!f) return;
+    const b64 = await fileToBase64(f);
+    $("#cf-avatar-img").src = "data:image/png;base64," + b64;
+    $("#cf-avatar-img").style.display = "block";
+  });
+  $("#cf-json-toggle").addEventListener("click", () => {
+    const t = $("#cf-json");
+    const show = t.style.display === "none";
+    t.style.display = show ? "block" : "none";
+    $("#cf-json-toggle").textContent = show ? "收起" : "展开";
+    if (show) t.value = JSON.stringify(collectCardForm(structuredClone(card), mode), null, 2);
+  });
+  $("#cf-json-load").addEventListener("click", () => {
+    try {
+      const obj = JSON.parse($("#cf-json").value);
+      Object.keys(obj).forEach((k) => (card[k] = obj[k]));
+      fillFormFromCard(card, mode);
+      toast("已从 JSON 载入表单");
+    } catch (e) { toast("JSON 解析失败：" + e.message, false); }
+  });
+  fillProvidersIntoForm(card);
+}
+
+function cardFormDelHandler(e) {
+  if (e.target?.classList?.contains("wb-del")) {
+    const container = e.target.closest("#cf-book, #cf-regex");
+    if (container?.id === "cf-book" && container.querySelectorAll(".wb-row").length <= 1) {
+      toast("世界书至少保留一条（人物形象）", false);
+      return;
+    }
+    e.target.closest(".wb-row")?.remove();
+  }
+}
+
+function fillFormFromCard(card, mode) {
+  const st = card.sillytavern_v2 ?? {};
+  $("#cf-name").value = card.name ?? "";
+  if (mode === "create" && $("#cf-slug")) $("#cf-slug").value = card.slug ?? "";
+  if (mode === "create" && $("#cf-role")) $("#cf-role").value = card.identity?.role ?? "friend";
+  $("#cf-bio").value = st.description || card.identity?.bio || "";
+  $("#cf-first").value = st.first_mes ?? "";
+  if (card.identity?.avatar) {
+    $("#cf-avatar-img").src = card.identity.avatar;
+    $("#cf-avatar-img").style.display = "block";
+  } else {
+    $("#cf-avatar-img").style.display = "none";
+  }
+  const entries = st.character_book?.entries?.length
+    ? st.character_book.entries
+    : [{ keys: ["人物形象"], content: "" }];
+  $("#cf-book").innerHTML = entries.map((en, i) => wbRowHTML(en, i === 0)).join("");
+  $("#cf-regex").innerHTML = (st.regex_scripts ?? []).map(rxRowHTML).join("");
+  $("#cf-traits").value = (card.personality?.traits ?? []).join("\n");
+  $("#cf-catch").value = (card.voice?.catchphrases ?? []).join("\n");
+  $("#cf-tone").value = (card.voice?.tone_rules ?? []).join("\n");
+  $("#cf-bound").value = (card.personality?.boundaries ?? []).join("\n");
+  $("#cf-rounds").value = card.memoryConfig?.auto_rounds ?? 20;
+}
+
+async function fillProvidersIntoForm(card) {
   try {
-    health = await api.get("/api/health");
-    $("#drawer-meta").textContent = `v${health.schema} · ${health.dataDir ?? ""}`;
-    const model = await api.get("/api/config/model").catch(() => null);
-    setChip($("#ts-model"), model?.primary ? "模型 ✓" : "模型 ✗", Boolean(model?.primary));
-    const wx = await api.get("/api/channels/wechat/status").catch(() => null);
-    setChip($("#ts-wx"), wx?.connected ? "微信 ✓" : "微信 ✗", wx?.connected);
-    const qq = await api.get("/api/channels/qq/status").catch(() => null);
-    const qqOk = qq?.pluginInstalled && qq?.onebotSeen;
-    setChip($("#ts-qq"), qqOk ? "QQ ✓" : "QQ ✗", qqOk);
-  } catch { /* 服务未启动 */ }
+    providersCache = await api.get("/api/providers");
+    const sel = $("#cf-provider");
+    sel.innerHTML = '<option value="">（跟随默认）</option>' +
+      providersCache.chat.map((p) => `<option value="${escapeHtml(p.name)}">${escapeHtml(p.name)}${p.isDefault ? "（默认）" : ""}</option>`).join("");
+    const fillModels = () => {
+      const p = providersCache.chat.find((x) => x.name === sel.value);
+      const ms = $("#cf-model");
+      ms.innerHTML = '<option value="">（跟随默认）</option>' +
+        (p ? p.models.map((m) => `<option value="${escapeHtml(m)}">${escapeHtml(m)}</option>`).join("") : "");
+      ms.value = card?.model?.model && p?.models.includes(card.model.model) ? card.model.model : "";
+    };
+    sel.value = card?.model?.provider || "";
+    fillModels();
+    sel.addEventListener("change", fillModels);
+  } catch { /* providers 未配置 */ }
+}
+
+function collectCardForm(card, mode) {
+  card.name = $("#cf-name").value.trim() || card.name;
+  if (mode === "create" && $("#cf-slug")) card.slug = $("#cf-slug").value.trim();
+  card.identity = card.identity ?? {};
+  card.identity.bio = $("#cf-bio").value.trim();
+  if (card.identity.avatar === undefined) card.identity.avatar = "";
+  card.sillytavern_v2 = card.sillytavern_v2 ?? {};
+  const st = card.sillytavern_v2;
+  st.description = $("#cf-bio").value.trim();
+  st.first_mes = $("#cf-first").value.trim();
+  st.character_book = {
+    entries: [...$("#cf-book").querySelectorAll(".wb-row")]
+      .map((r) => {
+        const key = r.querySelector(".wb-key").value.trim();
+        const content = r.querySelector(".wb-content").value;
+        return { keys: [key || "人物形象"], content, name: key || "人物形象", constant: key === "人物形象", enabled: true };
+      })
+      .filter((e) => e.keys[0] && e.content),
+  };
+  st.regex_scripts = [...$("#cf-regex").querySelectorAll(".wb-row")]
+    .map((r) => ({
+      scriptName: r.querySelector(".rx-name").value.trim(),
+      findRegex: r.querySelector(".rx-find").value,
+      replaceString: r.querySelector(".rx-rep").value,
+      enabled: true,
+    }))
+    .filter((s) => s.findRegex);
+  card.personality = card.personality ?? {};
+  card.personality.traits = $("#cf-traits").value.split("\n").map((s) => s.trim()).filter(Boolean);
+  card.personality.boundaries = $("#cf-bound").value.split("\n").map((s) => s.trim()).filter(Boolean);
+  card.voice = card.voice ?? {};
+  card.voice.catchphrases = $("#cf-catch").value.split("\n").map((s) => s.trim()).filter(Boolean);
+  card.voice.tone_rules = $("#cf-tone").value.split("\n").map((s) => s.trim()).filter(Boolean);
+  card.model = { provider: $("#cf-provider")?.value || undefined, model: $("#cf-model")?.value || undefined };
+  card.memoryConfig = { auto_rounds: Math.min(50, Math.max(1, Number($("#cf-rounds").value) || 20)) };
+  return card;
 }
 
 // ============================================================
@@ -122,26 +305,16 @@ async function refreshTopStatus() {
 // ============================================================
 function renderHome() {
   return `
-  <div class="view home">
+  <div class="view">
     <div class="home-status">
-      <div class="status-card">
-        <div class="status-head"><span class="big">⚡</span> 模型</div>
-        <div id="hs-model" class="meta">检测中…</div>
-        <button class="small-btn" data-go="api">去配置</button>
-      </div>
-      <div class="status-card">
-        <div class="status-head"><span class="big">💬</span> 微信</div>
-        <div id="hs-wx" class="meta">检测中…</div>
-        <button class="small-btn" data-go="channels">去绑定</button>
-      </div>
-      <div class="status-card">
-        <div class="status-head"><span class="big">🐧</span> QQ</div>
-        <div id="hs-qq" class="meta">检测中…</div>
-        <button class="small-btn" data-go="channels">去绑定</button>
-      </div>
+      <div class="status-card"><div class="status-head"><span class="big">⚡</span> 模型</div>
+        <div id="hs-model" class="meta">检测中…</div><button class="ghost small-btn" data-go="api">去配置</button></div>
+      <div class="status-card"><div class="status-head"><span class="big">💬</span> 微信</div>
+        <div id="hs-wx" class="meta">检测中…</div><button class="ghost small-btn" data-go="channels">去绑定</button></div>
+      <div class="status-card"><div class="status-head"><span class="big">🐧</span> QQ</div>
+        <div id="hs-qq" class="meta">检测中…</div><button class="ghost small-btn" data-go="channels">去绑定</button></div>
     </div>
-
-    <div class="home-guide card">
+    <div class="card-box">
       <h3>🚀 快速上手</h3>
       <div class="steps">
         <div class="step" id="step-api"><span class="dot"></span>① 配置 API</div>
@@ -150,18 +323,16 @@ function renderHome() {
         <div class="step" id="step-chat"><span class="dot"></span>④ 开始聊天</div>
       </div>
       <div class="row" style="margin-top:10px">
-        <button class="primary" data-go="cards">🎴 去建卡 / 导入</button>
-        <button data-go="channels">💬 去绑定通道</button>
-        <button id="home-chat-test" disabled>💬 聊天测试</button>
+        <button class="primary" data-go="create">✏️ 去做卡</button>
+        <button data-go="cards">🎴 卡库</button>
+        <button data-go="channels">💬 绑定通道</button>
       </div>
     </div>
-
-    <div class="home-active card">
-      <h3>⚡ 当前生效人设 <span class="hint">（最后编译到通道的卡片）</span></h3>
+    <div class="card-box">
+      <h3>⚡ 当前生效人设</h3>
       <div id="home-active-box" class="active-box">—</div>
     </div>
-
-    <div class="home-cards card">
+    <div class="card-box">
       <h3>🎴 人设卡库</h3>
       <div id="home-card-grid" class="card-grid"></div>
     </div>
@@ -172,176 +343,111 @@ function initHome() {
   document.querySelectorAll("[data-go]").forEach((b) =>
     b.addEventListener("click", () => (location.hash = "#/" + b.dataset.go))
   );
-  refreshHomeStatus();
-  refreshHomeCards();
+  refreshHome();
 }
 
-async function refreshHomeStatus() {
+async function refreshHome() {
   try {
-    const model = await api.get("/api/config/model").catch(() => null);
-    const ok1 = Boolean(model?.primary);
-    $("#hs-model").textContent = model?.primary || "未配置模型";
+    const prov = await api.get("/api/providers").catch(() => null);
+    const ok1 = Boolean(prov?.chat?.length);
+    $("#hs-model").textContent = prov?.chat?.[0]
+      ? `${prov.chat[0].name} · ${prov.chat[0].models?.[0] ?? "未拉取模型"}`
+      : "未配置";
     $("#step-api").classList.toggle("done", ok1);
     const wx = await api.get("/api/channels/wechat/status").catch(() => null);
     $("#hs-wx").textContent = wx?.connected ? "已连接 ✓" : "未绑定";
-    $("#step-channel").classList.toggle("done", Boolean(wx?.connected));
     const qq = await api.get("/api/channels/qq/status").catch(() => null);
     $("#hs-qq").textContent = qq?.pluginInstalled && qq?.onebotSeen ? "已连接 ✓" : "未绑定";
     $("#step-channel").classList.toggle("done", Boolean(wx?.connected || (qq?.pluginInstalled && qq?.onebotSeen)));
-    const active = await api.get("/api/active-persona").catch(() => null);
-    $("#home-active-box").innerHTML = active?.active
-      ? `<span class="active-name">${escapeHtml(active.active)}</span>
-         <button id="home-goto-cards" class="small-btn">去人设卡页</button>`
-      : "还没有编译过人设卡，去人设卡页编译一张";
-    const go = $("#home-goto-cards");
-    if (go) go.addEventListener("click", () => (location.hash = "#/cards"));
     const cards = await api.get("/api/cards").catch(() => ({ cards: [] }));
     $("#step-card").classList.toggle("done", cards.cards?.length > 0);
     $("#step-chat").classList.toggle("done", ok1 && cards.cards?.length > 0);
-    const chatBtn = $("#home-chat-test");
-    if (chatBtn) {
-      chatBtn.disabled = !(ok1 && cards.cards?.length > 0);
-      chatBtn.addEventListener("click", () => (location.hash = "#/cards"));
-    }
-  } catch { /* 忽略 */ }
-}
-
-async function refreshHomeCards() {
-  const box = $("#home-card-grid");
-  if (!box) return;
-  try {
-    const { cards } = await api.get("/api/cards");
-    box.innerHTML = "";
-    if (!cards.length) {
-      box.innerHTML = '<div class="muted">还没有人设卡，点「去建卡 / 导入」开始</div>';
+    const active = await api.get("/api/active-persona").catch(() => null);
+    const box = $("#home-active-box");
+    box.innerHTML = active?.active
+      ? `<span class="active-name">${escapeHtml(active.active)}</span><button class="ghost small-btn" data-go="cards">去卡库</button>`
+      : `还没有编译过人设卡 <button class="ghost small-btn" data-go="cards">去卡库</button>`;
+    box.querySelector("[data-go]")?.addEventListener("click", (e) => (location.hash = "#/" + e.target.dataset.go));
+    const grid = $("#home-card-grid");
+    grid.innerHTML = "";
+    if (!cards.cards?.length) {
+      grid.innerHTML = '<div class="muted">还没有人设卡</div>';
       return;
     }
-    for (const c of cards.slice(-8).reverse()) {
+    for (const c of cards.cards.slice(-8).reverse()) {
       const d = document.createElement("div");
       d.className = "mini-card";
-      d.innerHTML = `<div class="mini-name">${escapeHtml(c.name)}</div>
-        <div class="meta">${c.slug} · ${c.role}</div>`;
+      d.innerHTML = `<div class="mini-name">${escapeHtml(c.name)}</div><div class="meta">${c.slug} · ${c.role}</div>`;
       d.addEventListener("click", () => {
-        currentSlug = c.slug;
         location.hash = "#/cards";
-        setTimeout(() => openCard(c.slug), 50);
+        setTimeout(() => loadCardIntoEditor(c.slug), 60);
       });
-      box.appendChild(d);
+      grid.appendChild(d);
     }
   } catch { /* 忽略 */ }
 }
 
 // ============================================================
-//  视图：人设卡库
+//  视图：人设卡库（表单化编辑 + 聊天测试）
 // ============================================================
 function renderCards() {
   return `
   <div class="cards-layout">
     <aside class="cards-side">
-      <div class="create-box">
-        <h2>新建人设卡</h2>
-        <input id="new-name" placeholder="名称（如：奶奶）" />
-        <input id="new-slug" placeholder="slug（留空自动生成）" />
-        <select id="new-role">
-          <option value="friend">朋友</option><option value="family">家人</option>
-          <option value="self">自己</option><option value="partner">前任/恋人</option>
-          <option value="colleague">同事</option><option value="public-figure">偶像/角色</option>
-        </select>
-        <button id="btn-create">创建</button>
-        <div class="row">
-          <button id="btn-card-wizard" class="small-btn">🃏 做卡向导</button>
-          <button id="btn-import-card" class="small-btn">📥 导入卡</button>
-          <input type="file" id="import-file" accept=".png,.json" style="display:none" />
-        </div>
+      <div class="side-actions">
+        <button id="btn-import-card" class="ghost small-btn">📥 导入 PNG/JSON</button>
+        <input type="file" id="import-file" accept=".png,.json" style="display:none">
+        <a href="#/create" class="btn-like primary small-btn">✏️ 做张新卡</a>
       </div>
       <h2>卡库</h2>
       <ul id="card-list" class="card-list"></ul>
     </aside>
     <section class="cards-editor">
-      <div id="card-wizard" class="wizard" style="display:none">
-        <h3>🃏 做卡向导 <span class="hint">填好后点「应用到卡片」，再点「保存」</span></h3>
-        <label>简介（description）</label>
-        <textarea id="wz-desc" rows="2" placeholder="如：80 岁的北方奶奶，说话直接但心软"></textarea>
-        <label>开场白（first_mes）</label>
-        <textarea id="wz-first" rows="2" placeholder="如：哎，你可算回来了，快坐下"></textarea>
-        <label>世界书（第一行固定「人物形象」）</label>
-        <div id="wz-book"></div>
-        <button id="btn-wz-add-entry" class="small-btn">+ 添加世界书条目</button>
-        <label>正则替换（可留空）</label>
-        <div id="wz-regex"></div>
-        <button id="btn-wz-add-regex" class="small-btn">+ 添加正则</button>
-        <label>头像（PNG，可选）</label>
-        <input type="file" id="wz-avatar" accept=".png" />
-        <div class="row">
-          <button id="btn-wz-apply" class="primary">应用到卡片</button>
-          <button id="btn-wz-close" class="small-btn">关闭</button>
-        </div>
-      </div>
-      <div class="emoji-panel">
-        <h3>😊 表情包 <span id="emoji-count" class="hint"></span></h3>
-        <p class="hint">最多 120 个，每个带解释让 AI 理解；聊天时 AI 会按人设语气用 [表情:名字] 标记引用。</p>
-        <div id="emoji-grid" class="emoji-grid"></div>
-        <div class="row">
-          <input id="emoji-name" placeholder="表情名（如：撒娇）" />
-          <input id="emoji-explain" placeholder="解释（让 AI 理解用法）" />
-          <input type="file" id="emoji-file" accept="image/*" style="display:none" />
-          <button id="btn-emoji-pick" class="small-btn">选图</button>
-          <button id="btn-emoji-add" class="primary small-btn">添加</button>
-        </div>
-      </div>
       <div class="editor-head">
-        <h2 id="editor-title">选择左侧卡片开始编辑 <span id="active-persona" class="chip" style="display:none"></span></h2>
+        <h2 id="editor-title">选择左侧卡片</h2>
         <div class="editor-actions">
-          <button id="btn-export-png">导出 PNG</button>
-          <button id="btn-export-json">导出 JSON</button>
-          <button id="btn-compile">编译到 OpenClaw</button>
-          <button id="btn-validate">校验</button>
-          <button id="btn-save" class="primary">保存</button>
+          <button id="btn-export-png" class="ghost">导出 PNG</button>
+          <button id="btn-export-json" class="ghost">导出 JSON</button>
+          <button id="btn-compile">编译到通道</button>
           <button id="btn-del" class="danger">删除</button>
+          <button id="btn-save" class="primary">保存</button>
         </div>
       </div>
-      <textarea id="editor-json" spellcheck="false" placeholder="卡片 JSON（persona-card v1 格式）"></textarea>
-      <div id="status" class="status"></div>
+      <div id="card-form-area" class="card-form-area"><div class="muted" style="padding:30px;text-align:center">从左侧选择一张卡片开始编辑</div></div>
       <div class="chat-test">
         <div class="chat-head">
-          <h3>💬 聊天测试 <span id="chat-head-hint" class="hint">普通聊天：纯人设对话</span></h3>
+          <h3>💬 聊天测试 <span id="chat-head-hint" class="hint">普通聊天（用此卡模型）</span></h3>
           <div>
-            <button id="btn-work-mode" class="small-btn">🔧 进入工作模式</button>
-            <button id="btn-chat-clear" class="small-btn">清空</button>
+            <button id="btn-work-mode" class="ghost small-btn">🔧 工作模式</button>
+            <button id="btn-chat-clear" class="ghost small-btn">清空</button>
           </div>
         </div>
         <div class="chat-opts" style="display:none">
           <span class="opt-group">工具：
-            <label title="危险工具，会先问你是否执行"><input type="checkbox" id="tool-code" /> 写代码*</label>
-            <label><input type="checkbox" id="tool-file" /> 沙箱文件</label>
-            <label><input type="checkbox" id="tool-search" /> 搜索</label>
-            <label><input type="checkbox" id="tool-weather" /> 天气</label>
-            <label><input type="checkbox" id="tool-time" /> 时间</label>
-            <label><input type="checkbox" id="tool-memory" /> 记忆</label>
-            <label><input type="checkbox" id="tool-image" /> 生图</label>
-            <label><input type="checkbox" id="tool-mcp" /> MCP</label>
+            <label><input type="checkbox" id="tool-code"> 写代码*</label>
+            <label><input type="checkbox" id="tool-file"> 文件</label>
+            <label><input type="checkbox" id="tool-search"> 搜索</label>
+            <label><input type="checkbox" id="tool-weather"> 天气</label>
+            <label><input type="checkbox" id="tool-memory"> 记忆</label>
+            <label><input type="checkbox" id="tool-mcp"> MCP</label>
           </span>
           <span class="opt-group">技能：
-            <label><input type="checkbox" id="skill-code" /> 代码专家</label>
-            <label><input type="checkbox" id="skill-trans" /> 翻译</label>
-            <label><input type="checkbox" id="skill-write" /> 写作</label>
-            <label><input type="checkbox" id="skill-companion" /> 陪伴</label>
+            <label><input type="checkbox" id="skill-code"> 代码</label>
+            <label><input type="checkbox" id="skill-trans"> 翻译</label>
+            <label><input type="checkbox" id="skill-write"> 写作</label>
+            <label><input type="checkbox" id="skill-companion"> 陪伴</label>
           </span>
           <span class="opt-group">深度：
             <select id="chat-thinking">
-              <option value="off">关闭</option><option value="auto" selected>自动（默认）</option>
+              <option value="off">关闭</option><option value="auto" selected>自动</option>
               <option value="low">低</option><option value="medium">中</option>
               <option value="high">高</option><option value="extreme">极高</option>
             </select>
           </span>
-          <span class="opt-group">语音：
-            <label><input type="checkbox" id="chat-voice-reply" /> 读回复</label>
-            <button id="btn-mic" class="small-btn">🎤</button>
-          </span>
         </div>
         <div id="chat-log" class="chat-log"></div>
         <div class="row">
-          <input id="chat-input" placeholder="试试：帮我写段代码算 1 加到 100…" />
+          <input id="chat-input" placeholder="对这个人设说点什么…">
           <button id="btn-chat-send" class="primary">发送</button>
         </div>
       </div>
@@ -351,389 +457,99 @@ function renderCards() {
 
 function initCards() {
   const def = capDefaults();
-  $("#tool-code").checked = def.tools?.includes("code_exec") ?? false;
-  $("#tool-file").checked = def.tools?.includes("sandbox_list") ?? false;
-  $("#tool-search").checked = def.tools?.includes("web_search") ?? false;
-  $("#tool-weather").checked = def.tools?.includes("weather") ?? false;
-  $("#tool-time").checked = def.tools?.includes("datetime") ?? false;
-  $("#tool-memory").checked = def.tools?.includes("memory_save") ?? false;
-  $("#tool-image").checked = def.tools?.includes("image_gen") ?? false;
-  $("#skill-code").checked = def.skills?.includes("code_expert") ?? false;
-  $("#skill-trans").checked = def.skills?.includes("translator") ?? false;
-  $("#skill-write").checked = def.skills?.includes("writing") ?? false;
-  $("#skill-companion").checked = def.skills?.includes("companion") ?? false;
+  const tools = def.tools ?? [];
+  $("#tool-code").checked = tools.includes("code_exec");
+  $("#tool-file").checked = tools.includes("sandbox_list");
+  $("#tool-search").checked = tools.includes("web_search");
+  $("#tool-weather").checked = tools.includes("weather");
+  $("#tool-memory").checked = tools.includes("memory_save");
+  const skills = def.skills ?? [];
+  $("#skill-code").checked = skills.includes("code_expert");
+  $("#skill-trans").checked = skills.includes("translator");
+  $("#skill-write").checked = skills.includes("writing");
+  $("#skill-companion").checked = skills.includes("companion");
   $("#chat-thinking").value = def.thinking ?? "auto";
-  $("#chat-voice-reply").checked = def.voiceReply ?? false;
 
-  $("#btn-create").addEventListener("click", createCard);
-  $("#btn-save").addEventListener("click", saveCard);
-  $("#btn-compile").addEventListener("click", compileCard);
-  $("#btn-validate").addEventListener("click", validateCard);
-  $("#btn-del").addEventListener("click", deleteCard);
-  $("#editor-json").addEventListener("input", () => { dirty = true; });
-  $("#btn-export-png").addEventListener("click", () => exportCard("png"));
-  $("#btn-export-json").addEventListener("click", () => exportCard("json"));
   $("#btn-import-card").addEventListener("click", () => $("#import-file").click());
   $("#import-file").addEventListener("change", importCard);
-  $("#btn-card-wizard").addEventListener("click", openWizard);
-  $("#btn-wz-close").addEventListener("click", closeWizard);
-  $("#btn-wz-apply").addEventListener("click", applyWizard);
-  $("#btn-wz-add-entry").addEventListener("click", () => $("#wz-book").appendChild(wizardBookRow({}).row));
-  $("#btn-wz-add-regex").addEventListener("click", () => $("#wz-regex").appendChild(wizardRegexRow({}).row));
+  $("#btn-export-png").addEventListener("click", () => exportCard("png"));
+  $("#btn-export-json").addEventListener("click", () => exportCard("json"));
+  $("#btn-compile").addEventListener("click", compileCard);
+  $("#btn-del").addEventListener("click", deleteCard);
+  $("#btn-save").addEventListener("click", saveCard);
   $("#btn-chat-send").addEventListener("click", sendChat);
   $("#btn-chat-clear").addEventListener("click", clearChat);
-  $("#btn-mic").addEventListener("click", startMic);
   $("#btn-work-mode").addEventListener("click", toggleWorkMode);
   $("#chat-input").addEventListener("keydown", (e) => { if (e.key === "Enter") sendChat(); });
-  $("#btn-emoji-pick").addEventListener("click", () => $("#emoji-file").click());
-  $("#emoji-file").addEventListener("change", addEmoji);
-  $("#btn-emoji-add").addEventListener("click", () => $("#emoji-file").click());
 
-  loadList();
-  loadActivePersona();
+  loadCardList();
 }
 
-// ---- 卡库 CRUD ----
-async function loadList() {
+async function loadCardList() {
   const { cards } = await api.get("/api/cards");
   const ul = $("#card-list");
   if (!ul) return;
   ul.innerHTML = "";
   for (const c of cards) {
     const li = document.createElement("li");
-    li.innerHTML = `<div><div class="name">${escapeHtml(c.name)}</div>
-      <div class="meta">${c.slug} · ${c.role} · v${c.version}</div></div>`;
-    li.addEventListener("click", () => openCard(c.slug));
-    if (c.slug === currentSlug) li.classList.add("active");
+    li.innerHTML = `<div><div class="name">${escapeHtml(c.name)}</div><div class="meta">${c.slug} · ${c.role}</div></div>`;
+    li.addEventListener("click", () => loadCardIntoEditor(c.slug));
+    if (editingCard?.slug === c.slug) li.classList.add("active");
     ul.appendChild(li);
   }
-  refreshHomeCards();
 }
 
-async function openCard(slug) {
-  if (dirty && !confirm("当前卡片有未保存修改，确定放弃？")) return;
-  const card = await api.get(`/api/cards/${slug}`);
-  currentSlug = slug;
-  currentCardSt = card.sillytavern_v2 || null;
-  emojiMap = {};
-  (card.emojis ?? []).forEach((e) => { emojiMap[e.name] = e; });
-  renderEmojiGrid(card);
-  $("#editor-title").firstChild.textContent = `编辑：${card.name} (${card.slug}) `;
-  $("#editor-json").value = JSON.stringify(card, null, 2);
-  dirty = false;
-  setStatus(`已加载 v${card.version}，编辑后点保存`);
-  loadList();
-}
-
-async function createCard() {
-  const name = $("#new-name").value.trim();
-  if (!name) return setStatus("请输入名称", "err");
+async function loadCardIntoEditor(slug) {
   try {
-    await api.send("/api/cards", {
-      method: "POST",
-      body: JSON.stringify({ name, slug: $("#new-slug").value.trim() || undefined, role: $("#new-role").value }),
-    });
-    $("#new-name").value = "";
-    $("#new-slug").value = "";
-    setStatus("✓ 已创建，可开始编辑", "ok");
-    loadList();
-  } catch (e) {
-    setStatus("创建失败：" + e.message, "err");
-  }
+    editingCard = await api.get(`/api/cards/${slug}`);
+    chatHistory = [];
+    $("#chat-log").innerHTML = "";
+    $("#editor-title").textContent = `编辑：${editingCard.name}`;
+    $("#card-form-area").innerHTML = cardFormHTML("edit");
+    bindCardForm(editingCard, "edit");
+    loadCardList();
+  } catch (e) { toast("加载失败：" + e.message, false); }
 }
 
 async function saveCard() {
-  if (!currentSlug) return;
-  let card;
+  if (!editingCard) return toast("先选择一张卡片", false);
+  collectCardForm(editingCard, "edit");
+  const avatarSrc = $("#cf-avatar-img")?.src;
+  if (avatarSrc?.startsWith("data:image/png")) editingCard.identity.avatar = avatarSrc;
   try {
-    card = JSON.parse($("#editor-json").value);
-  } catch (e) {
-    return setStatus("JSON 解析失败：" + e.message, "err");
-  }
-  try {
-    const res = await api.send(`/api/cards/${currentSlug}`, { method: "PUT", body: JSON.stringify(card) });
-    dirty = false;
-    setStatus("✓ 已保存 v" + res.card.version + (res.warnings?.length ? "\n⚠ " + res.warnings.join("\n⚠ ") : ""), "ok");
-    loadList();
-  } catch (e) {
-    setStatus("保存失败：" + e.message, "err");
-  }
-}
-
-async function validateCard() {
-  if (!currentSlug) return;
-  let card;
-  try {
-    card = JSON.parse($("#editor-json").value);
-  } catch (e) {
-    return setStatus("JSON 解析失败：" + e.message, "err");
-  }
-  try {
-    const res = await api.send(`/api/cards/${currentSlug}`, { method: "PUT", body: JSON.stringify(card) });
-    setStatus("✓ 校验通过" + (res.warnings?.length ? "\n⚠ " + res.warnings.join("\n⚠ ") : ""), "ok");
-  } catch (e) {
-    setStatus("✗ 校验失败：" + e.message, "err");
-  }
-}
-
-async function deleteCard() {
-  if (!currentSlug) return;
-  if (!confirm(`确定删除 ${currentSlug}？不可恢复。`)) return;
-  await api.send(`/api/cards/${currentSlug}`, { method: "DELETE" });
-  currentSlug = null;
-  $("#editor-title").firstChild.textContent = "选择左侧卡片开始编辑 ";
-  $("#editor-json").value = "";
-  setStatus("已删除");
-  loadList();
+    const res = await api.send(`/api/cards/${editingCard.slug}`, { method: "PUT", body: JSON.stringify(editingCard) });
+    toast("✓ 已保存 v" + res.card.version);
+    loadCardList();
+  } catch (e) { toast("保存失败：" + e.message, false); }
 }
 
 async function compileCard() {
-  if (!currentSlug) return;
+  if (!editingCard) return toast("先选择一张卡片", false);
+  await saveCard();
   try {
-    await saveCard();
-    const res = await api.send(`/api/cards/${currentSlug}/compile`, { method: "POST" });
-    setStatus("✓ 已编译到 workspace，共 " + res.files.length + " 个文件", "ok");
-    loadActivePersona();
-    refreshHomeStatus();
-  } catch (e) {
-    setStatus("编译失败：" + e.message, "err");
-  }
+    const res = await api.send(`/api/cards/${editingCard.slug}/compile`, { method: "POST" });
+    toast(`✓ 已编译 ${res.files.length} 个文件到通道`);
+  } catch (e) { toast("编译失败：" + e.message, false); }
 }
 
-async function loadActivePersona() {
-  try {
-    const r = await api.get("/api/active-persona");
-    const el = $("#active-persona");
-    if (r.active) {
-      el.textContent = "⚡ 当前生效人设：" + r.active;
-      el.style.display = "inline-block";
-    } else {
-      el.style.display = "none";
-    }
-  } catch { /* 忽略 */ }
+async function deleteCard() {
+  if (!editingCard) return;
+  if (!confirm(`确定删除 ${editingCard.name}？不可恢复。`)) return;
+  await api.send(`/api/cards/${editingCard.slug}`, { method: "DELETE" });
+  editingCard = null;
+  $("#editor-title").textContent = "选择左侧卡片";
+  $("#card-form-area").innerHTML = '<div class="muted" style="padding:30px;text-align:center">从左侧选择一张卡片开始编辑</div>';
+  loadCardList();
 }
 
-// ---- 聊天测试 ----
-function addChatBubble(role, text) {
-  const log = $("#chat-log");
-  const div = document.createElement("div");
-  div.className = "bubble " + (role === "user" ? "me" : "bot");
-  div.textContent = text;
-  log.appendChild(div);
-  log.scrollTop = log.scrollHeight;
-  return div;
-}
-
-function speak(text) {
-  try {
-    const u = new SpeechSynthesisUtterance(text.replace(/[`*#_]/g, ""));
-    u.lang = "zh-CN";
-    speechSynthesis.cancel();
-    speechSynthesis.speak(u);
-  } catch { /* 忽略 */ }
-}
-
-function gatherChatOptions() {
-  const tools = [];
-  if ($("#tool-code").checked) tools.push("code_exec");
-  if ($("#tool-file").checked) tools.push("sandbox_list", "sandbox_read", "sandbox_write", "sandbox_grep");
-  if ($("#tool-search").checked) tools.push("web_search");
-  if ($("#tool-weather").checked) tools.push("weather");
-  if ($("#tool-time").checked) tools.push("datetime");
-  if ($("#tool-memory").checked) tools.push("memory_save");
-  if ($("#tool-image").checked) tools.push("image_gen");
-  const skills = [];
-  if ($("#skill-code").checked) skills.push("code_expert");
-  if ($("#skill-trans").checked) skills.push("translator");
-  if ($("#skill-write").checked) skills.push("writing");
-  if ($("#skill-companion").checked) skills.push("companion");
-  return { tools, useMCP: $("#tool-mcp").checked, skills, thinking: $("#chat-thinking").value };
-}
-
-function toggleWorkMode() {
-  workMode = !workMode;
-  const btn = $("#btn-work-mode");
-  btn.textContent = workMode ? "💬 返回聊天模式" : "🔧 进入工作模式";
-  btn.classList.toggle("active", workMode);
-  $(".chat-opts").style.display = workMode ? "flex" : "none";
-  $("#chat-head-hint").textContent = workMode ? "工作模式：开放全部功能" : "普通聊天：纯人设对话";
-}
-
-async function sendChat() {
-  const input = $("#chat-input");
-  const message = input.value.trim();
-  if (!message) return;
-  if (!currentSlug) { addChatBubble("bot", "请先选择一张人设卡。"); return; }
-  addChatBubble("user", message);
-  input.value = "";
-  chatHistory.push({ role: "user", content: message });
-  const btn = $("#btn-chat-send");
-  btn.disabled = true;
-  const opts = workMode ? gatherChatOptions() : { tools: [], useMCP: false, skills: [], thinking: "auto" };
-  try {
-    const r = await api.send("/api/chat", {
-      method: "POST",
-      body: JSON.stringify({ slug: currentSlug, message, history: chatHistory.slice(0, -1), ...opts }),
-    });
-    await finishTurn(r);
-  } catch (e) {
-    chatHistory.pop();
-    addChatBubble("bot", "⚠ " + e.message);
-  }
-  btn.disabled = false;
-}
-
-async function finishTurn(r) {
-  if (r.type === "reply") {
-    const log = $("#chat-log");
-    log.appendChild(renderBotReply(r.reply));
-    log.scrollTop = log.scrollHeight;
-    chatHistory.push({ role: "assistant", content: r.reply });
-    if ($("#chat-voice-reply")?.checked) speak(r.reply);
-  } else if (r.type === "pending") {
-    const bubble = addChatBubble("bot", "🛡️ 需要你确认：机器人想调用\n" + r.pending.map((p) => "· " + p.name).join("\n"));
-    const row = document.createElement("div");
-    row.className = "approve-row";
-    const btnOk = document.createElement("button");
-    btnOk.className = "small-btn primary";
-    btnOk.textContent = "✅ 执行";
-    const btnNo = document.createElement("button");
-    btnNo.className = "small-btn danger";
-    btnNo.textContent = "🚫 拒绝";
-    pendingData = { slug: currentSlug, messages: r.messages, tools: gatherChatOptions().tools, useMCP: $("#tool-mcp").checked, approve: false };
-    btnOk.addEventListener("click", async () => { row.remove(); pendingData.approve = true; await sendApprove(); });
-    btnNo.addEventListener("click", async () => { row.remove(); pendingData.approve = false; await sendApprove(); });
-    row.append(btnOk, btnNo);
-    bubble.parentNode.appendChild(row);
-  }
-}
-
-async function sendApprove() {
-  const btn = $("#btn-chat-send");
-  btn.disabled = true;
-  try {
-    const r = await api.send("/api/chat/approve", { method: "POST", body: JSON.stringify(pendingData) });
-    pendingData = null;
-    await finishTurn(r);
-  } catch (e) {
-    addChatBubble("bot", "⚠ " + e.message);
-  }
-  btn.disabled = false;
-}
-
-function clearChat() {
-  chatHistory = [];
-  pendingData = null;
-  $("#chat-log").innerHTML = "";
-}
-
-function startMic() {
-  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-  if (!SR) { alert("当前浏览器不支持语音输入，请用 Chrome 或 Edge"); return; }
-  const rec = new SR();
-  rec.lang = "zh-CN";
-  rec.onresult = (e) => { $("#chat-input").value = e.results[0][0].transcript; };
-  rec.onerror = () => {};
-  rec.start();
-}
-
-// ---- 做卡向导 ----
-function wizardBookRow(entry, fixed) {
-  const row = document.createElement("div");
-  row.className = "wz-row";
-  const key = document.createElement("input");
-  key.placeholder = "关键词";
-  key.value = entry?.keys?.[0] ?? "";
-  key.disabled = !!fixed;
-  const content = document.createElement("textarea");
-  content.rows = 1;
-  content.placeholder = "内容（触发时注入）";
-  content.value = entry?.content ?? "";
-  const del = document.createElement("button");
-  del.className = "small-btn danger";
-  del.textContent = "✕";
-  del.addEventListener("click", () => row.remove());
-  row.append(key, content, del);
-  return { row, key, content };
-}
-
-function wizardRegexRow(script) {
-  const row = document.createElement("div");
-  row.className = "wz-row";
-  const name = document.createElement("input");
-  name.placeholder = "名称"; name.value = script?.scriptName ?? "";
-  const re = document.createElement("input");
-  re.placeholder = "匹配（正则）"; re.value = script?.findRegex ?? "";
-  const rep = document.createElement("input");
-  rep.placeholder = "替换为"; rep.value = script?.replaceString ?? "";
-  const del = document.createElement("button");
-  del.className = "small-btn danger";
-  del.textContent = "✕";
-  del.addEventListener("click", () => row.remove());
-  row.append(name, re, rep, del);
-  return { row, name, re, rep };
-}
-
-function openWizard() {
-  const st = currentCardSt || { description: "", first_mes: "", regex_scripts: [], character_book: { entries: [{ keys: ["人物形象"], content: "（请填写外貌、穿着、气质等形象描述）", constant: true }] } };
-  $("#wz-desc").value = st.description ?? "";
-  $("#wz-first").value = st.first_mes ?? "";
-  const book = $("#wz-book");
-  book.innerHTML = "";
-  const entries = st.character_book?.entries?.length ? st.character_book.entries : [{ keys: ["人物形象"], content: "" }];
-  entries.forEach((e, i) => book.appendChild(wizardBookRow(e, i === 0).row));
-  const rx = $("#wz-regex");
-  rx.innerHTML = "";
-  (st.regex_scripts ?? []).forEach((s) => rx.appendChild(wizardRegexRow(s).row));
-  $("#card-wizard").style.display = "block";
-}
-
-function closeWizard() { $("#card-wizard").style.display = "none"; }
-
-function applyWizard() {
-  if (!currentSlug) { setStatus("请先选择一张卡片", "err"); return; }
-  let card;
-  try {
-    card = JSON.parse($("#editor-json").value);
-  } catch (e) {
-    return setStatus("当前 JSON 解析失败：" + e.message, "err");
-  }
-  card.sillytavern_v2 = card.sillytavern_v2 || {};
-  card.sillytavern_v2.description = $("#wz-desc").value.trim() || card.identity?.bio || "";
-  card.sillytavern_v2.first_mes = $("#wz-first").value.trim();
-  card.sillytavern_v2.character_book = { entries: [...$("#wz-book").querySelectorAll(".wz-row")].map((r) => {
-    const [k, c] = r.querySelectorAll("input, textarea");
-    return { keys: [k.value.trim()].filter(Boolean), content: c.value, enabled: true };
-  }).filter((e) => e.keys.length && e.content) };
-  card.sillytavern_v2.regex_scripts = [...$("#wz-regex").querySelectorAll(".wz-row")].map((r) => {
-    const [n, re, rep] = r.querySelectorAll("input");
-    return { scriptName: n.value, findRegex: re.value, replaceString: rep.value, enabled: true };
-  }).filter((s) => s.findRegex);
-  const finish = () => {
-    $("#editor-json").value = JSON.stringify(card, null, 2);
-    dirty = true;
-    setStatus("✓ 已应用到卡片，点「保存」生效", "ok");
-  };
-  const avatarFile = $("#wz-avatar").files[0];
-  if (avatarFile) {
-    fileToBase64(avatarFile).then((b64) => {
-      card.identity = card.identity || {};
-      card.identity.avatar = "data:image/png;base64," + b64;
-      finish();
-    });
-  } else finish();
-}
-
-// ---- 导出 / 导入 ----
 async function exportCard(format) {
-  if (!currentSlug) { setStatus("请先选择一张卡片", "err"); return; }
+  if (!editingCard) return toast("先选择一张卡片", false);
+  await saveCard();
   try {
-    const r = await api.send(`/api/cards/${currentSlug}/export`, { method: "POST", body: JSON.stringify({ format }) });
+    const r = await api.send(`/api/cards/${editingCard.slug}/export`, { method: "POST", body: JSON.stringify({ format }) });
     downloadDataUrl(r.dataUrl, r.filename);
-    setStatus(`✓ 已导出 ${r.filename}（CCv2 角色卡）`, "ok");
-  } catch (e) {
-    setStatus("导出失败：" + e.message, "err");
-  }
+    toast("✓ 已导出 " + r.filename);
+  } catch (e) { toast("导出失败：" + e.message, false); }
 }
 
 async function importCard() {
@@ -743,213 +559,439 @@ async function importCard() {
     const b64 = await fileToBase64(f);
     const r = await api.send("/api/cards/import-card", { method: "POST", body: JSON.stringify({ fileBase64: b64, fileName: f.name }) });
     $("#import-file").value = "";
-    setStatus(`✓ 已导入：${r.card.name}`, "ok");
-    await loadList();
-    await openCard(r.card.slug);
-  } catch (e) {
-    setStatus("导入失败：" + e.message, "err");
-  }
-}
-
-// ---- 表情包 ----
-function renderEmojiGrid(card) {
-  const box = $("#emoji-grid");
-  const count = $("#emoji-count");
-  if (!box) return;
-  const emojis = card?.emojis ?? [];
-  if (count) count.textContent = `（${emojis.length}/120）`;
-  box.innerHTML = "";
-  if (!emojis.length) {
-    box.innerHTML = '<div class="muted">还没有表情包，选一张图 + 填名字和解释添加</div>';
-    return;
-  }
-  for (const e of emojis) {
-    const d = document.createElement("div");
-    d.className = "emoji-item";
-    d.innerHTML = `<img src="/emojis/${encodeURIComponent(card.slug)}/${encodeURIComponent(e.file)}" alt="${escapeHtml(e.name)}" />
-      <div class="emoji-name">${escapeHtml(e.name)}</div>
-      <div class="emoji-exp">${escapeHtml(e.explanation || "")}</div>
-      <button class="small-btn danger" data-id="${e.id}">删除</button>`;
-    d.querySelector("button").addEventListener("click", () => deleteEmoji(card.slug, e.id));
-    box.appendChild(d);
-  }
-}
-
-async function addEmoji() {
-  const f = $("#emoji-file").files[0];
-  const name = $("#emoji-name").value.trim();
-  if (!f || !name) { setStatus("请先填表情名并选图", "err"); return; }
-  if (!currentSlug) { setStatus("请先选择一张卡片", "err"); return; }
-  const ext = (f.name.split(".").pop() || "png").toLowerCase();
-  const b64 = await fileToBase64(f);
-  try {
-    const r = await api.send(`/api/cards/${currentSlug}/emoji`, {
-      method: "POST",
-      body: JSON.stringify({ name, explanation: $("#emoji-explain").value.trim(), imageBase64: b64, ext }),
-    });
-    $("#emoji-file").value = "";
-    $("#emoji-name").value = "";
-    $("#emoji-explain").value = "";
-    setStatus(`✓ 已添加表情包（${r.card.emojis.length}/120）`, "ok");
-    emojiMap = {};
-    (r.card.emojis ?? []).forEach((e) => { emojiMap[e.name] = e; });
-    renderEmojiGrid(r.card);
-    loadList();
-  } catch (e) {
-    setStatus("添加失败：" + e.message, "err");
-  }
-}
-
-async function deleteEmoji(slug, id) {
-  try {
-    const r = await api.send(`/api/cards/${slug}/emoji/${id}`, { method: "DELETE" });
-    emojiMap = {};
-    (r.card.emojis ?? []).forEach((e) => { emojiMap[e.name] = e; });
-    renderEmojiGrid(r.card);
-    setStatus("已删除表情", "ok");
-    loadList();
-  } catch (e) {
-    setStatus("删除失败：" + e.message, "err");
-  }
-}
-
-// ---- 聊天渲染（表情包 / 生图图片） ----
-function renderBotReply(text) {
-  let html = escapeHtml(text);
-  html = html.replace(/\[表情:([^\]]+)\]/g, (m, name) => {
-    const e = emojiMap[name.trim()];
-    return e
-      ? `<img class="chat-emoji" src="/emojis/${encodeURIComponent(currentSlug)}/${encodeURIComponent(e.file)}" alt="${escapeHtml(e.name)}" title="${escapeHtml(e.explanation || "")}" />`
-      : m;
-  });
-  html = html.replace(/!\[([^\]]*)\]\((https?:\/\/[^)\s]+|\/img\/[^)\s]+)\)/g, (m, alt, url) => {
-    if (url.startsWith("/img/")) url = encodeURI(url);
-    return `<img class="chat-img" src="${escapeHtml(url)}" alt="${escapeHtml(alt)}" />`;
-  });
-  html = html.replace(/(^|\s)(\/img\/[^\s)\]]+)/g, (m, pre, url) => `${pre}<img class="chat-img" src="${escapeHtml(encodeURI(url))}" />`);
-  const div = document.createElement("div");
-  div.className = "bubble bot";
-  div.innerHTML = html;
-  return div;
-}
-
-// ---- 生图配置 ----
-async function loadImageConfig() {
-  try {
-    const cfg = await api.get("/api/image/config");
-    $("#img-provider").value = cfg.provider;
-    $("#img-nai-key").placeholder = cfg.novelai.key || "pst_xxx";
-    $("#img-nai-model").value = cfg.novelai.model;
-    $("#img-oa-base").value = cfg.openai.baseUrl;
-    $("#img-oa-key").placeholder = cfg.openai.key || "sk-...";
-    $("#img-oa-model").value = cfg.openai.model;
-    toggleImgProvider();
-  } catch { /* 忽略 */ }
-}
-
-function toggleImgProvider() {
-  const p = $("#img-provider")?.value;
-  if (!p) return;
-  $("#img-novelai").style.display = p === "novelai" ? "flex" : "none";
-  $("#img-openai").style.display = p === "openai" ? "flex" : "none";
-}
-
-async function testImage() {
-  const provider = $("#img-provider").value;
-  const body = { provider };
-  if (provider === "novelai") body.novelai = { key: $("#img-nai-key").value.trim() || undefined, model: $("#img-nai-model").value.trim() };
-  if (provider === "openai") body.openai = { baseUrl: $("#img-oa-base").value.trim(), key: $("#img-oa-key").value.trim() || undefined, model: $("#img-oa-model").value.trim() };
-  $("#img-msg").textContent = "测试中…";
-  try {
-    const r = await api.send("/api/image/test", { method: "POST", body: JSON.stringify(body) });
-    $("#img-msg").textContent = (r.ok ? "✓ " : "✗ ") + r.info;
-    $("#img-msg").className = "status " + (r.ok ? "ok" : "err");
-  } catch (e) {
-    $("#img-msg").textContent = "测试出错：" + e.message;
-    $("#img-msg").className = "status err";
-  }
-}
-
-async function saveImage() {
-  try {
-    const r = await api.send("/api/image/config", {
-      method: "POST",
-      body: JSON.stringify({
-        provider: $("#img-provider").value,
-        novelai: { key: $("#img-nai-key").value.trim() || undefined, model: $("#img-nai-model").value.trim() },
-        openai: {
-          baseUrl: $("#img-oa-base").value.trim(),
-          key: $("#img-oa-key").value.trim() || undefined,
-          model: $("#img-oa-model").value.trim(),
-        },
-      }),
-    });
-    $("#img-msg").textContent = "✓ " + (r.hint || "已保存");
-    $("#img-msg").className = "status ok";
-    $("#img-nai-key").value = "";
-    $("#img-oa-key").value = "";
-    loadImageConfig();
-  } catch (e) {
-    $("#img-msg").textContent = "保存失败：" + e.message;
-    $("#img-msg").className = "status err";
-  }
+    toast(`✓ 已导入：${r.card.name}`);
+    await loadCardList();
+    loadCardIntoEditor(r.card.slug);
+  } catch (e) { toast("导入失败：" + e.message, false); }
 }
 
 // ============================================================
-//  视图：蒸馏工厂
+//  视图：做卡（独立页）
+// ============================================================
+function renderCreate() {
+  return `
+  <div class="view create-view">
+    <div class="page-head"><h2>✏️ 做卡</h2><p class="hint">填写卡片内容 → 保存进卡库 → 可导出 PNG/JSON 或直接编译到通道</p></div>
+    <div id="card-form-area" class="card-form-area">${cardFormHTML("create")}</div>
+    <div class="create-actions">
+      <button id="btn-create-save" class="primary big">💾 保存卡片</button>
+      <button id="btn-create-save-compile" class="big">💾 保存并编译到通道</button>
+    </div>
+  </div>`;
+}
+
+function initCreate() {
+  editingCard = blankCard("", "");
+  bindCardForm(editingCard, "create");
+  $("#btn-create-save").addEventListener("click", () => saveNewCard(false));
+  $("#btn-create-save-compile").addEventListener("click", () => saveNewCard(true));
+}
+
+async function saveNewCard(compile) {
+  collectCardForm(editingCard, "create");
+  if (!editingCard.name) return toast("请填写名称", false);
+  if (!editingCard.slug) {
+    editingCard.slug = /^[a-z0-9][a-z0-9-]*$/.test(editingCard.name.toLowerCase())
+      ? editingCard.name.toLowerCase()
+      : "card-" + Date.now().toString(36);
+  }
+  const avatarSrc = $("#cf-avatar-img")?.src;
+  if (avatarSrc?.startsWith("data:image/png")) editingCard.identity.avatar = avatarSrc;
+  editingCard.identity.relation = editingCard.name;
+  try {
+    const r = await api.send("/api/cards/import", { method: "POST", body: JSON.stringify({ card: editingCard }) });
+    toast(`✓ 已保存：${r.card.name}`);
+    if (compile) {
+      await api.send(`/api/cards/${r.card.slug}/compile`, { method: "POST" });
+      toast("✓ 已编译到通道");
+    }
+    location.hash = "#/cards";
+    setTimeout(() => loadCardIntoEditor(r.card.slug), 80);
+  } catch (e) { toast("保存失败：" + e.message, false); }
+}
+
+// ============================================================
+//  视图：API 与模型 / 生图配置（多提供商，模型自动拉取）
+// ============================================================
+function renderApi() { return renderProvidersPage("chat", "⚡ API 与模型", "对话 API 提供商；第一个为默认，卡片未单独指定时使用它。"); }
+function renderImagegen() { return renderProvidersPage("image", "🎨 生图配置", "生图 API 提供商（模型自动拉取）。"); }
+
+function renderProvidersPage(type, title, desc) {
+  return `
+  <div class="view">
+    <div class="page-head"><h2>${title}</h2><p class="hint">${desc}</p></div>
+    <div id="prov-list"></div>
+    <button id="prov-add" class="primary">＋ 添加提供商</button>
+    <div id="prov-form" class="card-box" style="display:none;margin-top:12px">
+      <h3 id="pv-title">添加提供商</h3>
+      <div class="form">
+        <div class="cf-grid2">
+          <div><label>名称（字母/数字）</label><input id="pv-name" placeholder="如 agnes / myrelay"></div>
+          <div><label>Base URL（以 /v1 结尾）</label><input id="pv-url" placeholder="https://api.example.com/v1"></div>
+        </div>
+        <label>API Key（编辑时留空 = 保留原值）</label>
+        <input id="pv-key" type="password" placeholder="sk-...">
+        <div class="row">
+          <button id="pv-save-fetch" class="primary">保存并拉取模型</button>
+          <button id="pv-cancel" class="ghost">取消</button>
+        </div>
+        <div id="pv-fetch-msg" class="status"></div>
+        <div id="pv-models-wrap" style="display:none">
+          <label>点击模型加入/移除（★ 第一个为默认模型）</label>
+          <div id="pv-models" class="model-chips"></div>
+          <div class="row" style="margin-top:8px"><button id="pv-done" class="primary">完成</button></div>
+        </div>
+      </div>
+    </div>
+  </div>`;
+}
+
+let provState = { type: "chat", editing: null, allModels: [], selected: [] };
+
+function initApi() { initProvidersPage("chat"); }
+function initImagegen() { initProvidersPage("image"); }
+
+function initProvidersPage(type) {
+  provState = { type, editing: null, allModels: [], selected: [] };
+  $("#prov-add").addEventListener("click", () => showProvForm(null));
+  $("#pv-cancel").addEventListener("click", () => ($("#prov-form").style.display = "none"));
+  $("#pv-save-fetch").addEventListener("click", provSaveAndFetch);
+  $("#pv-done").addEventListener("click", provDone);
+  loadProvList();
+}
+
+async function loadProvList() {
+  const box = $("#prov-list");
+  if (!box) return;
+  try {
+    const data = await api.get("/api/providers");
+    const list = provState.type === "chat" ? data.chat : data.image;
+    box.innerHTML = "";
+    if (!list.length) {
+      box.innerHTML = '<div class="card-box muted">还没有提供商，点下方按钮添加</div>';
+      return;
+    }
+    list.forEach((p, i) => {
+      const d = document.createElement("div");
+      d.className = "prov-item" + (i === 0 ? " default" : "");
+      d.innerHTML = `
+        <div class="prov-head">
+          <b>${escapeHtml(p.name)}</b>
+          ${i === 0 ? '<span class="chip ok">默认</span>' : ""}
+          <span class="prov-btns">
+            ${i !== 0 ? `<button class="ghost small-btn" data-act="default" data-name="${escapeHtml(p.name)}">设为默认</button>` : ""}
+            <button class="ghost small-btn" data-act="edit" data-name="${escapeHtml(p.name)}">编辑</button>
+            <button class="danger small-btn" data-act="del" data-name="${escapeHtml(p.name)}">删除</button>
+          </span>
+        </div>
+        <div class="meta">${escapeHtml(p.baseUrl)} · key ${escapeHtml(p.apiKey || "未填")}</div>
+        <div class="meta">模型（${p.models.length}）：${escapeHtml(p.models.slice(0, 6).join("、"))}${p.models.length > 6 ? "…" : ""}</div>`;
+      box.appendChild(d);
+    });
+    box.querySelectorAll("button[data-act]").forEach((b) =>
+      b.addEventListener("click", async () => {
+        const name = b.dataset.name;
+        if (b.dataset.act === "edit") showProvForm(name);
+        else if (b.dataset.act === "del") {
+          if (!confirm(`删除提供商 ${name}？`)) return;
+          await api.send("/api/providers/delete", { method: "POST", body: JSON.stringify({ type: provState.type, name }) });
+          loadProvList();
+        } else if (b.dataset.act === "default") {
+          await api.send("/api/providers/set-default", { method: "POST", body: JSON.stringify({ type: provState.type, name }) });
+          loadProvList();
+          toast("✓ 已设为默认");
+        }
+      })
+    );
+  } catch (e) { box.innerHTML = `<div class="card-box muted">读取失败：${escapeHtml(e.message)}</div>`; }
+}
+
+async function showProvForm(name) {
+  provState.editing = name;
+  provState.allModels = [];
+  provState.selected = [];
+  const form = $("#prov-form");
+  form.style.display = "block";
+  $("#pv-title").textContent = name ? `编辑 ${name}` : "添加提供商";
+  $("#pv-name").value = name ?? "";
+  $("#pv-name").disabled = Boolean(name);
+  $("#pv-url").value = "";
+  $("#pv-key").value = "";
+  $("#pv-models-wrap").style.display = "none";
+  $("#pv-fetch-msg").textContent = name ? "（Base URL 留空 = 保留原值）" : "";
+  if (name) {
+    const data = await api.get("/api/providers");
+    const p = (provState.type === "chat" ? data.chat : data.image).find((x) => x.name === name);
+    if (p) {
+      $("#pv-url").value = p.baseUrl;
+      provState.selected = [...p.models];
+      if (p.models.length) {
+        provState.allModels = [...p.models];
+        renderModelChips();
+        $("#pv-models-wrap").style.display = "block";
+      }
+    }
+  }
+  form.scrollIntoView({ behavior: "smooth", block: "nearest" });
+}
+
+async function provSaveAndFetch() {
+  const name = $("#pv-name").value.trim();
+  const baseUrl = $("#pv-url").value.trim();
+  if (!name) return toast("请填名称", false);
+  if (!baseUrl && !provState.editing) return toast("请填 Base URL", false);
+  $("#pv-fetch-msg").textContent = "保存中，随后拉取模型…";
+  try {
+    await api.send("/api/providers/save", {
+      method: "POST",
+      body: JSON.stringify({ type: provState.type, name, baseUrl, apiKey: $("#pv-key").value.trim() || undefined }),
+    });
+    const r = await api.send("/api/providers/fetch-models", {
+      method: "POST",
+      body: JSON.stringify({ type: provState.type, name }),
+    });
+    provState.allModels = r.models;
+    if (!provState.selected.length) provState.selected = r.models.slice(0, 1);
+    renderModelChips();
+    $("#pv-models-wrap").style.display = "block";
+    $("#pv-fetch-msg").textContent = `✓ 拉取到 ${r.models.length} 个模型`;
+    loadProvList();
+  } catch (e) {
+    $("#pv-fetch-msg").textContent = "失败：" + e.message;
+  }
+}
+
+function renderModelChips() {
+  const box = $("#pv-models");
+  box.innerHTML = "";
+  provState.allModels.forEach((m) => {
+    const idx = provState.selected.indexOf(m);
+    const chip = document.createElement("button");
+    chip.type = "button";
+    chip.className = "model-chip" + (idx >= 0 ? " on" : "");
+    chip.textContent = (idx === 0 ? "★ " : "") + m;
+    chip.addEventListener("click", () => {
+      const i = provState.selected.indexOf(m);
+      if (i >= 0) provState.selected.splice(i, 1);
+      else provState.selected.push(m);
+      renderModelChips();
+    });
+    box.appendChild(chip);
+  });
+}
+
+async function provDone() {
+  const name = $("#pv-name").value.trim();
+  const baseUrl = $("#pv-url").value.trim();
+  try {
+    await api.send("/api/providers/save", {
+      method: "POST",
+      body: JSON.stringify({ type: provState.type, name, baseUrl, apiKey: $("#pv-key").value.trim() || undefined, models: provState.selected }),
+    });
+    $("#prov-form").style.display = "none";
+    toast("✓ 已保存");
+    loadProvList();
+  } catch (e) { toast("保存失败：" + e.message, false); }
+}
+
+// ============================================================
+//  视图：记忆（每卡配置 + 查看）
+// ============================================================
+function renderMemory() {
+  return `
+  <div class="view">
+    <div class="page-head"><h2>🧠 记忆</h2><p class="hint">每张卡独立的长期记忆；设定每几轮对话自动总结（默认 20，1-50）</p></div>
+    <div id="mem-cards" class="card-grid"></div>
+    <div id="mem-detail" class="card-box" style="display:none">
+      <h3 id="mem-title"></h3>
+      <div class="row" style="align-items:center">
+        <label>每 <input id="mem-rounds" type="number" min="1" max="50" style="width:64px;text-align:center"> 轮自动总结</label>
+        <button id="mem-save-rounds" class="primary small-btn">保存</button>
+        <button id="mem-clear" class="danger small-btn">清空此卡记忆</button>
+      </div>
+      <h3>已记住的事实</h3>
+      <div id="mem-entries" class="small-out tall"></div>
+    </div>
+  </div>`;
+}
+
+let memCard = null;
+function initMemory() {
+  (async () => {
+    const { cards } = await api.get("/api/cards");
+    const box = $("#mem-cards");
+    box.innerHTML = "";
+    if (!cards.length) { box.innerHTML = '<div class="muted">还没有卡片</div>'; return; }
+    for (const c of cards) {
+      const d = document.createElement("div");
+      d.className = "mini-card";
+      d.innerHTML = `<div class="mini-name">${escapeHtml(c.name)}</div><div class="meta">${c.slug}</div>`;
+      d.addEventListener("click", () => openMemDetail(c.slug));
+      box.appendChild(d);
+    }
+  })();
+  $("#mem-save-rounds").addEventListener("click", saveMemRounds);
+  $("#mem-clear").addEventListener("click", clearMem);
+}
+
+async function openMemDetail(slug) {
+  memCard = await api.get(`/api/cards/${slug}`);
+  $("#mem-detail").style.display = "block";
+  $("#mem-title").textContent = `🧠 ${memCard.name} 的记忆`;
+  $("#mem-rounds").value = memCard.memoryConfig?.auto_rounds ?? 20;
+  const mem = await api.get("/api/memory").catch(() => ({ memory: {} }));
+  const entries = mem.memory?.[slug] ?? [];
+  $("#mem-entries").textContent = entries.length ? entries.map((e) => "· " + e).join("\n") : "（还没有记忆）";
+  $("#mem-detail").scrollIntoView({ behavior: "smooth" });
+}
+
+async function saveMemRounds() {
+  if (!memCard) return;
+  const rounds = Math.min(50, Math.max(1, Number($("#mem-rounds").value) || 20));
+  memCard.memoryConfig = { auto_rounds: rounds };
+  try {
+    await api.send(`/api/cards/${memCard.slug}`, { method: "PUT", body: JSON.stringify(memCard) });
+    toast(`✓ 每 ${rounds} 轮自动总结`);
+  } catch (e) { toast("保存失败：" + e.message, false); }
+}
+
+async function clearMem() {
+  if (!memCard || !confirm(`清空 ${memCard.name} 的全部记忆？`)) return;
+  await api.send("/api/memory/clear", { method: "POST", body: JSON.stringify({ slug: memCard.slug }) });
+  openMemDetail(memCard.slug);
+  toast("✓ 已清空");
+}
+
+// ============================================================
+//  聊天（模型由服务端按卡解析）
+// ============================================================
+function addChatBubble(role, text) {
+  const log = $("#chat-log");
+  const div = document.createElement("div");
+  div.className = "bubble " + (role === "user" ? "me" : "bot");
+  div.textContent = text;
+  log.appendChild(div);
+  log.scrollTop = log.scrollHeight;
+  return div;
+}
+function gatherChatOptions() {
+  const tools = [];
+  if ($("#tool-code")?.checked) tools.push("code_exec");
+  if ($("#tool-file")?.checked) tools.push("sandbox_list", "sandbox_read", "sandbox_write", "sandbox_grep");
+  if ($("#tool-search")?.checked) tools.push("web_search");
+  if ($("#tool-weather")?.checked) tools.push("weather");
+  if ($("#tool-memory")?.checked) tools.push("memory_save");
+  const skills = [];
+  if ($("#skill-code")?.checked) skills.push("code_expert");
+  if ($("#skill-trans")?.checked) skills.push("translator");
+  if ($("#skill-write")?.checked) skills.push("writing");
+  if ($("#skill-companion")?.checked) skills.push("companion");
+  return { tools, useMCP: $("#tool-mcp")?.checked, skills, thinking: $("#chat-thinking")?.value ?? "auto" };
+}
+function toggleWorkMode() {
+  workMode = !workMode;
+  const btn = $("#btn-work-mode");
+  btn.textContent = workMode ? "💬 聊天模式" : "🔧 工作模式";
+  btn.classList.toggle("active", workMode);
+  $(".chat-opts").style.display = workMode ? "flex" : "none";
+  $("#chat-head-hint").textContent = workMode ? "工作模式：开放工具/技能" : "普通聊天（用此卡模型）";
+}
+async function sendChat() {
+  const input = $("#chat-input");
+  const message = input.value.trim();
+  if (!message) return;
+  if (!editingCard) { addChatBubble("bot", "请先选择一张人设卡。"); return; }
+  addChatBubble("user", message);
+  input.value = "";
+  chatHistory.push({ role: "user", content: message });
+  const btn = $("#btn-chat-send");
+  btn.disabled = true;
+  const opts = workMode ? gatherChatOptions() : { tools: [], useMCP: false, skills: [], thinking: "auto" };
+  try {
+    const r = await api.send("/api/chat", {
+      method: "POST",
+      body: JSON.stringify({ slug: editingCard.slug, message, history: chatHistory.slice(0, -1), ...opts }),
+    });
+    await finishTurn(r);
+  } catch (e) {
+    chatHistory.pop();
+    addChatBubble("bot", "⚠ " + e.message);
+  }
+  btn.disabled = false;
+}
+async function finishTurn(r) {
+  if (r.type === "reply") {
+    addChatBubble("bot", r.reply);
+    chatHistory.push({ role: "assistant", content: r.reply });
+  } else if (r.type === "pending") {
+    const bubble = addChatBubble("bot", "🛡️ 需要你确认：机器人想调用\n" + r.pending.map((p) => "· " + p.name).join("\n"));
+    const row = document.createElement("div");
+    row.className = "approve-row";
+    const ok = document.createElement("button");
+    ok.className = "small-btn primary"; ok.textContent = "✅ 执行";
+    const no = document.createElement("button");
+    no.className = "small-btn danger"; no.textContent = "🚫 拒绝";
+    pendingData = { slug: editingCard.slug, messages: r.messages, tools: gatherChatOptions().tools, useMCP: $("#tool-mcp").checked, approve: false };
+    ok.addEventListener("click", async () => { row.remove(); pendingData.approve = true; await sendApprove(); });
+    no.addEventListener("click", async () => { row.remove(); pendingData.approve = false; await sendApprove(); });
+    row.append(ok, no);
+    bubble.parentNode.appendChild(row);
+  }
+}
+async function sendApprove() {
+  const btn = $("#btn-chat-send");
+  btn.disabled = true;
+  try {
+    const r = await api.send("/api/chat/approve", { method: "POST", body: JSON.stringify(pendingData) });
+    pendingData = null;
+    await finishTurn(r);
+  } catch (e) { addChatBubble("bot", "⚠ " + e.message); }
+  btn.disabled = false;
+}
+function clearChat() { chatHistory = []; pendingData = null; $("#chat-log").innerHTML = ""; }
+
+// ============================================================
+//  视图：蒸馏 / 通道 / 能力 / 数据 / 设置
 // ============================================================
 function renderDistill() {
   return `
   <div class="view">
-    <div class="api-layout">
-      <div class="channel-card">
-        <h2>🧪 聊天记录蒸馏（数字分身）</h2>
-        <p class="hint">导入微信聊天记录 → 自动脱敏 → 四维蒸馏（互动/人格/记忆）→ 生成人设卡。调用「API 与模型」页配置的模型。</p>
+    <div class="page-head"><h2>🧪 蒸馏工厂</h2><p class="hint">聊天记录 → 脱敏 → 四维蒸馏 → 人设卡</p></div>
+    <div class="two-col">
+      <div class="card-box">
         <div class="form">
-          <label>聊天记录文件（WeFlow 导出的 JSON）</label>
-          <input id="distill-file" type="file" accept=".json" />
-          <div class="note" style="margin-top:0">📥 没有记录？下载 <a href="https://github.com/hicccc77/WeFlow" target="_blank">WeFlow</a> 导出 JSON，或直接粘贴下面文本。</div>
-          <label>或直接粘贴聊天文本（每行：<code>昵称: 内容</code>）</label>
-          <textarea id="distill-paste" rows="4" placeholder="奶奶: 多喝水，别又熬夜&#10;我: 知道了奶奶"></textarea>
-          <label>卡片名称</label>
-          <input id="distill-name" placeholder="如：奶奶" />
-          <label>关系类型</label>
-          <select id="distill-role">
-            <option value="friend">朋友</option><option value="family">家人</option>
-            <option value="self">自己</option><option value="partner">前任/恋人</option>
-            <option value="colleague">同事</option><option value="public-figure">偶像/角色</option>
-          </select>
-          <label>目标人物昵称（留空自动取最活跃的对方）</label>
-          <input id="distill-target" placeholder="如：奶奶" />
-          <label>我方昵称（逗号分隔）</label>
-          <input id="distill-self" placeholder="如：我,本人" />
-          <label>屏蔽词（逗号分隔，命中整条剔除）</label>
-          <input id="distill-blocked" placeholder="如：工资,某敏感词" />
-          <div class="row">
-            <button id="btn-distill-run" class="primary">开始蒸馏</button>
+          <label>聊天记录文件（WeFlow JSON）</label>
+          <input id="distill-file" type="file" accept=".json">
+          <label>或粘贴文本（每行：昵称: 内容）</label>
+          <textarea id="distill-paste" rows="3" placeholder="奶奶: 多喝水&#10;我: 知道了"></textarea>
+          <div class="cf-grid2">
+            <div><label>卡片名称</label><input id="distill-name" placeholder="如：奶奶"></div>
+            <div><label>关系</label>
+              <select id="distill-role">
+                <option value="friend">朋友</option><option value="family">家人</option>
+                <option value="self">自己</option><option value="partner">前任/恋人</option>
+                <option value="colleague">同事</option><option value="public-figure">偶像/角色</option>
+              </select></div>
           </div>
+          <div class="cf-grid2">
+            <div><label>目标人物（留空自动）</label><input id="distill-target" placeholder="如：奶奶"></div>
+            <div><label>我方昵称（逗号分隔）</label><input id="distill-self" placeholder="我,本人"></div>
+          </div>
+          <label>屏蔽词（逗号分隔）</label>
+          <input id="distill-blocked" placeholder="工资,敏感词">
+          <div class="row"><button id="btn-distill-run" class="primary">开始蒸馏</button></div>
           <div id="distill-msg" class="status"></div>
         </div>
-        <hr style="border-color:var(--border)" />
         <h3>🔌 直连 WeFlow（本机 5031）</h3>
-        <p class="hint">WeFlow 运行时免导出直接拉取：填 access_token → 探测 → 填 talker → 导入并蒸馏。</p>
-        <div class="row">
-          <input id="wf-token" placeholder="WeFlow access_token" />
-          <button id="btn-wf-probe" class="small-btn">探测</button>
-        </div>
-        <div class="row">
-          <input id="wf-talker" placeholder="talker（如 xxx@chatroom）" />
-          <input id="wf-limit" type="number" value="500" style="max-width:80px" />
-          <button id="btn-wf-distill" class="primary">导入并蒸馏</button>
-        </div>
+        <div class="row"><input id="wf-token" placeholder="access_token"><button id="btn-wf-probe" class="ghost small-btn">探测</button></div>
+        <div class="row"><input id="wf-talker" placeholder="talker"><input id="wf-limit" type="number" value="500" style="max-width:80px"><button id="btn-wf-distill" class="primary small-btn">导入蒸馏</button></div>
         <pre id="wf-out" class="small-out"></pre>
       </div>
-      <div class="channel-card">
-        <h2>蒸馏结果</h2>
-        <div class="editor-actions" style="margin-bottom:8px">
-          <button id="btn-distill-save" class="primary">保存到卡库</button>
-          <button id="btn-distill-export-png">导出 PNG</button>
-          <button id="btn-distill-export-json">导出 JSON</button>
+      <div class="card-box">
+        <h3>蒸馏结果</h3>
+        <div class="row">
+          <button id="btn-distill-save" class="primary small-btn">保存到卡库</button>
+          <button id="btn-distill-export-png" class="ghost small-btn">导出 PNG</button>
         </div>
         <pre id="distill-result" class="small-out tall">（结果会显示在这里）</pre>
       </div>
@@ -961,108 +1003,73 @@ function initDistill() {
   $("#btn-distill-run").addEventListener("click", runDistill);
   $("#btn-distill-save").addEventListener("click", saveDistilled);
   $("#btn-distill-export-png").addEventListener("click", () => exportDistillCard("png"));
-  $("#btn-distill-export-json").addEventListener("click", () => exportDistillCard("json"));
   $("#btn-wf-probe").addEventListener("click", probeWeFlow);
   $("#btn-wf-distill").addEventListener("click", distillFromWeFlow);
-  loadDistillModel();
-}
-
-async function loadDistillModel() {
-  try {
-    const cfg = await api.get("/api/config/model");
-    const el = $("#distill-model");
-    if (el) el.textContent = cfg.primary || "（未设置，先到 API 页配置）";
-  } catch { /* 忽略 */ }
 }
 
 async function runDistill() {
   const file = $("#distill-file").files[0];
   const paste = $("#distill-paste").value.trim();
-  if (!file && !paste) { $("#distill-msg").textContent = "请选择文件或粘贴文本"; return; }
+  if (!file && !paste) return toast("请选择文件或粘贴文本", false);
   const name = $("#distill-name").value.trim();
-  if (!name) { $("#distill-msg").textContent = "请填写卡片名称"; return; }
-  const text = file ? await file.text() : paste;
-  $("#distill-msg").textContent = "蒸馏中…（调用模型 3 次，需要一点时间）";
+  if (!name) return toast("请填写卡片名称", false);
+  $("#distill-msg").textContent = "蒸馏中…（调用模型 3 次）";
   $("#btn-distill-run").disabled = true;
   try {
     const r = await api.send("/api/distill", {
       method: "POST",
       body: JSON.stringify({
-        fileContent: text,
+        fileContent: file ? await file.text() : paste,
         fileName: file?.name || "paste.txt",
-        name,
-        role: $("#distill-role").value,
+        name, role: $("#distill-role").value,
         target: $("#distill-target").value.trim() || undefined,
         selfNames: $("#distill-self").value.split(",").map((s) => s.trim()).filter(Boolean),
         blockedWords: $("#distill-blocked").value.split(",").map((s) => s.trim()).filter(Boolean),
       }),
     });
     lastDistilledCard = r.card;
-    const lines = [
-      `✓ 蒸馏完成：${r.card.name} (${r.card.slug})`,
-      `目标人物：${r.card.identity.relation ?? "—"}`,
-      `消息：共 ${r.stats.totalMessages} 条 → 目标 ${r.stats.usedMessages} 条`,
-      `脱敏替换：${r.stats.redact.replaced} 处`,
-      "",
-    ];
-    for (const [dim, s] of Object.entries(r.stats.dimensions)) lines.push(`${dim}: ${s.items} 条（${s.via}）`);
-    lines.push("", "人格（traits）:", ...(r.card.personality.traits ?? []).map((t) => "  - " + t));
-    lines.push("", "⚠ 发布前请在卡里把 source.consent.granted 改为 true");
-    $("#distill-result").textContent = lines.join("\n");
-    $("#distill-msg").textContent = "完成。可保存到卡库或直接导出 PNG。";
-    $("#distill-msg").className = "status ok";
-  } catch (e) {
-    $("#distill-msg").textContent = "蒸馏失败：" + e.message;
-    $("#distill-msg").className = "status err";
-  }
+    $("#distill-result").textContent =
+      `✓ ${r.card.name}（${r.card.slug}）\n消息 ${r.stats.totalMessages} → 目标 ${r.stats.usedMessages}，脱敏 ${r.stats.redact.replaced} 处\n\n` +
+      r.card.personality.traits.map((t) => "· " + t).join("\n");
+    $("#distill-msg").textContent = "完成，可保存或导出";
+  } catch (e) { $("#distill-msg").textContent = "失败：" + e.message; }
   $("#btn-distill-run").disabled = false;
 }
 
 async function saveDistilled() {
-  if (!lastDistilledCard) { $("#distill-msg").textContent = "还没有蒸馏结果"; return; }
+  if (!lastDistilledCard) return toast("还没有蒸馏结果", false);
   try {
-    await api.send("/api/cards/import", { method: "POST", body: JSON.stringify({ card: lastDistilledCard }) });
-    $("#distill-msg").textContent = "✓ 已保存到卡库，去「人设卡库」编辑";
-    $("#distill-msg").className = "status ok";
+    const r = await api.send("/api/cards/import", { method: "POST", body: JSON.stringify({ card: lastDistilledCard }) });
+    toast(`✓ 已保存：${r.card.name}`);
     lastDistilledCard = null;
-  } catch (e) {
-    $("#distill-msg").textContent = "保存失败：" + e.message;
-    $("#distill-msg").className = "status err";
-  }
+  } catch (e) { toast("保存失败：" + e.message, false); }
 }
 
 async function exportDistillCard(format) {
-  if (!lastDistilledCard) { $("#distill-msg").textContent = "还没有蒸馏结果"; return; }
+  if (!lastDistilledCard) return toast("还没有蒸馏结果", false);
   try {
     const r = await api.send("/api/cards/export-card", { method: "POST", body: JSON.stringify({ card: lastDistilledCard, format }) });
     downloadDataUrl(r.dataUrl, r.filename);
-    $("#distill-msg").textContent = "✓ 已导出 " + r.filename;
-    $("#distill-msg").className = "status ok";
-  } catch (e) {
-    $("#distill-msg").textContent = "导出失败：" + e.message;
-    $("#distill-msg").className = "status err";
-  }
+    toast("✓ 已导出 " + r.filename);
+  } catch (e) { toast("导出失败：" + e.message, false); }
 }
 
 async function probeWeFlow() {
   const token = $("#wf-token").value.trim();
-  if (!token) { $("#wf-out").textContent = "请先填 access_token"; return; }
+  if (!token) return toast("请填 access_token", false);
   $("#wf-out").textContent = "探测中…";
   try {
     const r = await api.send("/api/weflow/probe", { method: "POST", body: JSON.stringify({ token }) });
-    $("#wf-out").textContent = r.results.map((x) => `${x.path} → HTTP ${x.status}${x.hint ? " " + x.hint : ""}`).join("\n");
-  } catch (e) {
-    $("#wf-out").textContent = "探测失败：" + e.message;
-  }
+    $("#wf-out").textContent = r.results.map((x) => `${x.path} → HTTP ${x.status}`).join("\n");
+  } catch (e) { $("#wf-out").textContent = "失败：" + e.message; }
 }
 
 async function distillFromWeFlow() {
   const token = $("#wf-token").value.trim();
   const talker = $("#wf-talker").value.trim();
   const name = $("#distill-name").value.trim();
-  if (!token || !talker || !name) { $("#wf-out").textContent = "请填 token / talker / 卡片名称"; return; }
-  $("#wf-out").textContent = "从 WeFlow 拉取并蒸馏中…";
-  $("#btn-wf-distill").disabled = true;
+  if (!token || !talker || !name) return toast("请填 token / talker / 名称", false);
+  $("#wf-out").textContent = "拉取并蒸馏中…";
   try {
     const r = await api.send("/api/distill/weflow", {
       method: "POST",
@@ -1075,72 +1082,42 @@ async function distillFromWeFlow() {
       }),
     });
     lastDistilledCard = r.card;
-    $("#wf-out").textContent = `✓ 蒸馏完成：${r.card.name}（${r.card.slug}）\n消息 ${r.stats.totalMessages} 条 → 目标 ${r.stats.usedMessages} 条`;
-    $("#distill-msg").textContent = "完成（WeFlow 导入），可保存或导出";
-    $("#distill-msg").className = "status ok";
-  } catch (e) {
-    $("#wf-out").textContent = "失败：" + e.message;
-  }
-  $("#btn-wf-distill").disabled = false;
+    $("#wf-out").textContent = `✓ ${r.card.name}：${r.stats.totalMessages} → ${r.stats.usedMessages} 条`;
+    toast("蒸馏完成，可保存/导出");
+  } catch (e) { $("#wf-out").textContent = "失败：" + e.message; }
 }
 
-// ============================================================
-//  视图：通道连接
-// ============================================================
+// ---- 通道 ----
 function renderChannels() {
   return `
   <div class="view">
-    <div class="channel-grid">
-      <div class="channel-card">
-        <h2>💬 微信 <span id="wx-status" class="chip">检测中…</span></h2>
-        <p class="hint">腾讯官方通道（openclaw-weixin），当前仅支持单聊；需微信有 ClawBot 入口（灰度）。</p>
-        <div class="channel-actions">
-          <button id="btn-wx-login">开始扫码绑定</button>
-          <button id="btn-wx-refresh">刷新状态</button>
-        </div>
+    <div class="page-head"><h2>💬 通道连接</h2><p class="hint">微信 / QQ 官方扫码绑定</p></div>
+    <div class="two-col">
+      <div class="card-box">
+        <h3>💬 微信 <span id="wx-status" class="chip">检测中…</span></h3>
+        <p class="hint">腾讯官方通道，仅单聊；需微信有 ClawBot 入口（灰度）。</p>
+        <div class="row"><button id="btn-wx-login" class="primary">开始扫码绑定</button><button id="btn-wx-refresh" class="ghost">刷新</button></div>
         <pre id="wx-qr" class="qr-box" style="display:none"></pre>
         <div id="wx-login-msg" class="status"></div>
-        <hr />
-        <h3>新好友配对授权</h3>
-        <div class="row">
-          <input id="pairing-code" placeholder="配对码" />
-          <button id="btn-pair-approve">批准</button>
-        </div>
+        <h3>配对授权</h3>
+        <div class="row"><input id="pairing-code" placeholder="配对码"><button id="btn-pair-approve" class="primary small-btn">批准</button></div>
         <pre id="pairing-list" class="small-out"></pre>
-        <div class="note">⚠️ 微信里没有 ClawBot 入口 = 账号在灰度外，扫码会失败，这是微信侧限制。</div>
       </div>
-      <div class="channel-card">
-        <h2>🐧 QQ <span id="qq-status" class="chip">检测中…</span></h2>
-        <p class="hint">官方 QQ 开放平台机器人（腾讯官方插件）。支持单聊 / 群聊@ / 频道 / 富媒体。</p>
-        <div class="channel-actions">
-          <button id="btn-qq-login">开始扫码绑定</button>
-          <button id="btn-qq-refresh">刷新状态</button>
-        </div>
+      <div class="card-box">
+        <h3>🐧 QQ <span id="qq-status" class="chip">检测中…</span></h3>
+        <p class="hint">官方开放平台机器人（单聊/群聊@/频道）。</p>
+        <div class="row"><button id="btn-qq-login" class="primary">开始扫码绑定</button><button id="btn-qq-refresh" class="ghost">刷新</button></div>
         <pre id="qq-qr" class="qr-box" style="display:none"></pre>
         <div id="qq-login-msg" class="status"></div>
-        <div class="guide">
-          <ol>
-            <li><b>创建机器人</b>：<a href="https://q.qq.com/" target="_blank">QQ 开放平台</a> 扫码登录 → 点「创建机器人」</li>
-            <li><b>扫码绑定</b>：点上方「开始扫码绑定」，手机 QQ 扫网页二维码</li>
-            <li><b>开始对话</b>：QQ 消息列表找到机器人发消息（未配置完成前回「已去火星」）</li>
-          </ol>
-        </div>
+        <div class="guide"><ol>
+          <li><a href="https://q.qq.com/" target="_blank">QQ 开放平台</a> 扫码登录 → 创建机器人</li>
+          <li>点上方「开始扫码绑定」，手机 QQ 扫网页二维码</li>
+          <li>QQ 消息列表找到机器人发消息测试</li>
+        </ol></div>
         <pre id="qq-out" class="small-out"></pre>
-        <div class="note">官方机器人是「消息列表里的机器人」；想用自己的 QQ 号（NapCat 方案）暂未就绪。</div>
       </div>
     </div>
   </div>`;
-}
-
-function initChannels() {
-  $("#btn-wx-login").addEventListener("click", () => startLogin("/api/channels/wechat/login", "#wx-qr", "#wx-login-msg", () => { refreshWechat(); refreshPairing(); }));
-  $("#btn-wx-refresh").addEventListener("click", refreshWechat);
-  $("#btn-pair-approve").addEventListener("click", approvePairing);
-  $("#btn-qq-login").addEventListener("click", () => startLogin("/api/channels/qq/login", "#qq-qr", "#qq-login-msg", refreshQQ));
-  $("#btn-qq-refresh").addEventListener("click", refreshQQ);
-  refreshWechat();
-  refreshPairing();
-  refreshQQ();
 }
 
 const loginTimers = {};
@@ -1153,41 +1130,40 @@ async function startLogin(channelPath, qrSel, msgSel, refreshCb) {
     loginTimers[channelPath] = setInterval(async () => {
       try {
         const s = await api.get(channelPath);
-        if (s.output) {
-          $(qrSel).textContent = s.output;
-          $(qrSel).style.display = "block";
-        }
+        if (s.output) { $(qrSel).textContent = s.output; $(qrSel).style.display = "block"; }
         if (!s.running && s.done) {
           clearInterval(loginTimers[channelPath]);
           loginTimers[channelPath] = null;
-          $(msgSel).textContent = s.ok ? "✓ 扫码成功，已绑定！" : "✗ 登录结束（未成功），检查平台侧配置后重试";
+          $(msgSel).textContent = s.ok ? "✓ 扫码成功，已绑定！" : "✗ 未成功，检查平台侧后重试";
           refreshCb && refreshCb();
         }
       } catch { /* 忽略 */ }
     }, 2000);
-  } catch (e) {
-    $(msgSel).textContent = "启动失败：" + e.message;
-  }
+  } catch (e) { $(msgSel).textContent = "启动失败：" + e.message; }
 }
 
+function initChannels() {
+  $("#btn-wx-login").addEventListener("click", () => startLogin("/api/channels/wechat/login", "#wx-qr", "#wx-login-msg", () => { refreshWechat(); refreshPairing(); }));
+  $("#btn-wx-refresh").addEventListener("click", refreshWechat);
+  $("#btn-pair-approve").addEventListener("click", approvePairing);
+  $("#btn-qq-login").addEventListener("click", () => startLogin("/api/channels/qq/login", "#qq-qr", "#qq-login-msg", refreshQQ));
+  $("#btn-qq-refresh").addEventListener("click", refreshQQ);
+  refreshWechat(); refreshPairing(); refreshQQ();
+}
 async function refreshWechat() {
   try {
     const s = await api.get("/api/channels/wechat/status");
-    setChip($("#wx-status"), s.connected ? "已连接 ✓" : "未连接", s.connected);
-    if (!s.connected && s.raw) $("#pairing-list").textContent = s.raw.slice(-800);
-    refreshTopStatus();
-  } catch { setChip($("#wx-status"), "检测失败", false); }
+    const el = $("#wx-status");
+    el.textContent = s.connected ? "已连接 ✓" : "未连接";
+    el.className = "chip " + (s.connected ? "ok" : "");
+  } catch { $("#wx-status").textContent = "检测失败"; }
 }
-
 async function refreshPairing() {
   try {
     const r = await api.get("/api/channels/wechat/pairing");
     $("#pairing-list").textContent = r.raw || "（暂无待处理配对）";
-  } catch (e) {
-    $("#pairing-list").textContent = "读取失败：" + e.message;
-  }
+  } catch (e) { $("#pairing-list").textContent = "读取失败：" + e.message; }
 }
-
 async function approvePairing() {
   const code = $("#pairing-code").value.trim();
   if (!code) return;
@@ -1195,207 +1171,58 @@ async function approvePairing() {
     const r = await api.send("/api/channels/wechat/pairing/approve", { method: "POST", body: JSON.stringify({ code }) });
     $("#pairing-list").textContent = r.output || (r.ok ? "✓ 已批准" : "批准失败");
     $("#pairing-code").value = "";
-    refreshPairing();
-  } catch (e) {
-    $("#pairing-list").textContent = "批准失败：" + e.message;
-  }
+  } catch (e) { $("#pairing-list").textContent = "失败：" + e.message; }
 }
-
 async function refreshQQ() {
   try {
     const s = await api.get("/api/channels/qq/status");
-    const parts = [s.pluginInstalled ? "插件✓" : "插件✗", s.napcatRunning ? "NapCat✓" : "NapCat✗", s.onebotSeen ? "连接✓" : "连接✗"];
-    setChip("#qq-status", parts.join(" "), s.pluginInstalled && s.onebotSeen);
-    if (!s.pluginInstalled) $("#qq-out").textContent = "官方 QQ Bot 插件未安装，先装插件再绑定。";
-    refreshTopStatus();
-  } catch { setChip("#qq-status", "检测失败", false); }
+    const ok = s.pluginInstalled && s.onebotSeen;
+    const el = $("#qq-status");
+    el.textContent = ok ? "已连接 ✓" : "未连接";
+    el.className = "chip " + (ok ? "ok" : "");
+    $("#qq-out").textContent = s.pluginInstalled ? "" : "官方 QQ Bot 插件未安装";
+  } catch { $("#qq-status").textContent = "检测失败"; }
 }
 
-// ============================================================
-//  视图：API 与模型
-// ============================================================
-function renderApi() {
-  return `
-  <div class="view">
-    <div class="api-layout">
-      <div class="channel-card">
-        <h2>⚡ 当前模型配置</h2>
-        <p class="hint">默认模型 <code id="cur-primary">—</code>（保存后需重启网关生效，可用桌面开关）</p>
-        <div id="provider-list" class="provider-list"></div>
-      </div>
-      <div class="channel-card">
-        <h2>添加 / 修改提供商</h2>
-        <div class="form">
-          <label>名称（如 agnes / myrelay）</label>
-          <input id="cfg-name" placeholder="agnes" />
-          <label>Base URL（OpenAI 兼容，以 /v1 结尾）</label>
-          <input id="cfg-baseurl" placeholder="https://apihub.agnes-ai.cn/v1" />
-          <label>API Key（留空保留原值）</label>
-          <input id="cfg-key" type="password" placeholder="sk-..." />
-          <label>模型 ID</label>
-          <input id="cfg-model" placeholder="agnes-2.0-flash" />
-          <label class="checkbox"><input id="cfg-default" type="checkbox" checked /> 设为默认模型</label>
-          <div class="row">
-            <button id="btn-model-test">测试连接</button>
-            <button id="btn-model-save" class="primary">保存</button>
-          </div>
-          <div id="model-msg" class="status"></div>
-        </div>
-      </div>
-      <div class="channel-card">
-        <h2>🎨 生图（AI 绘画）</h2>
-        <p class="hint">工作模式勾选「生图」工具即可让 AI 生成图片。来源：NovelAI / OpenAI 兼容 API / 本地（规划中）。</p>
-        <div class="form">
-          <label>来源</label>
-          <select id="img-provider">
-            <option value="novelai">NovelAI</option>
-            <option value="openai">API（OpenAI 兼容）</option>
-            <option value="local">电脑本地（规划中）</option>
-          </select>
-          <div id="img-novelai" class="form">
-            <label>NovelAI Key（pst_...，任何有效账号 key 均可）</label>
-            <input id="img-nai-key" type="password" placeholder="pst_xxx" />
-            <label>模型</label>
-            <input id="img-nai-model" placeholder="nai-diffusion-4-5-full" />
-          </div>
-          <div id="img-openai" class="form" style="display:none">
-            <label>Base URL（OpenAI 兼容，/v1）</label>
-            <input id="img-oa-base" placeholder="https://apihub.agnes-ai.cn/v1" />
-            <label>Key</label>
-            <input id="img-oa-key" type="password" />
-            <label>模型（如 agnes-image-2.0-flash / gpt-image-1）</label>
-            <input id="img-oa-model" placeholder="agnes-image-2.0-flash" />
-          </div>
-          <div class="row">
-            <button id="btn-img-test">测试</button>
-            <button id="btn-img-save" class="primary">保存</button>
-          </div>
-          <div id="img-msg" class="status"></div>
-        </div>
-      </div>
-    </div>
-  </div>`;
-}
-
-function initApi() {
-  $("#btn-model-test").addEventListener("click", testModel);
-  $("#btn-model-save").addEventListener("click", saveModel);
-  $("#img-provider").addEventListener("change", toggleImgProvider);
-  $("#btn-img-test").addEventListener("click", testImage);
-  $("#btn-img-save").addEventListener("click", saveImage);
-  loadModelConfig();
-  loadImageConfig();
-}
-
-async function loadModelConfig() {
-  try {
-    const cfg = await api.get("/api/config/model");
-    $("#cur-primary").textContent = cfg.primary || "（未设置）";
-    const box = $("#provider-list");
-    box.innerHTML = "";
-    if (!cfg.providers.length) {
-      box.innerHTML = '<div class="muted">还没有配置提供商</div>';
-      return;
-    }
-    for (const p of cfg.providers) {
-      const d = document.createElement("div");
-      d.className = "provider-item" + (cfg.primary.startsWith(p.name + "/") ? " active" : "");
-      d.innerHTML = `<div><b>${escapeHtml(p.name)}</b> ${cfg.primary.startsWith(p.name + "/") ? "· 默认" : ""}</div>
-        <div class="meta">${escapeHtml(p.baseUrl)} · ${escapeHtml(p.models.join(", "))}</div>
-        <div class="meta">key: ${escapeHtml(p.apiKey)}</div>`;
-      box.appendChild(d);
-    }
-  } catch (e) {
-    $("#provider-list").innerHTML = `<div class="muted">读取失败：${escapeHtml(e.message)}</div>`;
-  }
-}
-
-async function testModel() {
-  const baseUrl = $("#cfg-baseurl").value.trim();
-  const apiKey = $("#cfg-key").value.trim();
-  const modelId = $("#cfg-model").value.trim();
-  if (!baseUrl || !apiKey || !modelId) { $("#model-msg").textContent = "请先填 Base URL / Key / 模型 ID"; return; }
-  $("#model-msg").textContent = "测试中…";
-  try {
-    const r = await api.send("/api/config/model/test", { method: "POST", body: JSON.stringify({ baseUrl, apiKey, modelId }) });
-    $("#model-msg").textContent = r.ok ? "✓ 连接成功" : `✗ 失败（HTTP ${r.status ?? "-"}）：${r.error ?? ""}`;
-    $("#model-msg").className = "status " + (r.ok ? "ok" : "err");
-  } catch (e) {
-    $("#model-msg").textContent = "测试出错：" + e.message;
-  }
-}
-
-async function saveModel() {
-  try {
-    const r = await api.send("/api/config/model", {
-      method: "POST",
-      body: JSON.stringify({
-        name: $("#cfg-name").value.trim(),
-        baseUrl: $("#cfg-baseurl").value.trim(),
-        apiKey: $("#cfg-key").value.trim() || undefined,
-        modelId: $("#cfg-model").value.trim(),
-        setDefault: $("#cfg-default").checked,
-      }),
-    });
-    $("#model-msg").textContent = "✓ " + (r.hint || "已保存");
-    $("#model-msg").className = "status ok";
-    $("#cfg-key").value = "";
-    loadModelConfig();
-    refreshTopStatus();
-  } catch (e) {
-    $("#model-msg").textContent = "保存失败：" + e.message;
-    $("#model-msg").className = "status err";
-  }
-}
-
-// ============================================================
-//  视图：能力中心（工具/技能/深度/语音 默认 + MCP）
-// ============================================================
+// ---- 能力中心 ----
 function renderCapabilities() {
   return `
   <div class="view">
-    <div class="api-layout">
-      <div class="channel-card">
-        <h2>🛠 默认能力</h2>
-        <p class="hint">设置聊天测试工作模式的默认开关；测试时可临时改，这里存的是默认值。</p>
+    <div class="page-head"><h2>🛠 能力中心</h2><p class="hint">工作模式的默认开关；聊天测试时可临时覆盖</p></div>
+    <div class="two-col">
+      <div class="card-box">
+        <h3>默认能力</h3>
         <div class="form">
-          <label>工具（默认）</label>
+          <label>工具</label>
           <div class="cap-checks">
-            <label><input type="checkbox" id="cap-code" /> 写代码*</label>
-            <label><input type="checkbox" id="cap-file" /> 沙箱文件</label>
-            <label><input type="checkbox" id="cap-search" /> 搜索</label>
-            <label><input type="checkbox" id="cap-weather" /> 天气</label>
-            <label><input type="checkbox" id="cap-time" /> 时间</label>
-            <label><input type="checkbox" id="cap-memory" /> 记忆</label>
-            <label><input type="checkbox" id="cap-image" /> 生图</label>
+            <label><input type="checkbox" id="cap-code"> 写代码*</label>
+            <label><input type="checkbox" id="cap-file"> 文件</label>
+            <label><input type="checkbox" id="cap-search"> 搜索</label>
+            <label><input type="checkbox" id="cap-weather"> 天气</label>
+            <label><input type="checkbox" id="cap-memory"> 记忆</label>
           </div>
-          <label>技能（默认）</label>
+          <label>技能</label>
           <div class="cap-checks">
-            <label><input type="checkbox" id="cap-skill-code" /> 代码专家</label>
-            <label><input type="checkbox" id="cap-skill-trans" /> 翻译</label>
-            <label><input type="checkbox" id="cap-skill-write" /> 写作</label>
-            <label><input type="checkbox" id="cap-skill-companion" /> 陪伴</label>
+            <label><input type="checkbox" id="cap-skill-code"> 代码</label>
+            <label><input type="checkbox" id="cap-skill-trans"> 翻译</label>
+            <label><input type="checkbox" id="cap-skill-write"> 写作</label>
+            <label><input type="checkbox" id="cap-skill-companion"> 陪伴</label>
           </div>
-          <label>思考深度（默认）</label>
+          <label>思考深度</label>
           <select id="cap-thinking">
-            <option value="off">关闭</option><option value="auto" selected>自动（默认）</option>
+            <option value="off">关闭</option><option value="auto" selected>自动</option>
             <option value="low">低</option><option value="medium">中</option>
             <option value="high">高</option><option value="extreme">极高</option>
           </select>
-          <label class="checkbox"><input type="checkbox" id="cap-voice" /> 读回复（语音）</label>
-          <div class="row">
-            <button id="btn-cap-save" class="primary">保存默认</button>
-          </div>
+          <div class="row"><button id="btn-cap-save" class="primary">保存默认</button></div>
           <div id="cap-msg" class="status"></div>
         </div>
       </div>
-      <div class="channel-card">
-        <h2>🔌 MCP 服务器</h2>
-        <p class="hint">JSON 数组，每项 <code>{"name":"服务名","command":"命令","args":[]}</code>。保存后工作模式勾选「MCP」即可用（工具默认需审批）。</p>
+      <div class="card-box">
+        <h3>🔌 MCP 服务器</h3>
+        <p class="hint">JSON 数组：{"name","command","args"}；工具默认需审批</p>
         <textarea id="mcp-config" rows="6" spellcheck="false"></textarea>
-        <div class="row" style="margin-top:8px">
-          <button id="btn-mcp-save" class="primary">保存并重连</button>
-        </div>
+        <div class="row" style="margin-top:8px"><button id="btn-mcp-save" class="primary">保存并重连</button></div>
         <div id="mcp-msg" class="status"></div>
       </div>
     </div>
@@ -1409,160 +1236,98 @@ function initCapabilities() {
   $("#cap-file").checked = tools.includes("sandbox_list");
   $("#cap-search").checked = tools.includes("web_search");
   $("#cap-weather").checked = tools.includes("weather");
-  $("#cap-time").checked = tools.includes("datetime");
   $("#cap-memory").checked = tools.includes("memory_save");
-  $("#cap-image").checked = tools.includes("image_gen");
   const skills = def.skills ?? [];
   $("#cap-skill-code").checked = skills.includes("code_expert");
   $("#cap-skill-trans").checked = skills.includes("translator");
   $("#cap-skill-write").checked = skills.includes("writing");
   $("#cap-skill-companion").checked = skills.includes("companion");
   $("#cap-thinking").value = def.thinking ?? "auto";
-  $("#cap-voice").checked = !!def.voiceReply;
   $("#btn-cap-save").addEventListener("click", () => {
-    const toolsArr = [];
-    if ($("#cap-code").checked) toolsArr.push("code_exec");
-    if ($("#cap-file").checked) toolsArr.push("sandbox_list", "sandbox_read", "sandbox_write", "sandbox_grep");
-    if ($("#cap-search").checked) toolsArr.push("web_search");
-    if ($("#cap-weather").checked) toolsArr.push("weather");
-    if ($("#cap-time").checked) toolsArr.push("datetime");
-    if ($("#cap-memory").checked) toolsArr.push("memory_save");
-    if ($("#cap-image").checked) toolsArr.push("image_gen");
-    const skillsArr = [];
-    if ($("#cap-skill-code").checked) skillsArr.push("code_expert");
-    if ($("#cap-skill-trans").checked) skillsArr.push("translator");
-    if ($("#cap-skill-write").checked) skillsArr.push("writing");
-    if ($("#cap-skill-companion").checked) skillsArr.push("companion");
-    saveCapDefaults({ tools: toolsArr, skills: skillsArr, thinking: $("#cap-thinking").value, voiceReply: $("#cap-voice").checked });
-    $("#cap-msg").textContent = "✓ 已保存默认能力";
-    $("#cap-msg").className = "status ok";
+    const t = [];
+    if ($("#cap-code").checked) t.push("code_exec");
+    if ($("#cap-file").checked) t.push("sandbox_list", "sandbox_read", "sandbox_write", "sandbox_grep");
+    if ($("#cap-search").checked) t.push("web_search");
+    if ($("#cap-weather").checked) t.push("weather");
+    if ($("#cap-memory").checked) t.push("memory_save");
+    const s = [];
+    if ($("#cap-skill-code").checked) s.push("code_expert");
+    if ($("#cap-skill-trans").checked) s.push("translator");
+    if ($("#cap-skill-write").checked) s.push("writing");
+    if ($("#cap-skill-companion").checked) s.push("companion");
+    saveCapDefaults({ tools: t, skills: s, thinking: $("#cap-thinking").value });
+    $("#cap-msg").textContent = "✓ 已保存";
   });
-  $("#btn-mcp-save").addEventListener("click", saveMCP);
-  loadMCPConfig();
+  $("#btn-mcp-save").addEventListener("click", async () => {
+    try {
+      const servers = JSON.parse($("#mcp-config").value);
+      const r = await api.send("/api/mcp/config", { method: "POST", body: JSON.stringify({ servers }) });
+      $("#mcp-msg").textContent = "✓ 已保存并重连，" + r.servers + " 个服务器";
+    } catch (e) { $("#mcp-msg").textContent = "失败：" + e.message; }
+  });
+  api.get("/api/mcp/config").then((cfg) => { $("#mcp-config").value = JSON.stringify(cfg.servers, null, 2); }).catch(() => {});
 }
 
-async function loadMCPConfig() {
-  try {
-    const cfg = await api.get("/api/mcp/config");
-    $("#mcp-config").value = JSON.stringify(cfg.servers, null, 2);
-  } catch (e) {
-    $("#mcp-msg").textContent = "读取失败：" + e.message;
-  }
-}
-
-async function saveMCP() {
-  try {
-    const servers = JSON.parse($("#mcp-config").value);
-    const r = await api.send("/api/mcp/config", { method: "POST", body: JSON.stringify({ servers }) });
-    $("#mcp-msg").textContent = "✓ 已保存并重连，" + r.servers + " 个服务器";
-    $("#mcp-msg").className = "status ok";
-  } catch (e) {
-    $("#mcp-msg").textContent = "保存失败：" + e.message;
-    $("#mcp-msg").className = "status err";
-  }
-}
-
-// ============================================================
-//  视图：数据
-// ============================================================
+// ---- 数据 / 设置 ----
 function renderData() {
   return `
   <div class="view">
-    <div class="api-layout">
-      <div class="channel-card">
-        <h2>📦 备份</h2>
-        <p class="hint">把全部人设卡、长期记忆、MCP 配置打包成一个 JSON 下载，可随时导入恢复。</p>
-        <div class="row">
-          <button id="btn-backup" class="primary">📦 下载备份</button>
-        </div>
-        <div id="backup-msg" class="status"></div>
+    <div class="page-head"><h2>📦 数据</h2><p class="hint">备份与记忆</p></div>
+    <div class="two-col">
+      <div class="card-box">
+        <h3>📦 备份</h3>
+        <p class="hint">全部卡片 + 记忆 + MCP 配置 → 一个 JSON</p>
+        <button id="btn-backup" class="primary">下载备份</button>
       </div>
-      <div class="channel-card">
-        <h2>🧠 长期记忆</h2>
-        <p class="hint">各人设卡记住的用户事实（data/memory）。</p>
+      <div class="card-box">
+        <h3>全部记忆</h3>
         <div id="memory-list" class="small-out tall"></div>
-        <div class="row" style="margin-top:8px">
-          <button id="btn-memory-clear" class="danger small-btn">清空全部记忆</button>
-        </div>
       </div>
     </div>
   </div>`;
 }
-
 function initData() {
   $("#btn-backup").addEventListener("click", async () => {
     try {
       const r = await api.get("/api/backup");
       downloadDataUrl(r.dataUrl, r.filename);
-      $("#backup-msg").textContent = "✓ 备份已下载：" + r.filename;
-      $("#backup-msg").className = "status ok";
-    } catch (e) {
-      $("#backup-msg").textContent = "备份失败：" + e.message;
-      $("#backup-msg").className = "status err";
-    }
+      toast("✓ 备份已下载");
+    } catch (e) { toast("备份失败：" + e.message, false); }
   });
-  $("#btn-memory-clear").addEventListener("click", async () => {
-    if (!confirm("确定清空全部长期记忆？")) return;
-    try {
-      await api.send("/api/memory/clear", { method: "POST" });
-      loadMemory();
-    } catch (e) {
-      $("#memory-list").textContent = "清空失败：" + e.message;
-    }
-  });
-  loadMemory();
-}
-
-async function loadMemory() {
-  try {
-    const r = await api.get("/api/memory");
+  api.get("/api/memory").then((r) => {
     const el = $("#memory-list");
-    if (!r.memory || !Object.keys(r.memory).length) {
-      el.textContent = "（还没有记忆）";
-      return;
-    }
-    el.textContent = Object.entries(r.memory)
-      .map(([f, lines]) => `📄 ${f}\n  ` + (lines || []).join("\n  "))
-      .join("\n\n");
-  } catch (e) {
-    $("#memory-list").textContent = "读取失败：" + e.message;
-  }
+    el.textContent = Object.keys(r.memory ?? {}).length
+      ? Object.entries(r.memory).map(([f, l]) => `📄 ${f}\n  ` + (l || []).join("\n  ")).join("\n\n")
+      : "（还没有记忆）";
+  }).catch(() => {});
 }
 
-// ============================================================
-//  视图：设置
-// ============================================================
 function renderSettings() {
   return `
   <div class="view">
-    <div class="api-layout">
-      <div class="channel-card">
-        <h2>⚙ 服务信息</h2>
-        <div id="svc-info" class="small-out">读取中…</div>
-      </div>
-      <div class="channel-card">
-        <h2>ℹ️ 说明</h2>
+    <div class="page-head"><h2>⚙️ 设置</h2><p class="hint">服务信息与说明</p></div>
+    <div class="two-col">
+      <div class="card-box"><h3>服务信息</h3><div id="svc-info" class="small-out">读取中…</div></div>
+      <div class="card-box"><h3>说明</h3>
         <ul class="guide">
-          <li>管理台地址：<code>http://127.0.0.1:17880</code>；公网：<code>https://openclaw.319274.xyz</code></li>
-          <li>开机自启 / 桌面开关：<code>桌面/openclaw-shell 开关.bat</code></li>
-          <li>数据全部保存在本机 <code>data/</code>，不上传</li>
-          <li>模型与通道的绑定验证：扫码需要手机操作，见「通道连接」页</li>
+          <li>本机：<code>http://127.0.0.1:17880</code></li>
+          <li>公网：<code>https://openclaw.319274.xyz</code></li>
+          <li>开关：桌面「openclaw-shell 开关.bat」（已配开机自启）</li>
+          <li>数据全部在本机 <code>data/</code>，不上传</li>
         </ul>
       </div>
     </div>
   </div>`;
 }
-
 function initSettings() {
-  (async () => {
-    try {
-      const h = await api.get("/api/health");
-      $("#svc-info").textContent =
-        `服务：openclaw-shell\n版本：${h.schema}\n数据目录：${h.dataDir ?? "—"}\n监听：${h.port ? "127.0.0.1:" + h.port : "—"}`;
-    } catch (e) {
-      $("#svc-info").textContent = "无法连接服务：" + e.message;
-    }
-  })();
+  api.get("/api/health").then((h) => {
+    $("#svc-info").textContent = `服务：openclaw-shell\n版本：${h.schema}\n数据目录：${h.dataDir ?? "—"}\n监听：127.0.0.1:${h.port ?? "—"}`;
+    $("#drawer-meta").textContent = `v${h.schema}`;
+    $("#svc-dot").classList.add("on");
+  }).catch(() => {
+    $("#svc-info").textContent = "无法连接服务";
+    $("#svc-dot").classList.add("bad");
+  });
 }
 
 // ============================================================
@@ -1571,9 +1336,12 @@ function initSettings() {
 const routes = {
   home: { render: renderHome, init: initHome },
   cards: { render: renderCards, init: initCards },
+  create: { render: renderCreate, init: initCreate },
   distill: { render: renderDistill, init: initDistill },
   channels: { render: renderChannels, init: initChannels },
   api: { render: renderApi, init: initApi },
+  imagegen: { render: renderImagegen, init: initImagegen },
+  memory: { render: renderMemory, init: initMemory },
   capabilities: { render: renderCapabilities, init: initCapabilities },
   data: { render: renderData, init: initData },
   settings: { render: renderSettings, init: initSettings },
@@ -1581,9 +1349,6 @@ const routes = {
 
 $("#btn-menu").addEventListener("click", openDrawer);
 $("#drawer-overlay").addEventListener("click", closeDrawer);
-document.querySelectorAll(".drawer-nav a, .bottom-nav a").forEach((a) =>
-  a.addEventListener("click", closeDrawer)
-);
+document.querySelectorAll(".drawer-nav a, .bottom-nav a").forEach((a) => a.addEventListener("click", closeDrawer));
 
 router();
-refreshTopStatus();

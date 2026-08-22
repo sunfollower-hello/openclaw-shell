@@ -230,6 +230,21 @@ const emojiSchema = z.object({
   explanation: z.string().default(""),
 });
 
+// ---------- 卡片独立模型配置（每张卡可用不同 API/模型） ----------
+const cardModelSchema = z
+  .object({
+    provider: z.string().optional(),
+    model: z.string().optional(),
+  })
+  .default({});
+
+// ---------- 记忆配置（每 N 轮自动总结一次，默认 20，1-50） ----------
+const memoryConfigSchema = z
+  .object({
+    auto_rounds: z.number().int().min(1).max(50).default(20),
+  })
+  .default({});
+
 // ---------- 卡片主体 ----------
 export const personaCardSchema = z.object({
   schema: z.literal(SCHEMA_VERSION).default(SCHEMA_VERSION),
@@ -253,6 +268,8 @@ export const personaCardSchema = z.object({
   chat: chatSchema.default({}),
   presets: presetsSchema.default({}),
   tools: toolsSchema,
+  model: cardModelSchema,
+  memoryConfig: memoryConfigSchema,
   emojis: z.array(emojiSchema).max(120).default([]),
   sillytavern_v2: sillytavernSchema.optional(),
   ethics: ethicsSchema.default({}),

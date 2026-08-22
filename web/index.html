@@ -2,24 +2,18 @@
 <html lang="zh-CN">
 <head>
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
   <title>openclaw-shell</title>
   <link rel="stylesheet" href="style.css" />
 </head>
 <body>
   <div id="app">
-    <!-- 顶栏 -->
     <header class="topbar">
-      <button id="btn-menu" class="menu-btn" title="菜单">🦞</button>
-      <div class="brand">openclaw-shell <span class="sub">AI 角色机器人工作室</span></div>
-      <div class="top-status">
-        <span class="chip" id="ts-model" title="模型">模型…</span>
-        <span class="chip" id="ts-wx" title="微信">微信…</span>
-        <span class="chip" id="ts-qq" title="QQ">QQ…</span>
-      </div>
+      <button id="btn-menu" class="menu-btn" title="菜单" aria-label="菜单"><span></span><span></span><span></span></button>
+      <div class="brand">openclaw-shell</div>
+      <span id="svc-dot" class="svc-dot" title="服务状态"></span>
     </header>
 
-    <!-- 抽屉 -->
     <div id="drawer-overlay" class="drawer-overlay" hidden></div>
     <aside id="drawer" class="drawer">
       <div class="drawer-user">
@@ -32,27 +26,28 @@
       <nav class="drawer-nav">
         <a href="#/home" data-route="home">🏠 首页</a>
         <a href="#/cards" data-route="cards">🎴 人设卡库</a>
+        <a href="#/create" data-route="create">✏️ 做卡</a>
         <a href="#/distill" data-route="distill">🧪 蒸馏工厂</a>
         <a href="#/channels" data-route="channels">💬 通道连接</a>
         <a href="#/api" data-route="api">⚡ API 与模型</a>
+        <a href="#/imagegen" data-route="imagegen">🎨 生图配置</a>
+        <a href="#/memory" data-route="memory">🧠 记忆</a>
         <a href="#/capabilities" data-route="capabilities">🛠 能力中心</a>
         <a href="#/data" data-route="data">📦 数据</a>
-        <a href="#/settings" data-route="settings">⚙ 设置</a>
+        <a href="#/settings" data-route="settings">⚙️ 设置</a>
       </nav>
       <div class="drawer-foot">数据保存在本机，不上传</div>
     </aside>
 
-    <!-- 视图容器 -->
     <main id="view" class="view-main"></main>
 
-    <!-- 底部快捷栏（窄屏） -->
     <nav class="bottom-nav">
-      <a href="#/home" data-route="home">🏠 首页</a>
-      <a href="#/cards" data-route="cards">🎴 卡库</a>
-      <a href="#/channels" data-route="channels">💬 通道</a>
+      <a href="#/home" data-route="home">🏠<span>首页</span></a>
+      <a href="#/cards" data-route="cards">🎴<span>卡库</span></a>
+      <a href="#/create" data-route="create">✏️<span>做卡</span></a>
+      <a href="#/memory" data-route="memory">🧠<span>记忆</span></a>
     </nav>
   </div>
-
   <script src="app.js"></script>
 </body>
 </html>

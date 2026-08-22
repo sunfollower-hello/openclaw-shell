@@ -4,7 +4,7 @@ import express from "express";
 import path from "node:path";
 import { promises as fs } from "node:fs";
 import { CardStore, dataDir, newCardId, nowIso } from "./core/cardStore.js";
-import { defaultCard, SCHEMA_VERSION, type PersonaCard } from "./core/schema.js";
+import { defaultCard, SCHEMA_VERSION, personaCardSchema, type PersonaCard } from "./core/schema.js";
 import { validateCard } from "./core/validator.js";
 import { compileCard } from "./core/compiler.js";
 import { findProjectRoot } from "./core/cardStore.js";
@@ -16,6 +16,14 @@ import {
   portListening,
 } from "./core/openclawCli.js";
 import { getModelConfig, saveModelConfig, testModelEndpoint, getModelLLMConfig } from "./core/modelConfig.js";
+import {
+  listProviders,
+  saveProvider,
+  deleteProvider,
+  renameProvider,
+  fetchModels,
+  resolveChatLLM,
+} from "./core/providers.js";
 import { runDistill, saveDistilledCard } from "./distiller/pipeline.js";
 import { parsePlainText } from "./distiller/parser.js";
 import { RELATION_ROLES } from "./core/schema.js";
@@ -270,6 +278,89 @@ app.post("/api/config/model/test", async (req, res) => {
   }
 });
 
+// ---------- API 提供商管理（对话 + 生图；第一个为默认，模型自动拉取） ----------
+app.get("/api/providers", async (_req, res) => {
+  try {
+    const data = await listProviders(true);
+    res.json({
+      chat: data.chat.map((p, i) => ({ ...p, isDefault: i === 0 })),
+      image: data.image.map((p, i) => ({ ...p, isDefault: i === 0 })),
+    });
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+app.post("/api/providers/save", async (req, res) => {
+  try {
+    const { type, name, baseUrl, apiKey, models } = req.body ?? {};
+    if (type !== "chat" && type !== "image") return res.status(400).json({ error: "type 必须是 chat 或 image" });
+    const entry = await saveProvider(type, { name, baseUrl, apiKey, models });
+    res.json({ ok: true, entry: { ...entry, apiKey: entry.apiKey.slice(0, 6) + "…" } });
+  } catch (e) {
+    res.status(400).json({ error: String(e) });
+  }
+});
+
+app.post("/api/providers/delete", async (req, res) => {
+  try {
+    const { type, name } = req.body ?? {};
+    if ((type !== "chat" && type !== "image") || !name) return res.status(400).json({ error: "缺少 type / name" });
+    await deleteProvider(type, name);
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+app.post("/api/providers/rename", async (req, res) => {
+  try {
+    const { type, oldName, newName } = req.body ?? {};
+    if ((type !== "chat" && type !== "image") || !oldName || !newName) {
+      return res.status(400).json({ error: "缺少 type / oldName / newName" });
+    }
+    await renameProvider(type, oldName, newName);
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(400).json({ error: String(e) });
+  }
+});
+
+app.post("/api/providers/fetch-models", async (req, res) => {
+  try {
+    const { baseUrl, apiKey, type, name } = req.body ?? {};
+    let url = baseUrl;
+    let key = apiKey;
+    // 未直接给凭证时，按名称读取已保存的提供商
+    if (!key && name) {
+      const data = await listProviders(false);
+      const p = ((type === "image" ? data.image : data.chat) as { name: string; baseUrl: string; apiKey: string }[]).find(
+        (x) => x.name === name
+      );
+      if (!p) return res.status(404).json({ error: `找不到提供商 ${name}` });
+      url = p.baseUrl;
+      key = p.apiKey;
+    }
+    if (!url || !key) return res.status(400).json({ error: "缺少 baseUrl / apiKey（或 type + name）" });
+    const models = await fetchModels(url, key);
+    res.json({ models });
+  } catch (e) {
+    res.status(502).json({ error: String(e) });
+  }
+});
+
+app.post("/api/providers/set-default", async (req, res) => {
+  try {
+    const { type, name } = req.body ?? {};
+    if ((type !== "chat" && type !== "image") || !name) return res.status(400).json({ error: "缺少 type / name" });
+    const { moveProviderDefault } = await import("./core/providers.js");
+    await moveProviderDefault(type, name);
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(400).json({ error: String(e) });
+  }
+});
+
 // ---------- 蒸馏工厂 ----------
 app.post("/api/distill", async (req, res) => {
   try {
@@ -280,7 +371,7 @@ app.post("/api/distill", async (req, res) => {
     if (!RELATION_ROLES.includes(role)) {
       return res.status(400).json({ error: `无效角色: ${role}` });
     }
-    const llm = await getModelLLMConfig();
+    const llm = await resolveChatLLM();
     if (!llm || !llm.apiKey) {
       return res.status(400).json({ error: "未配置模型 API。请先到「API」页添加提供商并设为默认" });
     }
@@ -317,10 +408,15 @@ app.post("/api/cards/import", async (req, res) => {
   try {
     const card = req.body?.card;
     if (!card) return res.status(400).json({ error: "缺少 card" });
-    const result = validateCard(card);
+    // 解析补全默认字段后保存（做卡/导入的卡可能只填了部分字段）
+    const parsed = personaCardSchema.safeParse(card);
+    if (!parsed.success) {
+      return res.status(400).json({ error: parsed.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("; ") });
+    }
+    const result = validateCard(parsed.data);
     if (!result.ok) return res.status(400).json({ error: result.errors.join("; ") });
-    await store.save(card);
-    res.json({ card });
+    await store.save(parsed.data);
+    res.json({ card: parsed.data });
   } catch (e) {
     res.status(500).json({ error: String(e) });
   }
@@ -421,7 +517,7 @@ app.post("/api/distill/weflow", async (req, res) => {
     if (!token || !talker || !name || !role) {
       return res.status(400).json({ error: "token / talker / name / role 不能为空" });
     }
-    const llm = await getModelLLMConfig();
+    const llm = await resolveChatLLM();
     if (!llm || !llm.apiKey) return res.status(400).json({ error: "未配置模型 API（API 页）" });
     const url = `${WEFLOW_BASE}/api/v1/messages?access_token=${encodeURIComponent(token)}&talker=${encodeURIComponent(talker)}&limit=${Number(limit) || 500}`;
     const r = await fetch(url, { signal: AbortSignal.timeout(30000) });
@@ -565,9 +661,9 @@ app.post("/api/chat", async (req, res) => {
   try {
     const { slug, message, history, tools, skills, thinking, useMCP } = req.body ?? {};
     if (!slug || !message) return res.status(400).json({ error: "slug / message 不能为空" });
-    const llm = await getModelLLMConfig();
-    if (!llm || !llm.apiKey) return res.status(400).json({ error: "未配置模型 API（API 页）" });
     const card = await store.get(slug);
+    const llm = await resolveChatLLM(card);
+    if (!llm || !llm.apiKey) return res.status(400).json({ error: "未配置模型 API（API 页）" });
     const enabledTools = Array.isArray(tools) ? (tools as string[]) : [];
     const { defs: toolDefs, mcpErrors } = await resolveChatTools(enabledTools, useMCP === true);
 
@@ -625,17 +721,86 @@ app.post("/api/chat", async (req, res) => {
       { role: "user", content: message },
     ];
     const result = await runToolLoop(llm, messages, toolDefs, chatCtx(slug), card.tools?.policy === "ask", reasoning);
+    if (result.type === "reply") {
+      // 每 N 轮自动总结记忆（后台执行，不阻塞回复）
+      void autoMemorize(slug, card, messages).catch(() => {});
+    }
     res.json(result);
   } catch (e) {
     res.status(500).json({ error: String(e) });
   }
 });
 
+// ---------- 每 N 轮自动记忆（参考 rphub 群聊定期总结思路） ----------
+async function autoMemorize(slug: string, card: { memoryConfig?: { auto_rounds?: number } }, messages: unknown[]): Promise<void> {
+  const rounds = card.memoryConfig?.auto_rounds ?? 20;
+  if (!rounds || rounds < 1) return;
+  const ctx = chatCtx(slug);
+  const countFile = ctx.memoryPath + ".count";
+  let count = Number(await fs.readFile(countFile, "utf8").catch(() => "0")) || 0;
+  count++;
+  if (count < rounds) {
+    await fs.writeFile(countFile, String(count), "utf8");
+    return;
+  }
+  await fs.writeFile(countFile, "0", "utf8");
+  const llm = await resolveChatLLM(card as never);
+  if (!llm?.apiKey) return;
+  const existing = await fs.readFile(ctx.memoryPath, "utf8").catch(() => "");
+  const recent = messages
+    .filter((m) => {
+      const role = (m as { role?: string }).role;
+      return role === "user" || role === "assistant";
+    })
+    .slice(-(rounds * 2))
+    .map((m) => {
+      const r = m as { role?: string; content?: string };
+      return `${r.role === "user" ? "用户" : "角色"}: ${String(r.content ?? "").slice(0, 500)}`;
+    })
+    .join("\n");
+  if (!recent.trim()) return;
+  try {
+    const r = await fetch(`${llm.baseUrl.replace(/\/+$/, "")}/chat/completions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${llm.apiKey}` },
+      body: JSON.stringify({
+        model: llm.model,
+        messages: [
+          {
+            role: "system",
+            content:
+              "你是记忆提取器。从下面的对话中提取【值得长期记住的用户事实】（用户的名字/住址/喜好/重要事件/关系等）。" +
+              "已经记住的不要重复；没有新事实就返回空数组。输出严格 JSON 数组，每项一个字符串，不要任何其他文字。",
+          },
+          { role: "user", content: `已记住的事实：\n${existing || "（无）"}\n\n最近对话：\n${recent}` },
+        ],
+        temperature: 0.2,
+        max_tokens: 400,
+      }),
+      signal: AbortSignal.timeout(45000),
+    });
+    if (!r.ok) return;
+    const data = await r.json();
+    const text = String(data.choices?.[0]?.message?.content ?? "").replace(/```json|```/g, "").trim();
+    const start = text.indexOf("[");
+    const end = text.lastIndexOf("]");
+    if (start === -1 || end === -1) return;
+    const facts = JSON.parse(text.slice(start, end + 1));
+    if (!Array.isArray(facts) || facts.length === 0) return;
+    const lines = facts.map((f) => String(f).trim()).filter(Boolean).slice(0, 10);
+    if (!lines.length) return;
+    await fs.mkdir(path.dirname(ctx.memoryPath), { recursive: true });
+    await fs.appendFile(ctx.memoryPath, lines.join("\n") + "\n", "utf8");
+  } catch {
+    /* 自动记忆失败不影响聊天 */
+  }
+}
+
 app.post("/api/chat/approve", async (req, res) => {
   try {
     const { slug, messages, approve, tools, useMCP } = req.body ?? {};
     if (!slug || !Array.isArray(messages)) return res.status(400).json({ error: "slug / messages 不能为空" });
-    const llm = await getModelLLMConfig();
+    const llm = await resolveChatLLM();
     if (!llm || !llm.apiKey) return res.status(400).json({ error: "未配置模型 API（API 页）" });
     const card = await store.get(slug);
     const enabledTools = Array.isArray(tools) ? (tools as string[]) : [];
@@ -733,11 +898,17 @@ app.get("/api/memory", async (_req, res) => {
   }
 });
 
-app.post("/api/memory/clear", async (_req, res) => {
+app.post("/api/memory/clear", async (req, res) => {
   try {
+    const slug = req.body?.slug;
     const memDir = path.join(dataDir(), "memory");
-    for (const f of await fs.readdir(memDir).catch(() => [])) {
-      await fs.rm(path.join(memDir, f), { force: true }).catch(() => {});
+    if (slug) {
+      await fs.rm(path.join(memDir, `${slug}.mem`), { force: true }).catch(() => {});
+      await fs.rm(path.join(memDir, `${slug}.mem.count`), { force: true }).catch(() => {});
+    } else {
+      for (const f of await fs.readdir(memDir).catch(() => [])) {
+        await fs.rm(path.join(memDir, f), { force: true }).catch(() => {});
+      }
     }
     res.json({ ok: true });
   } catch (e) {
