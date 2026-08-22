@@ -383,37 +383,43 @@ async function refreshHome() {
         setTimeout(() => loadCardIntoEditor(c.slug), 60);
       });
       grid.appendChild(d);
-    }
-  } catch { /* 忽略 */ }
+    }  } catch { /* 忽略 */ }
 }
 
 // ============================================================
-//  视图：人设卡库（表单化编辑 + 聊天测试）
+//  视图：人设卡库（RP-Hub 式头像卡片网格 + 编辑表单）
 // ============================================================
+let cardsGridData = [];
+let cardSearch = "";
+
 function renderCards() {
   return `
-  <div class="cards-layout">
-    <aside class="cards-side">
-      <div class="side-actions">
-        <button id="btn-import-card" class="ghost small-btn">📥 导入 PNG/JSON</button>
-        <input type="file" id="import-file" accept=".png,.json" style="display:none">
-        <a href="#/create" class="btn-like primary small-btn">✏️ 做张新卡</a>
-      </div>
-      <h2>卡库</h2>
-      <ul id="card-list" class="card-list"></ul>
-    </aside>
-    <section class="cards-editor">
-      <div class="editor-head">
-        <h2 id="editor-title">选择左侧卡片</h2>
-        <div class="editor-actions">
-          <button id="btn-export-png" class="ghost">导出 PNG</button>
-          <button id="btn-export-json" class="ghost">导出 JSON</button>
-          <button id="btn-compile">编译到通道</button>
-          <button id="btn-del" class="danger">删除</button>
-          <button id="btn-save" class="primary">保存</button>
+  <div class="view">
+    <div id="cards-grid-view">
+      <div class="lib-head">
+        <div class="page-head" style="margin-bottom:0"><h2>🎴 人设卡库</h2></div>
+        <div class="lib-actions">
+          <input id="card-search" placeholder="检索角色卡名称…" value="${escapeHtml(cardSearch)}">
+          <button id="btn-import-card" class="ghost">📥 导入</button>
+          <input type="file" id="import-file" accept=".png,.json" style="display:none">
+          <a href="#/create" class="btn-like primary">＋ 做卡</a>
         </div>
       </div>
-      <div id="card-form-area" class="card-form-area"><div class="muted" style="padding:30px;text-align:center">从左侧选择一张卡片开始编辑</div></div>
+      <div id="cards-grid" class="cards-grid"></div>
+    </div>
+    <div id="card-edit-view" style="display:none">
+      <div class="editor-head">
+        <button id="btn-back-grid" class="ghost">← 返回卡库</button>
+        <h2 id="editor-title"></h2>
+        <div class="editor-actions">
+          <button id="btn-export-png" class="ghost small-btn">PNG</button>
+          <button id="btn-export-json" class="ghost small-btn">JSON</button>
+          <button id="btn-compile" class="small-btn">编译到通道</button>
+          <button id="btn-del" class="danger small-btn">删除</button>
+          <button id="btn-save" class="primary small-btn">保存</button>
+        </div>
+      </div>
+      <div id="card-form-area" class="card-form-area"></div>
       <div class="chat-test">
         <div class="chat-head">
           <h3>💬 聊天测试 <span id="chat-head-hint" class="hint">普通聊天（用此卡模型）</span></h3>
@@ -451,7 +457,7 @@ function renderCards() {
           <button id="btn-chat-send" class="primary">发送</button>
         </div>
       </div>
-    </section>
+    </div>
   </div>`;
 }
 
@@ -472,6 +478,11 @@ function initCards() {
 
   $("#btn-import-card").addEventListener("click", () => $("#import-file").click());
   $("#import-file").addEventListener("change", importCard);
+  $("#card-search").addEventListener("input", (e) => {
+    cardSearch = e.target.value.trim();
+    renderCardsGrid();
+  });
+  $("#btn-back-grid").addEventListener("click", showCardsGrid);
   $("#btn-export-png").addEventListener("click", () => exportCard("png"));
   $("#btn-export-json").addEventListener("click", () => exportCard("json"));
   $("#btn-compile").addEventListener("click", compileCard);
@@ -482,21 +493,51 @@ function initCards() {
   $("#btn-work-mode").addEventListener("click", toggleWorkMode);
   $("#chat-input").addEventListener("keydown", (e) => { if (e.key === "Enter") sendChat(); });
 
-  loadCardList();
+  loadCardsGrid();
 }
 
-async function loadCardList() {
-  const { cards } = await api.get("/api/cards");
-  const ul = $("#card-list");
-  if (!ul) return;
-  ul.innerHTML = "";
-  for (const c of cards) {
-    const li = document.createElement("li");
-    li.innerHTML = `<div><div class="name">${escapeHtml(c.name)}</div><div class="meta">${c.slug} · ${c.role}</div></div>`;
-    li.addEventListener("click", () => loadCardIntoEditor(c.slug));
-    if (editingCard?.slug === c.slug) li.classList.add("active");
-    ul.appendChild(li);
+async function loadCardsGrid() {
+  try {
+    const { cards } = await api.get("/api/cards");
+    cardsGridData = cards;
+    renderCardsGrid();
+  } catch (e) { $("#cards-grid").innerHTML = `<div class="muted">读取失败：${escapeHtml(e.message)}</div>`; }
+}
+
+function renderCardsGrid() {
+  const grid = $("#cards-grid");
+  if (!grid) return;
+  const kw = cardSearch.toLowerCase();
+  const list = kw
+    ? cardsGridData.filter((c) => c.name.toLowerCase().includes(kw) || c.slug.includes(kw))
+    : cardsGridData;
+  grid.innerHTML = "";
+  if (!list.length) {
+    grid.innerHTML = `<div class="muted" style="grid-column:1/-1;text-align:center;padding:40px 0">
+      ${kw ? "没有匹配的角色卡" : "卡库是空的，点右上「＋ 做卡」创建第一张"}</div>`;
+    return;
   }
+  for (const c of list) {
+    const d = document.createElement("div");
+    d.className = "char-card";
+    d.innerHTML = `
+      <div class="char-card-img">
+        ${c.avatar ? `<img src="${c.avatar}" alt="" loading="lazy">` : `<div class="char-card-ph">${escapeHtml(c.name.slice(0, 1))}</div>`}
+      </div>
+      <div class="char-card-info">
+        <div class="char-card-name">${escapeHtml(c.name)}</div>
+        <div class="meta">${c.role} · v${c.version}</div>
+      </div>`;
+    d.addEventListener("click", () => loadCardIntoEditor(c.slug));
+    grid.appendChild(d);
+  }
+}
+
+function showCardsGrid() {
+  $("#card-edit-view").style.display = "none";
+  $("#cards-grid-view").style.display = "block";
+  editingCard = null;
+  loadCardsGrid();
 }
 
 async function loadCardIntoEditor(slug) {
@@ -504,10 +545,12 @@ async function loadCardIntoEditor(slug) {
     editingCard = await api.get(`/api/cards/${slug}`);
     chatHistory = [];
     $("#chat-log").innerHTML = "";
+    $("#cards-grid-view").style.display = "none";
+    $("#card-edit-view").style.display = "block";
     $("#editor-title").textContent = `编辑：${editingCard.name}`;
     $("#card-form-area").innerHTML = cardFormHTML("edit");
     bindCardForm(editingCard, "edit");
-    loadCardList();
+    $("#view").scrollTop = 0;
   } catch (e) { toast("加载失败：" + e.message, false); }
 }
 
@@ -536,10 +579,7 @@ async function deleteCard() {
   if (!editingCard) return;
   if (!confirm(`确定删除 ${editingCard.name}？不可恢复。`)) return;
   await api.send(`/api/cards/${editingCard.slug}`, { method: "DELETE" });
-  editingCard = null;
-  $("#editor-title").textContent = "选择左侧卡片";
-  $("#card-form-area").innerHTML = '<div class="muted" style="padding:30px;text-align:center">从左侧选择一张卡片开始编辑</div>';
-  loadCardList();
+  showCardsGrid();
 }
 
 async function exportCard(format) {

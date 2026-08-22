@@ -34,6 +34,7 @@ export interface CardMeta {
   role: string;
   updated_at?: string;
   tags: string[];
+  avatar?: string;
 }
 
 export class CardStore {
@@ -85,9 +86,10 @@ export class CardStore {
           slug: e.name,
           name: card.name,
           version: card.version,
-          role: card.identity.role,
+          role: card.identity?.role ?? "friend",
           updated_at: card.updated_at,
-          tags: card.identity.tags,
+          tags: card.identity?.tags ?? [],
+          avatar: card.identity?.avatar || undefined,
         });
       } catch {
         // 目录损坏/未完成导入，跳过

@@ -77,7 +77,10 @@ if (UI_USER && UI_PASS) {
 }
 
 const projectRoot = findProjectRoot();
-app.use(express.static(path.join(projectRoot, "web")));
+// 静态资源不缓存（版本号 query 也已加，双保险防旧 JS/CSS 残留）
+app.use(express.static(path.join(projectRoot, "web"), { etag: true, maxAge: 0, setHeaders: (res) => {
+  res.setHeader("Cache-Control", "no-cache");
+} }));
 // 表情包与生图产物（挂在认证之后，公网同样受 Basic 保护）
 app.use("/emojis", express.static(path.join(dataDir(), "emojis")));
 app.use("/img", express.static(path.join(dataDir(), "images")));

@@ -338,6 +338,41 @@ button:disabled { opacity: 0.45; cursor: not-allowed; transform: none; }
 .editor-actions { display: flex; gap: 6px; flex-wrap: wrap; }
 .card-form-area { min-width: 0; }
 
+/* ============ 卡库（RP-Hub 式头像网格） ============ */
+.lib-head {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 10px; flex-wrap: wrap; margin-bottom: 14px;
+}
+.lib-actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+.lib-actions input[type="text"], .lib-actions input:not([type]) { width: 200px; }
+.cards-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: 12px;
+}
+.char-card {
+  background: var(--card);
+  border: 1.5px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+  cursor: pointer;
+  transition: transform 0.15s, border-color 0.15s, box-shadow 0.2s;
+  box-shadow: var(--shadow);
+}
+.char-card:hover { border-color: var(--accent); transform: translateY(-2px); box-shadow: 0 6px 20px rgba(20, 24, 40, 0.1); }
+.char-card:active { transform: scale(0.97); }
+.char-card-img {
+  aspect-ratio: 2 / 2.6;
+  background: linear-gradient(135deg, #e8ecf7, #dde3f2);
+  overflow: hidden;
+  display: flex; align-items: center; justify-content: center;
+}
+.char-card-img img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.char-card-ph { font-size: 42px; font-weight: 800; color: #b4bdd6; }
+.char-card-info { padding: 10px 12px; }
+.char-card-name { font-size: 14px; font-weight: 700; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.editor-head { margin-bottom: 10px; }
+
 /* ============ 卡片表单 ============ */
 .cf-section {
   background: var(--card);
