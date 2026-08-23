@@ -575,3 +575,17 @@ button:disabled { opacity: 0.45; cursor: not-allowed; transform: none; }
 .ok-badge { color: #26a65b; font-weight: 600; font-size: 12px; }
 .warn-badge { color: #d97706; font-weight: 600; font-size: 12px; }
 .bot-login-area { margin-top: 10px; }
+
+/* ============ 高级配置弹窗（编辑卡右上角入口） ============ */
+.adv-dialog { width: min(640px, 94vw); }
+.adv-sec { border-top: 1px solid var(--border); padding: 12px 0 4px; margin-top: 8px; }
+.adv-sec h4 { margin: 0 0 8px; font-size: 13.5px; }
+.adv-abilities { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 8px; }
+.adv-switch {
+  display: flex; align-items: flex-start; gap: 8px; padding: 8px 10px;
+  border: 1px solid var(--border); border-radius: 8px; cursor: pointer; font-size: 13px;
+}
+.adv-switch:hover { border-color: var(--accent); }
+.adv-switch input { margin-top: 2px; }
+.adv-switch span { display: flex; flex-direction: column; gap: 2px; }
+.adv-switch small { color: #8a92a8; font-size: 11.5px; }

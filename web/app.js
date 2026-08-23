@@ -373,6 +373,7 @@ function renderCards() {
         <button id="btn-back-grid" class="ghost">← 返回卡库</button>
         <h2 id="editor-title"></h2>
         <div class="editor-actions">
+          <button id="btn-adv-config" class="ghost small-btn">⚙ 高级配置</button>
           <button id="btn-export-png" class="ghost small-btn">PNG</button>
           <button id="btn-export-json" class="ghost small-btn">JSON</button>
           <button id="btn-compile" class="small-btn">编译到通道</button>
@@ -383,7 +384,7 @@ function renderCards() {
       <div id="card-form-area" class="card-form-area"></div>
       <div class="chat-test">
         <div class="chat-head">
-          <h3>💬 聊天测试 <span id="chat-head-hint" class="hint">普通聊天（用此卡模型）</span></h3>
+          <h3>💬 聊天测试 <span id="chat-head-hint" class="hint">普通聊天（按此卡「高级配置」走）</span></h3>
           <div>
             <button id="btn-work-mode" class="ghost small-btn">🔧 工作模式</button>
             <button id="btn-chat-clear" class="ghost small-btn">清空</button>
@@ -444,6 +445,7 @@ function initCards() {
     renderCardsGrid();
   });
   $("#btn-back-grid").addEventListener("click", showCardsGrid);
+  $("#btn-adv-config").addEventListener("click", () => openAdvConfig());
   $("#btn-export-png").addEventListener("click", () => exportCard("png"));
   $("#btn-export-json").addEventListener("click", () => exportCard("json"));
   $("#btn-compile").addEventListener("click", compileCard);
@@ -648,6 +650,123 @@ async function startBotLogin(botId) {
       }
     } catch { /* 轮询失败忽略 */ }
   }, 1500);
+}
+
+// ============================================================
+//  高级配置（编辑卡时右上角入口）：机器人接入 + 模型 + 能力开关
+// ============================================================
+let advChatProviders = [];
+
+function closeAdvConfig() {
+  if (botLoginTimer) { clearInterval(botLoginTimer); botLoginTimer = null; }
+  $("#adv-overlay")?.remove();
+  botDialogSlug = "";
+}
+
+async function openAdvConfig() {
+  if (!editingCard) return;
+  closeAdvConfig();
+  closeBotDialog();
+  botDialogSlug = editingCard.slug;
+  const prov = await api.get("/api/providers").catch(() => ({ chat: [] }));
+  advChatProviders = prov.chat ?? [];
+  botsData = await api.get("/api/bots").catch(() => ({ bots: [] }));
+  const bot = (botsData.bots ?? []).find((b) => b.cardSlug === editingCard.slug);
+  const cur = editingCard.model ?? {};
+  const provOpts = [`<option value="">（跟随默认提供商）</option>`]
+    .concat(advChatProviders.map((p) => `<option value="${escapeHtml(p.name)}" ${p.name === cur.provider ? "selected" : ""}>${escapeHtml(p.name)}${p.isDefault ? "（默认）" : ""}</option>`))
+    .join("");
+  const curProv = advChatProviders.find((p) => p.name === cur.provider);
+  const modelOpts = [`<option value="">（用提供商第一个模型）</option>`]
+    .concat((curProv?.models ?? []).map((m) => `<option value="${escapeHtml(m)}" ${m === cur.model ? "selected" : ""}>${escapeHtml(m)}</option>`))
+    .join("");
+  const enabledTools = new Set(editingCard.tools?.enabled ?? []);
+  const ab = editingCard.abilities ?? {};
+  const toolSwitch = (id, label, desc) => `
+    <label class="adv-switch"><input type="checkbox" data-adv-tool="${id}" ${enabledTools.has(id) ? "checked" : ""}>
+      <span><b>${label}</b><small>${desc}</small></span></label>`;
+  const ov = document.createElement("div");
+  ov.id = "adv-overlay";
+  ov.className = "bot-overlay";
+  ov.innerHTML = `<div class="bot-dialog adv-dialog">
+    <div class="bot-dialog-head">
+      <h3>⚙ 高级配置 · ${escapeHtml(editingCard.name)}</h3>
+      <button class="ghost small-btn" id="adv-close">✕</button>
+    </div>
+
+    <div class="adv-sec">
+      <h4>🧠 模型（这张卡单独用哪个模型）</h4>
+      <div class="bot-form">
+        <label>提供商：<select id="adv-model-provider">${provOpts}</select></label>
+        <label>模型：<select id="adv-model-id">${modelOpts}</select></label>
+      </div>
+    </div>
+
+    <div class="adv-sec">
+      <h4>⚡ 能力开关（普通聊天与机器人的默认行为）</h4>
+      <div class="adv-abilities">
+        ${toolSwitch("web_search", "联网搜索", "可搜索实时信息")}
+        ${toolSwitch("image_gen", "生图", "AI 画图（需在生图配置页设置上游）")}
+        ${toolSwitch("code_exec", "写代码", "沙箱运行代码")}
+        ${toolSwitch("memory_save", "长期记忆", "记住关于你和它的事")}
+        ${toolSwitch("weather", "天气", "查天气预报")}
+        ${toolSwitch("datetime", "时间", "报日期时间")}
+        <label class="adv-switch"><input type="checkbox" id="adv-skill" ${ab.skills !== false ? "checked" : ""}>
+          <span><b>技能库</b><small>代码专家/翻译/写作/陪伴</small></span></label>
+        <label class="adv-switch"><input type="checkbox" id="adv-tts" ${ab.tts === true ? "checked" : ""}>
+          <span><b>TTS 朗读</b><small>自动语音朗读回复（语音合成页配置）</small></span></label>
+      </div>
+      <p class="hint">网页「普通聊天」按这里的开关走；「工作模式」仍可临时手动勾选。QQ/微信机器人侧工具随 OpenClaw 端策略接入逐步生效。</p>
+    </div>
+
+    <div class="adv-sec">
+      <h4>🤖 机器人接入（这张卡单独接 QQ / 微信）</h4>
+      <div id="bot-dialog-body"></div>
+    </div>
+
+    <div class="row" style="justify-content:flex-end;margin-top:6px">
+      <button id="adv-save" class="primary">保存配置</button>
+    </div>
+  </div>`;
+  document.body.appendChild(ov);
+  ov.addEventListener("click", (e) => { if (e.target === ov) closeAdvConfig(); });
+  $("#adv-close").addEventListener("click", closeAdvConfig);
+  renderBotBody(bot ?? null);
+
+  $("#adv-model-provider").addEventListener("change", (e) => {
+    const p = advChatProviders.find((x) => x.name === e.target.value);
+    $("#adv-model-id").innerHTML = [`<option value="">（用提供商第一个模型）</option>`]
+      .concat((p?.models ?? []).map((m) => `<option value="${escapeHtml(m)}">${escapeHtml(m)}</option>`))
+      .join("");
+  });
+
+  $("#adv-save").addEventListener("click", async () => {
+    const btn = $("#adv-save");
+    btn.disabled = true; btn.textContent = "保存中…";
+    try {
+      const provider = $("#adv-model-provider").value;
+      const model = $("#adv-model-id").value;
+      editingCard.model = provider ? { provider, ...(model ? { model } : {}) } : {};
+      editingCard.tools = editingCard.tools ?? { enabled: [], policy: "auto", deny: [] };
+      editingCard.tools.enabled = [...document.querySelectorAll("[data-adv-tool]")].filter((c) => c.checked).map((c) => c.dataset.advTool);
+      editingCard.abilities = { skills: $("#adv-skill").checked, tts: $("#adv-tts").checked };
+      const res = await api.send(`/api/cards/${editingCard.slug}`, { method: "PUT", body: JSON.stringify(editingCard) });
+      editingCard = res.card ?? editingCard;
+      toast("✓ 高级配置已保存 v" + editingCard.version);
+      closeAdvConfig();
+    } catch (e) {
+      toast("保存失败：" + e.message, false);
+      btn.disabled = false; btn.textContent = "保存配置";
+    }
+  });
+}
+
+/** 普通聊天的默认行为来自卡「高级配置」 */
+function cardChatOptions() {
+  const c = editingCard ?? {};
+  const tools = Array.isArray(c.tools?.enabled) ? [...c.tools.enabled] : [];
+  const skills = c.abilities?.skills === false ? [] : ["code_expert", "translator", "writing", "companion"];
+  return { tools, useMCP: false, skills, thinking: "auto" };
 }
 
 function showCardsGrid() {
@@ -1819,8 +1938,9 @@ function toggleWorkMode() {
   btn.textContent = workMode ? "💬 聊天模式" : "🔧 工作模式";
   btn.classList.toggle("active", workMode);
   $(".chat-opts").style.display = workMode ? "flex" : "none";
-  $("#chat-head-hint").textContent = workMode ? "工作模式：开放工具/技能" : "普通聊天（用此卡模型）";
+  $("#chat-head-hint").textContent = workMode ? "工作模式：开放工具/技能" : "普通聊天（按此卡「高级配置」走）";
 }
+let lastChatOpts = null;
 async function sendChat() {
   const input = $("#chat-input");
   const message = input.value.trim();
@@ -1831,7 +1951,9 @@ async function sendChat() {
   chatHistory.push({ role: "user", content: message });
   const btn = $("#btn-chat-send");
   btn.disabled = true;
-  const opts = workMode ? gatherChatOptions() : { tools: [], useMCP: false, skills: [], thinking: "auto" };
+  // 工作模式=手动勾选；普通聊天=卡「高级配置」的模型工具技能
+  lastChatOpts = workMode ? gatherChatOptions() : cardChatOptions();
+  const opts = lastChatOpts;
   try {
     const r = await api.send("/api/chat", {
       method: "POST",
@@ -1848,6 +1970,7 @@ async function finishTurn(r) {
   if (r.type === "reply") {
     addChatBubble("bot", r.reply);
     chatHistory.push({ role: "assistant", content: r.reply });
+    if (!workMode && editingCard?.abilities?.tts) speakText(r.reply); // 高级配置开了 TTS → 自动朗读
   } else if (r.type === "pending") {
     const bubble = addChatBubble("bot", "🛡️ 需要你确认：机器人想调用\n" + r.pending.map((p) => "· " + p.name).join("\n"));
     const row = document.createElement("div");
@@ -1856,7 +1979,7 @@ async function finishTurn(r) {
     ok.className = "small-btn primary"; ok.textContent = "✅ 执行";
     const no = document.createElement("button");
     no.className = "small-btn danger"; no.textContent = "🚫 拒绝";
-    pendingData = { slug: editingCard.slug, messages: r.messages, tools: gatherChatOptions().tools, useMCP: $("#tool-mcp").checked, approve: false };
+    pendingData = { slug: editingCard.slug, messages: r.messages, tools: lastChatOpts?.tools ?? gatherChatOptions().tools, useMCP: lastChatOpts?.useMCP ?? $("#tool-mcp").checked, approve: false };
     ok.addEventListener("click", async () => { row.remove(); pendingData.approve = true; await sendApprove(); });
     no.addEventListener("click", async () => { row.remove(); pendingData.approve = false; await sendApprove(); });
     row.append(ok, no);

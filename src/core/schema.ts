@@ -218,13 +218,28 @@ const ethicsSchema = z.object({
 });
 
 // ---------- 工具（能力层，让机器人不只是聊天） ----------
-export const TOOL_IDS = ["code_exec", "web_search", "weather", "datetime"] as const;
+export const TOOL_IDS = [
+  "code_exec",
+  "web_search",
+  "weather",
+  "datetime",
+  "memory_save",
+  "image_gen",
+] as const;
 
 const toolsSchema = z
   .object({
     enabled: z.array(z.enum(TOOL_IDS)).default([]),
     policy: z.enum(["auto", "ask"]).default("auto"),
     deny: z.array(z.string()).default([]),
+  })
+  .default({});
+
+// ---------- 高级配置：能力开关（每卡，普通聊天/机器人的默认行为） ----------
+const cardAbilitiesSchema = z
+  .object({
+    skills: z.boolean().default(true), // 技能库（代码专家/翻译/写作/陪伴）
+    tts: z.boolean().default(false), // 自动朗读回复（网页聊天）
   })
   .default({});
 
@@ -275,6 +290,7 @@ export const personaCardSchema = z.object({
   presets: presetsSchema.default({}),
   tools: toolsSchema,
   model: cardModelSchema,
+  abilities: cardAbilitiesSchema,
   memoryConfig: memoryConfigSchema,
   emojis: z.array(emojiSchema).max(120).default([]),
   sillytavern_v2: sillytavernSchema.optional(),
