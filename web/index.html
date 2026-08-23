@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
   <title>openclaw-shell</title>
-  <link rel="stylesheet" href="style.css?v=4" />
+  <link rel="stylesheet" href="style.css?v=5" />
 </head>
 <body>
   <div id="app">
@@ -16,39 +16,33 @@
 
     <div id="drawer-overlay" class="drawer-overlay" hidden></div>
     <aside id="drawer" class="drawer">
-      <div class="drawer-user">
-        <div class="avatar">🦞</div>
+      <button id="drawer-user-btn" class="drawer-user" title="编辑昵称与头像">
+        <div class="avatar" id="drawer-avatar"></div>
         <div class="drawer-user-info">
-          <div class="uname">本地用户</div>
+          <div class="uname" id="drawer-uname">本地用户</div>
           <div class="umeta" id="drawer-meta">openclaw-shell</div>
         </div>
-      </div>
+        <span class="drawer-user-edit" title="编辑资料"></span>
+      </button>
       <nav class="drawer-nav">
-        <a href="#/home" data-route="home">🏠 首页</a>
-        <a href="#/cards" data-route="cards">🎴 人设卡库</a>
-        <a href="#/create" data-route="create">✏️ 做卡</a>
-        <a href="#/distill" data-route="distill">🧪 蒸馏工厂</a>
-        <a href="#/channels" data-route="channels">💬 通道连接</a>
-        <a href="#/api" data-route="api">⚡ API 与模型</a>
-        <a href="#/imagegen" data-route="imagegen">🎨 生图配置</a>
-        <a href="#/tts" data-route="tts">🔊 语音合成</a>
-        <a href="#/memory" data-route="memory">🧠 记忆</a>
-        <a href="#/capabilities" data-route="capabilities">🛠 能力中心</a>
-        <a href="#/data" data-route="data">📦 数据</a>
-        <a href="#/settings" data-route="settings">⚙️ 设置</a>
+        <a href="#/home" data-route="home" data-icon="home">首页</a>
+        <a href="#/cards" data-route="cards" data-icon="layers">人设卡库</a>
+        <a href="#/create" data-route="create" data-icon="pen">做卡</a>
+        <a href="#/distill" data-route="distill" data-icon="flask">蒸馏工厂</a>
+        <a href="#/channels" data-route="channels" data-icon="chat">通道连接</a>
+        <a href="#/api" data-route="api" data-icon="zap">API 与模型</a>
+        <a href="#/imagegen" data-route="imagegen" data-icon="image">生图配置</a>
+        <a href="#/tts" data-route="tts" data-icon="volume">语音合成</a>
+        <a href="#/memory" data-route="memory" data-icon="database">记忆</a>
+        <a href="#/capabilities" data-route="capabilities" data-icon="tool">能力中心</a>
+        <a href="#/data" data-route="data" data-icon="package">数据</a>
+        <a href="#/settings" data-route="settings" data-icon="settings">设置</a>
       </nav>
       <div class="drawer-foot">数据保存在本机，不上传</div>
     </aside>
 
     <main id="view" class="view-main"></main>
-
-    <nav class="bottom-nav">
-      <a href="#/home" data-route="home">🏠<span>首页</span></a>
-      <a href="#/cards" data-route="cards">🎴<span>卡库</span></a>
-      <a href="#/create" data-route="create">✏️<span>做卡</span></a>
-      <a href="#/memory" data-route="memory">🧠<span>记忆</span></a>
-    </nav>
   </div>
-  <script src="app.js?v=4"></script>
+  <script src="app.js?v=5"></script>
 </body>
 </html>

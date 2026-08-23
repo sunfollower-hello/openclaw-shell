@@ -124,6 +124,48 @@ app.get("/api/health", (_req, res) => {
   res.json({ ok: true, service: "openclaw-shell", schema: SCHEMA_VERSION, port: PORT, dataDir: dataDir() });
 });
 
+// ---------- 用户资料（抽屉头像/昵称，可编辑） ----------
+const PROFILE_FILE = () => path.join(dataDir(), "user-profile.json");
+app.get("/api/profile", async (_req, res) => {
+  try {
+    res.json(JSON.parse(await fs.readFile(PROFILE_FILE(), "utf8")));
+  } catch {
+    res.json({ name: "本地用户", avatar: "" });
+  }
+});
+app.post("/api/profile", async (req, res) => {
+  try {
+    const { name, avatar } = req.body ?? {};
+    const profile = {
+      name: String(name ?? "").trim().slice(0, 40) || "本地用户",
+      avatar: typeof avatar === "string" && avatar.startsWith("data:image/") && avatar.length < 1_500_000 ? avatar : "",
+    };
+    await fs.writeFile(PROFILE_FILE(), JSON.stringify(profile), "utf8");
+    res.json({ ok: true, profile });
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+// ---------- 首页公告 ----------
+const ANNOUNCEMENT_FILE = () => path.join(dataDir(), "announcement.json");
+app.get("/api/announcement", async (_req, res) => {
+  try {
+    res.json(JSON.parse(await fs.readFile(ANNOUNCEMENT_FILE(), "utf8")));
+  } catch {
+    res.json({ text: "", updatedAt: "" });
+  }
+});
+app.post("/api/announcement", async (req, res) => {
+  try {
+    const announcement = { text: String(req.body?.text ?? "").slice(0, 2000), updatedAt: nowIso() };
+    await fs.writeFile(ANNOUNCEMENT_FILE(), JSON.stringify(announcement), "utf8");
+    res.json({ ok: true, announcement });
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
+
 app.get("/api/cards", async (_req, res) => {
   try {
     res.json({ cards: await store.list() });

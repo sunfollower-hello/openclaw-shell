@@ -3,15 +3,28 @@ const $ = (sel) => document.querySelector(sel);
 const $$ = (sel) => document.querySelectorAll(sel);
 
 // ================= 基础 =================
+// 某些浏览器（如内嵌 webview）打开 URL 内嵌凭据（user:pass@host）时，页面内 fetch 不会自动携带，
+// 首次 401 就用 URL 里的凭据显式重试一次
+async function fetchApi(path, options = {}) {
+  let r = await fetch(path, options);
+  if (r.status === 401 && location.username) {
+    const token = btoa(unescape(encodeURIComponent(`${location.username}:${location.password}`)));
+    r = await fetch(path, {
+      ...options,
+      headers: { ...(options.headers ?? {}), Authorization: "Basic " + token },
+    });
+  }
+  return r;
+}
 const api = {
   async get(path) {
-    const r = await fetch(path);
+    const r = await fetchApi(path);
     const data = await r.json().catch(() => ({}));
     if (!r.ok) throw new Error(data.error || r.statusText);
     return data;
   },
   async send(path, options = {}) {
-    const r = await fetch(path, { headers: { "Content-Type": "application/json" }, ...options });
+    const r = await fetchApi(path, { headers: { "Content-Type": "application/json" }, ...options });
     const data = await r.json().catch(() => ({}));
     if (!r.ok) throw new Error(data.error || r.statusText);
     return data;
@@ -55,6 +68,127 @@ function capDefaults() {
 }
 function saveCapDefaults(d) { localStorage.setItem(DEFAULTS_KEY, JSON.stringify(d)); }
 
+// ================= 图标（内联 SVG，线性风格） =================
+const ICONS = {
+  home: '<path d="M3 9.5 12 3l9 6.5V20a1.5 1.5 0 0 1-1.5 1.5h-15A1.5 1.5 0 0 1 3 20z"/><path d="M9 21.5v-7h6v7"/>',
+  layers: '<path d="M12 2.5 2.5 7.5 12 12.5l9.5-5z"/><path d="M2.5 16.5 12 21.5l9.5-5"/><path d="M2.5 12 12 17l9.5-5"/>',
+  pen: '<path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"/>',
+  flask: '<path d="M9.5 3h5"/><path d="M10 3v5.2L4.6 18.6A2 2 0 0 0 6.4 21.5h11.2a2 2 0 0 0 1.8-2.9L14 8.2V3"/><path d="M7.5 15h9"/>',
+  chat: '<path d="M21 11.5a8.4 8.4 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.4 8.4 0 0 1-3.8-.9L3 21l1.9-5.7a8.4 8.4 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.4 8.4 0 0 1 3.8-.9h.5a8.5 8.5 0 0 1 8 7.95z"/>',
+  zap: '<path d="M13 2 3 14h9l-1 8 10-12h-9z"/>',
+  image: '<rect x="3" y="3" width="18" height="18" rx="2.5"/><circle cx="8.5" cy="8.5" r="1.6"/><path d="M21 15.5 16 10.5 5 21"/>',
+  volume: '<path d="M11 5 6 9H2v6h4l5 4z"/><path d="M15.5 8.5a5 5 0 0 1 0 7"/><path d="M18.8 5.2a9.5 9.5 0 0 1 0 13.6"/>',
+  database: '<ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v14c0 1.66 3.58 3 8 3s8-1.34 8-3V5"/><path d="M4 12c0 1.66 3.58 3 8 3s8-1.34 8-3"/>',
+  tool: '<path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/>',
+  package: '<path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><path d="m3.3 7 8.7 5 8.7-5"/><path d="M12 22V12"/>',
+  settings: '<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33h.08a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51h.08a1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82v.08a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>',
+  download: '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="m7 10 5 5 5-5"/><path d="M12 15V3"/>',
+  plus: '<path d="M12 5v14"/><path d="M5 12h14"/>',
+  save: '<path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><path d="M17 21v-8H7v8"/><path d="M7 3v5h8"/>',
+  bot: '<rect x="4" y="8.5" width="16" height="11.5" rx="2.5"/><path d="M12 8.5V5.5"/><circle cx="12" cy="3.8" r="1.3"/><path d="M9 14.5h.01M15 14.5h.01" stroke-width="2.4"/>',
+  search: '<circle cx="11" cy="11" r="7.5"/><path d="m21 21-4.35-4.35"/>',
+  x: '<path d="M18 6 6 18"/><path d="m6 6 12 12"/>',
+  trash: '<path d="M3 6h18"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>',
+  shield: '<path d="M12 22s8-3.5 8-10V5.5L12 2 4 5.5V12c0 6.5 8 10 8 10z"/>',
+  check: '<path d="M20 6 9 17l-5-5"/>',
+  clipboard: '<rect x="8" y="2.5" width="8" height="4" rx="1"/><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/>',
+  user: '<path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/>',
+  info: '<circle cx="12" cy="12" r="9.5"/><path d="M12 16v-4.5"/><path d="M12 8h.01"/>',
+  message: '<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>',
+  book: '<path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/>',
+  send: '<path d="m22 2-7 20-4-9-9-4z"/><path d="M22 2 11 13"/>',
+};
+function icon(name, size) {
+  return `<svg class="ic${size ? " ic-" + size : ""}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICONS[name] ?? ""}</svg>`;
+}
+
+// ================= 用户资料（昵称/头像，后端 data/user-profile.json） =================
+let userProfile = { name: "本地用户", avatar: "" };
+function applyProfileToUI() {
+  const avatarEl = $("#drawer-avatar");
+  const nameEl = $("#drawer-uname");
+  if (!avatarEl || !nameEl) return;
+  if (userProfile.avatar) {
+    avatarEl.innerHTML = "";
+    const img = document.createElement("img");
+    img.src = userProfile.avatar;
+    img.alt = "头像";
+    avatarEl.appendChild(img);
+  } else {
+    avatarEl.textContent = (userProfile.name || "本").slice(0, 1);
+  }
+  nameEl.textContent = userProfile.name || "本地用户";
+}
+async function loadProfile() {
+  try {
+    userProfile = await api.get("/api/profile");
+  } catch { /* 默认值 */ }
+  applyProfileToUI();
+  // 首页横幅可能已在资料加载前渲染，补一次同步
+  const hash = (location.hash || "").replace(/^#\/?/, "") || "home";
+  if (hash === "home") refreshHome();
+}
+function openProfileDialog() {
+  const old = $("#profile-overlay");
+  if (old) old.remove();
+  const ov = document.createElement("div");
+  ov.id = "profile-overlay";
+  ov.className = "bot-overlay";
+  ov.innerHTML = `<div class="bot-dialog profile-dialog">
+    <div class="bot-dialog-head">
+      <h3>${icon("user")} 编辑资料</h3>
+      <button class="ghost small-btn" id="profile-close">${icon("x")}</button>
+    </div>
+    <div class="profile-body">
+      <div class="profile-avatar-row">
+        <div class="profile-avatar" id="profile-avatar-box">${userProfile.avatar ? `<img src="${userProfile.avatar}" alt="">` : (userProfile.name || "本").slice(0, 1)}</div>
+        <div>
+          <label class="btn-like">${icon("download")} 上传头像（PNG/JPG）
+            <input type="file" id="profile-avatar-file" accept=".png,.jpg,.jpeg" hidden>
+          </label>
+          <button class="ghost small-btn" id="profile-avatar-remove">移除头像</button>
+        </div>
+      </div>
+      <label>昵称</label>
+      <input id="profile-name" maxlength="40" value="${escapeHtml(userProfile.name)}" placeholder="给自己起个名字">
+      <div class="row" style="justify-content:flex-end;margin-top:8px">
+        <button id="profile-save" class="primary">${icon("check")} 保存</button>
+      </div>
+    </div>
+  </div>`;
+  document.body.appendChild(ov);
+  ov.addEventListener("click", (e) => { if (e.target === ov) ov.remove(); });
+  $("#profile-close").addEventListener("click", () => ov.remove());
+  let newAvatar = userProfile.avatar;
+  $("#profile-avatar-file").addEventListener("change", async (e) => {
+    const f = e.target.files[0];
+    if (!f) return;
+    if (f.size > 1_000_000) return toast("头像请小于 1MB", false);
+    const b64 = await fileToBase64(f);
+    newAvatar = `data:${f.type || "image/png"};base64,${b64}`;
+    $("#profile-avatar-box").innerHTML = `<img src="${newAvatar}" alt="">`;
+  });
+  $("#profile-avatar-remove").addEventListener("click", () => {
+    newAvatar = "";
+    $("#profile-avatar-box").textContent = ($("#profile-name").value || "本").slice(0, 1);
+  });
+  $("#profile-name").addEventListener("input", (e) => {
+    if (!newAvatar) $("#profile-avatar-box").textContent = (e.target.value || "本").slice(0, 1);
+  });
+  $("#profile-save").addEventListener("click", async () => {
+    const name = $("#profile-name").value.trim();
+    if (!name) return toast("昵称不能为空", false);
+    try {
+      const r = await api.send("/api/profile", { method: "POST", body: JSON.stringify({ name, avatar: newAvatar }) });
+      userProfile = r.profile;
+      applyProfileToUI();
+      ov.remove();
+      toast("✓ 资料已保存");
+      refreshHome();
+    } catch (e) { toast("保存失败：" + e.message, false); }
+  });
+}
+
 // ================= 全局状态 =================
 let editingCard = null;
 let chatHistory = [];
@@ -96,7 +230,7 @@ function router() {
   $("#view").innerHTML = route.render();
   closeDrawer();
   $("#view").scrollTop = 0;
-  document.querySelectorAll(".bottom-nav a, .drawer-nav a").forEach((a) =>
+  document.querySelectorAll(".drawer-nav a").forEach((a) =>
     a.classList.toggle("active", a.dataset.route === hash)
   );
   route.init();
@@ -116,7 +250,7 @@ function wbRowHTML(e) {
         <label><input type="checkbox" class="wb-enabled" ${e?.enabled !== false ? "checked" : ""}> 启用</label>
         <label title="多条条目同时触发时的排序">顺序 <input type="number" class="wb-order" min="0" value="${e?.insertion_order ?? 100}" style="width:56px"></label>
       </span>
-      <button class="wb-del danger small-btn" type="button">✕</button>
+      <button class="wb-del danger small-btn" type="button">${icon("x")}</button>
     </div>
     <input class="wb-keys" placeholder="触发关键词，逗号分隔（常驻条目可留空）" value="${escapeHtml(keys)}">
     <textarea class="wb-content" rows="4" placeholder="条目内容……（角色的血肉都写在这里：外貌、性格、语言风格、背景、喜好、雷区……）">${escapeHtml(e?.content ?? "")}</textarea>
@@ -125,7 +259,7 @@ function wbRowHTML(e) {
 
 function cardFormHTML(mode) {
   return `
-  <div class="cf-section"><h3>📋 基本信息</h3>
+  <div class="cf-section"><h3>${icon("info")} 基本信息</h3>
     <div class="cf-grid">
       <div><label>名称</label><input id="cf-name" placeholder="如：许桃"></div>
       ${mode === "create" ? `<div><label>slug（留空自动）</label><input id="cf-slug" placeholder="xutao"></div>` : ""}
@@ -144,21 +278,21 @@ function cardFormHTML(mode) {
       <input type="file" id="cf-avatar" accept=".png">
     </div>
   </div>
-  <div class="cf-section"><h3>👋 开场白</h3>
+  <div class="cf-section"><h3>${icon("message")} 开场白</h3>
     <textarea id="cf-first" rows="3" placeholder="新对话开始时，角色说/做的第一段话。写成一个有画面感的小场景，别只写一句问候"></textarea>
   </div>
-  <div class="cf-section"><h3>📚 世界书 <span class="hint">（角色设定的核心都在这里：人格、语气、背景、人物关系……常驻条目始终生效；有触发关键词的条目，聊天出现关键词时才注入）</span></h3>
+  <div class="cf-section"><h3>${icon("book")} 世界书 <span class="hint">（角色的血肉都在这里；常驻条目始终生效，带关键词的条目被触发时注入）</span></h3>
     <div id="cf-book"></div>
-    <button id="cf-book-add" class="ghost small-btn" type="button">＋ 添加条目</button>
+    <button id="cf-book-add" class="ghost small-btn" type="button">${icon("plus")} 添加条目</button>
   </div>
-  <div class="cf-section"><h3>⚡ 模型（此卡专用，留空跟随默认 API）</h3>
+  <div class="cf-section"><h3>${icon("zap")} 模型 <span class="hint">（此卡专用，留空跟随默认）</span></h3>
     <div class="cf-grid2">
       <div><label>API 提供商</label><select id="cf-provider"><option value="">（跟随默认）</option></select></div>
       <div><label>模型</label><select id="cf-model"><option value="">（跟随默认）</option></select></div>
     </div>
   </div>
-  <div class="cf-section"><h3>🧠 记忆</h3>
-    <label>每 <input id="cf-rounds" type="number" min="1" max="50" value="20" style="width:64px;display:inline-block;text-align:center"> 轮对话自动总结一次（1-50，默认 20；内容在「记忆」页管理）</label>
+  <div class="cf-section"><h3>${icon("database")} 记忆</h3>
+    <label>每 <input id="cf-rounds" type="number" min="1" max="50" value="20" style="width:64px;display:inline-block;text-align:center"> 轮对话自动总结一次（1-50）</label>
   </div>`;
 }
 
@@ -261,89 +395,137 @@ function collectCardForm(card, mode) {
 }
 
 // ============================================================
-//  视图：首页
+//  视图：首页（欢迎横幅 + 公告 + 快捷入口 + 卡库速览）
 // ============================================================
+function greeting() {
+  const h = new Date().getHours();
+  if (h < 5) return "夜深了";
+  if (h < 11) return "早上好";
+  if (h < 14) return "中午好";
+  if (h < 18) return "下午好";
+  return "晚上好";
+}
+
 function renderHome() {
   return `
-  <div class="view">
-    <div class="home-status">
-      <div class="status-card"><div class="status-head"><span class="big">⚡</span> 模型</div>
-        <div id="hs-model" class="meta">检测中…</div><button class="ghost small-btn" data-go="api">去配置</button></div>
-      <div class="status-card"><div class="status-head"><span class="big">💬</span> 微信</div>
-        <div id="hs-wx" class="meta">检测中…</div><button class="ghost small-btn" data-go="channels">去绑定</button></div>
-      <div class="status-card"><div class="status-head"><span class="big">🐧</span> QQ</div>
-        <div id="hs-qq" class="meta">检测中…</div><button class="ghost small-btn" data-go="channels">去绑定</button></div>
-    </div>
-    <div class="card-box">
-      <h3>🚀 快速上手</h3>
-      <div class="steps">
-        <div class="step" id="step-api"><span class="dot"></span>① 配置 API</div>
-        <div class="step" id="step-card"><span class="dot"></span>② 建卡 / 导入</div>
-        <div class="step" id="step-channel"><span class="dot"></span>③ 绑定通道</div>
-        <div class="step" id="step-chat"><span class="dot"></span>④ 开始聊天</div>
+  <div class="view home-view">
+    <div class="home-hero">
+      <div class="home-hero-main">
+        <div class="home-hero-hi">${greeting()}，<span id="home-uname">${escapeHtml(userProfile.name)}</span></div>
+        <div class="home-hero-sub" id="home-hero-sub">正在读取工作台状态…</div>
       </div>
-      <div class="row" style="margin-top:10px">
-        <button class="primary" data-go="create">✏️ 去做卡</button>
-        <button data-go="cards">🎴 卡库</button>
-        <button data-go="channels">💬 绑定通道</button>
+      <div class="home-hero-avatar" id="home-avatar">${userProfile.avatar ? `<img src="${userProfile.avatar}" alt="">` : escapeHtml((userProfile.name || "本").slice(0, 1))}</div>
+    </div>
+
+    <div class="card-box home-notice">
+      <div class="home-notice-head">
+        <h3>${icon("clipboard")} 公告</h3>
+        <button id="notice-edit" class="ghost small-btn" title="编辑公告">${icon("pen")} 编辑</button>
       </div>
+      <div id="home-notice-body" class="home-notice-body muted">—</div>
     </div>
-    <div class="card-box">
-      <h3>⚡ 当前生效人设</h3>
-      <div id="home-active-box" class="active-box">—</div>
+
+    <div class="home-quick">
+      <a class="quick-item" href="#/create">${icon("pen")}<span>做卡</span></a>
+      <a class="quick-item" href="#/cards">${icon("layers")}<span>卡库</span></a>
+      <a class="quick-item" href="#/distill">${icon("flask")}<span>蒸馏</span></a>
+      <a class="quick-item" href="#/channels">${icon("chat")}<span>通道</span></a>
+      <a class="quick-item" href="#/tts">${icon("volume")}<span>语音</span></a>
+      <a class="quick-item" href="#/imagegen">${icon("image")}<span>生图</span></a>
     </div>
+
     <div class="card-box">
-      <h3>🎴 人设卡库</h3>
+      <div class="home-cards-head"><h3>${icon("layers")} 卡库速览</h3><a class="ghost small-btn" href="#/cards">全部 →</a></div>
       <div id="home-card-grid" class="card-grid"></div>
     </div>
   </div>`;
 }
 
 function initHome() {
-  document.querySelectorAll("[data-go]").forEach((b) =>
-    b.addEventListener("click", () => (location.hash = "#/" + b.dataset.go))
-  );
+  $("#notice-edit").addEventListener("click", openNoticeEditor);
   refreshHome();
+}
+
+function openNoticeEditor() {
+  const old = $("#notice-overlay");
+  if (old) old.remove();
+  const ov = document.createElement("div");
+  ov.id = "notice-overlay";
+  ov.className = "bot-overlay";
+  ov.innerHTML = `<div class="bot-dialog profile-dialog">
+    <div class="bot-dialog-head">
+      <h3>${icon("clipboard")} 编辑公告</h3>
+      <button class="ghost small-btn" id="notice-close">${icon("x")}</button>
+    </div>
+    <div class="profile-body">
+      <label>公告内容（显示在首页，支持换行）</label>
+      <textarea id="notice-text" rows="5" maxlength="2000"></textarea>
+      <div class="row" style="justify-content:flex-end;margin-top:8px">
+        <button id="notice-save" class="primary">${icon("check")} 保存</button>
+      </div>
+    </div>
+  </div>`;
+  document.body.appendChild(ov);
+  ov.addEventListener("click", (e) => { if (e.target === ov) ov.remove(); });
+  $("#notice-close").addEventListener("click", () => ov.remove());
+  api.get("/api/announcement").then((a) => { $("#notice-text").value = a.text ?? ""; }).catch(() => {});
+  $("#notice-save").addEventListener("click", async () => {
+    try {
+      await api.send("/api/announcement", { method: "POST", body: JSON.stringify({ text: $("#notice-text").value }) });
+      ov.remove();
+      toast("✓ 公告已更新");
+      refreshHome();
+    } catch (e) { toast("保存失败：" + e.message, false); }
+  });
 }
 
 async function refreshHome() {
   try {
-    const prov = await api.get("/api/providers").catch(() => null);
-    const ok1 = Boolean(prov?.chat?.length);
-    $("#hs-model").textContent = prov?.chat?.[0]
-      ? `${prov.chat[0].name} · ${prov.chat[0].models?.[0] ?? "未拉取模型"}`
-      : "未配置";
-    $("#step-api").classList.toggle("done", ok1);
-    const wx = await api.get("/api/channels/wechat/status").catch(() => null);
-    $("#hs-wx").textContent = wx?.connected ? "已连接 ✓" : "未绑定";
-    const qq = await api.get("/api/channels/qq/status").catch(() => null);
-    $("#hs-qq").textContent = qq?.pluginInstalled && qq?.onebotSeen ? "已连接 ✓" : "未绑定";
-    $("#step-channel").classList.toggle("done", Boolean(wx?.connected || (qq?.pluginInstalled && qq?.onebotSeen)));
-    const cards = await api.get("/api/cards").catch(() => ({ cards: [] }));
-    $("#step-card").classList.toggle("done", cards.cards?.length > 0);
-    $("#step-chat").classList.toggle("done", ok1 && cards.cards?.length > 0);
-    const active = await api.get("/api/active-persona").catch(() => null);
-    const box = $("#home-active-box");
-    box.innerHTML = active?.active
-      ? `<span class="active-name">${escapeHtml(active.active)}</span><button class="ghost small-btn" data-go="cards">去卡库</button>`
-      : `还没有编译过人设卡 <button class="ghost small-btn" data-go="cards">去卡库</button>`;
-    box.querySelector("[data-go]")?.addEventListener("click", (e) => (location.hash = "#/" + e.target.dataset.go));
+    // 资料可能刚改过，横幅昵称/头像同步一次
+    const hiName = $("#home-uname");
+    if (hiName) hiName.textContent = userProfile.name;
+    const hiAvatar = $("#home-avatar");
+    if (hiAvatar) {
+      hiAvatar.innerHTML = userProfile.avatar
+        ? `<img src="${userProfile.avatar}" alt="">`
+        : escapeHtml((userProfile.name || "本").slice(0, 1));
+    }
+    const [ann, cards, active] = await Promise.all([
+      api.get("/api/announcement").catch(() => ({ text: "" })),
+      api.get("/api/cards").catch(() => ({ cards: [] })),
+      api.get("/api/active-persona").catch(() => null),
+    ]);
+    const noticeBody = $("#home-notice-body");
+    if (noticeBody) {
+      noticeBody.classList.toggle("muted", !ann.text);
+      noticeBody.textContent = ann.text || "还没有公告，点右上「编辑」写一条给自己或访客的欢迎语";
+    }
+    const sub = $("#home-hero-sub");
+    if (sub) {
+      const n = cards.cards?.length ?? 0;
+      const persona = active?.active ? `当前人设「${active.active}」` : "还没有编译人设";
+      sub.textContent = `${persona} · 卡库 ${n} 张`;
+    }
     const grid = $("#home-card-grid");
+    if (!grid) return;
     grid.innerHTML = "";
     if (!cards.cards?.length) {
-      grid.innerHTML = '<div class="muted">还没有人设卡</div>';
+      grid.innerHTML = `<div class="home-empty">${icon("layers")}<p>卡库还是空的</p><a class="btn-like primary" href="#/create">${icon("plus")} 做第一张卡</a></div>`;
       return;
     }
     for (const c of cards.cards.slice(-8).reverse()) {
       const d = document.createElement("div");
       d.className = "mini-card";
-      d.innerHTML = `<div class="mini-name">${escapeHtml(c.name)}</div><div class="meta">${c.slug} · ${c.role}</div>`;
+      d.innerHTML = `
+        <div class="mini-avatar">${c.avatar ? `<img src="${c.avatar}" alt="">` : `<span>${escapeHtml(c.name.slice(0, 1))}</span>`}</div>
+        <div class="mini-name">${escapeHtml(c.name)}</div>`;
       d.addEventListener("click", () => {
         location.hash = "#/cards";
         setTimeout(() => loadCardIntoEditor(c.slug), 60);
       });
       grid.appendChild(d);
-    }  } catch { /* 忽略 */ }
+    }
+  } catch { /* 忽略 */ }
 }
 
 // ============================================================
@@ -358,12 +540,12 @@ function renderCards() {
   <div class="view">
     <div id="cards-grid-view">
       <div class="lib-head">
-        <div class="page-head" style="margin-bottom:0"><h2>🎴 人设卡库</h2></div>
+        <div class="page-head" style="margin-bottom:0"><h2>人设卡库</h2></div>
         <div class="lib-actions">
           <input id="card-search" placeholder="检索角色卡名称…" value="${escapeHtml(cardSearch)}">
-          <button id="btn-import-card" class="ghost">📥 导入</button>
+          <button id="btn-import-card" class="ghost">${icon("download")} 导入</button>
           <input type="file" id="import-file" accept=".png,.json" style="display:none">
-          <a href="#/create" class="btn-like primary">＋ 做卡</a>
+          <a href="#/create" class="btn-like primary">${icon("plus")} 做卡</a>
         </div>
       </div>
       <div id="cards-grid" class="cards-grid"></div>
@@ -373,20 +555,20 @@ function renderCards() {
         <button id="btn-back-grid" class="ghost">← 返回卡库</button>
         <h2 id="editor-title"></h2>
         <div class="editor-actions">
-          <button id="btn-adv-config" class="ghost small-btn">⚙ 高级配置</button>
+          <button id="btn-adv-config" class="ghost small-btn">${icon("settings")} 高级配置</button>
           <button id="btn-export-png" class="ghost small-btn">PNG</button>
           <button id="btn-export-json" class="ghost small-btn">JSON</button>
           <button id="btn-compile" class="small-btn">编译到通道</button>
-          <button id="btn-del" class="danger small-btn">删除</button>
-          <button id="btn-save" class="primary small-btn">保存</button>
+          <button id="btn-del" class="danger small-btn">${icon("trash")} 删除</button>
+          <button id="btn-save" class="primary small-btn">${icon("save")} 保存</button>
         </div>
       </div>
       <div id="card-form-area" class="card-form-area"></div>
       <div class="chat-test">
         <div class="chat-head">
-          <h3>💬 聊天测试 <span id="chat-head-hint" class="hint">普通聊天（按此卡「高级配置」走）</span></h3>
+          <h3>${icon("chat")} 聊天测试 <span id="chat-head-hint" class="hint">普通聊天</span></h3>
           <div>
-            <button id="btn-work-mode" class="ghost small-btn">🔧 工作模式</button>
+            <button id="btn-work-mode" class="ghost small-btn">${icon("tool")} 工作模式</button>
             <button id="btn-chat-clear" class="ghost small-btn">清空</button>
           </div>
         </div>
@@ -494,7 +676,7 @@ function renderCardsGrid() {
     d.innerHTML = `
       <div class="char-card-img">
         ${c.avatar ? `<img src="${c.avatar}" alt="" loading="lazy">` : `<div class="char-card-ph">${escapeHtml(c.name.slice(0, 1))}</div>`}
-        <button class="char-card-bot ${bot ? "on" : ""}" title="机器人配置（QQ/微信）">🤖</button>
+        <button class="char-card-bot ${bot ? "on" : ""}" title="机器人配置（QQ/微信）">${icon("bot")}</button>
       </div>
       <div class="char-card-info">
         <div class="char-card-name">${escapeHtml(c.name)}</div>
@@ -536,8 +718,8 @@ async function openBotDialog(slug) {
     ov.className = "bot-overlay";
     ov.innerHTML = `<div class="bot-dialog">
       <div class="bot-dialog-head">
-        <h3>🤖 机器人配置 · ${escapeHtml(card.name)}</h3>
-        <button class="ghost small-btn" id="bot-close">✕</button>
+        <h3>${icon("bot")} 机器人配置 · ${escapeHtml(card.name)}</h3>
+        <button class="ghost small-btn" id="bot-close">${icon("x")}</button>
       </div>
       <div id="bot-dialog-body">${bot === undefined ? '<p class="muted">加载中…</p>' : ""}</div>
     </div>`;
@@ -690,12 +872,12 @@ async function openAdvConfig() {
   ov.className = "bot-overlay";
   ov.innerHTML = `<div class="bot-dialog adv-dialog">
     <div class="bot-dialog-head">
-      <h3>⚙ 高级配置 · ${escapeHtml(editingCard.name)}</h3>
-      <button class="ghost small-btn" id="adv-close">✕</button>
+      <h3>${icon("settings")} 高级配置 · ${escapeHtml(editingCard.name)}</h3>
+      <button class="ghost small-btn" id="adv-close">${icon("x")}</button>
     </div>
 
     <div class="adv-sec">
-      <h4>🧠 模型（这张卡单独用哪个模型）</h4>
+      <h4>${icon("zap")} 模型（这张卡单独用哪个模型）</h4>
       <div class="bot-form">
         <label>提供商：<select id="adv-model-provider">${provOpts}</select></label>
         <label>模型：<select id="adv-model-id">${modelOpts}</select></label>
@@ -703,7 +885,7 @@ async function openAdvConfig() {
     </div>
 
     <div class="adv-sec">
-      <h4>⚡ 能力开关（普通聊天与机器人的默认行为）</h4>
+      <h4>${icon("tool")} 能力开关（普通聊天与机器人的默认行为）</h4>
       <div class="adv-abilities">
         ${toolSwitch("web_search", "联网搜索", "可搜索实时信息")}
         ${toolSwitch("image_gen", "生图", "AI 画图（需在生图配置页设置上游）")}
@@ -716,11 +898,11 @@ async function openAdvConfig() {
         <label class="adv-switch"><input type="checkbox" id="adv-tts" ${ab.tts === true ? "checked" : ""}>
           <span><b>TTS 朗读</b><small>自动语音朗读回复（语音合成页配置）</small></span></label>
       </div>
-      <p class="hint">网页「普通聊天」按这里的开关走；「工作模式」仍可临时手动勾选。QQ/微信机器人侧工具随 OpenClaw 端策略接入逐步生效。</p>
+      <p class="hint">网页「普通聊天」按这里的开关走；「工作模式」可临时手动勾选。</p>
     </div>
 
     <div class="adv-sec">
-      <h4>🤖 机器人接入（这张卡单独接 QQ / 微信）</h4>
+      <h4>${icon("bot")} 机器人接入（这张卡单独接 QQ / 微信）</h4>
       <div id="bot-dialog-body"></div>
     </div>
 
@@ -847,11 +1029,11 @@ async function importCard() {
 function renderCreate() {
   return `
   <div class="view create-view">
-    <div class="page-head"><h2>✏️ 做卡</h2><p class="hint">填写卡片内容 → 保存进卡库 → 可导出 PNG/JSON 或直接编译到通道</p></div>
+    <div class="page-head"><h2>做卡</h2><p class="hint">填写卡片内容 → 保存进卡库 → 可导出 PNG/JSON 或直接编译到通道</p></div>
     <div id="card-form-area" class="card-form-area">${cardFormHTML("create")}</div>
     <div class="create-actions">
-      <button id="btn-create-save" class="primary big">💾 保存卡片</button>
-      <button id="btn-create-save-compile" class="big">💾 保存并编译到通道</button>
+      <button id="btn-create-save" class="primary big">${icon("save")} 保存卡片</button>
+      <button id="btn-create-save-compile" class="big">保存并编译到通道</button>
     </div>
   </div>`;
 }
@@ -889,14 +1071,14 @@ async function saveNewCard(compile) {
 // ============================================================
 //  视图：API 与模型 / 生图配置（多提供商，模型自动拉取）
 // ============================================================
-function renderApi() { return renderProvidersPage("chat", "⚡ API 与模型", "对话 API 提供商；第一个为默认，卡片未单独指定时使用它。"); }
+function renderApi() { return renderProvidersPage("chat", "API 与模型", "对话 API 提供商；第一个为默认，卡片未单独指定时使用它。"); }
 function renderImagegen() { return renderImgGenPage(); }
 
 // 生图配置专用页（NovelAI / OpenAI 兼容 / 本地 SD WebUI 三套参数，网页聊天与 QQ/微信共用）
 function renderImgGenPage() {
   return `
   <div class="view">
-    <div class="page-head"><h2>🎨 生图配置</h2><p class="hint">配置 AI 生图（网页聊天 + QQ/微信机器人共用一套）。中文提示词可自动翻译扩写为英文。</p></div>
+    <div class="page-head"><h2>生图配置</h2><p class="hint">网页聊天与 QQ/微信机器人共用这一套生图配置。</p></div>
     <div class="card-box">
       <div class="form">
         <label>提供商</label>
@@ -929,7 +1111,7 @@ function renderImgGenPage() {
               <option value="none">None（不加预设）</option>
             </select></div>
           </div>
-          <label class="check"><input id="ig-nai-translate" type="checkbox"> 中文提示词自动翻译扩写为英文（用默认对话模型）</label>
+          <label class="check"><input id="ig-nai-translate" type="checkbox"> 中文提示词自动翻译扩写为英文</label>
           <label>负面提示词（追加在预设之后）</label>
           <textarea id="ig-nai-negative" rows="2"></textarea>
         </div>
@@ -964,16 +1146,16 @@ function renderImgGenPage() {
           <textarea id="ig-local-negative" rows="2"></textarea>
         </div>
         <div class="row" style="margin-top:12px">
-          <button id="ig-save" class="primary">💾 保存配置</button>
-          <button id="ig-test" class="ghost">🔌 测试 Key / 服务</button>
+          <button id="ig-save" class="primary">${icon("save")} 保存配置</button>
+          <button id="ig-test" class="ghost">测试 Key / 服务</button>
         </div>
         <div id="ig-status" class="status"></div>
       </div>
     </div>
     <div class="card-box">
-      <h3>🧪 试生一张</h3>
+      <h3>试生一张</h3>
       <div class="form">
-        <label>提示词（未保存也可先试，用上面表单的配置）</label>
+        <label>提示词</label>
         <textarea id="ig-test-prompt" rows="2" placeholder="如：一个穿和服的少女，樱花树下，黄昏光线，精致细节"></textarea>
         <div class="row">
           <select id="ig-test-aspect">
@@ -983,14 +1165,14 @@ function renderImgGenPage() {
             <option value="tall">9:16 长竖版</option>
             <option value="wide">16:9 长横版</option>
           </select>
-          <button id="ig-test-go" class="primary">🎨 生成</button>
+          <button id="ig-test-go" class="primary">生成</button>
         </div>
         <div id="ig-test-status" class="status"></div>
         <div id="ig-test-img"></div>
       </div>
     </div>
     <div class="card-box">
-      <h3>🗂 已生成图片（data/images）</h3>
+      <h3>已生成图片</h3>
       <div id="ig-gallery" class="ig-gallery"><div class="muted">加载中…</div></div>
     </div>
   </div>`;
@@ -1001,7 +1183,7 @@ function renderProvidersPage(type, title, desc) {
   <div class="view">
     <div class="page-head"><h2>${title}</h2><p class="hint">${desc}</p></div>
     <div id="prov-list"></div>
-    <button id="prov-add" class="primary">＋ 添加提供商</button>
+    <button id="prov-add" class="primary">${icon("plus")} 添加提供商</button>
     <div id="prov-form" class="card-box" style="display:none;margin-top:12px">
       <h3 id="pv-title">添加提供商</h3>
       <div class="form">
@@ -1166,7 +1348,7 @@ async function loadImgGallery() {
     const r = await api.get("/api/image/list");
     const imgs = r.images ?? [];
     if (!imgs.length) {
-      box.innerHTML = `<div class="muted">还没有生成过图片。配置好后点「试生一张」或让 AI 调用生图工具。</div>`;
+      box.innerHTML = `<div class="muted">还没有生成过图片</div>`;
       return;
     }
     box.innerHTML = imgs.map((it) => `
@@ -1267,7 +1449,7 @@ const TTS_KIND_LABEL = { openai: "OpenAI 兼容", minimax: "MiniMax 海螺（t2a
 function renderTtsPage() {
   return `
   <div class="view">
-    <div class="page-head"><h2>🔊 语音合成（TTS）</h2><p class="hint">聚合上游 TTS 供网页朗读、可对外售卖赚差价；本地仅测试/兜底。聊天气泡 hover 出 🔊 即可朗读。</p></div>
+    <div class="page-head"><h2>语音合成</h2><p class="hint">配置 TTS 上游与本地兜底；聊天气泡右上角的喇叭可朗读回复。</p></div>
 
     <div class="card-box">
       <h3>默认通道与本地兜底</h3>
@@ -1306,9 +1488,9 @@ function renderTtsPage() {
     </div>
 
     <div class="card-box">
-      <h3>TTS 提供商 <span class="hint">跟 API 配置一样：点「＋ 添加提供商」→ 选择服务商 → 填 Key → 自动拉取模型</span></h3>
+      <h3>TTS 提供商 <span class="hint">选择服务商 → 填 Key → 自动拉取模型与音色</span></h3>
       <div id="tts-prov-list"></div>
-      <button id="tts-prov-add" class="primary" style="margin-top:10px">＋ 添加提供商</button>
+      <button id="tts-prov-add" class="primary" style="margin-top:10px">${icon("plus")} 添加提供商</button>
       <div id="tts-prov-form" class="card-box" style="display:none;margin-top:12px">
         <h3 id="tts-pv-title">添加提供商</h3>
         <div class="form">
@@ -1355,10 +1537,9 @@ function renderTtsPage() {
     </div>
 
     <div class="card-box">
-      <h3>📊 用量统计</h3>
+      <h3>用量统计</h3>
       <div id="tts-usage" class="hint">加载中…</div>
     </div>
-    <div class="hint" style="margin-top:6px">对外售卖：<code>npm run tts-server</code>（默认 0.0.0.0:17900，Bearer key 认证），客户用 OpenAI SDK 调 POST /v1/audio/speech 即可；本机聊天朗读不经过售卖服务。</div>
   </div>`;
 }
 
@@ -1698,7 +1879,6 @@ async function provDone() {
 //  视图：记忆（每卡配置 + 查看 + 单条管理）
 // ============================================================
 const MEM_CATS = ["信息", "偏好", "关系", "事件", "待定"];
-const MEM_CAT_EMOJI = { 信息: "📌", 偏好: "💖", 关系: "👥", 事件: "📅", 待定: "❓" };
 const MEM_SRC_LABEL = { manual: "手动", auto: "自动总结", tool: "工具", legacy: "旧数据" };
 
 function fmtTime(iso) {
@@ -1718,7 +1898,7 @@ function fmtTime(iso) {
 function renderMemory() {
   return `
   <div class="view">
-    <div class="page-head"><h2>🧠 记忆</h2><p class="hint">每张卡独立的长期记忆；可手动添加、单条编辑/删除；设定每几轮对话自动总结（默认 20，1-50）</p></div>
+    <div class="page-head"><h2>记忆</h2><p class="hint">每张卡独立的长期记忆；可手动添加、单条编辑/删除</p></div>
     <div id="mem-cards" class="card-grid"></div>
     <div id="mem-detail" class="card-box" style="display:none">
       <h3 id="mem-title"></h3>
@@ -1732,7 +1912,7 @@ function renderMemory() {
         <input id="mem-add-input" type="text" placeholder="添加一条记忆，例如：用户养了一只叫旺财的狗">
         <button id="mem-add-btn" class="primary small-btn">添加</button>
       </div>
-      <input id="mem-search" type="text" placeholder="🔍 搜索记忆…" style="width:100%">
+      <input id="mem-search" type="text" placeholder="搜索记忆…" style="width:100%">
       <div id="mem-entries" class="small-out tall" style="max-height:520px;padding:4px 10px"></div>
     </div>
   </div>`;
@@ -1764,7 +1944,7 @@ function initMemory() {
 async function openMemDetail(slug) {
   memCard = await api.get(`/api/cards/${slug}`);
   $("#mem-detail").style.display = "block";
-  $("#mem-title").textContent = `🧠 ${memCard.name} 的记忆`;
+  $("#mem-title").textContent = `${memCard.name} 的记忆`;
   $("#mem-rounds").value = memCard.memoryConfig?.auto_rounds ?? 20;
   const catSel = $("#mem-add-cat");
   catSel.innerHTML = MEM_CATS.map((c) => `<option>${c}</option>`).join("");
@@ -1787,7 +1967,7 @@ async function loadMemEntries() {
 function renderMemRow(e) {
   const src = MEM_SRC_LABEL[e.src] ?? e.src ?? "";
   return `<div class="mem-row" data-id="${escapeHtml(e.id)}">
-    <span class="mem-badge cat-${escapeHtml(e.cat)}">${MEM_CAT_EMOJI[e.cat] ?? ""} ${escapeHtml(e.cat)}</span>
+    <span class="mem-badge cat-${escapeHtml(e.cat)}">${escapeHtml(e.cat)}</span>
     <span class="mem-fact">${escapeHtml(e.fact)}</span>
     <span class="mem-meta">${fmtTime(e.ts)}${src ? " · " + src : ""}</span>
     <span class="mem-ops">
@@ -1895,8 +2075,8 @@ function addChatBubble(role, text) {
   if (role === "bot") {
     const btn = document.createElement("button");
     btn.className = "tts-speak-btn";
-    btn.textContent = "🔊";
-    btn.title = "朗读这条回复（TTS）";
+    btn.innerHTML = icon("volume");
+    btn.title = "朗读这条回复";
     btn.addEventListener("click", (ev) => {
       ev.stopPropagation();
       speakText(text);
@@ -1935,10 +2115,10 @@ function gatherChatOptions() {
 function toggleWorkMode() {
   workMode = !workMode;
   const btn = $("#btn-work-mode");
-  btn.textContent = workMode ? "💬 聊天模式" : "🔧 工作模式";
+  btn.innerHTML = workMode ? `${icon("chat")} 聊天模式` : `${icon("tool")} 工作模式`;
   btn.classList.toggle("active", workMode);
   $(".chat-opts").style.display = workMode ? "flex" : "none";
-  $("#chat-head-hint").textContent = workMode ? "工作模式：开放工具/技能" : "普通聊天（按此卡「高级配置」走）";
+  $("#chat-head-hint").textContent = workMode ? "工作模式：手动勾选工具/技能" : "普通聊天";
 }
 let lastChatOpts = null;
 async function sendChat() {
@@ -1972,13 +2152,13 @@ async function finishTurn(r) {
     chatHistory.push({ role: "assistant", content: r.reply });
     if (!workMode && editingCard?.abilities?.tts) speakText(r.reply); // 高级配置开了 TTS → 自动朗读
   } else if (r.type === "pending") {
-    const bubble = addChatBubble("bot", "🛡️ 需要你确认：机器人想调用\n" + r.pending.map((p) => "· " + p.name).join("\n"));
+    const bubble = addChatBubble("bot", "需要确认：机器人想调用\n" + r.pending.map((p) => "· " + p.name).join("\n"));
     const row = document.createElement("div");
     row.className = "approve-row";
     const ok = document.createElement("button");
-    ok.className = "small-btn primary"; ok.textContent = "✅ 执行";
+    ok.className = "small-btn primary"; ok.textContent = "执行";
     const no = document.createElement("button");
-    no.className = "small-btn danger"; no.textContent = "🚫 拒绝";
+    no.className = "small-btn danger"; no.textContent = "拒绝";
     pendingData = { slug: editingCard.slug, messages: r.messages, tools: lastChatOpts?.tools ?? gatherChatOptions().tools, useMCP: lastChatOpts?.useMCP ?? $("#tool-mcp").checked, approve: false };
     ok.addEventListener("click", async () => { row.remove(); pendingData.approve = true; await sendApprove(); });
     no.addEventListener("click", async () => { row.remove(); pendingData.approve = false; await sendApprove(); });
@@ -2004,7 +2184,7 @@ function clearChat() { chatHistory = []; pendingData = null; $("#chat-log").inne
 function renderDistill() {
   return `
   <div class="view">
-    <div class="page-head"><h2>🧪 蒸馏工厂</h2><p class="hint">聊天记录 → 脱敏 → 四维蒸馏 → 人设卡</p></div>
+    <div class="page-head"><h2>蒸馏工厂</h2><p class="hint">聊天记录 → 脱敏 → 四维蒸馏 → 人设卡</p></div>
     <div class="two-col">
       <div class="card-box">
         <div class="form">
@@ -2030,7 +2210,7 @@ function renderDistill() {
           <div class="row"><button id="btn-distill-run" class="primary">开始蒸馏</button></div>
           <div id="distill-msg" class="status"></div>
         </div>
-        <h3>🔌 直连 WeFlow（本机 5031）</h3>
+        <h3>${icon("zap")} 直连 WeFlow（本机 5031）</h3>
         <div class="row"><input id="wf-token" placeholder="access_token"><button id="btn-wf-probe" class="ghost small-btn">探测</button></div>
         <div class="row"><input id="wf-talker" placeholder="talker"><input id="wf-limit" type="number" value="500" style="max-width:80px"><button id="btn-wf-distill" class="primary small-btn">导入蒸馏</button></div>
         <pre id="wf-out" class="small-out"></pre>
@@ -2139,10 +2319,10 @@ async function distillFromWeFlow() {
 function renderChannels() {
   return `
   <div class="view">
-    <div class="page-head"><h2>💬 通道连接</h2><p class="hint">微信 / QQ 官方扫码绑定</p></div>
+    <div class="page-head"><h2>通道连接</h2><p class="hint">微信 / QQ 官方扫码绑定</p></div>
     <div class="two-col">
       <div class="card-box">
-        <h3>💬 微信 <span id="wx-status" class="chip">检测中…</span></h3>
+        <h3>微信 <span id="wx-status" class="chip">检测中…</span></h3>
         <p class="hint">腾讯官方通道，仅单聊；需微信有 ClawBot 入口（灰度）。</p>
         <div class="row"><button id="btn-wx-login" class="primary">开始扫码绑定</button><button id="btn-wx-refresh" class="ghost">刷新</button></div>
         <pre id="wx-qr" class="qr-box" style="display:none"></pre>
@@ -2152,7 +2332,7 @@ function renderChannels() {
         <pre id="pairing-list" class="small-out"></pre>
       </div>
       <div class="card-box">
-        <h3>🐧 QQ <span id="qq-status" class="chip">检测中…</span></h3>
+        <h3>QQ <span id="qq-status" class="chip">检测中…</span></h3>
         <p class="hint">官方开放平台机器人（单聊/群聊@/频道）。</p>
         <div class="row"><button id="btn-qq-login" class="primary">开始扫码绑定</button><button id="btn-qq-refresh" class="ghost">刷新</button></div>
         <pre id="qq-qr" class="qr-box" style="display:none"></pre>
@@ -2236,7 +2416,7 @@ async function refreshQQ() {
 function renderCapabilities() {
   return `
   <div class="view">
-    <div class="page-head"><h2>🛠 能力中心</h2><p class="hint">工作模式的默认开关；聊天测试时可临时覆盖</p></div>
+    <div class="page-head"><h2>能力中心</h2><p class="hint">工作模式的默认开关；聊天测试时可临时覆盖</p></div>
     <div class="two-col">
       <div class="card-box">
         <h3>默认能力</h3>
@@ -2267,7 +2447,7 @@ function renderCapabilities() {
         </div>
       </div>
       <div class="card-box">
-        <h3>🔌 MCP 服务器</h3>
+        <h3>MCP 服务器</h3>
         <p class="hint">JSON 数组：{"name","command","args"}；工具默认需审批</p>
         <textarea id="mcp-config" rows="6" spellcheck="false"></textarea>
         <div class="row" style="margin-top:8px"><button id="btn-mcp-save" class="primary">保存并重连</button></div>
@@ -2320,10 +2500,10 @@ function initCapabilities() {
 function renderData() {
   return `
   <div class="view">
-    <div class="page-head"><h2>📦 数据</h2><p class="hint">备份与记忆</p></div>
+    <div class="page-head"><h2>数据</h2><p class="hint">备份与记忆</p></div>
     <div class="two-col">
       <div class="card-box">
-        <h3>📦 备份</h3>
+        <h3>备份</h3>
         <p class="hint">全部卡片 + 记忆 + MCP 配置 → 一个 JSON</p>
         <button id="btn-backup" class="primary">下载备份</button>
       </div>
@@ -2346,7 +2526,7 @@ function initData() {
     const el = $("#memory-list");
     el.textContent = Object.keys(r.memory ?? {}).length
       ? Object.entries(r.memory).map(([f, entries]) =>
-          `📄 ${f}\n  ` + (entries || []).map((e) => `[${e.cat}] ${e.fact}`).join("\n  ")).join("\n\n")
+          `${f}\n  ` + (entries || []).map((e) => `[${e.cat}] ${e.fact}`).join("\n  ")).join("\n\n")
       : "（还没有记忆）";
   }).catch(() => {});
 }
@@ -2354,7 +2534,7 @@ function initData() {
 function renderSettings() {
   return `
   <div class="view">
-    <div class="page-head"><h2>⚙️ 设置</h2><p class="hint">服务信息与说明</p></div>
+    <div class="page-head"><h2>设置</h2><p class="hint">服务信息与说明</p></div>
     <div class="two-col">
       <div class="card-box"><h3>服务信息</h3><div id="svc-info" class="small-out">读取中…</div></div>
       <div class="card-box"><h3>说明</h3>
@@ -2399,6 +2579,11 @@ const routes = {
 
 $("#btn-menu").addEventListener("click", openDrawer);
 $("#drawer-overlay").addEventListener("click", closeDrawer);
-document.querySelectorAll(".drawer-nav a, .bottom-nav a").forEach((a) => a.addEventListener("click", closeDrawer));
-
-router();
+$("#drawer-user-btn").addEventListener("click", openProfileDialog);
+document.querySelectorAll(".drawer-nav a").forEach((a) => a.addEventListener("click", closeDrawer));
+// 抽屉导航注入线性 SVG 图标（替代 emoji）
+document.querySelectorAll(".drawer-nav a").forEach((a) => {
+  a.insertAdjacentHTML("afterbegin", icon(a.dataset.icon));
+});
+// 先拿用户资料再渲染首页（横幅昵称/头像一次到位），失败不阻塞
+loadProfile().finally(() => router());
