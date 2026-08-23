@@ -51,38 +51,43 @@ export interface ChannelLoginState {
 const logins: Record<string, ChannelLoginState> = {};
 const loginProcs: Record<string, ChildProcess | null> = {};
 
-export function startChannelLogin(channel: string): ChannelLoginState {
-  const proc = loginProcs[channel];
-  if (proc && !proc.killed) return { ...logins[channel] };
-  logins[channel] = { running: true, done: false, ok: false, output: "" };
-  loginProcs[channel] = spawn("node", [openclawEntry(), "channels", "login", "--channel", channel], {
+/** 发起通道扫码登录；带 accountId 时登录到指定渠道账号（多机器人用），否则登录默认账号（兼容旧通道页） */
+export function startChannelLogin(channel: string, accountId?: string): ChannelLoginState {
+  const key = accountId ? `${channel}:${accountId}` : channel;
+  const proc = loginProcs[key];
+  if (proc && !proc.killed) return { ...logins[key] };
+  logins[key] = { running: true, done: false, ok: false, output: "" };
+  const args = ["channels", "login", "--channel", channel];
+  if (accountId) args.push("--account", accountId);
+  loginProcs[key] = spawn("node", [openclawEntry(), ...args], {
     windowsHide: true,
   });
   const append = (d: Buffer | string) => {
-    const s = logins[channel];
+    const s = logins[key];
     s.output = (s.output + stripAnsi(d.toString())).slice(-16000);
   };
-  loginProcs[channel]?.stdout?.on("data", append);
-  loginProcs[channel]?.stderr?.on("data", append);
-  loginProcs[channel]?.on("close", (code) => {
-    const s = logins[channel];
+  loginProcs[key]?.stdout?.on("data", append);
+  loginProcs[key]?.stderr?.on("data", append);
+  loginProcs[key]?.on("close", (code) => {
+    const s = logins[key];
     s.running = false;
     s.done = true;
     s.ok = code === 0;
-    loginProcs[channel] = null;
+    loginProcs[key] = null;
   });
-  loginProcs[channel]?.on("error", () => {
-    const s = logins[channel];
+  loginProcs[key]?.on("error", () => {
+    const s = logins[key];
     s.running = false;
     s.done = true;
     s.ok = false;
-    loginProcs[channel] = null;
+    loginProcs[key] = null;
   });
-  return { ...logins[channel] };
+  return { ...logins[key] };
 }
 
-export function getChannelLoginState(channel: string): ChannelLoginState {
-  const s = logins[channel];
+export function getChannelLoginState(channel: string, accountId?: string): ChannelLoginState {
+  const key = accountId ? `${channel}:${accountId}` : channel;
+  const s = logins[key];
   return s ? { ...s } : { running: false, done: false, ok: false, output: "" };
 }
 

@@ -51,9 +51,13 @@ export function validateCard(input: unknown): ValidationResult {
     warnings.push("知识边界未填写（known/unknown 都为空），AI 容易编造");
   }
 
-  // 声音规则可编译性
-  if (card.voice.tone_rules.length === 0 && card.voice.catchphrases.length === 0) {
-    warnings.push("声线规则为空（voice.tone_rules / catchphrases），编译出的 SOUL.md 会缺少人格");
+  // 人格设定完整性：语音规则或世界书（人物形象/常驻条目）至少有一处承载人格
+  const hasWorldbookProfile = Boolean(
+    card.sillytavern_v2?.description?.trim() ||
+      (card.sillytavern_v2?.character_book?.entries ?? []).some((e) => e.enabled !== false && String(e.content ?? "").trim())
+  );
+  if (card.voice.tone_rules.length === 0 && card.voice.catchphrases.length === 0 && !hasWorldbookProfile) {
+    warnings.push("人格设定为空：语音规则和世界书都没有内容，这张卡会是空的（在世界书「人物形象」里写角色定义）");
   }
 
   // 语录样本的脱敏抽查：出现手机号/邮箱即报错

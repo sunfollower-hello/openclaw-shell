@@ -47,10 +47,12 @@ openclaw-shell/
 │   │   ├── chatPrompt.ts # 人设卡 → 聊天 system prompt
 │   │   ├── skills.ts     # 内置技能库（代码专家/翻译/写作/陪伴）
 │   │   ├── modelConfig.ts# 读改写 ~/.openclaw/openclaw.json 的 models.providers + 默认模型
-│   │   ├── imageConfig.ts# data/imageConfig.json 生图配置（NovelAI/OpenAI/本地占位）
-│   │   ├── ttsConfig.ts  # data/ttsConfig.json 语音合成：多上游聚合（OpenAI 兼容，预置硅基流动）+ 本地兜底（Edge 在线/SAPI 离线）
+│   │   ├── botStore.ts    # 多机器人实例表 data/bots.json：卡×渠道账号×agent；上限 2 个/微信 1 个/每卡 1 个；每 agent 独立 workspace=data/agent-workspaces/<slug>/
+│   │   ├── imageConfig.ts# data/imageConfig.json 生图配置（NovelAI/OpenAI 兼容/本地 SD WebUI）
+│   │   ├── imageGen.ts   # 生图核心：三 provider 统一生成逻辑（网页工具与 OpenClaw 插件共用同一配置）
+│   │   ├── ttsConfig.ts  # data/ttsConfig.json 语音合成：多上游聚合（kind: openai/minimax/volc，前端添加向导录入，默认不预置）+ 本地兜底（Edge 在线/SAPI 离线）
 │   │   ├── ttsUsage.ts   # TTS 用量记账（data/tts-usage.jsonl 追加 + 汇总统计）
-│   │   └── openclawCli.ts# openclaw CLI 封装（扫码登录进程管理/状态/端口检测）
+│   │   └── openclawCli.ts# openclaw CLI 封装（扫码登录进程管理——支持 --account 按账号多机器人登录/状态/端口检测）
 │   ├── tts-server.ts     # 独立 TTS 售卖服务：POST /v1/audio/speech（OpenAI 兼容、Bearer key、17900、可单独部署到服务器赚差价）
 │   ├── distiller/        # 蒸馏：parser(WeFlow/纯文本) / redact(PII) / extract(四维LLM) / pipeline
 │   └── tools/
@@ -58,10 +60,10 @@ openclaw-shell/
 │       └── mcp.ts        # MCP 客户端（@modelcontextprotocol/sdk，stdio）
 ├── web/                  # 前端 v2：抽屉导航 + hash 路由（home/cards/distill/channels/api/capabilities/data/settings）
 │   ├── index.html        # 骨架（顶栏/抽屉/视图容器）
-│   ├── app.js            # 全部前端逻辑（路由 render/init、聊天、做卡、表情、生图、通道扫码…）
+│   ├── app.js            # 全部前端逻辑（路由 render/init、聊天、做卡、表情、生图、通道扫码、卡片🤖机器人弹窗…）
 │   └── style.css         # 样式（用户已美化，改动前先读）
-├── scripts/              # start-stack.ps1 / stop-stack.ps1 / toggle-stack.bat / autostart.bat
-├── data/                 # 运行数据（gitignored）：cards/ memory/ sandbox/ emojis/ images/ workspace/ mcp.json imageConfig.json samples/
+├── scripts/              # start-stack.ps1 / stop-stack.ps1 / toggle-stack.bat / autostart.bat / test-bots.mjs（多机器人 API 回归测试）
+├── data/                 # 运行数据（gitignored）：cards/ memory/ sandbox/ emojis/ images/ workspace/ mcp.json imageConfig.json samples/ bots.json（机器人实例表） agent-workspaces/（每 agent 独立编译产物）
 ├── DESIGN.md / README.md / package.json / tsconfig.json / .env(gitignored 登录凭据)
 ```
 
@@ -71,16 +73,16 @@ openclaw-shell/
 |---|---|
 | 人设卡 | 建/编/校验/编译、聊天测试（人设+工具+技能+记忆+语音+思考深度）、做卡向导（简介/开场白/世界书/正则/头像）、导出 PNG/JSON、导入 PNG/JSON（CCv2）、生效人设指示、**表情包（每卡≤120，带解释，AI 用 [表情:名字] 标记）** |
 | 蒸馏 | WeFlow JSON 上传 / 粘贴「昵称: 内容」文本 / 直连本机 WeFlow(5031) → PII 脱敏 → 四维蒸馏（互动/人格/记忆，证据分级）→ 保存或直接导出 PNG |
-| 通道 | 微信官方插件扫码绑定（单聊，ClawBot 灰度）、QQ 官方开放平台扫码绑定（q.qq.com 机器人，单聊/群@/频道）、配对授权 |
-| API | 模型提供商配置+测试、默认模型、**生图配置（NovelAI/OpenAI 兼容/本地占位）**、**TTS 语音合成（上游聚合：任意 OpenAI 兼容 /v1/audio/speech，预置硅基流动待填 key；用量记账；对外售卖接口）**、MCP 服务器、数据备份 |
-| 聊天能力 | 工具：沙箱写代码+文件（危险先问后做审批）/搜索/天气/时间/记忆/生图；技能库；思考深度 关闭/自动/低/中/高/极高（对齐 rikkahub，极高=xhigh 不支持自动降级）；**TTS 朗读（bot 气泡 hover 出 🔊，点击合成播放，走默认通道）**；普通聊天/工作模式分离 |
+| 通道 | 微信官方插件扫码绑定（单聊，ClawBot 灰度）、QQ 官方开放平台扫码绑定（q.qq.com 机器人，单聊/群@/频道）、配对授权；**多机器人（2026-08-24）：卡库每卡右上角 🤖 → 建独立 bot（OpenClaw agents 多 agent + 渠道账号路由），上限 2 个实例（微信最多 1 个，每卡 1 个），每 agent 独立 workspace/模型/会话；创建=编译卡→agents add→扫码绑定该账号，卡片更新可一键重编译，入口保留旧通道页** |
+| API | 模型提供商配置+测试、默认模型、**生图配置（NovelAI/OpenAI 兼容/本地 SD WebUI，中文提示词自动翻译扩写、种子/采样器/负面预设可配、测试 Key/试生一张/图片库管理）**、MCP 服务器、数据备份；**TTS 语音合成为独立页 #/tts（上游聚合 OpenAI 兼容/MiniMax/火山豆包，添加向导+自动拉取模型；用量记账；对外售卖接口）** |
+| 聊天能力 | 工具：沙箱写代码+文件（危险先问后做审批）/搜索/天气/时间/记忆/生图；**聊天气泡内直接渲染生成的图片（点击放大）**；技能库；思考深度 关闭/自动/低/中/高/极高（对齐 rikkahub，极高=xhigh 不支持自动降级）；**TTS 朗读（bot 气泡 hover 出 🔊，点击合成播放，走默认通道）**；普通聊天/工作模式分离 |
 | 记忆 | 每卡独立长期记忆（JSONL 结构化）；**相关召回注入**（关键词+新鲜度，不再一刀切取最后 N 条）、memory_save 工具去重+分类、每 N 轮自动总结（LLM 提取带分类）、**前端单条管理**（手动添加/编辑/删除/搜索/分类徽标/相对时间）、旧纯文本自动迁移、每卡 300 条上限自动淘汰、备份兼容 |
 | 基建 | 开机自启 + 桌面开关、Cloudflare 独立隧道公网、Basic 认证、数据全本地 |
 
 ## 5. 服务与依赖（关键路径/配置）
 
 - **OpenClaw 配置** `~/.openclaw/openclaw.json`：`gateway.mode=local` + `gateway.auth.token`；`agents.defaults.workspace = D:\ai_workspace\openclaw-shell\data\workspace`；`models.providers.agnes`（测试上游：`https://apihub.agnes-ai.cn/v1`，模型 ID **必须写 `agnes-2.0-flash`**，写 2.0Flash 会 503）
-- **插件**（~/.openclaw/npm/projects/）：`openclaw-weixin` v2.4.6（腾讯官方微信）、`openclaw-qqbot` v2.0.1（腾讯官方 QQ）
+- **插件**（~/.openclaw/npm/projects/）：`openclaw-weixin` v2.4.6（腾讯官方微信）、`openclaw-qqbot` v2.0.1（腾讯官方 QQ）；**自研插件 `openclaw-shell-imagegen`**（源码在项目 `plugins/openclaw-shell-imagegen/`，`openclaw plugins install --link` 已装，gateway 启动时自动加载）→ 给 OpenClaw agent（QQ/微信）注册 `image_gen` 生图工具，复用项目 `dist/core/imageGen.js`（同一份 data/imageConfig.json），图片存 `~/.openclaw/media`（QQ 插件白名单目录），返回文本带 `MEDIA:<路径>` 行 + 结构化 attachments（双保险投递）
 - **Cloudflare**：
   - 新隧道 `openclaw`（ID 74975232-d922-4337-9644-76fac4d04c26），配置 `C:\Users\followsun\.cloudflared\config-openclaw.yml`，用户账户运行（由 start-stack 托管）→ 子域名 `openclaw.319274.xyz` → 17880
   - 旧隧道 `fwq`（ID abbf0656-...）是系统服务（SYSTEM 身份，配置在 systemprofile 目录），**别动**，服务它自己的 8080
@@ -98,8 +100,8 @@ openclaw-shell/
 
 ## 7. 未来展望（详见 D:\ai_workspace\未来规划书.md）
 
-- **等条件**：QQ/微信绑定验证（等用户扫码，验收清单已在规划书）、M5 中转商业化（等中转站，用 one-api/new-api）、**TTS 开卖（等用户注册硅基流动拿 key 填入 API 页并启用；售卖接口/记账已就绪）**、App 更新推送机制（参考 rikkahub 的 GitHub Releases 方案）
-- **功能增强**：MetaPact 多模态能力包（vision/hearing/voice skills）、cc-connect 自己的号渠道（封号风险待拍板）、本地生图（ComfyUI/Forge 分析已写）、GPT-SoVITS 声音克隆（付费增值：TTS 已留 provider 结构，加 kind 即可扩）、语音 STT 输入、OpenClaw 端工具/表情/生图接入（让 QQ/微信里的机器人也用上，目前只在网页聊天测试生效）、记忆增强、群运营、MCP 真实联调、心跳主动消息、模型能力路由、README 宣传
+- **等条件**：QQ/微信绑定验证（等用户扫码，验收清单已在规划书）、M5 中转商业化（等中转站，用 one-api/new-api）、**TTS 开卖（等用户注册任一上游拿 key 填入 API 页并启用；售卖接口/记账/多协议适配器已就绪）**、App 更新推送机制（参考 rikkahub 的 GitHub Releases 方案）
+- **功能增强**：MetaPact 多模态能力包（vision/hearing/voice skills）、cc-connect 自己的号渠道（封号风险待拍板）、本地生图（ComfyUI/Forge 分析已写）、GPT-SoVITS 声音克隆（付费增值：TTS 已留 provider 结构，加 kind 即可扩）、语音 STT 输入、OpenClaw 端工具策略接入（**生图 ✅ 已接入**：openclaw-shell-imagegen 插件，QQ/微信机器人已可调用 image_gen 发图；沙箱/记忆/技能/表情/审批 待接入，目前只在网页聊天测试生效）、记忆增强、群运营、MCP 真实联调、心跳主动消息、模型能力路由、README 宣传
 - **打包分发**：Windows 便携版/安装包（内嵌 Node+OpenClaw+首次引导）优先；与 M5 中转配套
 
 ## 8. 踩坑记录（接手必读，避免重复踩）
@@ -117,6 +119,11 @@ openclaw-shell/
 11. 微信扫码登录必须在**跑 gateway 的同一台机器**上；微信 ClawBot 入口是灰度，账号没有就扫不了
 12. **edge-tts（Edge 在线免费语音）WS 合成握手 403**：语音列表 HTTP 200（网络通），但 WebSocket 合成被拒（token/风控），本网络环境不可用 → 本地兜底用 **Windows SAPI**（离线必可用，音质一般）；edge 选项保留在前端，换网络环境可能恢复
 13. **edge-tts npm 包 main 指向 index.ts**：必须 `import ... from "edge-tts/out/index.js"`（编译产物），否则 dist 下 node 跑不起来
+14. **`tools.allow` 是白名单不是"额外放行"**：在 openclaw.json 加 `tools.allow: ["image_gen"]` 会把其他 73 个工具（含 exec/edit/qq_*）全部移除。自研插件注册**非 optional 工具默认就对 agent 可见**（`defineToolPlugin`/`registerTool` 不传 optional 即可），不要加 allow。删掉 tools 段即恢复默认全集
+15. **CLI `openclaw agent` 走 gateway 会因 scope 配对失败而自动降级 embedded**（"scope upgrade pending approval"）——embedded 回退同样加载插件与 tools 配置，但工具集可能不含部分 runtime 工具，且不影响 QQ/微信通道（通道消息走 gateway 内部）
+16. **openclaw CLI 并发跑会互相拖慢**：`agents add` 刚结束立刻 `agents list` 可能超时/输出不全 → GET /api/bots 的 agentExists 检测在 CLI 失败时返回 null（前端显示"状态未知"），别断言"缺失"；runOpenclaw 超时给足 60s
+17. **前端慢接口别挡主渲染**：/api/bots 内部要 spawn openclaw CLI（5-15s），卡片网格先渲染、机器人角标异步补——任何页面把慢接口和首屏绑 Promise.all 都会让页面"空白"被当成 bug
+18. **多机器人实测事实（2026-08-24）**：`agents add <slug> --workspace <dir> --model <p/m> --bind qqbot:<acc> --non-interactive --json` 全参数可用；`agents delete --force` 会把 workspace 目录移入回收站（重建时 compileCard 自动重生成，无碍）；qqbot 扫码输出含终端二维码 + `https://q.qq.com/qqbot/openclaw/connect.html?task_id=...` 链接，一次扫码只绑一个机器人；QQ 个体开发者一号最多 5 个机器人
 
 ## 9. 参考内容索引
 

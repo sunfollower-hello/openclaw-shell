@@ -180,6 +180,7 @@ const presetsSchema = z.object({
 // ---------- SillyTavern Spec V2 兼容段（世界书/正则/简介/开场白） ----------
 const worldbookEntry = z.object({
   keys: z.array(z.string()).default([]),
+  secondary_keys: z.array(z.string()).default([]),
   content: z.string().default(""),
   name: z.string().optional(),
   comment: z.string().optional(),
@@ -189,6 +190,10 @@ const worldbookEntry = z.object({
   insertion_order: z.number().default(100),
   priority: z.number().default(10),
   id: z.number().optional(),
+  // 酒馆卡(SillyTavern CCv2/v3)兼容字段：保留原样，编辑/导出不丢
+  position: z.string().optional(),
+  use_regex: z.boolean().optional(),
+  extensions: z.record(z.string(), z.unknown()).optional(),
 });
 
 const sillytavernSchema = z.object({
@@ -198,6 +203,7 @@ const sillytavernSchema = z.object({
   scenario: z.string().default(""),
   first_mes: z.string().default(""),
   mes_example: z.string().default(""),
+  alternate_greetings: z.array(z.string()).default([]),
   regex_scripts: z.array(z.record(z.string(), z.unknown())).default([]),
   character_book: z
     .object({ entries: z.array(worldbookEntry).default([]) })
@@ -281,15 +287,17 @@ export const defaultCard = (name: string, slug: string): PersonaCard =>
   personaCardSchema.parse({
     name,
     slug,
-    // 空白卡：世界书第一条固定为「人物形象」
+    // 空白卡：世界书第一条固定为「人物形象」（角色定义核心，常驻生效）
     sillytavern_v2: {
       chara_card_v2: "0.0.1",
       character_book: {
         entries: [
           {
             keys: ["人物形象"],
-            content: "（请填写外貌、穿着、气质等形象描述）",
+            content:
+              "（在这里完整定义角色：基本信息、外貌、性格、语言风格、背景故事、喜好雷区等。这一条常驻生效，是角色扮演的核心依据）",
             name: "人物形象",
+            comment: "人物形象",
             constant: true,
             insertion_order: 0,
           },

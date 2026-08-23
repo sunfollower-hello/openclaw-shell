@@ -42,9 +42,19 @@ import {
   testTts,
   listEdgeVoices,
   COMMON_EDGE_VOICES,
+  TTS_KINDS,
   type TtsProvider,
 } from "./core/ttsConfig.js";
 import { recordUsage, getUsageSummary } from "./core/ttsUsage.js";
+import {
+  listBots,
+  addBot,
+  removeBot,
+  agentWorkspaceDir,
+  CHANNEL_LABELS,
+  MAX_BOTS,
+  MAX_WEIXIN_BOTS,
+} from "./core/botStore.js";
 import {
   recall,
   appendEntry,
@@ -263,6 +273,138 @@ app.post("/api/channels/qq/install-plugin", async (_req, res) => {
   try {
     const r = await runOpenclaw(["plugins", "install", "@hyl_aa/napcat"], { timeoutMs: 180000 });
     res.json({ ok: r.code === 0, output: stripAnsi(r.stdout + r.stderr).slice(-1500) });
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+// ---------- 多机器人：每卡一个独立 bot（卡 × 渠道账号 × OpenClaw agent） ----------
+app.get("/api/bots", async (_req, res) => {
+  try {
+    const bots = await listBots();
+    const agents = await runOpenclaw(["agents", "list"], { timeoutMs: 60000 });
+    const agentsText = stripAnsi(agents.stdout + agents.stderr);
+    // CLI 跑挂/超时时输出不完整，不能断言"不存在"，返回 null 表示未知
+    const listOk = agents.code === 0 && /Agents:|main/i.test(agentsText);
+    res.json({
+      bots: bots.map((b) => ({
+        ...b,
+        channelLabel: CHANNEL_LABELS[b.channel],
+        agentExists: listOk ? new RegExp(`^-\\s+${b.agentId}(\\s|$)`, "m").test(agentsText) : null,
+      })),
+      limits: { maxBots: MAX_BOTS, maxWeixin: MAX_WEIXIN_BOTS },
+    });
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+app.post("/api/bots", async (req, res) => {
+  try {
+    const { cardSlug, channel, accountId } = req.body ?? {};
+    if (channel !== "qqbot" && channel !== "openclaw-weixin") {
+      return res.status(400).json({ error: "channel 必须是 qqbot 或 openclaw-weixin" });
+    }
+    const card = await store.get(String(cardSlug)).catch(() => null);
+    if (!card) {
+      return res.status(400).json({ error: `人设卡 ${cardSlug} 不存在` });
+    }
+    if (!/^[a-z0-9-]+$/i.test(card.slug)) {
+      return res.status(400).json({ error: "卡 slug 不能用作 agent 名（仅字母数字横线）" });
+    }
+    const account = String(accountId ?? "").trim() || (channel === "qqbot" ? `qq-${Date.now().toString(36).slice(-4)}` : "wx-main");
+    const bot = await addBot({ cardSlug: card.slug, channel, accountId: account });
+
+    // ① 编译卡到该 agent 专属 workspace（每 agent 一份 SOUL.md，互不覆盖）
+    // zod parse 补全默认字段，避免残缺卡（缺 voice 等）编译崩溃
+    const compile = await compileCard(personaCardSchema.parse(card), agentWorkspaceDir(bot.cardSlug));
+
+    // ② 解析模型：卡单独配置优先，否则默认提供商
+    const llm = await resolveChatLLM(card);
+    if (!llm) {
+      await removeBot(bot.id);
+      return res.status(400).json({ error: "没有可用模型（先在 API 页配置模型提供商）" });
+    }
+
+    // ③ 创建隔离 agent 并绑定渠道路由；若 agent 已存在（上次残留），退化为补绑定
+    const add = await runOpenclaw(
+      [
+        "agents", "add", bot.agentId,
+        "--workspace", agentWorkspaceDir(bot.cardSlug),
+        "--model", `${llm.provider}/${llm.model}`,
+        "--bind", `${bot.channel}:${bot.accountId}`,
+        "--non-interactive", "--json",
+      ],
+      { timeoutMs: 60000 }
+    );
+    let addOutput = stripAnsi(add.stdout + add.stderr);
+    if (add.code !== 0 && !/already exist|已存在/i.test(addOutput)) {
+      await removeBot(bot.id);
+      return res.status(500).json({ error: `创建 agent 失败：${addOutput.slice(-800)}` });
+    }
+    if (add.code !== 0) {
+      const bind = await runOpenclaw(
+        ["agents", "bind", "--agent", bot.agentId, "--bind", `${bot.channel}:${bot.accountId}`, "--json"],
+        { timeoutMs: 30000 }
+      );
+      addOutput += "\n" + stripAnsi(bind.stdout + bind.stderr);
+    }
+
+    res.json({
+      bot,
+      compileFiles: compile.files,
+      model: `${llm.provider}/${llm.model}`,
+      output: addOutput.slice(-1500),
+      hint: "agent 已创建并绑定路由。下一步点「扫码绑定」完成渠道账号登录；网关在跑的话重启后生效（桌面开关）。",
+    });
+  } catch (e) {
+    res.status(400).json({ error: String(e) });
+  }
+});
+
+app.post("/api/bots/:id/login", async (req, res) => {
+  try {
+    const bot = (await listBots()).find((b) => b.id === req.params.id);
+    if (!bot) return res.status(404).json({ error: "机器人实例不存在" });
+    res.json(startChannelLogin(bot.channel, bot.accountId));
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+app.get("/api/bots/:id/login", async (req, res) => {
+  try {
+    const bot = (await listBots()).find((b) => b.id === req.params.id);
+    if (!bot) return res.status(404).json({ error: "机器人实例不存在" });
+    res.json(getChannelLoginState(bot.channel, bot.accountId));
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+// 卡片更新后重编译到该 agent 的 workspace
+app.post("/api/bots/:id/recompile", async (req, res) => {
+  try {
+    const bot = (await listBots()).find((b) => b.id === req.params.id);
+    if (!bot) return res.status(404).json({ error: "机器人实例不存在" });
+    const card = personaCardSchema.parse(await store.get(bot.cardSlug));
+    const out = await compileCard(card, agentWorkspaceDir(bot.cardSlug));
+    res.json({ ok: true, files: out.files, workspace: out.workspace });
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+app.delete("/api/bots/:id", async (req, res) => {
+  try {
+    const bot = await removeBot(req.params.id);
+    if (!bot) return res.status(404).json({ error: "机器人实例不存在" });
+    const del = await runOpenclaw(["agents", "delete", bot.agentId, "--force"], { timeoutMs: 60000 });
+    res.json({
+      ok: true,
+      output: stripAnsi(del.stdout + del.stderr).slice(-800),
+      hint: "agent 已删除（workspace/state 进入回收站）。网关重启后路由完全移除。",
+    });
   } catch (e) {
     res.status(500).json({ error: String(e) });
   }
@@ -1028,14 +1170,38 @@ app.delete("/api/cards/:slug/emoji/:id", async (req, res) => {
   }
 });
 
-// ---------- 生图配置（NovelAI / OpenAI 兼容 / 本地占位） ----------
+// ---------- 生图配置（NovelAI / OpenAI 兼容 / 本地 SD WebUI） ----------
 app.get("/api/image/config", async (_req, res) => {
   try {
     const cfg = await getImageConfig();
     res.json({
       provider: cfg.provider,
-      novelai: { key: maskKey(cfg.novelai.key), model: cfg.novelai.model, steps: cfg.novelai.steps, scale: cfg.novelai.scale, negative: cfg.novelai.negative },
-      openai: { baseUrl: cfg.openai.baseUrl, key: maskKey(cfg.openai.key), model: cfg.openai.model, size: cfg.openai.size },
+      novelai: {
+        key: maskKey(cfg.novelai.key),
+        model: cfg.novelai.model,
+        steps: cfg.novelai.steps,
+        scale: cfg.novelai.scale,
+        negative: cfg.novelai.negative,
+        sampler: cfg.novelai.sampler,
+        seed: cfg.novelai.seed,
+        ucPreset: cfg.novelai.ucPreset,
+        translate: cfg.novelai.translate,
+      },
+      openai: {
+        baseUrl: cfg.openai.baseUrl,
+        key: maskKey(cfg.openai.key),
+        model: cfg.openai.model,
+        size: cfg.openai.size,
+        translate: cfg.openai.translate,
+      },
+      local: {
+        baseUrl: cfg.local.baseUrl,
+        model: cfg.local.model,
+        steps: cfg.local.steps,
+        cfg: cfg.local.cfg,
+        sampler: cfg.local.sampler,
+        negative: cfg.local.negative,
+      },
     });
   } catch (e) {
     res.status(500).json({ error: String(e) });
@@ -1044,7 +1210,7 @@ app.get("/api/image/config", async (_req, res) => {
 
 app.post("/api/image/config", async (req, res) => {
   try {
-    const { provider, novelai, openai } = req.body ?? {};
+    const { provider, novelai, openai, local } = req.body ?? {};
     const cur = await getImageConfig();
     const next = {
       provider: ["novelai", "openai", "local"].includes(provider) ? provider : cur.provider,
@@ -1054,12 +1220,25 @@ app.post("/api/image/config", async (req, res) => {
         steps: Number(novelai?.steps) || cur.novelai.steps,
         scale: Number(novelai?.scale) || cur.novelai.scale,
         negative: novelai?.negative ?? cur.novelai.negative,
+        sampler: novelai?.sampler ?? cur.novelai.sampler,
+        seed: typeof novelai?.seed === "number" ? novelai.seed : cur.novelai.seed,
+        ucPreset: ["none", "light", "heavy"].includes(novelai?.ucPreset) ? novelai.ucPreset : cur.novelai.ucPreset,
+        translate: novelai?.translate !== undefined ? Boolean(novelai.translate) : cur.novelai.translate,
       },
       openai: {
         baseUrl: openai?.baseUrl ?? cur.openai.baseUrl,
         key: openai?.key ? String(openai.key) : cur.openai.key,
         model: openai?.model ?? cur.openai.model,
         size: openai?.size ?? cur.openai.size,
+        translate: openai?.translate !== undefined ? Boolean(openai.translate) : cur.openai.translate,
+      },
+      local: {
+        baseUrl: local?.baseUrl ?? cur.local.baseUrl,
+        model: local?.model ?? cur.local.model,
+        steps: Number(local?.steps) || cur.local.steps,
+        cfg: Number(local?.cfg) || cur.local.cfg,
+        sampler: local?.sampler ?? cur.local.sampler,
+        negative: local?.negative ?? cur.local.negative,
       },
     };
     await saveImageConfig(next);
@@ -1071,7 +1250,7 @@ app.post("/api/image/config", async (req, res) => {
 
 app.post("/api/image/test", async (req, res) => {
   try {
-    const { provider, novelai, openai } = req.body ?? {};
+    const { provider, novelai, openai, local } = req.body ?? {};
     if (provider === "novelai") {
       const key = novelai?.key ?? (await getImageConfig()).novelai.key;
       if (!key) return res.json({ ok: false, info: "未填 NovelAI Key" });
@@ -1085,7 +1264,111 @@ app.post("/api/image/test", async (req, res) => {
       res.json(await testOpenAIImageKey(String(baseUrl), String(key)));
       return;
     }
-    res.json({ ok: false, info: "本地生图未启用（方案见未来规划书）" });
+    if (provider === "local") {
+      const baseUrl = local?.baseUrl ?? (await getImageConfig()).local.baseUrl;
+      if (!baseUrl) return res.json({ ok: false, info: "未填本地生图 Base URL" });
+      try {
+        const r = await fetch(`${String(baseUrl).replace(/\/+$/, "")}/sdapi/v1/options`, { signal: AbortSignal.timeout(10000) });
+        res.json({ ok: r.ok, info: r.ok ? "本地服务可达（/sdapi/v1/options 正常）" : `HTTP ${r.status}` });
+      } catch (e) {
+        res.json({ ok: false, info: "本地服务不可达：" + String(e) });
+      }
+      return;
+    }
+    res.json({ ok: false, info: "未知提供商" });
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+// 真实生成一张测试图（保存到 data/images/_test/），配置页「试生一张」用
+app.post("/api/image/generate", async (req, res) => {
+  try {
+    const { prompt, negative, aspect, provider, novelai, openai, local } = req.body ?? {};
+    const { generateImage } = await import("./core/imageGen.js");
+    const { getImageConfig } = await import("./core/imageConfig.js");
+    const cfg = await getImageConfig();
+    // 页面表单可能未保存，用提交值覆盖本次生成
+    const override = {
+      ...cfg,
+      provider: ["novelai", "openai", "local"].includes(provider) ? provider : cfg.provider,
+      novelai: {
+        ...cfg.novelai,
+        key: novelai?.key ? String(novelai.key) : cfg.novelai.key,
+        model: novelai?.model ?? cfg.novelai.model,
+        steps: Number(novelai?.steps) || cfg.novelai.steps,
+        scale: Number(novelai?.scale) || cfg.novelai.scale,
+        negative: novelai?.negative ?? cfg.novelai.negative,
+        sampler: novelai?.sampler ?? cfg.novelai.sampler,
+      },
+      openai: {
+        ...cfg.openai,
+        baseUrl: openai?.baseUrl ?? cfg.openai.baseUrl,
+        key: openai?.key ? String(openai.key) : cfg.openai.key,
+        model: openai?.model ?? cfg.openai.model,
+        size: openai?.size ?? cfg.openai.size,
+      },
+      local: {
+        ...cfg.local,
+        baseUrl: local?.baseUrl ?? cfg.local.baseUrl,
+        steps: Number(local?.steps) || cfg.local.steps,
+        cfg: Number(local?.cfg) || cfg.local.cfg,
+        sampler: local?.sampler ?? cfg.local.sampler,
+        negative: local?.negative ?? cfg.local.negative,
+      },
+    };
+    const saveDir = path.join(dataDir(), "images", "_test");
+    const r = await generateImage(
+      {
+        prompt: String(prompt ?? ""),
+        negative: negative ? String(negative) : undefined,
+        aspect: aspect ? String(aspect) : undefined,
+        cfg: override,
+      },
+      saveDir
+    );
+    if (!r.ok) return res.json({ ok: false, error: r.error });
+    const file = r.file ? path.basename(r.file) : "gen.png";
+    res.json({ ok: true, url: `/img/_test/${file}`, promptUsed: r.promptUsed, width: r.width, height: r.height });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e) });
+  }
+});
+
+// 图片库：列出 data/images 下全部图片（按时间倒序），供管理/删除
+app.get("/api/image/list", async (_req, res) => {
+  try {
+    const root = path.join(dataDir(), "images");
+    const out: { dir: string; file: string; url: string; size: number; mtime: number }[] = [];
+    for (const dir of await fs.readdir(root).catch(() => [] as string[])) {
+      const full = path.join(root, dir);
+      const st = await fs.stat(full).catch(() => null);
+      if (!st?.isDirectory()) continue;
+      for (const f of await fs.readdir(full).catch(() => [] as string[])) {
+        if (!/\.(png|jpe?g|webp|gif)$/i.test(f)) continue;
+        const fst = await fs.stat(path.join(full, f)).catch(() => null);
+        if (!fst?.isFile()) continue;
+        out.push({ dir, file: f, url: `/img/${dir}/${f}`, size: fst.size, mtime: fst.mtimeMs });
+      }
+    }
+    out.sort((a, b) => b.mtime - a.mtime);
+    res.json({ images: out });
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+app.post("/api/image/delete", async (req, res) => {
+  try {
+    const { url } = req.body ?? {};
+    if (typeof url !== "string") return res.status(400).json({ error: "缺少 url" });
+    const m = /^\/img\/([^/]+)\/([A-Za-z0-9._-]+)$/.exec(url);
+    if (!m || m[1].includes("\\") || m[1].includes("..")) return res.status(400).json({ error: "url 不合法" });
+    const target = path.join(dataDir(), "images", m[1], m[2]);
+    const root = path.join(dataDir(), "images");
+    if (!target.startsWith(root + path.sep)) return res.status(400).json({ error: "非法路径" });
+    await fs.unlink(target);
+    res.json({ ok: true });
   } catch (e) {
     res.status(500).json({ error: String(e) });
   }
@@ -1139,13 +1422,14 @@ app.post("/api/tts/providers", async (req, res) => {
     const existing = providers.find((p) => p.id === id);
     const patch: Partial<TtsProvider> = {
       name: body.name,
-      kind: body.kind === "openai" ? "openai" : "openai",
+      kind: body.kind && TTS_KINDS.includes(body.kind) ? body.kind : "openai",
       baseUrl: body.baseUrl,
       model: body.model,
       voice: body.voice,
       speed: typeof body.speed === "number" ? body.speed : undefined,
       markup: typeof body.markup === "number" ? body.markup : undefined,
       enabled: typeof body.enabled === "boolean" ? body.enabled : undefined,
+      appId: typeof body.appId === "string" ? body.appId || undefined : undefined,
     };
     if (existing) {
       // 更新：key 为空表示保留旧 key
@@ -1158,7 +1442,7 @@ app.post("/api/tts/providers", async (req, res) => {
       providers.push({
         id,
         name: String(body.name),
-        kind: "openai",
+        kind: body.kind && TTS_KINDS.includes(body.kind) ? body.kind : "openai",
         baseUrl: String(body.baseUrl),
         key: String(body.key ?? ""),
         model: String(body.model ?? ""),
@@ -1166,6 +1450,7 @@ app.post("/api/tts/providers", async (req, res) => {
         speed: typeof body.speed === "number" ? body.speed : 1,
         markup: typeof body.markup === "number" ? body.markup : 1,
         enabled: body.enabled !== false,
+        appId: typeof body.appId === "string" ? body.appId : "",
       });
     }
     await saveTtsConfig({ ...cur, providers });
@@ -1186,6 +1471,66 @@ app.delete("/api/tts/providers/:id", async (req, res) => {
       defaultProvider: cur.defaultProvider === id ? "local" : cur.defaultProvider,
     });
     res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+// 拉取 TTS 上游的模型/音色列表：openai 兼容走 GET {base}/models（+尽力 /audio/voice/list）；minimax/volc 给内置可选列表
+function extractVoiceIds(j: unknown): string[] {
+  const out: string[] = [];
+  const walk = (v: unknown): void => {
+    if (typeof v === "string") {
+      const s = v.trim();
+      if (s && s.length < 120 && s !== "null") out.push(s);
+      return;
+    }
+    if (Array.isArray(v)) {
+      v.forEach(walk);
+      return;
+    }
+    if (v && typeof v === "object") {
+      const o = v as Record<string, unknown>;
+      for (const k of ["voice_id", "voiceId", "voice", "speaker", "name", "id"]) {
+        const val = o[k];
+        if (typeof val === "string" && val.trim() && val !== "null") {
+          out.push(val.trim());
+          break;
+        }
+      }
+    }
+  };
+  walk((j as { data?: unknown })?.data ?? j);
+  return [...new Set(out)];
+}
+
+app.post("/api/tts/fetch-models", async (req, res) => {
+  try {
+    const { kind, baseUrl, key } = req.body ?? {};
+    const k: string = TTS_KINDS.includes(kind) ? kind : "openai";
+    const base = String(baseUrl ?? "").replace(/\/+$/, "");
+    if (!base || !key) return res.status(400).json({ error: "Base URL 与 API Key 必填" });
+    let models: string[] = [];
+    let voices: string[] = [];
+    if (k === "openai") {
+      const r = await fetch(`${base}/models`, { headers: { Authorization: `Bearer ${key}` }, signal: AbortSignal.timeout(20000) });
+      if (!r.ok) return res.status(502).json({ error: `拉取模型失败 HTTP ${r.status}: ${(await r.text()).slice(0, 200)}` });
+      const j = (await r.json().catch(() => null)) as { data?: { id?: string }[] } | null;
+      const ids = Array.isArray(j?.data) ? j.data.map((m) => String(m?.id ?? "")).filter(Boolean) : [];
+      models = ids.filter((id) => /tts|speech|voice|audio|cosy|moss/i.test(id));
+      if (!models.length) models = ids; // 过滤不到就全给
+      // 尽力拉音色列表（硅基流动等支持 GET /audio/voice/list），失败不影响模型
+      const vr = await fetch(`${base}/audio/voice/list`, { headers: { Authorization: `Bearer ${key}` }, signal: AbortSignal.timeout(20000) }).catch(() => null);
+      if (vr?.ok) {
+        const vj = await vr.json().catch(() => null);
+        voices = extractVoiceIds(vj);
+      }
+    } else if (k === "minimax") {
+      models = ["speech-2.8-hd", "speech-2.8-turbo", "speech-2.6-hd", "speech-2.6-turbo", "speech-02-hd", "speech-02-turbo", "speech-01-hd", "speech-01-turbo"];
+    } else if (k === "volc") {
+      models = ["seed-tts-1.0", "seed-tts-2.0", "seed-tts-1.0-concurr", "seed-icl-2.0"];
+    }
+    res.json({ models, voices });
   } catch (e) {
     res.status(500).json({ error: String(e) });
   }

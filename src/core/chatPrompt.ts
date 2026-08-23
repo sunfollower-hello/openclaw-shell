@@ -8,6 +8,17 @@ export function buildChatSystem(card: PersonaCard): string {
   );
   lines.push("");
   if (card.identity.bio) lines.push(`【简介】${card.identity.bio}`);
+  const st = card.sillytavern_v2;
+  const fullDesc = st?.description?.trim();
+  if (fullDesc) lines.push(`【人物档案】${fullDesc}`);
+  if (st?.character_book?.entries?.length) {
+    for (const e of st.character_book.entries) {
+      if (e.enabled === false) continue;
+      const title = e.comment || e.name || "世界书条目";
+      const keys = Array.isArray(e.keys) && e.keys.length ? `（触发词：${e.keys.join("、")}）` : "";
+      lines.push(`【${title}】${e.constant ? "常驻设定。" : keys ? `${keys}出现时使用。` : ""}${String(e.content ?? "").trim()}`);
+    }
+  }
   if (card.voice.tone_rules.length > 0) {
     lines.push("【说话方式】");
     for (const t of card.voice.tone_rules) lines.push(`- ${t}`);

@@ -14,13 +14,19 @@
 ## 1. 文件地图（改哪里找哪里）
 
 ```
-src/core/ttsConfig.ts    核心模块：TtsProvider 多上游定义 + TtsConfig + 三个合成后端
-                         （synthProvider=OpenAI 兼容 / synthEdge=Edge 在线 / synthSapi=Windows 离线）
-                         + synthesize() 总入口 + testTts() + COMMON_EDGE_VOICES 22 个中文语音表
+src/core/ttsConfig.ts    核心模块：TtsProvider 多上游定义（kind: openai/minimax/volc）+ TtsConfig
+                         + 合成后端：synthProvider=OpenAI 兼容 /v1/audio/speech、
+                           synthMinimax=海螺 t2a_v2（hex/url 自动解码）、
+                           synthVolc=豆包 openspeech V3（NDJSON base64）、
+                           synthEdge=Edge 在线 / synthSapi=Windows 离线
+                         + synthByKind 按 kind 分派 + synthesize() 总入口 + testTts()
+                         + COMMON_EDGE_VOICES 22 个中文语音表
 src/core/ttsUsage.ts     用量记账：recordUsage() 追加 jsonl / getUsageSummary() 汇总
 src/tts-server.ts        独立售卖服务：POST /v1/audio/speech（OpenAI 兼容）+ /health，17900 端口
 src/server.ts            管理台路由（搜 "语音合成（TTS）" 段）：/api/tts/* 共 8 个端点 + /tts 静态目录
-web/app.js               前端：renderTtsBlock/initTtsBlock（API 页区块，搜 "语音合成"）
+web/app.js               前端：renderTtsPage/initTtsPage（**独立页 #/tts**，导航在生图配置下面）
+                         + TTS_PRESETS 服务商预设（硅基流动/OpenAI 官方/MiniMax/火山豆包/自定义）
+                         + 添加向导：选服务商 → 填 Key → 「保存并拉取模型」→ 模型/音色 chips 点选 → 完成
                          + addChatBubble 的 🔊 按钮 + speakText()（聊天朗读）
 web/style.css            .tts-speak-btn 样式（气泡 hover 显示）
 data/ttsConfig.json      运行配置（gitignored）：defaultProvider + local + providers[]
@@ -48,6 +54,9 @@ data/ttsConfig.json ─┤
 合成后端选择逻辑（`synthesize(text, opts)`）：
 - `opts.providerId` 显式指定 → 必须用该上游（未启用报错）
 - 否则用 `defaultProvider`：是 provider id 且启用 → 走该上游；未启用 → **兜底本地**；是 "local" → 本地
+- 合成后端按 `provider.kind` 分派：`openai` → POST {baseUrl}/audio/speech（硅基流动/OpenAI 官方等）；
+  `minimax` → POST {baseUrl}/t2a_v2（text + voice_setting.voice_id + audio_setting，`output_format: url` 拿下载链接，hex/base64 兜底自动解码）；
+  `volc` → POST {baseUrl}（X-Api-Key 新版单 Key / X-Api-App-Id+X-Api-Access-Key 旧版，X-Api-Resource-Id 按 `model` 字段，留空按音色名自动推断：S_→seed-icl-2.0、_uranus_/saturn_→seed-tts-2.0、其余→seed-tts-1.0；响应 NDJSON 逐行解析拼 base64）
 - 本地：`local.engine` = sapi（离线必可用）或 edge（在线免费，本网络 403）
 - **售卖接口（tts-server）不用 local 兜底**——没配上游时返回 503 提示，别把本地音质卖给客户
 
@@ -59,6 +68,7 @@ data/ttsConfig.json ─┤
 | `/api/tts/config` | GET/POST | 读/写配置（GET 时 key 打码、附 commonVoices；POST 只改 defaultProvider+local） |
 | `/api/tts/providers` | POST | 新增或更新上游（带已存在 id=更新，key 留空=保留旧值；新 id 形如 `p_<ts36>`） |
 | `/api/tts/providers/:id` | DELETE | 删上游（删的是默认则 defaultProvider 回落 local） |
+| `/api/tts/fetch-models` | POST | body `{kind, baseUrl, key}` → `{models, voices}`：openai 拉 `{base}/models`（过滤 tts/speech/voice/audio/cosy/moss，过滤不到全给）+ 尽力拉 `{base}/audio/voice/list`；minimax/volc 返回内置可选列表 |
 | `/api/tts/test` | POST | body `{target: "local"\|"providerId"}` 合成一小段测试，不记账 |
 | `/api/tts/voices` | GET | Edge 全部语音列表（在线接口） |
 | `/api/tts/synthesize` | POST | body `{text, providerId?, voice?, speed?}` → `{url:"/tts/xx.mp3", bytes}`，记账 via:admin |
@@ -82,18 +92,25 @@ data/ttsConfig.json ─┤
     "voice": "zh-CN-XiaoxiaoNeural",      // edge 语音名（22 个常用在 COMMON_EDGE_VOICES）
     "rate": "+0%", "pitch": "+0Hz"        // edge 的语速/音调语法
   },
-  "providers": [{
-    "id": "siliconflow",                  // 内部 id（defaultProvider 引用它）
-    "name": "硅基流动",                    // 显示名
-    "kind": "openai",                     // 协议类型：第一版只实现了 openai 兼容；扩 GPT-SoVITS 时加 "sovits"
-    "baseUrl": "https://api.siliconflow.cn/v1",
-    "key": "",                            // ← 等用户注册硅基流动后填入（PUT 时留空=保留旧值）
-    "model": "FunAudioLLM/CosyVoice2-0.5B",
-    "voice": "FunAudioLLM/CosyVoice2-0.5B:alex",   // 硅基流动音色必须带模型前缀 "模型:音色"
-    "speed": 1,                           // 0.25~4
-    "markup": 1,                          // 加价倍率（1=原价）——计费预留字段，当前不参与计算
-    "enabled": false                      // ← 填 key 后改 true 并设为 defaultProvider
-  }]
+  "providers": []
+}
+```
+
+`providers` 默认空，由前端「TTS 提供商 → ＋ 添加提供商」向导录入（服务商预设见 `web/app.js` 的 `TTS_PRESETS`：硅基流动 / OpenAI 官方 / MiniMax 海螺 / 火山豆包 / 自定义 OpenAI 兼容）。添加后形如：
+
+```json
+{
+  "id": "siliconflow",                  // 内部 id（defaultProvider 引用它）
+  "name": "硅基流动",                    // 显示名
+  "kind": "openai",                     // 协议类型：openai=OpenAI 兼容 | minimax=海螺 t2a_v2 | volc=豆包 openspeech V3
+  "baseUrl": "https://api.siliconflow.cn/v1",
+  "key": "",                            // ← 注册后填入（PUT 时留空=保留旧值）
+  "model": "FunAudioLLM/CosyVoice2-0.5B",
+  "voice": "FunAudioLLM/CosyVoice2-0.5B:alex",   // 硅基流动音色必须带模型前缀 "模型:音色"
+  "speed": 1,                           // openai 0.25~4；minimax 0.5~2 自动 clamp；volc 暂不支持忽略
+  "markup": 1,                          // 加价倍率：one-api 计费预留字段，UI 已移除，当前不参与计算
+  "enabled": false,                     // ← 填 key 后改 true 并设为 defaultProvider
+  "appId": ""                           // 仅 volc：火山旧版鉴权 App ID；新版单 Key 鉴权留空
 }
 ```
 
@@ -119,15 +136,19 @@ npm run tts-server           # 开发；生产 node dist/tts-server.js；端口 
 | SAPI 离线合成 | ✅ 151KB wav 实测 |
 | 售卖链路（mock 上游） | ✅ model 路由/默认路由/空文本 400/音频返回/记账 via:api 全过 |
 | 真实聊天朗读 | ✅ 浏览器实测：Agnes 奶奶人设回复 → 🔊 → SAPI 合成播放 → usage+1 |
-| API 页 TTS 区块 UI | ✅ 渲染/22 语音下拉/上游卡片/用量显示/视觉检查通过 |
+| API 页 TTS 区块 UI | ✅ 渲染/22 语音下拉/上游卡片/协议类型选择/用量显示/视觉检查通过 |
 | edge 在线合成 | ❌ 本网络 WS 握手 403（语音列表接口 200，网络通）；保留选项，换网络可能恢复 |
-| siliconflow 上游 | 预置未启用（key 空）——**等用户注册拿 key，这是开卖唯一缺口** |
-| 当前生效配置 | defaultProvider=local，local.engine=sapi（朗读开箱可用） |
+| MiniMax 适配器 | ✅ 代码就绪（kind=minimax，t2a_v2 + url/hex 解码；build + 分派冒烟通过，无 key 未实测） |
+| 火山豆包适配器 | ✅ 代码就绪（kind=volc，openspeech V3 + NDJSON 解析 + Resource ID 自动推断；无 key 未实测） |
+| 添加向导（预设） | ✅ 独立页 #/tts：4 家服务商预设可选（硅基流动/OpenAI 官方/MiniMax/火山豆包/自定义），**不预写配置**；注册任一家→添加→填 key 即用，这是开卖唯一缺口 |
+| 自动拉取模型 | ✅ `/api/tts/fetch-models`：openai 兼容走 `{base}/models`（过滤 tts 相关）+尽力拉音色列表；minimax/volc 返回内置可选列表（未注册 key 未实测真实拉取） |
+| 加价倍率（markup） | 已从 UI 移除（数据模型保留，默认 1，one-api 计费预留，当前不参与计算） |
+| 当前生效配置 | defaultProvider=local，local.engine=sapi（朗读开箱可用），providers 空 |
 
 ## 7. 开卖三步（等用户做）
 
-1. 注册 siliconflow.cn 拿 key → API 页「语音合成」区块 → 编辑「硅基流动」→ 填 key → 保存 → 测试 → 启用（或直接启用+设默认通道）
-2. `npm run tts-server` → 写 `data/ttsKeys.json` 发 key 给客户 → 客户 OpenAI SDK baseUrl 指 `http://服务器:17900/v1`，model 填 `FunAudioLLM/CosyVoice2-0.5B`
+1. 注册上游拿 key（任选一家或多家：siliconflow.cn / MiniMax 开放平台 / 火山引擎豆包语音 / OpenAI）→ 「语音合成」页 → ＋ 添加提供商 → 选服务商 → 填 key → 保存并拉取模型 → 点选模型/音色 → 完成 → 测试 → 启用（或直接启用+设默认通道）。OpenAI 官方国内需代理
+2. `npm run tts-server` → 写 `data/ttsKeys.json` 发 key 给客户 → 客户 OpenAI SDK baseUrl 指 `http://服务器:17900/v1`，model 填你启用的上游 model（如 `FunAudioLLM/CosyVoice2-0.5B` / `speech-02-hd` / `seed-tts-2.0`）
 3. 部署公网服务器（第 5 节），后续接 one-api 计费（用量数据已在 tts-usage.jsonl）
 
 ## 8. 踩坑记录（TTS 专属，接手必读）
@@ -139,11 +160,17 @@ npm run tts-server           # 开发；生产 node dist/tts-server.js；端口 
 5. **/tts 音频在 Basic 认证后**：curl 测音频要带 `-u`；浏览器登录后 `<audio>` 会自动带凭据，用户无感
 6. **售卖接口音频格式**：上游固定 mp3（response_format: mp3 透传给上游），但 SAPI 兜底产 wav——synthesize 路由按 RIFF 头判扩展名；tts-server 的 response_format 参数透传给上游，本地兜底不支持格式选择
 7. **杀 tts-server**：npm 外层杀了 node 子进程会残留占 17900，`netstat -ano | grep :17900` 找 PID taskkill
+8. **MiniMax 响应编码有坑**：文档说 data.audio 是 hex，但示例看着像 base64/zip——别赌编码。适配器请求 `output_format: "url"` 拿 24h 下载链接再 fetch，hex/base64 仅兜底（纯 hex 字符串按 hex 解码，否则 base64）
+9. **豆包 Resource ID 必须跟音色对得上**：克隆音色（S_ 开头）→ seed-icl-2.0；官方 2.0（_uranus_/saturn_ 开头）→ seed-tts-2.0；官方 1.0（_mars_/_moon_）→ seed-tts-1.0。对不上报 55000000，适配器按 model 字段（留空按音色名自动推断）
+10. **豆包鉴权两套**：新版单 API Key（X-Api-Key，推荐）+ 旧版 AppID/Token（X-Api-App-Id + X-Api-Access-Key）。配置里填了 `appId` 就走旧版（key 即 access token），否则新版。豆包 V3 暂不支持语速参数，speed 会被忽略
+11. **新 kind 的 model 路由**：tts-server 按客户填的 model 匹配 `p.model === 客户 model || 客户 model 含 p.model 末段`——minimax 的 speech-02-hd、豆包的 seed-tts-2.0 都能命中，`seed-tts-2.0-expressive` 也会命中豆包
 
 ## 9. 待办与扩展点（按价值排序）
 
-- [ ] **用户注册硅基流动填 key**（开卖唯一前置）
-- [ ] OpenAI 官方 TTS / MiniMax / 火山豆包 上游适配（OpenAI 兼容的直接加 provider 即可；MiniMax/火山协议有差异需加 kind 适配器）
+- [ ] **用户注册上游填 key**（硅基流动 / MiniMax / 火山豆包 / OpenAI 官方任选，开卖唯一前置；适配器+添加向导已就绪）
+- [x] OpenAI 官方 TTS / MiniMax / 火山豆包 上游适配（2026-08-24：kind 扩为 openai/minimax/volc，MiniMax 与豆包适配器已实现并通过分派冒烟；OpenAI 官方直接走 openai kind 零代码）
+- [x] TTS 独立页改造（2026-08-24：从 API 页区块迁到独立页 #/tts（导航在生图配置下）；添加方式同 API 配置——选服务商→填 key→自动拉取模型/音色 chips 点选；默认不再预置任何供应商；加价倍率字段从 UI 移除，数据模型保留待 one-api 计费）
+- [ ] 新增上游实测：注册后填 key 逐家跑 `/api/tts/test`，验证真实合成 + 音频可播放（当前只验证了报错路径）
 - [ ] GPT-SoVITS 声音克隆（付费增值）：加 `kind: "sovits"` 分支，需 NVIDIA 显卡，用户已有本地推理条件时做
 - [ ] one-api/new-api 计费对接（等中转站，markup 字段就是为这准备的）
 - [ ] 语音 STT（语音输入）——TTS 做了，STT 完全没做

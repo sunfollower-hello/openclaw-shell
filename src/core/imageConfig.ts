@@ -1,12 +1,23 @@
-// 生图配置：NovelAI / OpenAI 兼容 API / 本地（占位）
+// 生图配置：NovelAI / OpenAI 兼容 / 本地 SD WebUI（A1111/Forge）
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { dataDir } from "./cardStore.js";
 
 export interface ImageConfig {
   provider: "novelai" | "openai" | "local";
-  novelai: { key: string; model: string; steps: number; scale: number; negative: string };
-  openai: { baseUrl: string; key: string; model: string; size: string };
+  novelai: {
+    key: string;
+    model: string;
+    steps: number;
+    scale: number;
+    negative: string;
+    sampler: string;
+    seed: number;
+    ucPreset: "none" | "light" | "heavy";
+    translate: boolean; // 中文 prompt 自动翻译扩写为英文（用默认 chat 模型）
+  };
+  openai: { baseUrl: string; key: string; model: string; size: string; translate: boolean };
+  local: { baseUrl: string; model: string; steps: number; cfg: number; sampler: string; negative: string };
 }
 
 const DEFAULTS: ImageConfig = {
@@ -17,8 +28,13 @@ const DEFAULTS: ImageConfig = {
     steps: 28,
     scale: 6,
     negative: "bad anatomy,bad hands,bad proportions,blurry,low quality,worst quality,watermark,text",
+    sampler: "k_dpmpp_2m_sde",
+    seed: 0,
+    ucPreset: "heavy",
+    translate: true,
   },
-  openai: { baseUrl: "", key: "", model: "agnes-image-2.0-flash", size: "1024x1024" },
+  openai: { baseUrl: "", key: "", model: "agnes-image-2.0-flash", size: "1024x1024", translate: true },
+  local: { baseUrl: "", model: "", steps: 24, cfg: 7, sampler: "Euler a", negative: "bad anatomy,bad hands,bad proportions,blurry,low quality,worst quality,watermark,text" },
 };
 
 async function cfgPath(): Promise<string> {
@@ -33,6 +49,7 @@ export async function getImageConfig(): Promise<ImageConfig> {
       ...c,
       novelai: { ...DEFAULTS.novelai, ...(c.novelai ?? {}) },
       openai: { ...DEFAULTS.openai, ...(c.openai ?? {}) },
+      local: { ...DEFAULTS.local, ...(c.local ?? {}) },
     };
   } catch {
     return structuredClone(DEFAULTS);

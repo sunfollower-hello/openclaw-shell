@@ -16,6 +16,7 @@ export function cardToCCv2(card: PersonaCard): Record<string, unknown> {
     scenario: "",
     first_mes: "",
     mes_example: "",
+    alternate_greetings: [],
     regex_scripts: [],
     character_book: { entries: [] },
   };
@@ -35,7 +36,7 @@ export function cardToCCv2(card: PersonaCard): Record<string, unknown> {
       tags: card.identity.tags ?? [],
       creator: "openclaw-shell",
       character_version: `v${card.version}`,
-      alternate_greetings: [],
+      alternate_greetings: st.alternate_greetings ?? [],
       extensions: {
         openclaw_shell: {
           slug: card.slug,
@@ -73,7 +74,11 @@ export function ccv2ToCard(cc: unknown, avatarDataUrl?: string): PersonaCard {
   card.created_at = nowIso();
   card.updated_at = nowIso();
 
-  card.identity.bio = String(data.description ?? "").slice(0, 500) || undefined;
+  // 酒馆卡 description 是完整角色档案（可能很长）：一句话简介只放短文本，全长保留在 sillytavern_v2.description
+  const fullDesc = String(data.description ?? "");
+  if (fullDesc && fullDesc.length <= 500) {
+    card.identity.bio = fullDesc;
+  }
   if (Array.isArray(data.tags)) card.identity.tags = (data.tags as unknown[]).map(String).slice(0, 20);
   if (avatarDataUrl) card.identity.avatar = avatarDataUrl;
   card.identity.relation = name;
@@ -96,6 +101,9 @@ export function ccv2ToCard(cc: unknown, avatarDataUrl?: string): PersonaCard {
     scenario: String(data.scenario ?? ""),
     first_mes: String(data.first_mes ?? ""),
     mes_example: String(data.mes_example ?? ""),
+    alternate_greetings: Array.isArray(data.alternate_greetings)
+      ? (data.alternate_greetings as unknown[]).map(String)
+      : [],
     regex_scripts: Array.isArray(exts.regex_scripts) ? (exts.regex_scripts as Record<string, unknown>[]) : [],
     character_book:
       book && Array.isArray(book.entries) ? { entries: book.entries as never[] } : { entries: [] },

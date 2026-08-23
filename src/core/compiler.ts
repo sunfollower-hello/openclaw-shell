@@ -215,16 +215,33 @@ function renderSkill(card: PersonaCard): string {
     lines.push("- 用户请求适合用工具完成时（写代码、搜索、查天气等），调用工具而不是凭空编造结果");
   }
 
-  // 世界书：关键词触发的背景设定（编译进 skill，通道对话同样生效）
+  // 人物档案：酒馆卡/手工卡的完整角色描述（可能很长，独立成节）
+  const desc = card.sillytavern_v2?.description?.trim();
+  if (desc) {
+    lines.push("");
+    lines.push("## 人物档案");
+    lines.push(desc);
+  }
+
+  // 世界书：常驻条目始终作为背景，关键词条目在出现关键词时注入相关内容
   const book = card.sillytavern_v2?.character_book?.entries ?? [];
   if (book.length > 0) {
     lines.push("");
-    lines.push("## 世界书（背景设定，出现关键词时注入相关内容）");
+    lines.push("## 世界书（背景设定与人物信息）");
     for (const e of book) {
-      const keys = Array.isArray(e.keys) && e.keys.length ? e.keys.join(" / ") : "常驻";
-      const enabled = e.enabled !== false;
-      if (!enabled) continue;
-      lines.push(`- [${keys}] ${String(e.content ?? "").trim()}`);
+      if (e.enabled === false) continue;
+      const title = e.comment || e.name || "未命名条目";
+      const keys = Array.isArray(e.keys) && e.keys.length ? e.keys.join("、") : "";
+      lines.push("");
+      lines.push(`### ${title}${e.constant ? "（常驻）" : ""}`);
+      if (e.constant) {
+        lines.push("- 常驻生效：始终作为角色背景与行为依据");
+      } else if (keys) {
+        lines.push(`- 触发关键词：${keys}（聊天出现这些词时注入本条）`);
+      } else {
+        lines.push("- 按需使用：场景相关时参考本条");
+      }
+      lines.push(String(e.content ?? "").trim());
     }
   }
   const firstMes = card.sillytavern_v2?.first_mes;

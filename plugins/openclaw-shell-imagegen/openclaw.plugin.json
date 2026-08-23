@@ -1,0 +1,19 @@
+{
+  "id": "openclaw-shell-imagegen",
+  "name": "Openclaw Shell Imagegen",
+  "description": "openclaw-shell 生图工具：NovelAI / OpenAI 兼容 / 本地 SD WebUI",
+  "version": "0.1.0",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  },
+  "activation": {
+    "onStartup": true
+  },
+  "contracts": {
+    "tools": [
+      "image_gen"
+    ]
+  }
+}

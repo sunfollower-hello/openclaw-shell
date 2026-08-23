@@ -106,19 +106,20 @@ window.addEventListener("hashchange", router);
 // ============================================================
 //  卡片表单（做卡 / 编辑共用）
 // ============================================================
-function wbRowHTML(e, locked) {
-  return `<div class="wb-row">
-    <input class="wb-key" placeholder="关键词" value="${escapeHtml(e?.keys?.[0] ?? "")}" ${locked ? "disabled" : ""}>
-    <textarea class="wb-content" rows="1" placeholder="内容（触发时注入）">${escapeHtml(e?.content ?? "")}</textarea>
-    <button class="wb-del danger small-btn" type="button">✕</button>
-  </div>`;
-}
-function rxRowHTML(s) {
-  return `<div class="wb-row rx">
-    <input class="rx-name" placeholder="名称" value="${escapeHtml(s?.scriptName ?? "")}">
-    <input class="rx-find" placeholder="匹配（正则）" value="${escapeHtml(s?.findRegex ?? "")}">
-    <input class="rx-rep" placeholder="替换为" value="${escapeHtml(s?.replaceString ?? "")}">
-    <button class="wb-del danger small-btn" type="button">✕</button>
+function wbRowHTML(e) {
+  const keys = Array.isArray(e?.keys) ? e.keys.join("、") : (e?.keys ?? "");
+  return `<div class="wb-entry">
+    <div class="wb-head">
+      <input class="wb-comment" placeholder="条目名称（如：人物形象 / 世界观 / 人物关系）" value="${escapeHtml(e?.comment || e?.name || "")}">
+      <span class="wb-flags">
+        <label title="常驻条目始终生效，不靠关键词触发"><input type="checkbox" class="wb-constant" ${e?.constant ? "checked" : ""}> 常驻</label>
+        <label><input type="checkbox" class="wb-enabled" ${e?.enabled !== false ? "checked" : ""}> 启用</label>
+        <label title="多条条目同时触发时的排序">顺序 <input type="number" class="wb-order" min="0" value="${e?.insertion_order ?? 100}" style="width:56px"></label>
+      </span>
+      <button class="wb-del danger small-btn" type="button">✕</button>
+    </div>
+    <input class="wb-keys" placeholder="触发关键词，逗号分隔（常驻条目可留空）" value="${escapeHtml(keys)}">
+    <textarea class="wb-content" rows="4" placeholder="条目内容……（角色的血肉都写在这里：外貌、性格、语言风格、背景、喜好、雷区……）">${escapeHtml(e?.content ?? "")}</textarea>
   </div>`;
 }
 
@@ -126,8 +127,8 @@ function cardFormHTML(mode) {
   return `
   <div class="cf-section"><h3>📋 基本信息</h3>
     <div class="cf-grid">
-      <div><label>名称</label><input id="cf-name" placeholder="如：奶奶"></div>
-      ${mode === "create" ? `<div><label>slug（留空自动）</label><input id="cf-slug" placeholder="nainai"></div>` : ""}
+      <div><label>名称</label><input id="cf-name" placeholder="如：许桃"></div>
+      ${mode === "create" ? `<div><label>slug（留空自动）</label><input id="cf-slug" placeholder="xutao"></div>` : ""}
       ${mode === "create" ? `<div><label>关系类型</label>
         <select id="cf-role">
           <option value="friend">朋友</option><option value="family">家人</option>
@@ -135,8 +136,8 @@ function cardFormHTML(mode) {
           <option value="colleague">同事</option><option value="public-figure">偶像/角色</option>
         </select></div>` : ""}
     </div>
-    <label>简介（一句话介绍角色）</label>
-    <textarea id="cf-bio" rows="2" placeholder="如：80 岁的北方奶奶，说话直接但心软"></textarea>
+    <label>简介（一句话介绍角色，选填）</label>
+    <textarea id="cf-bio" rows="2" placeholder="如：开甜品铺的 26 岁姑娘，嘴上凶巴巴，心里软乎乎的"></textarea>
     <label>头像（PNG，可选）</label>
     <div class="cf-avatar-row">
       <img id="cf-avatar-img" class="cf-avatar" style="display:none" alt="头像">
@@ -144,23 +145,11 @@ function cardFormHTML(mode) {
     </div>
   </div>
   <div class="cf-section"><h3>👋 开场白</h3>
-    <textarea id="cf-first" rows="2" placeholder="对话开始时的第一句话，如：哎，你可算回来了，快坐下"></textarea>
+    <textarea id="cf-first" rows="3" placeholder="新对话开始时，角色说/做的第一段话。写成一个有画面感的小场景，别只写一句问候"></textarea>
   </div>
-  <div class="cf-section"><h3>📚 世界书 <span class="hint">（关键词触发背景设定，第一条固定「人物形象」）</span></h3>
+  <div class="cf-section"><h3>📚 世界书 <span class="hint">（角色设定的核心都在这里：人格、语气、背景、人物关系……常驻条目始终生效；有触发关键词的条目，聊天出现关键词时才注入）</span></h3>
     <div id="cf-book"></div>
     <button id="cf-book-add" class="ghost small-btn" type="button">＋ 添加条目</button>
-  </div>
-  <div class="cf-section"><h3>🔀 正则替换 <span class="hint">（可留空）</span></h3>
-    <div id="cf-regex"></div>
-    <button id="cf-regex-add" class="ghost small-btn" type="button">＋ 添加正则</button>
-  </div>
-  <div class="cf-section"><h3>🎭 人格与语气</h3>
-    <div class="cf-grid2">
-      <div><label>性格特质（一行一条）</label><textarea id="cf-traits" rows="3"></textarea></div>
-      <div><label>口头禅（一行一条）</label><textarea id="cf-catch" rows="3"></textarea></div>
-      <div><label>说话方式（一行一条）</label><textarea id="cf-tone" rows="3"></textarea></div>
-      <div><label>边界禁区（一行一条）</label><textarea id="cf-bound" rows="3"></textarea></div>
-    </div>
   </div>
   <div class="cf-section"><h3>⚡ 模型（此卡专用，留空跟随默认 API）</h3>
     <div class="cf-grid2">
@@ -170,17 +159,12 @@ function cardFormHTML(mode) {
   </div>
   <div class="cf-section"><h3>🧠 记忆</h3>
     <label>每 <input id="cf-rounds" type="number" min="1" max="50" value="20" style="width:64px;display:inline-block;text-align:center"> 轮对话自动总结一次（1-50，默认 20；内容在「记忆」页管理）</label>
-  </div>
-  <div class="cf-section"><h3>🔧 高级（JSON）<button id="cf-json-toggle" class="ghost small-btn" type="button">展开</button></h3>
-    <textarea id="cf-json" rows="10" style="display:none" spellcheck="false"></textarea>
-    <div class="row" style="margin-top:6px"><button id="cf-json-load" class="ghost small-btn" type="button">从 JSON 载入表单</button></div>
   </div>`;
 }
 
 function bindCardForm(card, mode) {
   fillFormFromCard(card, mode);
   $("#cf-book-add").addEventListener("click", () => $("#cf-book").insertAdjacentHTML("beforeend", wbRowHTML({})));
-  $("#cf-regex-add").addEventListener("click", () => $("#cf-regex").insertAdjacentHTML("beforeend", rxRowHTML({})));
   document.addEventListener("click", cardFormDelHandler);
   $("#cf-avatar").addEventListener("change", async (e) => {
     const f = e.target.files[0];
@@ -189,32 +173,17 @@ function bindCardForm(card, mode) {
     $("#cf-avatar-img").src = "data:image/png;base64," + b64;
     $("#cf-avatar-img").style.display = "block";
   });
-  $("#cf-json-toggle").addEventListener("click", () => {
-    const t = $("#cf-json");
-    const show = t.style.display === "none";
-    t.style.display = show ? "block" : "none";
-    $("#cf-json-toggle").textContent = show ? "收起" : "展开";
-    if (show) t.value = JSON.stringify(collectCardForm(structuredClone(card), mode), null, 2);
-  });
-  $("#cf-json-load").addEventListener("click", () => {
-    try {
-      const obj = JSON.parse($("#cf-json").value);
-      Object.keys(obj).forEach((k) => (card[k] = obj[k]));
-      fillFormFromCard(card, mode);
-      toast("已从 JSON 载入表单");
-    } catch (e) { toast("JSON 解析失败：" + e.message, false); }
-  });
   fillProvidersIntoForm(card);
 }
 
 function cardFormDelHandler(e) {
   if (e.target?.classList?.contains("wb-del")) {
-    const container = e.target.closest("#cf-book, #cf-regex");
-    if (container?.id === "cf-book" && container.querySelectorAll(".wb-row").length <= 1) {
-      toast("世界书至少保留一条（人物形象）", false);
+    const container = e.target.closest("#cf-book");
+    if (container?.id === "cf-book" && container.querySelectorAll(".wb-entry").length <= 1) {
+      toast("世界书至少保留一条条目", false);
       return;
     }
-    e.target.closest(".wb-row")?.remove();
+    e.target.closest(".wb-entry")?.remove();
   }
 }
 
@@ -223,6 +192,7 @@ function fillFormFromCard(card, mode) {
   $("#cf-name").value = card.name ?? "";
   if (mode === "create" && $("#cf-slug")) $("#cf-slug").value = card.slug ?? "";
   if (mode === "create" && $("#cf-role")) $("#cf-role").value = card.identity?.role ?? "friend";
+  // 简介框承载「一句话简介」；导入的酒馆卡如有完整角色档案（description），原样显示、原样保存
   $("#cf-bio").value = st.description || card.identity?.bio || "";
   $("#cf-first").value = st.first_mes ?? "";
   if (card.identity?.avatar) {
@@ -231,15 +201,8 @@ function fillFormFromCard(card, mode) {
   } else {
     $("#cf-avatar-img").style.display = "none";
   }
-  const entries = st.character_book?.entries?.length
-    ? st.character_book.entries
-    : [{ keys: ["人物形象"], content: "" }];
-  $("#cf-book").innerHTML = entries.map((en, i) => wbRowHTML(en, i === 0)).join("");
-  $("#cf-regex").innerHTML = (st.regex_scripts ?? []).map(rxRowHTML).join("");
-  $("#cf-traits").value = (card.personality?.traits ?? []).join("\n");
-  $("#cf-catch").value = (card.voice?.catchphrases ?? []).join("\n");
-  $("#cf-tone").value = (card.voice?.tone_rules ?? []).join("\n");
-  $("#cf-bound").value = (card.personality?.boundaries ?? []).join("\n");
+  const entries = st.character_book?.entries?.length ? st.character_book.entries : [];
+  $("#cf-book").innerHTML = entries.length ? entries.map(wbRowHTML).join("") : wbRowHTML({});
   $("#cf-rounds").value = card.memoryConfig?.auto_rounds ?? 20;
 }
 
@@ -266,35 +229,32 @@ function collectCardForm(card, mode) {
   card.name = $("#cf-name").value.trim() || card.name;
   if (mode === "create" && $("#cf-slug")) card.slug = $("#cf-slug").value.trim();
   card.identity = card.identity ?? {};
-  card.identity.bio = $("#cf-bio").value.trim();
-  if (card.identity.avatar === undefined) card.identity.avatar = "";
   card.sillytavern_v2 = card.sillytavern_v2 ?? {};
   const st = card.sillytavern_v2;
-  st.description = $("#cf-bio").value.trim();
+  const bioText = $("#cf-bio").value.trim();
+  st.description = bioText;                 // 完整档案（酒馆卡可能很长，原样保存）
+  card.identity.bio = bioText.length <= 500 ? bioText : ""; // 一句话简介超长则留空（校验限制 500）
   st.first_mes = $("#cf-first").value.trim();
   st.character_book = {
-    entries: [...$("#cf-book").querySelectorAll(".wb-row")]
+    entries: [...$("#cf-book").querySelectorAll(".wb-entry")]
       .map((r) => {
-        const key = r.querySelector(".wb-key").value.trim();
-        const content = r.querySelector(".wb-content").value;
-        return { keys: [key || "人物形象"], content, name: key || "人物形象", constant: key === "人物形象", enabled: true };
+        const comment = r.querySelector(".wb-comment").value.trim();
+        const keys = r.querySelector(".wb-keys").value.split(/[,，、]/).map((s) => s.trim()).filter(Boolean);
+        return {
+          name: comment || undefined,
+          comment: comment || undefined,
+          keys,
+          content: r.querySelector(".wb-content").value,
+          constant: r.querySelector(".wb-constant").checked,
+          enabled: r.querySelector(".wb-enabled").checked,
+          insertion_order: Number(r.querySelector(".wb-order").value) || 100,
+          priority: 10,
+        };
       })
-      .filter((e) => e.keys[0] && e.content),
+      .filter((e) => e.content.trim()),
   };
-  st.regex_scripts = [...$("#cf-regex").querySelectorAll(".wb-row")]
-    .map((r) => ({
-      scriptName: r.querySelector(".rx-name").value.trim(),
-      findRegex: r.querySelector(".rx-find").value,
-      replaceString: r.querySelector(".rx-rep").value,
-      enabled: true,
-    }))
-    .filter((s) => s.findRegex);
-  card.personality = card.personality ?? {};
-  card.personality.traits = $("#cf-traits").value.split("\n").map((s) => s.trim()).filter(Boolean);
-  card.personality.boundaries = $("#cf-bound").value.split("\n").map((s) => s.trim()).filter(Boolean);
-  card.voice = card.voice ?? {};
-  card.voice.catchphrases = $("#cf-catch").value.split("\n").map((s) => s.trim()).filter(Boolean);
-  card.voice.tone_rules = $("#cf-tone").value.split("\n").map((s) => s.trim()).filter(Boolean);
+  // 人格/语气/正则等结构化字段不在此编辑（写在世界书里），原样保留
+  if (card.identity.avatar === undefined) card.identity.avatar = "";
   card.model = { provider: $("#cf-provider")?.value || undefined, model: $("#cf-model")?.value || undefined };
   card.memoryConfig = { auto_rounds: Math.min(50, Math.max(1, Number($("#cf-rounds").value) || 20)) };
   return card;
@@ -391,6 +351,7 @@ async function refreshHome() {
 // ============================================================
 let cardsGridData = [];
 let cardSearch = "";
+let botsData = { bots: [] };
 
 function renderCards() {
   return `
@@ -502,6 +463,13 @@ async function loadCardsGrid() {
     cardsGridData = cards;
     renderCardsGrid();
   } catch (e) { $("#cards-grid").innerHTML = `<div class="muted">读取失败：${escapeHtml(e.message)}</div>`; }
+  // 机器人状态另走一步（后端要跑 openclaw CLI，较慢，别挡卡片渲染），到位后补角标
+  api.get("/api/bots").then((b) => { botsData = b; renderCardsGrid(); }).catch(() => {});
+}
+
+async function refreshBots() {
+  botsData = await api.get("/api/bots").catch(() => ({ bots: [] }));
+  renderCardsGrid();
 }
 
 function renderCardsGrid() {
@@ -518,19 +486,168 @@ function renderCardsGrid() {
     return;
   }
   for (const c of list) {
+    const bot = (botsData.bots ?? []).find((b) => b.cardSlug === c.slug);
     const d = document.createElement("div");
     d.className = "char-card";
     d.innerHTML = `
       <div class="char-card-img">
         ${c.avatar ? `<img src="${c.avatar}" alt="" loading="lazy">` : `<div class="char-card-ph">${escapeHtml(c.name.slice(0, 1))}</div>`}
+        <button class="char-card-bot ${bot ? "on" : ""}" title="机器人配置（QQ/微信）">🤖</button>
       </div>
       <div class="char-card-info">
         <div class="char-card-name">${escapeHtml(c.name)}</div>
-        <div class="meta">${c.role} · v${c.version}</div>
+        <div class="meta">${c.role} · v${c.version}${bot ? ` · <span class="bot-tag">已接${bot.channel === "qqbot" ? "QQ" : "微信"}</span>` : ""}</div>
       </div>`;
     d.addEventListener("click", () => loadCardIntoEditor(c.slug));
+    d.querySelector(".char-card-bot").addEventListener("click", (e) => {
+      e.stopPropagation();
+      openBotDialog(c.slug);
+    });
     grid.appendChild(d);
   }
+}
+
+// ============================================================
+//  机器人配置弹窗（每卡一个独立 bot：卡 × 渠道账号 × OpenClaw agent）
+// ============================================================
+let botLoginTimer = null;
+let botDialogSlug = "";
+
+function closeBotDialog() {
+  if (botLoginTimer) { clearInterval(botLoginTimer); botLoginTimer = null; }
+  const ov = $("#bot-overlay");
+  if (ov) ov.remove();
+  botDialogSlug = "";
+}
+
+async function openBotDialog(slug) {
+  closeBotDialog();
+  botDialogSlug = slug;
+  const card = cardsGridData.find((c) => c.slug === slug);
+  if (!card) return;
+  const render = (bot) => {
+    // 弹窗可能已被关闭，重挂前先清掉旧的
+    const old = $("#bot-overlay");
+    if (old) old.remove();
+    const ov = document.createElement("div");
+    ov.id = "bot-overlay";
+    ov.className = "bot-overlay";
+    ov.innerHTML = `<div class="bot-dialog">
+      <div class="bot-dialog-head">
+        <h3>🤖 机器人配置 · ${escapeHtml(card.name)}</h3>
+        <button class="ghost small-btn" id="bot-close">✕</button>
+      </div>
+      <div id="bot-dialog-body">${bot === undefined ? '<p class="muted">加载中…</p>' : ""}</div>
+    </div>`;
+    document.body.appendChild(ov);
+    ov.addEventListener("click", (e) => { if (e.target === ov) closeBotDialog(); });
+    $("#bot-close").addEventListener("click", closeBotDialog);
+    if (bot !== undefined) renderBotBody(bot);
+  };
+  render(undefined);
+  botsData = await api.get("/api/bots").catch(() => ({ bots: [] }));
+  const bot = (botsData.bots ?? []).find((b) => b.cardSlug === slug);
+  render(bot ?? null);
+}
+
+function renderBotBody(bot) {
+  const body = $("#bot-dialog-body");
+  if (!body) return;
+  if (!bot) {
+    const limits = botsData.limits ?? {};
+    const bots = botsData.bots ?? [];
+    const wxUsed = bots.some((b) => b.channel === "openclaw-weixin");
+    const full = bots.length >= (limits.maxBots ?? 2);
+    body.innerHTML = `
+      <p class="muted">给这张卡建一个专属机器人：独立人设、独立会话记忆，接到 QQ 或微信。</p>
+      <div class="bot-form">
+        <label>渠道：
+          <select id="bot-channel">
+            <option value="qqbot">QQ 机器人${full ? "（已达上限）" : ""}</option>
+            <option value="openclaw-weixin" ${wxUsed ? "disabled" : ""}>微信机器人${wxUsed ? "（已有 1 个，最多 1 个）" : ""}</option>
+          </select>
+        </label>
+        <label>账号 ID：<input id="bot-account" placeholder="留空自动生成（如 qq-a1b2）"></label>
+      </div>
+      <p class="hint">上限 ${limits.maxBots ?? 2} 个机器人（当前 ${bots.length} 个）；QQ 需先在 <a href="https://q.qq.com/" target="_blank">q.qq.com</a> 创建机器人；微信需手机有 ClawBot 入口。</p>
+      <div class="row" style="justify-content:flex-end">
+        <button id="bot-create" class="primary" ${full ? "disabled" : ""}>创建机器人</button>
+      </div>`;
+    $("#bot-create").addEventListener("click", async () => {
+      const btn = $("#bot-create");
+      btn.disabled = true; btn.textContent = "创建中…（编译+建 agent）";
+      try {
+        const r = await api.send("/api/bots", {
+          method: "POST",
+          body: JSON.stringify({
+            cardSlug: botDialogSlug,
+            channel: $("#bot-channel").value,
+            accountId: $("#bot-account").value.trim(),
+          }),
+        });
+        toast("机器人已创建，接下来扫码绑定");
+        renderBotBody(r.bot);
+        refreshBots();
+      } catch (e) {
+        toast("创建失败：" + e.message, false);
+        btn.disabled = false; btn.textContent = "创建机器人";
+      }
+    });
+    return;
+  }
+  // 已有实例：详情 + 操作
+  body.innerHTML = `
+    <div class="bot-detail">
+      <div class="bot-detail-row"><span>渠道</span><b>${bot.channelLabel ?? bot.channel}</b></div>
+      <div class="bot-detail-row"><span>账号 ID</span><code>${escapeHtml(bot.accountId)}</code></div>
+      <div class="bot-detail-row"><span>Agent</span><code>${escapeHtml(bot.agentId)}</code> ${bot.agentExists === true ? '<span class="ok-badge">已创建 ✓</span>' : bot.agentExists === false ? '<span class="warn-badge">agent 缺失</span>' : '<span class="muted">状态未知</span>'}</div>
+      <div class="bot-detail-row"><span>Workspace</span><code>data/agent-workspaces/${escapeHtml(bot.cardSlug)}</code></div>
+    </div>
+    <div class="bot-login-area">
+      <div class="row">
+        <button id="bot-login" class="primary small-btn">扫码绑定此账号</button>
+        <button id="bot-recompile" class="ghost small-btn">重编译（卡更新后）</button>
+        <button id="bot-delete" class="danger small-btn">删除机器人</button>
+      </div>
+      <p class="hint" id="bot-login-msg"></p>
+      <pre id="bot-qr" class="qr-box" style="display:none"></pre>
+    </div>`;
+  $("#bot-login").addEventListener("click", () => startBotLogin(bot.id));
+  $("#bot-recompile").addEventListener("click", async () => {
+    try {
+      const r = await api.send(`/api/bots/${bot.id}/recompile`, { method: "POST" });
+      toast(`已重编译 ${r.files?.length ?? 0} 个文件到 agent workspace`);
+    } catch (e) { toast("重编译失败：" + e.message, false); }
+  });
+  $("#bot-delete").addEventListener("click", async () => {
+    if (!confirm("删除这个机器人和它的 agent（渠道账号在平台侧的绑定不受影响）？")) return;
+    try {
+      await api.send(`/api/bots/${bot.id}`, { method: "DELETE" });
+      toast("已删除");
+      await refreshBots();
+      renderBotBody(null);
+    } catch (e) { toast("删除失败：" + e.message, false); }
+  });
+}
+
+async function startBotLogin(botId) {
+  const qr = $("#bot-qr"), msg = $("#bot-login-msg");
+  if (!qr || !msg) return;
+  try { await api.send(`/api/bots/${botId}/login`, { method: "POST" }); } catch (e) { msg.textContent = "发起失败：" + e.message; return; }
+  qr.style.display = "block";
+  msg.textContent = "二维码生成中…";
+  if (botLoginTimer) clearInterval(botLoginTimer);
+  botLoginTimer = setInterval(async () => {
+    try {
+      const s = await api.get(`/api/bots/${botId}/login`);
+      if (s.output) { qr.textContent = s.output; qr.style.display = "block"; }
+      if (s.done) {
+        clearInterval(botLoginTimer); botLoginTimer = null;
+        msg.textContent = s.ok ? "✓ 扫码成功，账号已绑定！网关重启后路由生效" : "✗ 未成功，检查输出后重试";
+        refreshBots();
+      }
+    } catch { /* 轮询失败忽略 */ }
+  }, 1500);
 }
 
 function showCardsGrid() {
@@ -653,8 +770,112 @@ async function saveNewCard(compile) {
 // ============================================================
 //  视图：API 与模型 / 生图配置（多提供商，模型自动拉取）
 // ============================================================
-function renderApi() { return renderProvidersPage("chat", "⚡ API 与模型", "对话 API 提供商；第一个为默认，卡片未单独指定时使用它。") + renderTtsBlock(); }
-function renderImagegen() { return renderProvidersPage("image", "🎨 生图配置", "生图 API 提供商（模型自动拉取）。"); }
+function renderApi() { return renderProvidersPage("chat", "⚡ API 与模型", "对话 API 提供商；第一个为默认，卡片未单独指定时使用它。"); }
+function renderImagegen() { return renderImgGenPage(); }
+
+// 生图配置专用页（NovelAI / OpenAI 兼容 / 本地 SD WebUI 三套参数，网页聊天与 QQ/微信共用）
+function renderImgGenPage() {
+  return `
+  <div class="view">
+    <div class="page-head"><h2>🎨 生图配置</h2><p class="hint">配置 AI 生图（网页聊天 + QQ/微信机器人共用一套）。中文提示词可自动翻译扩写为英文。</p></div>
+    <div class="card-box">
+      <div class="form">
+        <label>提供商</label>
+        <div class="img-provider-row">
+          <label class="radio"><input type="radio" name="ig-provider" value="novelai"> NovelAI（角色卡最佳）</label>
+          <label class="radio"><input type="radio" name="ig-provider" value="openai"> OpenAI 兼容</label>
+          <label class="radio"><input type="radio" name="ig-provider" value="local"> 本地 SD WebUI</label>
+        </div>
+        <div id="ig-pane-novelai" class="ig-pane">
+          <label>API Key（留空 = 保留原值）</label>
+          <input id="ig-nai-key" type="password" placeholder="sk-...">
+          <div class="cf-grid2">
+            <div><label>模型</label><input id="ig-nai-model" placeholder="nai-diffusion-4-5-full"></div>
+            <div><label>采样器</label><select id="ig-nai-sampler">
+              <option value="k_dpmpp_2m_sde">k_dpmpp_2m_sde（默认）</option>
+              <option value="k_euler_ancestral">k_euler_ancestral</option>
+              <option value="k_euler">k_euler</option>
+              <option value="k_dpmpp_2m">k_dpmpp_2m</option>
+              <option value="k_dpmpp_3m_sde">k_dpmpp_3m_sde</option>
+              <option value="k_dpmpp_sde">k_dpmpp_sde</option>
+              <option value="k_dpm_2">k_dpm_2</option>
+              <option value="k_dpm_fast">k_dpm_fast</option>
+            </select></div>
+            <div><label>步数 Steps</label><input id="ig-nai-steps" type="number" min="1" max="50" step="1"></div>
+            <div><label>尺度 Scale（CFG）</label><input id="ig-nai-scale" type="number" min="1" max="15" step="0.5"></div>
+            <div><label>种子（0 = 随机）</label><input id="ig-nai-seed" type="number" step="1"></div>
+            <div><label>负面预设</label><select id="ig-nai-ucpreset">
+              <option value="heavy">Heavy（强负面）</option>
+              <option value="light">Light（轻负面）</option>
+              <option value="none">None（不加预设）</option>
+            </select></div>
+          </div>
+          <label class="check"><input id="ig-nai-translate" type="checkbox"> 中文提示词自动翻译扩写为英文（用默认对话模型）</label>
+          <label>负面提示词（追加在预设之后）</label>
+          <textarea id="ig-nai-negative" rows="2"></textarea>
+        </div>
+        <div id="ig-pane-openai" class="ig-pane" style="display:none">
+          <div class="cf-grid2">
+            <div><label>Base URL（以 /v1 结尾）</label><input id="ig-oai-url" placeholder="https://api.example.com/v1"></div>
+            <div><label>模型</label><input id="ig-oai-model" placeholder="agnes-image-2.0-flash"></div>
+          </div>
+          <label>API Key（留空 = 保留原值）</label>
+          <input id="ig-oai-key" type="password" placeholder="sk-...">
+          <div class="cf-grid2">
+            <div><label>默认尺寸</label><select id="ig-oai-size">
+              <option value="1024x1024">1:1 方形</option>
+              <option value="832x1216">2:3 竖版</option>
+              <option value="1216x832">3:2 横版</option>
+              <option value="768x1344">9:16 长竖版</option>
+              <option value="1344x768">16:9 长横版</option>
+            </select></div>
+            <div></div>
+          </div>
+          <label class="check"><input id="ig-oai-translate" type="checkbox"> 中文提示词自动翻译扩写为英文</label>
+        </div>
+        <div id="ig-pane-local" class="ig-pane" style="display:none">
+          <div class="cf-grid2">
+            <div><label>Base URL（A1111/Forge，如 http://127.0.0.1:7860）</label><input id="ig-local-url" placeholder="http://127.0.0.1:7860"></div>
+            <div><label>模型（可留空用默认）</label><input id="ig-local-model" placeholder=""></div>
+            <div><label>步数</label><input id="ig-local-steps" type="number" min="1" max="60"></div>
+            <div><label>CFG</label><input id="ig-local-cfg" type="number" min="1" max="30" step="0.5"></div>
+            <div><label>采样器</label><input id="ig-local-sampler" placeholder="Euler a"></div>
+          </div>
+          <label>负面提示词</label>
+          <textarea id="ig-local-negative" rows="2"></textarea>
+        </div>
+        <div class="row" style="margin-top:12px">
+          <button id="ig-save" class="primary">💾 保存配置</button>
+          <button id="ig-test" class="ghost">🔌 测试 Key / 服务</button>
+        </div>
+        <div id="ig-status" class="status"></div>
+      </div>
+    </div>
+    <div class="card-box">
+      <h3>🧪 试生一张</h3>
+      <div class="form">
+        <label>提示词（未保存也可先试，用上面表单的配置）</label>
+        <textarea id="ig-test-prompt" rows="2" placeholder="如：一个穿和服的少女，樱花树下，黄昏光线，精致细节"></textarea>
+        <div class="row">
+          <select id="ig-test-aspect">
+            <option value="square">1:1 方形</option>
+            <option value="portrait">2:3 竖版</option>
+            <option value="landscape">3:2 横版</option>
+            <option value="tall">9:16 长竖版</option>
+            <option value="wide">16:9 长横版</option>
+          </select>
+          <button id="ig-test-go" class="primary">🎨 生成</button>
+        </div>
+        <div id="ig-test-status" class="status"></div>
+        <div id="ig-test-img"></div>
+      </div>
+    </div>
+    <div class="card-box">
+      <h3>🗂 已生成图片（data/images）</h3>
+      <div id="ig-gallery" class="ig-gallery"><div class="muted">加载中…</div></div>
+    </div>
+  </div>`;
+}
 
 function renderProvidersPage(type, title, desc) {
   return `
@@ -688,8 +909,174 @@ function renderProvidersPage(type, title, desc) {
 
 let provState = { type: "chat", editing: null, allModels: [], selected: [] };
 
-function initApi() { initProvidersPage("chat"); initTtsBlock(); }
-function initImagegen() { initProvidersPage("image"); }
+function initApi() { initProvidersPage("chat"); }
+function initImagegen() { initImgGenPage(); }
+
+// ---------- 生图配置页交互 ----------
+function igRadio() {
+  return document.querySelector('input[name="ig-provider"]:checked')?.value ?? "novelai";
+}
+function showIgPane(provider) {
+  for (const p of ["novelai", "openai", "local"]) {
+    const pane = $("#ig-pane-" + p);
+    if (pane) pane.style.display = p === provider ? "block" : "none";
+  }
+}
+function collectImgForm() {
+  const v = (id) => { const el = $(id); return el ? el.value.trim() : ""; };
+  return {
+    provider: igRadio(),
+    novelai: {
+      key: v("#ig-nai-key"),
+      model: v("#ig-nai-model"),
+      steps: Number(v("#ig-nai-steps")) || undefined,
+      scale: Number(v("#ig-nai-scale")) || undefined,
+      negative: v("#ig-nai-negative"),
+      sampler: v("#ig-nai-sampler"),
+      seed: Number(v("#ig-nai-seed")) || 0,
+      ucPreset: v("#ig-nai-ucpreset") || "heavy",
+      translate: !!$("#ig-nai-translate")?.checked,
+    },
+    openai: {
+      baseUrl: v("#ig-oai-url"),
+      key: v("#ig-oai-key"),
+      model: v("#ig-oai-model"),
+      size: v("#ig-oai-size"),
+      translate: !!$("#ig-oai-translate")?.checked,
+    },
+    local: {
+      baseUrl: v("#ig-local-url"),
+      model: v("#ig-local-model"),
+      steps: Number(v("#ig-local-steps")) || undefined,
+      cfg: Number(v("#ig-local-cfg")) || undefined,
+      sampler: v("#ig-local-sampler"),
+      negative: v("#ig-local-negative"),
+    },
+  };
+}
+function fillImgForm(cfg) {
+  document.querySelectorAll('input[name="ig-provider"]').forEach((r) => { r.checked = r.value === cfg.provider; });
+  showIgPane(cfg.provider);
+  const n = cfg.novelai || {}, o = cfg.openai || {}, l = cfg.local || {};
+  if ($("#ig-nai-key")) $("#ig-nai-key").value = "";
+  if ($("#ig-nai-model")) $("#ig-nai-model").value = n.model ?? "";
+  if ($("#ig-nai-steps")) $("#ig-nai-steps").value = n.steps ?? 28;
+  if ($("#ig-nai-scale")) $("#ig-nai-scale").value = n.scale ?? 6;
+  if ($("#ig-nai-negative")) $("#ig-nai-negative").value = n.negative ?? "";
+  if ($("#ig-nai-sampler")) $("#ig-nai-sampler").value = n.sampler ?? "k_dpmpp_2m_sde";
+  if ($("#ig-nai-seed")) $("#ig-nai-seed").value = n.seed ?? 0;
+  if ($("#ig-nai-ucpreset")) $("#ig-nai-ucpreset").value = n.ucPreset ?? "heavy";
+  if ($("#ig-nai-translate")) $("#ig-nai-translate").checked = !!n.translate;
+  if ($("#ig-oai-url")) $("#ig-oai-url").value = o.baseUrl ?? "";
+  if ($("#ig-oai-key")) $("#ig-oai-key").value = "";
+  if ($("#ig-oai-model")) $("#ig-oai-model").value = o.model ?? "";
+  if ($("#ig-oai-size")) $("#ig-oai-size").value = o.size ?? "1024x1024";
+  if ($("#ig-oai-translate")) $("#ig-oai-translate").checked = !!o.translate;
+  if ($("#ig-local-url")) $("#ig-local-url").value = l.baseUrl ?? "";
+  if ($("#ig-local-model")) $("#ig-local-model").value = l.model ?? "";
+  if ($("#ig-local-steps")) $("#ig-local-steps").value = l.steps ?? 24;
+  if ($("#ig-local-cfg")) $("#ig-local-cfg").value = l.cfg ?? 7;
+  if ($("#ig-local-sampler")) $("#ig-local-sampler").value = l.sampler ?? "Euler a";
+  if ($("#ig-local-negative")) $("#ig-local-negative").value = l.negative ?? "";
+  const keyHint = n.key || o.key ? "（已有 Key，留空保留）" : "";
+  if ($("#ig-nai-key")) $("#ig-nai-key").placeholder = "sk-..." + keyHint;
+  if ($("#ig-oai-key")) $("#ig-oai-key").placeholder = "sk-..." + keyHint;
+}
+async function initImgGenPage() {
+  document.querySelectorAll('input[name="ig-provider"]').forEach((r) =>
+    r.addEventListener("change", () => showIgPane(igRadio()))
+  );
+  $("#ig-save").addEventListener("click", async () => {
+    const f = collectImgForm();
+    const r = await api.send("/api/image/config", { method: "POST", body: JSON.stringify(f) });
+    if (r.ok) {
+      toast(r.hint || "已保存");
+      setStatus("#ig-status", "✓ 已保存", true);
+    } else setStatus("#ig-status", "保存失败：" + (r.error ?? "未知错误"), false);
+  });
+  $("#ig-test").addEventListener("click", async () => {
+    const f = collectImgForm();
+    setStatus("#ig-status", "测试中…");
+    const r = await api.send("/api/image/test", { method: "POST", body: JSON.stringify(f) });
+    setStatus("#ig-status", r.info ?? "无返回", r.ok);
+  });
+  $("#ig-test-go").addEventListener("click", async () => {
+    const prompt = $("#ig-test-prompt")?.value?.trim();
+    if (!prompt) return toast("先填提示词", false);
+    const f = collectImgForm();
+    setStatus("#ig-test-status", "生成中（约 30-120 秒，请耐心等待）…");
+    $("#ig-test-img").innerHTML = "";
+    const btn = $("#ig-test-go");
+    btn.disabled = true;
+    try {
+      const r = await api.send("/api/image/generate", {
+        method: "POST",
+        body: JSON.stringify({ prompt, aspect: $("#ig-test-aspect")?.value ?? "square", ...f }),
+      });
+      if (!r.ok || r.ok === false) {
+        setStatus("#ig-test-status", "生成失败：" + (r.error ?? "未知错误"), false);
+      } else {
+        setStatus("#ig-test-status", `✓ 生成完成${r.promptUsed && r.promptUsed !== prompt ? "（提示词已翻译）" : ""}（${r.width}×${r.height}）`, true);
+        $("#ig-test-img").innerHTML = `<img src="${r.url}" alt="测试图" onclick="showLightbox('${r.url}')">`;
+        loadImgGallery();
+      }
+    } catch (e) {
+      setStatus("#ig-test-status", "生成失败：" + e.message, false);
+    } finally {
+      btn.disabled = false;
+    }
+  });
+  loadImgGallery();
+  try {
+    const cfg = await api.get("/api/image/config");
+    fillImgForm(cfg);
+  } catch (e) {
+    setStatus("#ig-status", "读取配置失败：" + e.message, false);
+  }
+}
+function setStatus(sel, text, ok) {
+  const el = $(sel);
+  if (!el) return;
+  el.textContent = text;
+  el.style.color = ok === undefined ? "" : ok ? "var(--ok,#2e7d32)" : "var(--err,#c62828)";
+}
+async function loadImgGallery() {
+  const box = $("#ig-gallery");
+  if (!box) return;
+  try {
+    const r = await api.get("/api/image/list");
+    const imgs = r.images ?? [];
+    if (!imgs.length) {
+      box.innerHTML = `<div class="muted">还没有生成过图片。配置好后点「试生一张」或让 AI 调用生图工具。</div>`;
+      return;
+    }
+    box.innerHTML = imgs.map((it) => `
+      <div class="ig-item">
+        <img src="${it.url}" alt="${escapeHtml(it.file)}" loading="lazy" onclick="showLightbox('${it.url}')">
+        <div class="ig-item-meta">${escapeHtml(it.dir)}/${escapeHtml(it.file)}<br>${(it.size / 1024).toFixed(0)} KB</div>
+        <button class="danger small-btn" data-del="${it.url}">删除</button>
+      </div>`).join("");
+    box.querySelectorAll("[data-del]").forEach((b) =>
+      b.addEventListener("click", async () => {
+        if (!confirm("删除这张图片？")) return;
+        const r = await api.send("/api/image/delete", { method: "POST", body: JSON.stringify({ url: b.dataset.del }) });
+        if (r.ok) { toast("已删除"); loadImgGallery(); } else toast("删除失败：" + (r.error ?? ""), false);
+      })
+    );
+  } catch (e) {
+    box.innerHTML = `<div class="muted">读取失败：${escapeHtml(e.message)}</div>`;
+  }
+}
+// 图片放大查看（遮罩层，点击任意处关闭）
+function showLightbox(src) {
+  const ov = document.createElement("div");
+  ov.className = "lightbox";
+  const img = document.createElement("img");
+  img.src = src;
+  ov.appendChild(img);
+  ov.addEventListener("click", () => ov.remove());
+  document.body.appendChild(ov);
+}
 
 function initProvidersPage(type) {
   provState = { type, editing: null, allModels: [], selected: [] };
@@ -747,88 +1134,126 @@ async function loadProvList() {
 }
 
 // ============================================================
-//  语音合成（TTS）：上游聚合（OpenAI 兼容，可售卖）+ 本地兜底
+//  视图：语音合成 TTS（独立页：默认通道/本地兜底 + 提供商管理，同 API 页添加模式）
 // ============================================================
-function renderTtsBlock() {
+const TTS_PRESETS = [
+  { kind: "openai", name: "硅基流动", baseUrl: "https://api.siliconflow.cn/v1", voice: "FunAudioLLM/CosyVoice2-0.5B:alex", speed: 1, label: "OpenAI 兼容" },
+  { kind: "openai", name: "OpenAI 官方", baseUrl: "https://api.openai.com/v1", voice: "alloy", speed: 1, label: "OpenAI 兼容" },
+  { kind: "minimax", name: "MiniMax 海螺", baseUrl: "https://api.minimaxi.com/v1", voice: "male-qn-qingse", speed: 1, label: "MiniMax 海螺（t2a_v2）" },
+  { kind: "volc", name: "火山豆包", baseUrl: "https://openspeech.bytedance.com/api/v3/tts/unidirectional", voice: "zh_female_qingxin_mars_bigtts", speed: 1, label: "火山豆包（openspeech V3）" },
+  { kind: "openai", name: "", baseUrl: "", voice: "", speed: 1, label: "自定义 OpenAI 兼容" },
+];
+const TTS_KIND_LABEL = { openai: "OpenAI 兼容", minimax: "MiniMax 海螺（t2a_v2）", volc: "火山豆包（openspeech V3）" };
+
+function renderTtsPage() {
   return `
-  <div class="card-box" id="tts-box" style="margin-top:16px">
-    <h3>🔊 语音合成（TTS）<span class="hint">上游聚合可对外售卖；本地仅测试/兜底</span></h3>
-    <div class="form">
-      <div class="cf-grid">
-        <div>
-          <label>默认合成通道</label>
-          <select id="tts-default"></select>
-        </div>
-        <div>
-          <label>本地引擎</label>
-          <select id="tts-local-engine">
-            <option value="edge">Edge 神经语音（在线免费）</option>
-            <option value="sapi">Windows SAPI（离线）</option>
-          </select>
-        </div>
-        <div>
-          <label>本地语音</label>
-          <select id="tts-local-voice"></select>
-        </div>
-        <div>
-          <label>语速</label>
-          <input id="tts-local-rate" placeholder="+0%">
-        </div>
-        <div>
-          <label>音调</label>
-          <input id="tts-local-pitch" placeholder="+0Hz">
-        </div>
-      </div>
-      <div class="row">
-        <button id="tts-save-local" class="primary">保存设置</button>
-        <button id="tts-test-local" class="ghost">测试本地</button>
-        <span id="tts-test-msg" class="status"></span>
-      </div>
-    </div>
+  <div class="view">
+    <div class="page-head"><h2>🔊 语音合成（TTS）</h2><p class="hint">聚合上游 TTS 供网页朗读、可对外售卖赚差价；本地仅测试/兜底。聊天气泡 hover 出 🔊 即可朗读。</p></div>
 
-    <h3 style="margin-top:16px">上游供应商 <span class="hint">OpenAI 兼容 /v1/audio/speech，可加价出售</span></h3>
-    <div id="tts-prov-list"></div>
-    <button id="tts-prov-add" class="primary" style="margin-top:10px">＋ 添加上游</button>
-    <div id="tts-prov-form" class="card-box" style="display:none;margin-top:12px">
-      <h3 id="tts-pv-title">添加上游</h3>
+    <div class="card-box">
+      <h3>默认通道与本地兜底</h3>
       <div class="form">
-        <div class="cf-grid2">
-          <div><label>名称</label><input id="tts-pv-name" placeholder="如 硅基流动"></div>
-          <div><label>Base URL（以 /v1 结尾）</label><input id="tts-pv-url" placeholder="https://api.siliconflow.cn/v1"></div>
-        </div>
-        <div class="cf-grid2">
-          <div><label>默认模型</label><input id="tts-pv-model" placeholder="如 FunAudioLLM/CosyVoice2-0.5B"></div>
-          <div><label>默认音色</label><input id="tts-pv-voice" placeholder="如 FunAudioLLM/CosyVoice2-0.5B:alex"></div>
-        </div>
         <div class="cf-grid">
-          <div><label>API Key（编辑留空=保留）</label><input id="tts-pv-key" type="password"></div>
-          <div><label>语速 (0.25~4)</label><input id="tts-pv-speed" type="number" step="0.1" value="1"></div>
-          <div><label>加价倍率 (1=原价)</label><input id="tts-pv-markup" type="number" step="0.1" value="1"></div>
+          <div>
+            <label>默认合成通道</label>
+            <select id="tts-default"></select>
+          </div>
+          <div>
+            <label>本地引擎</label>
+            <select id="tts-local-engine">
+              <option value="edge">Edge 神经语音（在线免费）</option>
+              <option value="sapi">Windows SAPI（离线）</option>
+            </select>
+          </div>
+          <div>
+            <label>本地语音</label>
+            <select id="tts-local-voice"></select>
+          </div>
+          <div>
+            <label>语速</label>
+            <input id="tts-local-rate" placeholder="+0%">
+          </div>
+          <div>
+            <label>音调</label>
+            <input id="tts-local-pitch" placeholder="+0Hz">
+          </div>
         </div>
-        <label class="row"><input id="tts-pv-enabled" type="checkbox" checked> 启用此上游（未启用时默认通道自动兜底本地）</label>
         <div class="row">
-          <button id="tts-pv-save" class="primary">保存</button>
-          <button id="tts-pv-cancel" class="ghost">取消</button>
+          <button id="tts-save-local" class="primary">保存设置</button>
+          <button id="tts-test-local" class="ghost">测试本地</button>
+          <span id="tts-test-msg" class="status"></span>
         </div>
-        <div id="tts-pv-msg" class="status"></div>
       </div>
     </div>
 
-    <h3 style="margin-top:16px">📊 用量统计</h3>
-    <div id="tts-usage" class="hint">加载中…</div>
-    <div class="hint" style="margin-top:6px">对外售卖：<code>npm run tts-server</code>（默认 0.0.0.0:17900，Bearer key 认证），客户用 OpenAI SDK 调 POST /v1/audio/speech 即可。</div>
+    <div class="card-box">
+      <h3>TTS 提供商 <span class="hint">跟 API 配置一样：点「＋ 添加提供商」→ 选择服务商 → 填 Key → 自动拉取模型</span></h3>
+      <div id="tts-prov-list"></div>
+      <button id="tts-prov-add" class="primary" style="margin-top:10px">＋ 添加提供商</button>
+      <div id="tts-prov-form" class="card-box" style="display:none;margin-top:12px">
+        <h3 id="tts-pv-title">添加提供商</h3>
+        <div class="form">
+          <div class="cf-grid2">
+            <div><label>选择 TTS 服务商</label>
+              <select id="tts-pv-preset">
+                <option value="">— 选择 —</option>
+                ${TTS_PRESETS.map((p, i) => `<option value="${i}">${p.name || p.label}</option>`).join("")}
+              </select>
+            </div>
+            <div><label>协议</label><input id="tts-pv-kind" readonly placeholder="选择服务商后自动填入"></div>
+          </div>
+          <div class="cf-grid2">
+            <div><label>名称</label><input id="tts-pv-name" placeholder="如 硅基流动"></div>
+            <div><label>Base URL</label><input id="tts-pv-url" placeholder="OpenAI 兼容以 /v1 结尾；豆包填完整接口地址"></div>
+          </div>
+          <div class="cf-grid2">
+            <div><label>API Key（编辑留空=保留）</label><input id="tts-pv-key" type="password"></div>
+            <div><label>App ID（仅火山豆包旧版鉴权）</label><input id="tts-pv-appid" placeholder="豆包新版单 Key 鉴权留空"></div>
+          </div>
+          <div class="cf-grid2">
+            <div><label>默认模型</label><input id="tts-pv-model" placeholder="保存并拉取后点选填入"></div>
+            <div><label>默认音色</label><input id="tts-pv-voice" placeholder="如 FunAudioLLM/CosyVoice2-0.5B:alex"></div>
+          </div>
+          <div class="cf-grid">
+            <div><label>语速 (0.25~4)</label><input id="tts-pv-speed" type="number" step="0.1" value="1"></div>
+            <div></div><div></div>
+          </div>
+          <label class="row"><input id="tts-pv-enabled" type="checkbox" checked> 启用此提供商（未启用时默认通道自动兜底本地）</label>
+          <div class="row">
+            <button id="tts-pv-save-fetch" class="primary">保存并拉取模型</button>
+            <button id="tts-pv-done" class="ghost" style="display:none">完成</button>
+            <button id="tts-pv-cancel" class="ghost">取消</button>
+          </div>
+          <div id="tts-pv-msg" class="status"></div>
+          <div id="tts-pv-fetch" style="display:none">
+            <label>拉取到的模型（点击填入「默认模型」）</label>
+            <div id="tts-pv-models" class="model-chips"></div>
+            <label>音色（如有，点击填入「默认音色」）</label>
+            <div id="tts-pv-voices" class="model-chips"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card-box">
+      <h3>📊 用量统计</h3>
+      <div id="tts-usage" class="hint">加载中…</div>
+    </div>
+    <div class="hint" style="margin-top:6px">对外售卖：<code>npm run tts-server</code>（默认 0.0.0.0:17900，Bearer key 认证），客户用 OpenAI SDK 调 POST /v1/audio/speech 即可；本机聊天朗读不经过售卖服务。</div>
   </div>`;
 }
 
-let ttsState = { providers: [], commonVoices: [], editingId: null };
+let ttsState = { providers: [], commonVoices: [], editingId: null, models: [], voices: [], editKind: "openai" };
 
-async function initTtsBlock() {
-  ttsState = { providers: [], commonVoices: [], editingId: null };
+async function initTtsPage() {
+  ttsState = { providers: [], commonVoices: [], editingId: null, models: [], voices: [], editKind: "openai" };
   $("#tts-save-local").addEventListener("click", saveTtsLocal);
   $("#tts-test-local").addEventListener("click", () => testTtsTarget("local"));
   $("#tts-prov-add").addEventListener("click", () => showTtsProvForm(null));
   $("#tts-pv-cancel").addEventListener("click", () => ($("#tts-prov-form").style.display = "none"));
-  $("#tts-pv-save").addEventListener("click", saveTtsProvider);
+  $("#tts-pv-preset").addEventListener("change", ttsApplyPreset);
+  $("#tts-pv-save-fetch").addEventListener("click", ttsProvSaveAndFetch);
+  $("#tts-pv-done").addEventListener("click", saveTtsProvider);
   $("#tts-default").addEventListener("change", async (e) => {
     await saveTtsConfigOnly({ defaultProvider: e.target.value });
     toast("✓ 默认通道已切换");
@@ -863,7 +1288,7 @@ function renderTtsProviders() {
   const box = $("#tts-prov-list");
   if (!box) return;
   if (!ttsState.providers.length) {
-    box.innerHTML = '<div class="card-box muted">还没有上游供应商，点下方按钮添加（如 硅基流动）</div>';
+    box.innerHTML = '<div class="card-box muted">还没有 TTS 提供商，点下方按钮添加（如 硅基流动）</div>';
     return;
   }
   box.innerHTML = "";
@@ -880,7 +1305,7 @@ function renderTtsProviders() {
           <button class="danger small-btn" data-act="del">删除</button>
         </span>
       </div>
-      <div class="meta">${escapeHtml(p.baseUrl)} · key ${escapeHtml(p.key || "未填")} · 加价 x${p.markup ?? 1}</div>
+      <div class="meta">${escapeHtml(p.baseUrl)} · key ${escapeHtml(p.key || "未填")} · ${escapeHtml(TTS_KIND_LABEL[p.kind] || p.kind || "openai")}</div>
       <div class="meta">模型 ${escapeHtml(p.model || "—")} · 音色 ${escapeHtml(p.voice || "—")} · 语速 ${p.speed ?? 1}</div>`;
     box.appendChild(d);
     d.querySelectorAll("button[data-act]").forEach((b) =>
@@ -888,7 +1313,7 @@ function renderTtsProviders() {
         if (b.dataset.act === "test") testTtsTarget(p.id);
         else if (b.dataset.act === "edit") showTtsProvForm(p);
         else if (b.dataset.act === "del") {
-          if (!confirm(`删除上游 ${p.name}？`)) return;
+          if (!confirm(`删除提供商 ${p.name}？`)) return;
           await api.send(`/api/tts/providers/${p.id}`, { method: "DELETE" });
           toast("✓ 已删除");
           loadTtsConfig();
@@ -926,30 +1351,121 @@ async function saveTtsConfigOnly(body) {
 
 function showTtsProvForm(p) {
   ttsState.editingId = p?.id ?? null;
-  $("#tts-pv-title").textContent = p ? `编辑上游：${p.name}` : "添加上游";
+  ttsState.editKind = p?.kind || "openai";
+  ttsState.models = [];
+  ttsState.voices = [];
+  $("#tts-pv-title").textContent = p ? `编辑提供商：${p.name}` : "添加提供商";
   $("#tts-pv-name").value = p?.name ?? "";
   $("#tts-pv-url").value = p?.baseUrl ?? "";
+  $("#tts-pv-appid").value = p?.appId ?? "";
   $("#tts-pv-model").value = p?.model ?? "";
   $("#tts-pv-voice").value = p?.voice ?? "";
   $("#tts-pv-key").value = "";
   $("#tts-pv-speed").value = p?.speed ?? 1;
-  $("#tts-pv-markup").value = p?.markup ?? 1;
   $("#tts-pv-enabled").checked = p ? p.enabled : true;
+  // 服务商预设回显：编辑时 kind+baseUrl 都匹配才选中，否则归「自定义」；新添加默认「— 选择 —」让用户先选
+  if (p) {
+    const idx = TTS_PRESETS.findIndex((x) => x.kind === p.kind && x.baseUrl && x.baseUrl === p.baseUrl);
+    $("#tts-pv-preset").value = idx >= 0 ? String(idx) : String(TTS_PRESETS.length - 1);
+  } else {
+    $("#tts-pv-preset").value = "";
+  }
+  $("#tts-pv-kind").value = TTS_KIND_LABEL[ttsState.editKind] || "OpenAI 兼容";
+  $("#tts-pv-fetch").style.display = "none";
+  $("#tts-pv-done").style.display = "none";
+  $("#tts-pv-msg").textContent = "";
   $("#tts-prov-form").style.display = "block";
 }
 
-async function saveTtsProvider() {
-  const body = {
+/** 表单当前的 kind（预设选中且预设带 baseUrl 时以预设为准，否则用编辑时记录的 kind） */
+function ttsFormKind() {
+  const preset = TTS_PRESETS[Number($("#tts-pv-preset").value)];
+  if (preset && preset.baseUrl) return preset.kind;
+  return ttsState.editKind || "openai";
+}
+
+function ttsFormBody() {
+  return {
     id: ttsState.editingId || undefined,
     name: $("#tts-pv-name").value.trim(),
+    kind: ttsFormKind(),
     baseUrl: $("#tts-pv-url").value.trim(),
+    appId: $("#tts-pv-appid").value.trim(),
     model: $("#tts-pv-model").value.trim(),
     voice: $("#tts-pv-voice").value.trim(),
     key: $("#tts-pv-key").value.trim(),
     speed: Number($("#tts-pv-speed").value) || 1,
-    markup: Number($("#tts-pv-markup").value) || 1,
     enabled: $("#tts-pv-enabled").checked,
   };
+}
+
+function ttsApplyPreset() {
+  const v = $("#tts-pv-preset").value;
+  if (!v) return; // 「— 选择 —」占位不填充
+  const p = TTS_PRESETS[Number(v)];
+  if (!p) return;
+  ttsState.editKind = p.kind;
+  $("#tts-pv-name").value = p.name;
+  $("#tts-pv-url").value = p.baseUrl;
+  $("#tts-pv-kind").value = p.label;
+  $("#tts-pv-voice").value = p.voice;
+  $("#tts-pv-speed").value = p.speed;
+  $("#tts-pv-key").value = "";
+  $("#tts-pv-model").value = "";
+  $("#tts-pv-appid").value = "";
+  ttsState.models = [];
+  ttsState.voices = [];
+  $("#tts-pv-fetch").style.display = "none";
+  $("#tts-pv-done").style.display = "none";
+  $("#tts-pv-msg").textContent = "";
+}
+
+async function ttsProvSaveAndFetch() {
+  const body = ttsFormBody();
+  if (!body.name || !body.baseUrl) { toast("名称 / Base URL 必填", false); return; }
+  $("#tts-pv-msg").textContent = "保存中，随后拉取模型…";
+  try {
+    const r = await api.send("/api/tts/providers", { method: "POST", body: JSON.stringify(body) });
+    if (r.id) ttsState.editingId = r.id;
+    const fr = await api.send("/api/tts/fetch-models", {
+      method: "POST",
+      body: JSON.stringify({ kind: body.kind, baseUrl: body.baseUrl, key: body.key || undefined }),
+    });
+    ttsState.models = fr.models || [];
+    ttsState.voices = fr.voices || [];
+    renderTtsChips("tts-pv-models", ttsState.models, "tts-pv-model", body.model);
+    renderTtsChips("tts-pv-voices", ttsState.voices, "tts-pv-voice", body.voice);
+    $("#tts-pv-fetch").style.display = "block";
+    $("#tts-pv-done").style.display = "inline-block";
+    $("#tts-pv-msg").textContent = `✓ 已保存；拉取到 ${ttsState.models.length} 个模型${ttsState.voices.length ? `、${ttsState.voices.length} 个音色` : ""}。点击模型/音色填入后点「完成」`;
+    loadTtsConfig();
+  } catch (e) {
+    $("#tts-pv-msg").textContent = "失败：" + e.message;
+  }
+}
+
+function renderTtsChips(boxId, items, inputId, chosen) {
+  const box = $(boxId);
+  if (!box) return;
+  if (!items || !items.length) { box.innerHTML = '<div class="hint">（无，手动填写上方输入框）</div>'; return; }
+  box.innerHTML = "";
+  items.forEach((m) => {
+    const chip = document.createElement("button");
+    chip.type = "button";
+    chip.className = "model-chip" + (m === chosen ? " on" : "");
+    chip.textContent = m;
+    chip.addEventListener("click", () => {
+      const inp = $(inputId);
+      if (inp) inp.value = m;
+      box.querySelectorAll(".model-chip").forEach((c) => c.classList.remove("on"));
+      chip.classList.add("on");
+    });
+    box.appendChild(chip);
+  });
+}
+
+async function saveTtsProvider() {
+  const body = ttsFormBody();
   if (!body.name || !body.baseUrl) { toast("名称 / Base URL 必填", false); return; }
   try {
     const r = await api.send("/api/tts/providers", { method: "POST", body: JSON.stringify(body) });
@@ -1235,11 +1751,28 @@ async function clearMem() {
 // ============================================================
 //  聊天（模型由服务端按卡解析）
 // ============================================================
+const CHAT_IMG_RE = /(\/img\/[A-Za-z0-9_./-]+\.(?:png|jpe?g|webp|gif))/gi;
 function addChatBubble(role, text) {
   const log = $("#chat-log");
   const div = document.createElement("div");
   div.className = "bubble " + (role === "user" ? "me" : "bot");
-  div.textContent = text;
+  // 生图工具返回的 /img/... 路径渲染成可点击放大的图片
+  const parts = String(text).split(CHAT_IMG_RE);
+  for (let i = 0; i < parts.length; i++) {
+    const seg = parts[i];
+    if (!seg) continue;
+    if (i % 2 === 1) {
+      const img = document.createElement("img");
+      img.src = seg;
+      img.className = "chat-img";
+      img.alt = "AI 生成的图片";
+      img.loading = "lazy";
+      img.addEventListener("click", () => showLightbox(seg));
+      div.appendChild(img);
+    } else {
+      div.appendChild(document.createTextNode(seg));
+    }
+  }
   if (role === "bot") {
     const btn = document.createElement("button");
     btn.className = "tts-speak-btn";
@@ -1734,6 +2267,7 @@ const routes = {
   channels: { render: renderChannels, init: initChannels },
   api: { render: renderApi, init: initApi },
   imagegen: { render: renderImagegen, init: initImagegen },
+  tts: { render: renderTtsPage, init: initTtsPage },
   memory: { render: renderMemory, init: initMemory },
   capabilities: { render: renderCapabilities, init: initCapabilities },
   data: { render: renderData, init: initData },
