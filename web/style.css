@@ -474,5 +474,31 @@ button:disabled { opacity: 0.45; cursor: not-allowed; transform: none; }
 }
 .bubble.me { align-self: flex-end; background: var(--accent); color: #fff; border-bottom-right-radius: 4px; }
 .bubble.bot { align-self: flex-start; background: var(--card); border: 1px solid var(--border); border-bottom-left-radius: 4px; }
+.bubble { position: relative; }
+.tts-speak-btn {
+  position: absolute; top: -8px; right: -8px;
+  width: 24px; height: 24px; padding: 0;
+  border-radius: 50%; border: 1px solid var(--border);
+  background: var(--card, #fff); font-size: 12px; line-height: 1;
+  cursor: pointer; display: none; align-items: center; justify-content: center;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.15); opacity: 0.75;
+}
+.bubble.bot:hover .tts-speak-btn { display: flex; }
+.tts-speak-btn:hover { opacity: 1; }
 .approve-row { display: flex; gap: 8px; align-self: flex-start; }
 #btn-work-mode.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+
+/* ===== 记忆管理行 ===== */
+.mem-row { display: flex; align-items: center; gap: 8px; padding: 7px 2px; border-bottom: 1px dashed var(--border); }
+.mem-row:last-child { border-bottom: none; }
+.mem-badge { font-size: 11px; padding: 1px 8px; border-radius: 10px; background: var(--bg); border: 1px solid var(--border); color: var(--muted); white-space: nowrap; flex-shrink: 0; }
+.mem-badge.cat-信息 { background: #eef3ff; color: #4f7cff; border-color: #c9d8ff; }
+.mem-badge.cat-偏好 { background: #fff0f5; color: #d95a8b; border-color: #ffd3e4; }
+.mem-badge.cat-关系 { background: #ecfaf3; color: #2fa47a; border-color: #bfe7d6; }
+.mem-badge.cat-事件 { background: #fff8e8; color: #c08a1e; border-color: #f2dfb0; }
+.mem-badge.cat-待定 { background: #f2f3f7; color: #7a8099; border-color: #dfe1ea; }
+.mem-fact { flex: 1; font-size: 13px; line-height: 1.5; word-break: break-word; min-width: 0; }
+.mem-meta { font-size: 11px; color: var(--muted); white-space: nowrap; flex-shrink: 0; }
+.mem-ops { display: flex; gap: 5px; flex-shrink: 0; }
+.mem-edit input.mem-edit-fact { flex: 1; min-width: 120px; }
+.mem-edit select.mem-edit-cat { width: auto; flex-shrink: 0; }

@@ -7,11 +7,14 @@
   "scripts": {
     "cli": "tsx src/cli.ts",
     "server": "tsx src/server.ts",
+    "tts-server": "tsx src/tts-server.ts",
     "build": "tsc",
-    "start": "node dist/server.js"
+    "start": "node dist/server.js",
+    "start:tts": "node dist/tts-server.js"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",
+    "edge-tts": "^1.0.1",
     "express": "^4.21.2",
     "zod": "^3.24.1"
   },

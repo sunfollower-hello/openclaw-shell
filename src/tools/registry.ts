@@ -6,6 +6,7 @@ import os from "node:os";
 import path from "node:path";
 
 export interface ToolCtx {
+  slug: string;
   sandboxDir: string;
   memoryPath: string;
   imagesDir: string;
@@ -225,19 +226,27 @@ const datetime: ToolDef = {
   },
 };
 
-// ---------- 长期记忆（保存关于用户的事实） ----------
+// ---------- 长期记忆（保存关于用户的事实，去重 + 分类） ----------
 const memorySave: ToolDef = {
   id: "memory_save",
   name: "记住事实（长期记忆）",
   description:
-    "把关于用户的重要事实保存到长期记忆（例如：用户住在上海、用户养了一只叫旺财的狗、用户下周三过生日）。只保存值得长期记住的事实，不要保存一次性对话内容。",
-  parameters: { type: "object", properties: { fact: { type: "string", description: "要记住的事实" } }, required: ["fact"] },
+    "把关于用户的重要事实保存到长期记忆（例如：用户住在上海、用户养了一只叫旺财的狗、用户下周三过生日）。只保存值得长期记住的事实，不要保存一次性对话内容。已记住的相同/相似事实不会重复写入。category 可选，取值为：信息/偏好/关系/事件/待定，默认信息。",
+  parameters: {
+    type: "object",
+    properties: {
+      fact: { type: "string", description: "要记住的事实" },
+      category: { type: "string", description: "分类：信息/偏好/关系/事件/待定（可选）" },
+    },
+    required: ["fact"],
+  },
   async run(args, ctx) {
     const fact = String(args.fact ?? "").trim();
     if (!fact) return "错误：事实为空";
-    await fs.mkdir(path.dirname(ctx.memoryPath), { recursive: true });
-    await fs.appendFile(ctx.memoryPath, fact + "\n", "utf8");
-    return `已记住：${fact}`;
+    const { appendEntry } = await import("../core/memoryStore.js");
+    const res = await appendEntry(ctx.slug ?? "", { fact, cat: String(args.category ?? "") as never, src: "tool" });
+    if (!res.ok) return res.duplicate ? `这条已经记住了：${fact}` : "错误：事实为空";
+    return `已记住（${res.entry!.cat}）：${fact}`;
   },
 };
 

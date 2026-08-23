@@ -34,6 +34,28 @@ import { getMCPTools, loadMCPConfig, saveMCPConfig, reloadMCP } from "./tools/mc
 import { cardToCCv2, ccv2ToCard } from "./core/cardConvert.js";
 import { solidPng, pngWithText, extractCardJson } from "./core/png.js";
 import { getImageConfig, saveImageConfig, maskKey, testNovelaiKey, testOpenAIImageKey } from "./core/imageConfig.js";
+import {
+  getTtsConfig,
+  saveTtsConfig,
+  maskKey as maskTtsKey,
+  synthesize as synthesizeTts,
+  testTts,
+  listEdgeVoices,
+  COMMON_EDGE_VOICES,
+  type TtsProvider,
+} from "./core/ttsConfig.js";
+import { recordUsage, getUsageSummary } from "./core/ttsUsage.js";
+import {
+  recall,
+  appendEntry,
+  deleteEntry,
+  updateEntry,
+  clearMemory,
+  readAllMemories,
+  MEMORY_CATEGORIES,
+  type MemEntry,
+  type MemoryCategory,
+} from "./core/memoryStore.js";
 
 // 加载项目 .env（仅补环境变量空缺，如 OPENCLAW_SHELL_UI_USER/PASS）
 async function loadEnv(): Promise<void> {
@@ -84,6 +106,8 @@ app.use(express.static(path.join(projectRoot, "web"), { etag: true, maxAge: 0, s
 // 表情包与生图产物（挂在认证之后，公网同样受 Basic 保护）
 app.use("/emojis", express.static(path.join(dataDir(), "emojis")));
 app.use("/img", express.static(path.join(dataDir(), "images")));
+// 语音合成产物
+app.use("/tts", express.static(path.join(dataDir(), "tts")));
 
 // ---------- API ----------
 app.get("/api/health", (_req, res) => {
@@ -654,6 +678,7 @@ async function resolveChatTools(enabledTools: string[], useMCP: boolean): Promis
 
 function chatCtx(slug: string): ToolCtx {
   return {
+    slug,
     sandboxDir: path.join(dataDir(), "sandbox", slug),
     memoryPath: path.join(dataDir(), "memory", `${slug}.mem`),
     imagesDir: path.join(dataDir(), "images", slug),
@@ -674,12 +699,12 @@ app.post("/api/chat", async (req, res) => {
       .map((id) => SKILL_LIBRARY.find((s) => s.id === id)?.prompt)
       .filter(Boolean) as string[];
 
-    const memories = await fs
-      .readFile(chatCtx(slug).memoryPath, "utf8")
-      .then((t) => t.split("\n").filter(Boolean))
-      .catch(() => []);
+    // 相关召回：按关键词重合 + 新鲜度取与当前话题最相关的记忆（最多 30 条）
+    const memories = await recall(slug, message, 30).catch(() => []);
     const memoryBlock = memories.length
-      ? `\n\n【长期记忆（关于用户的事实，仅在相关时使用；要新增事实时调用 memory_save 工具）】\n- ${memories.slice(-30).join("\n- ")}`
+      ? `\n\n【长期记忆（关于用户的事实，仅在相关时使用；要新增事实时调用 memory_save 工具）】\n- ${memories
+          .map((m) => `[${m.cat}] ${m.fact}`)
+          .join("\n- ")}`
       : "";
 
     // 思考档位：关闭/自动 → 不传（由模型默认）；低/中/高/极高 → reasoning_effort（对齐 rikkahub：极高=xhigh）
@@ -749,7 +774,11 @@ async function autoMemorize(slug: string, card: { memoryConfig?: { auto_rounds?:
   await fs.writeFile(countFile, "0", "utf8");
   const llm = await resolveChatLLM(card as never);
   if (!llm?.apiKey) return;
-  const existing = await fs.readFile(ctx.memoryPath, "utf8").catch(() => "");
+  // 已记住的只带最近 100 条给 LLM，避免 token 随文件膨胀
+  const existing = (await readAllMemories().then((m) => m[slug] ?? []).catch(() => []))
+    .slice(-100)
+    .map((e) => `- [${e.cat}] ${e.fact}`)
+    .join("\n");
   const recent = messages
     .filter((m) => {
       const role = (m as { role?: string }).role;
@@ -772,13 +801,14 @@ async function autoMemorize(slug: string, card: { memoryConfig?: { auto_rounds?:
           {
             role: "system",
             content:
-              "你是记忆提取器。从下面的对话中提取【值得长期记住的用户事实】（用户的名字/住址/喜好/重要事件/关系等）。" +
-              "已经记住的不要重复；没有新事实就返回空数组。输出严格 JSON 数组，每项一个字符串，不要任何其他文字。",
+              "你是记忆提取器。从下面的对话中提取【值得长期记住的用户事实】（名字/住址/喜好/重要事件/关系等），给每条打分类标签：" +
+              `分类只能是：${MEMORY_CATEGORIES.join("/")}。已经记住的不要重复；没有新事实就返回空数组。` +
+              "输出严格 JSON 数组，每项是 {fact: 事实文本, cat: 分类}，不要任何其他文字。",
           },
           { role: "user", content: `已记住的事实：\n${existing || "（无）"}\n\n最近对话：\n${recent}` },
         ],
         temperature: 0.2,
-        max_tokens: 400,
+        max_tokens: 600,
       }),
       signal: AbortSignal.timeout(45000),
     });
@@ -790,10 +820,21 @@ async function autoMemorize(slug: string, card: { memoryConfig?: { auto_rounds?:
     if (start === -1 || end === -1) return;
     const facts = JSON.parse(text.slice(start, end + 1));
     if (!Array.isArray(facts) || facts.length === 0) return;
-    const lines = facts.map((f) => String(f).trim()).filter(Boolean).slice(0, 10);
-    if (!lines.length) return;
-    await fs.mkdir(path.dirname(ctx.memoryPath), { recursive: true });
-    await fs.appendFile(ctx.memoryPath, lines.join("\n") + "\n", "utf8");
+    const items = facts
+      .map((f) => {
+        const o = f as { fact?: unknown; cat?: unknown };
+        const fact = typeof o.fact === "string" ? o.fact.trim() : "";
+        const cat = (MEMORY_CATEGORIES as readonly string[]).includes(String(o.cat ?? ""))
+          ? (o.cat as MemoryCategory)
+          : "信息";
+        return fact ? { fact, cat } : null;
+      })
+      .filter((x): x is { fact: string; cat: MemoryCategory } => x !== null)
+      .slice(0, 10);
+    if (!items.length) return;
+    for (const it of items) {
+      await appendEntry(slug, { fact: it.fact, cat: it.cat, src: "auto" }).catch(() => {});
+    }
   } catch {
     /* 自动记忆失败不影响聊天 */
   }
@@ -864,11 +905,7 @@ app.get("/api/backup", async (_req, res) => {
   try {
     const cards: Record<string, unknown> = {};
     for (const meta of await store.list()) cards[meta.slug] = await store.get(meta.slug);
-    const memory: Record<string, string> = {};
-    const memDir = path.join(dataDir(), "memory");
-    for (const f of await fs.readdir(memDir).catch(() => [])) {
-      memory[f] = await fs.readFile(path.join(memDir, f), "utf8").catch(() => "");
-    }
+    const memory = await readAllMemories();
     const bundle = {
       app: "openclaw-shell",
       version: 1,
@@ -886,34 +923,71 @@ app.get("/api/backup", async (_req, res) => {
   }
 });
 
-// ---------- 长期记忆查看 / 清空 ----------
+// ---------- 长期记忆查看 / 管理 ----------
 app.get("/api/memory", async (_req, res) => {
   try {
-    const memDir = path.join(dataDir(), "memory");
-    const out: Record<string, string[]> = {};
-    for (const f of await fs.readdir(memDir).catch(() => [])) {
-      const text = await fs.readFile(path.join(memDir, f), "utf8").catch(() => "");
-      out[f.replace(/\.mem$/, "")] = text.split("\n").filter(Boolean);
-    }
-    res.json({ memory: out });
+    res.json({ memory: await readAllMemories() });
   } catch (e) {
     res.status(500).json({ error: String(e) });
   }
 });
 
+// 清空（定义在 :slug 之前，避免被当成 slug）
 app.post("/api/memory/clear", async (req, res) => {
   try {
     const slug = req.body?.slug;
-    const memDir = path.join(dataDir(), "memory");
     if (slug) {
-      await fs.rm(path.join(memDir, `${slug}.mem`), { force: true }).catch(() => {});
-      await fs.rm(path.join(memDir, `${slug}.mem.count`), { force: true }).catch(() => {});
+      await clearMemory(String(slug));
     } else {
-      for (const f of await fs.readdir(memDir).catch(() => [])) {
-        await fs.rm(path.join(memDir, f), { force: true }).catch(() => {});
+      for (const f of await fs.readdir(path.join(dataDir(), "memory")).catch(() => [])) {
+        if (f.endsWith(".mem")) await clearMemory(f.replace(/\.mem$/, ""));
       }
     }
     res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+// 手动添加一条记忆
+app.post("/api/memory/:slug", async (req, res) => {
+  try {
+    const { fact, cat } = req.body ?? {};
+    const result = await appendEntry(req.params.slug, {
+      fact: String(fact ?? ""),
+      cat: cat as MemoryCategory,
+      src: "manual",
+    });
+    if (!result.ok) return res.json({ ok: false, duplicate: result.duplicate === true });
+    res.json({ ok: true, entry: result.entry });
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+// 删除单条记忆
+app.post("/api/memory/:slug/delete", async (req, res) => {
+  try {
+    const id = String(req.body?.id ?? "");
+    if (!id) return res.status(400).json({ error: "id 不能为空" });
+    const removed = await deleteEntry(req.params.slug, id);
+    res.json({ ok: removed });
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+// 编辑单条记忆（fact / cat）
+app.post("/api/memory/:slug/update", async (req, res) => {
+  try {
+    const { id, fact, cat } = req.body ?? {};
+    if (!id) return res.status(400).json({ error: "id 不能为空" });
+    const entry = await updateEntry(req.params.slug, String(id), {
+      fact: typeof fact === "string" ? fact : undefined,
+      cat: cat as MemoryCategory,
+    });
+    if (!entry) return res.status(404).json({ error: "记忆不存在" });
+    res.json({ ok: true, entry });
   } catch (e) {
     res.status(500).json({ error: String(e) });
   }
@@ -1012,6 +1086,159 @@ app.post("/api/image/test", async (req, res) => {
       return;
     }
     res.json({ ok: false, info: "本地生图未启用（方案见未来规划书）" });
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+// ---------- 语音合成（TTS）：上游聚合（OpenAI 兼容，可售卖）+ 本地兜底（Edge/SAPI） ----------
+app.get("/api/tts/config", async (_req, res) => {
+  try {
+    const cfg = await getTtsConfig();
+    res.json({
+      defaultProvider: cfg.defaultProvider,
+      local: { engine: cfg.local.engine, voice: cfg.local.voice, rate: cfg.local.rate, pitch: cfg.local.pitch },
+      providers: cfg.providers.map((p) => ({ ...p, key: maskTtsKey(p.key) })),
+      commonVoices: COMMON_EDGE_VOICES,
+    });
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+app.post("/api/tts/config", async (req, res) => {
+  try {
+    const { defaultProvider, local } = req.body ?? {};
+    const cur = await getTtsConfig();
+    const next = {
+      ...cur,
+      defaultProvider: defaultProvider && (defaultProvider === "local" || cur.providers.some((p) => p.id === defaultProvider))
+        ? defaultProvider
+        : cur.defaultProvider,
+      local: {
+        engine: ["edge", "sapi"].includes(local?.engine) ? local.engine : cur.local.engine,
+        voice: local?.voice ?? cur.local.voice,
+        rate: local?.rate ?? cur.local.rate,
+        pitch: local?.pitch ?? cur.local.pitch,
+      },
+    };
+    await saveTtsConfig(next);
+    res.json({ ok: true, hint: "已保存。聊天里点「🔊」即可朗读 AI 回复" });
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+// 新增或更新上游（带 id 且已存在 → 更新；否则新增）
+app.post("/api/tts/providers", async (req, res) => {
+  try {
+    const body = (req.body ?? {}) as Partial<TtsProvider>;
+    const cur = await getTtsConfig();
+    const providers = [...cur.providers];
+    let id = String(body.id ?? "");
+    const existing = providers.find((p) => p.id === id);
+    const patch: Partial<TtsProvider> = {
+      name: body.name,
+      kind: body.kind === "openai" ? "openai" : "openai",
+      baseUrl: body.baseUrl,
+      model: body.model,
+      voice: body.voice,
+      speed: typeof body.speed === "number" ? body.speed : undefined,
+      markup: typeof body.markup === "number" ? body.markup : undefined,
+      enabled: typeof body.enabled === "boolean" ? body.enabled : undefined,
+    };
+    if (existing) {
+      // 更新：key 为空表示保留旧 key
+      const merged = { ...existing, ...patch };
+      if (body.key) merged.key = String(body.key);
+      providers[providers.indexOf(existing)] = merged;
+    } else {
+      if (!body.name || !body.baseUrl) return res.status(400).json({ error: "name / baseUrl 必填" });
+      id = `p_${Date.now().toString(36)}`;
+      providers.push({
+        id,
+        name: String(body.name),
+        kind: "openai",
+        baseUrl: String(body.baseUrl),
+        key: String(body.key ?? ""),
+        model: String(body.model ?? ""),
+        voice: String(body.voice ?? ""),
+        speed: typeof body.speed === "number" ? body.speed : 1,
+        markup: typeof body.markup === "number" ? body.markup : 1,
+        enabled: body.enabled !== false,
+      });
+    }
+    await saveTtsConfig({ ...cur, providers });
+    res.json({ ok: true, id, hint: existing ? "已更新上游" : "已新增上游" });
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+app.delete("/api/tts/providers/:id", async (req, res) => {
+  try {
+    const id = String(req.params.id ?? "");
+    const cur = await getTtsConfig();
+    const providers = cur.providers.filter((p) => p.id !== id);
+    await saveTtsConfig({
+      ...cur,
+      providers,
+      defaultProvider: cur.defaultProvider === id ? "local" : cur.defaultProvider,
+    });
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+app.get("/api/tts/voices", async (_req, res) => {
+  try {
+    res.json({ voices: await listEdgeVoices() });
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+// target: "local" 或 provider id
+app.post("/api/tts/test", async (req, res) => {
+  try {
+    const { target } = req.body ?? {};
+    res.json(await testTts(String(target ?? "")));
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+app.post("/api/tts/synthesize", async (req, res) => {
+  const started = Date.now();
+  try {
+    const { text, providerId, voice, speed } = req.body ?? {};
+    const buf = await synthesizeTts(String(text ?? ""), { providerId, voice, speed });
+    const ext = buf[0] === 0x52 && buf[1] === 0x49 ? "wav" : "mp3"; // RIFF → wav
+    const file = `tts-${Date.now()}.${ext}`;
+    const dir = path.join(dataDir(), "tts");
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(path.join(dir, file), buf);
+    res.json({ url: `/tts/${file}`, bytes: buf.length });
+    void recordUsage({
+      ts: new Date().toISOString(),
+      provider: providerId ?? (await getTtsConfig()).defaultProvider,
+      model: "admin",
+      voice: String(voice ?? ""),
+      chars: String(text ?? "").length,
+      ms: Date.now() - started,
+      bytes: buf.length,
+      ok: true,
+      via: "admin",
+    }).catch(() => {});
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+app.get("/api/tts/usage", async (_req, res) => {
+  try {
+    res.json(await getUsageSummary());
   } catch (e) {
     res.status(500).json({ error: String(e) });
   }

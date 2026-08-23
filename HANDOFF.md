@@ -1,7 +1,7 @@
 # openclaw-shell 项目交接文档（HANDOFF）
 
 > 更新：2026-08-21 · 目的：让接手 AI 读取本文后能快速上手、持续开发
-> 配套文档：`D:\ai_workspace\未来规划书.md`（未来规划）、项目内 `DESIGN.md`（设计稿）、`README.md`（使用说明）
+> 配套文档：`D:\ai_workspace\未来规划书.md`（未来规划）、项目内 `DESIGN.md`（设计稿）、`README.md`（使用说明）、`docs/tts-guide.md`（**TTS 专项完整指引：架构/API/部署/开卖三步/踩坑**）
 
 ---
 
@@ -48,7 +48,10 @@ openclaw-shell/
 │   │   ├── skills.ts     # 内置技能库（代码专家/翻译/写作/陪伴）
 │   │   ├── modelConfig.ts# 读改写 ~/.openclaw/openclaw.json 的 models.providers + 默认模型
 │   │   ├── imageConfig.ts# data/imageConfig.json 生图配置（NovelAI/OpenAI/本地占位）
+│   │   ├── ttsConfig.ts  # data/ttsConfig.json 语音合成：多上游聚合（OpenAI 兼容，预置硅基流动）+ 本地兜底（Edge 在线/SAPI 离线）
+│   │   ├── ttsUsage.ts   # TTS 用量记账（data/tts-usage.jsonl 追加 + 汇总统计）
 │   │   └── openclawCli.ts# openclaw CLI 封装（扫码登录进程管理/状态/端口检测）
+│   ├── tts-server.ts     # 独立 TTS 售卖服务：POST /v1/audio/speech（OpenAI 兼容、Bearer key、17900、可单独部署到服务器赚差价）
 │   ├── distiller/        # 蒸馏：parser(WeFlow/纯文本) / redact(PII) / extract(四维LLM) / pipeline
 │   └── tools/
 │       ├── registry.ts   # 工具注册表：code_exec(沙箱) / sandbox_list|read|write|grep / web_search / weather / datetime / memory_save / image_gen
@@ -69,8 +72,9 @@ openclaw-shell/
 | 人设卡 | 建/编/校验/编译、聊天测试（人设+工具+技能+记忆+语音+思考深度）、做卡向导（简介/开场白/世界书/正则/头像）、导出 PNG/JSON、导入 PNG/JSON（CCv2）、生效人设指示、**表情包（每卡≤120，带解释，AI 用 [表情:名字] 标记）** |
 | 蒸馏 | WeFlow JSON 上传 / 粘贴「昵称: 内容」文本 / 直连本机 WeFlow(5031) → PII 脱敏 → 四维蒸馏（互动/人格/记忆，证据分级）→ 保存或直接导出 PNG |
 | 通道 | 微信官方插件扫码绑定（单聊，ClawBot 灰度）、QQ 官方开放平台扫码绑定（q.qq.com 机器人，单聊/群@/频道）、配对授权 |
-| API | 模型提供商配置+测试、默认模型、**生图配置（NovelAI/OpenAI 兼容/本地占位）**、MCP 服务器、数据备份 |
-| 聊天能力 | 工具：沙箱写代码+文件（危险先问后做审批）/搜索/天气/时间/记忆/生图；技能库；思考深度 关闭/自动/低/中/高/极高（对齐 rikkahub，极高=xhigh 不支持自动降级）；语音 TTS/STT；普通聊天/工作模式分离 |
+| API | 模型提供商配置+测试、默认模型、**生图配置（NovelAI/OpenAI 兼容/本地占位）**、**TTS 语音合成（上游聚合：任意 OpenAI 兼容 /v1/audio/speech，预置硅基流动待填 key；用量记账；对外售卖接口）**、MCP 服务器、数据备份 |
+| 聊天能力 | 工具：沙箱写代码+文件（危险先问后做审批）/搜索/天气/时间/记忆/生图；技能库；思考深度 关闭/自动/低/中/高/极高（对齐 rikkahub，极高=xhigh 不支持自动降级）；**TTS 朗读（bot 气泡 hover 出 🔊，点击合成播放，走默认通道）**；普通聊天/工作模式分离 |
+| 记忆 | 每卡独立长期记忆（JSONL 结构化）；**相关召回注入**（关键词+新鲜度，不再一刀切取最后 N 条）、memory_save 工具去重+分类、每 N 轮自动总结（LLM 提取带分类）、**前端单条管理**（手动添加/编辑/删除/搜索/分类徽标/相对时间）、旧纯文本自动迁移、每卡 300 条上限自动淘汰、备份兼容 |
 | 基建 | 开机自启 + 桌面开关、Cloudflare 独立隧道公网、Basic 认证、数据全本地 |
 
 ## 5. 服务与依赖（关键路径/配置）
@@ -81,7 +85,8 @@ openclaw-shell/
   - 新隧道 `openclaw`（ID 74975232-d922-4337-9644-76fac4d04c26），配置 `C:\Users\followsun\.cloudflared\config-openclaw.yml`，用户账户运行（由 start-stack 托管）→ 子域名 `openclaw.319274.xyz` → 17880
   - 旧隧道 `fwq`（ID abbf0656-...）是系统服务（SYSTEM 身份，配置在 systemprofile 目录），**别动**，服务它自己的 8080
   - 死记录：`shell.319274.xyz` 指向旧隧道（404，无害，可在面板删）
-- **数据根** `data/`：cards、memory（`<slug>.mem`）、sandbox（每人设卡一个沙箱目录）、emojis、images、workspace（编译产物）
+- **数据根** `data/`：cards、memory（`<slug>.mem` 为 **JSONL 结构化记忆**：每行 `{id,fact,cat,ts,src}`，含分类[信息/偏好/关系/事件/待定]、时间戳、来源[手动/自动/工具/旧数据]；旧纯文本格式首次读取自动迁移）、sandbox（每人设卡一个沙箱目录）、emojis、images、tts（朗读音频产物）、ttsConfig.json（TTS 配置）、tts-usage.jsonl（TTS 用量）、workspace（编译产物）
+- **TTS 售卖服务**（独立进程，按需启动）：`npm run tts-server`（或 build 后 `node dist/tts-server.js`）→ 0.0.0.0:17900，`POST /v1/audio/speech` 完全 OpenAI 兼容（客户用 OpenAI SDK 改 baseUrl 即可）；本机 127.0.0.1 免 key 自测，外部必须 Bearer key（`data/ttsKeys.json` 数组 `[{"key":"...","name":"客户A"}]` 或环境变量 `TTS_API_KEYS="k1,k2"`）；按 model 名路由上游（不填走默认上游）；每次调用记入 tts-usage.jsonl。部署到服务器时带 dist + data/ttsConfig.json + ttsKeys.json 即可
 - 登录凭据：项目 `.env`（gitignored）——⚠️ 若仓库转 public 必须改
 
 ## 6. GitHub 状态
@@ -93,8 +98,8 @@ openclaw-shell/
 
 ## 7. 未来展望（详见 D:\ai_workspace\未来规划书.md）
 
-- **等条件**：QQ/微信绑定验证（等用户扫码，验收清单已在规划书）、M5 中转商业化（等中转站，用 one-api/new-api）、App 更新推送机制（参考 rikkahub 的 GitHub Releases 方案）
-- **功能增强**：MetaPact 多模态能力包（vision/hearing/voice skills）、cc-connect 自己的号渠道（封号风险待拍板）、本地生图（ComfyUI/Forge 分析已写）、GPT-SoVITS 声音克隆、OpenClaw 端工具/表情/生图接入（让 QQ/微信里的机器人也用上，目前只在网页聊天测试生效）、记忆增强、群运营、MCP 真实联调、心跳主动消息、模型能力路由、README 宣传
+- **等条件**：QQ/微信绑定验证（等用户扫码，验收清单已在规划书）、M5 中转商业化（等中转站，用 one-api/new-api）、**TTS 开卖（等用户注册硅基流动拿 key 填入 API 页并启用；售卖接口/记账已就绪）**、App 更新推送机制（参考 rikkahub 的 GitHub Releases 方案）
+- **功能增强**：MetaPact 多模态能力包（vision/hearing/voice skills）、cc-connect 自己的号渠道（封号风险待拍板）、本地生图（ComfyUI/Forge 分析已写）、GPT-SoVITS 声音克隆（付费增值：TTS 已留 provider 结构，加 kind 即可扩）、语音 STT 输入、OpenClaw 端工具/表情/生图接入（让 QQ/微信里的机器人也用上，目前只在网页聊天测试生效）、记忆增强、群运营、MCP 真实联调、心跳主动消息、模型能力路由、README 宣传
 - **打包分发**：Windows 便携版/安装包（内嵌 Node+OpenClaw+首次引导）优先；与 M5 中转配套
 
 ## 8. 踩坑记录（接手必读，避免重复踩）
@@ -110,6 +115,8 @@ openclaw-shell/
 9. **NovelAI 直连当前网络可能被墙**（fetch 网络错误，非代码问题）
 10. **NapCat 插件不可用**：npm 包无编译产物、源码版与 2026.6 SDK 不兼容 → QQ 走官方开放平台插件，别回头搞 NapCat
 11. 微信扫码登录必须在**跑 gateway 的同一台机器**上；微信 ClawBot 入口是灰度，账号没有就扫不了
+12. **edge-tts（Edge 在线免费语音）WS 合成握手 403**：语音列表 HTTP 200（网络通），但 WebSocket 合成被拒（token/风控），本网络环境不可用 → 本地兜底用 **Windows SAPI**（离线必可用，音质一般）；edge 选项保留在前端，换网络环境可能恢复
+13. **edge-tts npm 包 main 指向 index.ts**：必须 `import ... from "edge-tts/out/index.js"`（编译产物），否则 dist 下 node 跑不起来
 
 ## 9. 参考内容索引
 

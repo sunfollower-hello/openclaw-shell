@@ -653,7 +653,7 @@ async function saveNewCard(compile) {
 // ============================================================
 //  视图：API 与模型 / 生图配置（多提供商，模型自动拉取）
 // ============================================================
-function renderApi() { return renderProvidersPage("chat", "⚡ API 与模型", "对话 API 提供商；第一个为默认，卡片未单独指定时使用它。"); }
+function renderApi() { return renderProvidersPage("chat", "⚡ API 与模型", "对话 API 提供商；第一个为默认，卡片未单独指定时使用它。") + renderTtsBlock(); }
 function renderImagegen() { return renderProvidersPage("image", "🎨 生图配置", "生图 API 提供商（模型自动拉取）。"); }
 
 function renderProvidersPage(type, title, desc) {
@@ -688,7 +688,7 @@ function renderProvidersPage(type, title, desc) {
 
 let provState = { type: "chat", editing: null, allModels: [], selected: [] };
 
-function initApi() { initProvidersPage("chat"); }
+function initApi() { initProvidersPage("chat"); initTtsBlock(); }
 function initImagegen() { initProvidersPage("image"); }
 
 function initProvidersPage(type) {
@@ -745,6 +745,231 @@ async function loadProvList() {
     );
   } catch (e) { box.innerHTML = `<div class="card-box muted">读取失败：${escapeHtml(e.message)}</div>`; }
 }
+
+// ============================================================
+//  语音合成（TTS）：上游聚合（OpenAI 兼容，可售卖）+ 本地兜底
+// ============================================================
+function renderTtsBlock() {
+  return `
+  <div class="card-box" id="tts-box" style="margin-top:16px">
+    <h3>🔊 语音合成（TTS）<span class="hint">上游聚合可对外售卖；本地仅测试/兜底</span></h3>
+    <div class="form">
+      <div class="cf-grid">
+        <div>
+          <label>默认合成通道</label>
+          <select id="tts-default"></select>
+        </div>
+        <div>
+          <label>本地引擎</label>
+          <select id="tts-local-engine">
+            <option value="edge">Edge 神经语音（在线免费）</option>
+            <option value="sapi">Windows SAPI（离线）</option>
+          </select>
+        </div>
+        <div>
+          <label>本地语音</label>
+          <select id="tts-local-voice"></select>
+        </div>
+        <div>
+          <label>语速</label>
+          <input id="tts-local-rate" placeholder="+0%">
+        </div>
+        <div>
+          <label>音调</label>
+          <input id="tts-local-pitch" placeholder="+0Hz">
+        </div>
+      </div>
+      <div class="row">
+        <button id="tts-save-local" class="primary">保存设置</button>
+        <button id="tts-test-local" class="ghost">测试本地</button>
+        <span id="tts-test-msg" class="status"></span>
+      </div>
+    </div>
+
+    <h3 style="margin-top:16px">上游供应商 <span class="hint">OpenAI 兼容 /v1/audio/speech，可加价出售</span></h3>
+    <div id="tts-prov-list"></div>
+    <button id="tts-prov-add" class="primary" style="margin-top:10px">＋ 添加上游</button>
+    <div id="tts-prov-form" class="card-box" style="display:none;margin-top:12px">
+      <h3 id="tts-pv-title">添加上游</h3>
+      <div class="form">
+        <div class="cf-grid2">
+          <div><label>名称</label><input id="tts-pv-name" placeholder="如 硅基流动"></div>
+          <div><label>Base URL（以 /v1 结尾）</label><input id="tts-pv-url" placeholder="https://api.siliconflow.cn/v1"></div>
+        </div>
+        <div class="cf-grid2">
+          <div><label>默认模型</label><input id="tts-pv-model" placeholder="如 FunAudioLLM/CosyVoice2-0.5B"></div>
+          <div><label>默认音色</label><input id="tts-pv-voice" placeholder="如 FunAudioLLM/CosyVoice2-0.5B:alex"></div>
+        </div>
+        <div class="cf-grid">
+          <div><label>API Key（编辑留空=保留）</label><input id="tts-pv-key" type="password"></div>
+          <div><label>语速 (0.25~4)</label><input id="tts-pv-speed" type="number" step="0.1" value="1"></div>
+          <div><label>加价倍率 (1=原价)</label><input id="tts-pv-markup" type="number" step="0.1" value="1"></div>
+        </div>
+        <label class="row"><input id="tts-pv-enabled" type="checkbox" checked> 启用此上游（未启用时默认通道自动兜底本地）</label>
+        <div class="row">
+          <button id="tts-pv-save" class="primary">保存</button>
+          <button id="tts-pv-cancel" class="ghost">取消</button>
+        </div>
+        <div id="tts-pv-msg" class="status"></div>
+      </div>
+    </div>
+
+    <h3 style="margin-top:16px">📊 用量统计</h3>
+    <div id="tts-usage" class="hint">加载中…</div>
+    <div class="hint" style="margin-top:6px">对外售卖：<code>npm run tts-server</code>（默认 0.0.0.0:17900，Bearer key 认证），客户用 OpenAI SDK 调 POST /v1/audio/speech 即可。</div>
+  </div>`;
+}
+
+let ttsState = { providers: [], commonVoices: [], editingId: null };
+
+async function initTtsBlock() {
+  ttsState = { providers: [], commonVoices: [], editingId: null };
+  $("#tts-save-local").addEventListener("click", saveTtsLocal);
+  $("#tts-test-local").addEventListener("click", () => testTtsTarget("local"));
+  $("#tts-prov-add").addEventListener("click", () => showTtsProvForm(null));
+  $("#tts-pv-cancel").addEventListener("click", () => ($("#tts-prov-form").style.display = "none"));
+  $("#tts-pv-save").addEventListener("click", saveTtsProvider);
+  $("#tts-default").addEventListener("change", async (e) => {
+    await saveTtsConfigOnly({ defaultProvider: e.target.value });
+    toast("✓ 默认通道已切换");
+  });
+  await loadTtsConfig();
+}
+
+async function loadTtsConfig() {
+  try {
+    const cfg = await api.get("/api/tts/config");
+    ttsState.providers = cfg.providers || [];
+    ttsState.commonVoices = cfg.commonVoices || [];
+    const sel = $("#tts-default");
+    sel.innerHTML =
+      '<option value="local">本地兜底</option>' +
+      (cfg.providers || []).map((p) => `<option value="${escapeHtml(p.id)}">${escapeHtml(p.name)}${p.enabled ? "" : "（未启用）"}</option>`).join("");
+    sel.value = cfg.defaultProvider || "local";
+    $("#tts-local-engine").value = cfg.local?.engine || "edge";
+    const vSel = $("#tts-local-voice");
+    vSel.innerHTML = (cfg.commonVoices || []).map((v) => `<option value="${escapeHtml(v.id)}">${escapeHtml(v.label)}</option>`).join("");
+    vSel.value = cfg.local?.voice || "";
+    $("#tts-local-rate").value = cfg.local?.rate || "+0%";
+    $("#tts-local-pitch").value = cfg.local?.pitch || "+0Hz";
+    renderTtsProviders();
+    await loadTtsUsage();
+  } catch (e) {
+    $("#tts-prov-list").innerHTML = `<div class="card-box muted">读取失败：${escapeHtml(e.message)}</div>`;
+  }
+}
+
+function renderTtsProviders() {
+  const box = $("#tts-prov-list");
+  if (!box) return;
+  if (!ttsState.providers.length) {
+    box.innerHTML = '<div class="card-box muted">还没有上游供应商，点下方按钮添加（如 硅基流动）</div>';
+    return;
+  }
+  box.innerHTML = "";
+  ttsState.providers.forEach((p) => {
+    const d = document.createElement("div");
+    d.className = "prov-item";
+    d.innerHTML = `
+      <div class="prov-head">
+        <b>${escapeHtml(p.name)}</b>
+        ${p.enabled ? '<span class="chip ok">启用</span>' : '<span class="chip">停用</span>'}
+        <span class="prov-btns">
+          <button class="ghost small-btn" data-act="test">测试</button>
+          <button class="ghost small-btn" data-act="edit">编辑</button>
+          <button class="danger small-btn" data-act="del">删除</button>
+        </span>
+      </div>
+      <div class="meta">${escapeHtml(p.baseUrl)} · key ${escapeHtml(p.key || "未填")} · 加价 x${p.markup ?? 1}</div>
+      <div class="meta">模型 ${escapeHtml(p.model || "—")} · 音色 ${escapeHtml(p.voice || "—")} · 语速 ${p.speed ?? 1}</div>`;
+    box.appendChild(d);
+    d.querySelectorAll("button[data-act]").forEach((b) =>
+      b.addEventListener("click", async () => {
+        if (b.dataset.act === "test") testTtsTarget(p.id);
+        else if (b.dataset.act === "edit") showTtsProvForm(p);
+        else if (b.dataset.act === "del") {
+          if (!confirm(`删除上游 ${p.name}？`)) return;
+          await api.send(`/api/tts/providers/${p.id}`, { method: "DELETE" });
+          toast("✓ 已删除");
+          loadTtsConfig();
+        }
+      })
+    );
+  });
+}
+
+async function testTtsTarget(target) {
+  const msg = $("#tts-test-msg");
+  if (msg) { msg.textContent = "测试中…"; msg.className = "status"; }
+  const r = await api.send("/api/tts/test", { method: "POST", body: JSON.stringify({ target }) });
+  if (msg) { msg.textContent = (r.ok ? "✓ " : "✗ ") + r.info; msg.className = "status " + (r.ok ? "ok" : "err"); }
+}
+
+async function saveTtsLocal() {
+  try {
+    await saveTtsConfigOnly({
+      defaultProvider: $("#tts-default").value,
+      local: {
+        engine: $("#tts-local-engine").value,
+        voice: $("#tts-local-voice").value,
+        rate: $("#tts-local-rate").value,
+        pitch: $("#tts-local-pitch").value,
+      },
+    });
+    toast("✓ TTS 设置已保存");
+  } catch (e) { toast("保存失败：" + e.message, false); }
+}
+
+async function saveTtsConfigOnly(body) {
+  return api.send("/api/tts/config", { method: "POST", body: JSON.stringify(body) });
+}
+
+function showTtsProvForm(p) {
+  ttsState.editingId = p?.id ?? null;
+  $("#tts-pv-title").textContent = p ? `编辑上游：${p.name}` : "添加上游";
+  $("#tts-pv-name").value = p?.name ?? "";
+  $("#tts-pv-url").value = p?.baseUrl ?? "";
+  $("#tts-pv-model").value = p?.model ?? "";
+  $("#tts-pv-voice").value = p?.voice ?? "";
+  $("#tts-pv-key").value = "";
+  $("#tts-pv-speed").value = p?.speed ?? 1;
+  $("#tts-pv-markup").value = p?.markup ?? 1;
+  $("#tts-pv-enabled").checked = p ? p.enabled : true;
+  $("#tts-prov-form").style.display = "block";
+}
+
+async function saveTtsProvider() {
+  const body = {
+    id: ttsState.editingId || undefined,
+    name: $("#tts-pv-name").value.trim(),
+    baseUrl: $("#tts-pv-url").value.trim(),
+    model: $("#tts-pv-model").value.trim(),
+    voice: $("#tts-pv-voice").value.trim(),
+    key: $("#tts-pv-key").value.trim(),
+    speed: Number($("#tts-pv-speed").value) || 1,
+    markup: Number($("#tts-pv-markup").value) || 1,
+    enabled: $("#tts-pv-enabled").checked,
+  };
+  if (!body.name || !body.baseUrl) { toast("名称 / Base URL 必填", false); return; }
+  try {
+    const r = await api.send("/api/tts/providers", { method: "POST", body: JSON.stringify(body) });
+    toast(r.hint || "✓ 已保存");
+    $("#tts-prov-form").style.display = "none";
+    loadTtsConfig();
+  } catch (e) {
+    $("#tts-pv-msg").textContent = "保存失败：" + e.message;
+  }
+}
+
+async function loadTtsUsage() {
+  try {
+    const u = await api.get("/api/tts/usage");
+    const byProv = (u.byProvider || []).map((x) => `${x.id}(${x.calls}次/${x.chars}字符)`).join("、") || "—";
+    $("#tts-usage").textContent = `共 ${u.total} 次调用（成功 ${u.ok} / 失败 ${u.fail}），成功合成 ${u.totalChars} 字符，24h 内 ${u.last24h} 次。按上游：${byProv}`;
+    $("#tts-usage").className = "status";
+  } catch { /* 用量加载失败不影响其余 */ }
+}
+
 
 async function showProvForm(name) {
   provState.editing = name;
@@ -835,12 +1060,30 @@ async function provDone() {
 }
 
 // ============================================================
-//  视图：记忆（每卡配置 + 查看）
+//  视图：记忆（每卡配置 + 查看 + 单条管理）
 // ============================================================
+const MEM_CATS = ["信息", "偏好", "关系", "事件", "待定"];
+const MEM_CAT_EMOJI = { 信息: "📌", 偏好: "💖", 关系: "👥", 事件: "📅", 待定: "❓" };
+const MEM_SRC_LABEL = { manual: "手动", auto: "自动总结", tool: "工具", legacy: "旧数据" };
+
+function fmtTime(iso) {
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return "";
+  const diff = Date.now() - d.getTime();
+  if (diff < 60000) return "刚刚";
+  const m = Math.floor(diff / 60000);
+  if (m < 60) return `${m} 分钟前`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h} 小时前`;
+  const days = Math.floor(h / 24);
+  if (days < 30) return `${days} 天前`;
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
+
 function renderMemory() {
   return `
   <div class="view">
-    <div class="page-head"><h2>🧠 记忆</h2><p class="hint">每张卡独立的长期记忆；设定每几轮对话自动总结（默认 20，1-50）</p></div>
+    <div class="page-head"><h2>🧠 记忆</h2><p class="hint">每张卡独立的长期记忆；可手动添加、单条编辑/删除；设定每几轮对话自动总结（默认 20，1-50）</p></div>
     <div id="mem-cards" class="card-grid"></div>
     <div id="mem-detail" class="card-box" style="display:none">
       <h3 id="mem-title"></h3>
@@ -849,8 +1092,13 @@ function renderMemory() {
         <button id="mem-save-rounds" class="primary small-btn">保存</button>
         <button id="mem-clear" class="danger small-btn">清空此卡记忆</button>
       </div>
-      <h3>已记住的事实</h3>
-      <div id="mem-entries" class="small-out tall"></div>
+      <div class="row" style="align-items:center">
+        <select id="mem-add-cat" style="width:auto"></select>
+        <input id="mem-add-input" type="text" placeholder="添加一条记忆，例如：用户养了一只叫旺财的狗">
+        <button id="mem-add-btn" class="primary small-btn">添加</button>
+      </div>
+      <input id="mem-search" type="text" placeholder="🔍 搜索记忆…" style="width:100%">
+      <div id="mem-entries" class="small-out tall" style="max-height:520px;padding:4px 10px"></div>
     </div>
   </div>`;
 }
@@ -872,6 +1120,10 @@ function initMemory() {
   })();
   $("#mem-save-rounds").addEventListener("click", saveMemRounds);
   $("#mem-clear").addEventListener("click", clearMem);
+  $("#mem-add-btn").addEventListener("click", addMemEntry);
+  $("#mem-add-input").addEventListener("keydown", (e) => { if (e.key === "Enter") addMemEntry(); });
+  $("#mem-search").addEventListener("input", loadMemEntries);
+  $("#mem-entries").addEventListener("click", onMemRowClick);
 }
 
 async function openMemDetail(slug) {
@@ -879,10 +1131,88 @@ async function openMemDetail(slug) {
   $("#mem-detail").style.display = "block";
   $("#mem-title").textContent = `🧠 ${memCard.name} 的记忆`;
   $("#mem-rounds").value = memCard.memoryConfig?.auto_rounds ?? 20;
-  const mem = await api.get("/api/memory").catch(() => ({ memory: {} }));
-  const entries = mem.memory?.[slug] ?? [];
-  $("#mem-entries").textContent = entries.length ? entries.map((e) => "· " + e).join("\n") : "（还没有记忆）";
+  const catSel = $("#mem-add-cat");
+  catSel.innerHTML = MEM_CATS.map((c) => `<option>${c}</option>`).join("");
+  catSel.value = "信息";
+  await loadMemEntries();
   $("#mem-detail").scrollIntoView({ behavior: "smooth" });
+}
+
+async function loadMemEntries() {
+  if (!memCard) return;
+  const mem = await api.get("/api/memory").catch(() => ({ memory: {} }));
+  const entries = mem.memory?.[memCard.slug] ?? [];
+  const q = ($("#mem-search")?.value ?? "").trim();
+  const list = q ? entries.filter((e) => (e.fact + " " + e.cat).includes(q)) : entries;
+  const el = $("#mem-entries");
+  if (!list.length) { el.textContent = q ? "（没有匹配）" : "（还没有记忆）"; return; }
+  el.innerHTML = list.slice().reverse().map(renderMemRow).join("");
+}
+
+function renderMemRow(e) {
+  const src = MEM_SRC_LABEL[e.src] ?? e.src ?? "";
+  return `<div class="mem-row" data-id="${escapeHtml(e.id)}">
+    <span class="mem-badge cat-${escapeHtml(e.cat)}">${MEM_CAT_EMOJI[e.cat] ?? ""} ${escapeHtml(e.cat)}</span>
+    <span class="mem-fact">${escapeHtml(e.fact)}</span>
+    <span class="mem-meta">${fmtTime(e.ts)}${src ? " · " + src : ""}</span>
+    <span class="mem-ops">
+      <button class="small-btn" data-act="edit" data-id="${escapeHtml(e.id)}">编辑</button>
+      <button class="small-btn danger" data-act="del" data-id="${escapeHtml(e.id)}">删除</button>
+    </span>
+  </div>`;
+}
+
+function renderMemEditRow(e) {
+  return `<div class="mem-row mem-edit" data-id="${escapeHtml(e.id)}">
+    <select class="mem-edit-cat">${MEM_CATS.map((c) => `<option ${c === e.cat ? "selected" : ""}>${c}</option>`).join("")}</select>
+    <input class="mem-edit-fact" type="text" value="${escapeHtml(e.fact)}">
+    <span class="mem-ops">
+      <button class="small-btn primary" data-act="save" data-id="${escapeHtml(e.id)}">保存</button>
+      <button class="small-btn" data-act="cancel" data-id="${escapeHtml(e.id)}">取消</button>
+    </span>
+  </div>`;
+}
+
+async function onMemRowClick(ev) {
+  const btn = ev.target.closest("button[data-act]");
+  if (!btn || !memCard) return;
+  const id = btn.dataset.id;
+  const row = btn.closest(".mem-row");
+  if (btn.dataset.act === "del") {
+    if (!confirm("删除这条记忆？")) return;
+    await api.send(`/api/memory/${memCard.slug}/delete`, { method: "POST", body: JSON.stringify({ id }) });
+    loadMemEntries();
+    toast("✓ 已删除");
+  } else if (btn.dataset.act === "edit") {
+    const mem = await api.get("/api/memory");
+    const entry = (mem.memory?.[memCard.slug] ?? []).find((e) => e.id === id);
+    if (entry) row.outerHTML = renderMemEditRow(entry);
+  } else if (btn.dataset.act === "cancel") {
+    const mem = await api.get("/api/memory");
+    const entry = (mem.memory?.[memCard.slug] ?? []).find((e) => e.id === id);
+    if (entry) row.outerHTML = renderMemRow(entry);
+  } else if (btn.dataset.act === "save") {
+    const editRow = btn.closest(".mem-edit");
+    const fact = editRow.querySelector(".mem-edit-fact").value.trim();
+    const cat = editRow.querySelector(".mem-edit-cat").value;
+    if (!fact) { toast("事实不能为空", false); return; }
+    const r = await api.send(`/api/memory/${memCard.slug}/update`, { method: "POST", body: JSON.stringify({ id, fact, cat }) });
+    toast("✓ 已保存");
+    loadMemEntries();
+  }
+}
+
+async function addMemEntry() {
+  if (!memCard) return;
+  const fact = $("#mem-add-input").value.trim();
+  if (!fact) { toast("请输入要记住的事实", false); return; }
+  const cat = $("#mem-add-cat").value;
+  const r = await api.send(`/api/memory/${memCard.slug}`, { method: "POST", body: JSON.stringify({ fact, cat }) });
+  if (r.ok === false && r.duplicate) { toast("这条已经记住了", false); return; }
+  if (!r.ok) { toast("添加失败", false); return; }
+  $("#mem-add-input").value = "";
+  await loadMemEntries();
+  toast("✓ 已记住");
 }
 
 async function saveMemRounds() {
@@ -910,9 +1240,31 @@ function addChatBubble(role, text) {
   const div = document.createElement("div");
   div.className = "bubble " + (role === "user" ? "me" : "bot");
   div.textContent = text;
+  if (role === "bot") {
+    const btn = document.createElement("button");
+    btn.className = "tts-speak-btn";
+    btn.textContent = "🔊";
+    btn.title = "朗读这条回复（TTS）";
+    btn.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      speakText(text);
+    });
+    div.appendChild(btn);
+  }
   log.appendChild(div);
   log.scrollTop = log.scrollHeight;
   return div;
+}
+let ttsAudio = null;
+async function speakText(text) {
+  try {
+    if (ttsAudio) { ttsAudio.pause(); ttsAudio = null; }
+    const r = await api.send("/api/tts/synthesize", { method: "POST", body: JSON.stringify({ text: String(text).slice(0, 500) }) });
+    ttsAudio = new Audio(r.url);
+    ttsAudio.play();
+  } catch (e) {
+    toast("朗读失败：" + e.message, false);
+  }
 }
 function gatherChatOptions() {
   const tools = [];
@@ -1337,7 +1689,8 @@ function initData() {
   api.get("/api/memory").then((r) => {
     const el = $("#memory-list");
     el.textContent = Object.keys(r.memory ?? {}).length
-      ? Object.entries(r.memory).map(([f, l]) => `📄 ${f}\n  ` + (l || []).join("\n  ")).join("\n\n")
+      ? Object.entries(r.memory).map(([f, entries]) =>
+          `📄 ${f}\n  ` + (entries || []).map((e) => `[${e.cat}] ${e.fact}`).join("\n  ")).join("\n\n")
       : "（还没有记忆）";
   }).catch(() => {});
 }
