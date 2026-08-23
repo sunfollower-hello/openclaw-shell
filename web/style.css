@@ -51,6 +51,7 @@ body {
   background: var(--text); border-radius: 2px;
 }
 .brand { font-size: 16px; font-weight: 700; flex: 1; letter-spacing: -0.2px; }
+.brand-en { font-size: 12px; font-weight: 600; color: var(--muted); margin-left: 2px; letter-spacing: 0.2px; }
 .svc-dot { width: 10px; height: 10px; border-radius: 50%; background: #c6cad8; }
 .svc-dot.on { background: var(--ok); box-shadow: 0 0 0 3px var(--ok-soft); }
 .svc-dot.bad { background: var(--danger); }

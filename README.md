@@ -1,6 +1,8 @@
-# openclaw-shell 🦞
+# 魂匣 SoulBox（openclaw-shell）
 
-OpenClaw 图形化外壳：引导接入 QQ/微信、人设卡编辑、聊天记录蒸馏、API 中转配置。
+装在自己电脑上的 AI 角色机器人工作室——从聊天记录蒸馏出人设卡，接到 QQ/微信，让想念的人重新开口说话。
+
+原名 openclaw-shell：OpenClaw 图形化外壳，引导接入 QQ/微信、人设卡编辑、聊天记录蒸馏、API 中转配置。
 
 > 状态：M5 前的基础已就绪（人设卡 + 编译器 + 蒸馏 + 通道向导 + API 配置页）
 

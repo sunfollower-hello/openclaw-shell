@@ -418,10 +418,7 @@ function renderHome() {
     </div>
 
     <div class="card-box home-notice">
-      <div class="home-notice-head">
-        <h3>${icon("clipboard")} 公告</h3>
-        <button id="notice-edit" class="ghost small-btn" title="编辑公告">${icon("pen")} 编辑</button>
-      </div>
+      <h3>${icon("clipboard")} 公告</h3>
       <div id="home-notice-body" class="home-notice-body muted">—</div>
     </div>
 
@@ -442,41 +439,7 @@ function renderHome() {
 }
 
 function initHome() {
-  $("#notice-edit").addEventListener("click", openNoticeEditor);
   refreshHome();
-}
-
-function openNoticeEditor() {
-  const old = $("#notice-overlay");
-  if (old) old.remove();
-  const ov = document.createElement("div");
-  ov.id = "notice-overlay";
-  ov.className = "bot-overlay";
-  ov.innerHTML = `<div class="bot-dialog profile-dialog">
-    <div class="bot-dialog-head">
-      <h3>${icon("clipboard")} 编辑公告</h3>
-      <button class="ghost small-btn" id="notice-close">${icon("x")}</button>
-    </div>
-    <div class="profile-body">
-      <label>公告内容（显示在首页，支持换行）</label>
-      <textarea id="notice-text" rows="5" maxlength="2000"></textarea>
-      <div class="row" style="justify-content:flex-end;margin-top:8px">
-        <button id="notice-save" class="primary">${icon("check")} 保存</button>
-      </div>
-    </div>
-  </div>`;
-  document.body.appendChild(ov);
-  ov.addEventListener("click", (e) => { if (e.target === ov) ov.remove(); });
-  $("#notice-close").addEventListener("click", () => ov.remove());
-  api.get("/api/announcement").then((a) => { $("#notice-text").value = a.text ?? ""; }).catch(() => {});
-  $("#notice-save").addEventListener("click", async () => {
-    try {
-      await api.send("/api/announcement", { method: "POST", body: JSON.stringify({ text: $("#notice-text").value }) });
-      ov.remove();
-      toast("✓ 公告已更新");
-      refreshHome();
-    } catch (e) { toast("保存失败：" + e.message, false); }
-  });
 }
 
 async function refreshHome() {
@@ -498,7 +461,7 @@ async function refreshHome() {
     const noticeBody = $("#home-notice-body");
     if (noticeBody) {
       noticeBody.classList.toggle("muted", !ann.text);
-      noticeBody.textContent = ann.text || "还没有公告，点右上「编辑」写一条给自己或访客的欢迎语";
+      noticeBody.textContent = ann.text || "暂无公告";
     }
     const sub = $("#home-hero-sub");
     if (sub) {
@@ -2536,22 +2499,39 @@ function renderSettings() {
   <div class="view">
     <div class="page-head"><h2>设置</h2><p class="hint">服务信息与说明</p></div>
     <div class="two-col">
-      <div class="card-box"><h3>服务信息</h3><div id="svc-info" class="small-out">读取中…</div></div>
-      <div class="card-box"><h3>说明</h3>
-        <ul class="guide">
-          <li>本机：<code>http://127.0.0.1:17880</code></li>
-          <li>公网：<code>https://openclaw.319274.xyz</code></li>
-          <li>开关：桌面「openclaw-shell 开关.bat」（已配开机自启）</li>
-          <li>数据全部在本机 <code>data/</code>，不上传</li>
-        </ul>
+      <div class="card-box">
+        <h3>${icon("clipboard")} 首页公告</h3>
+        <div class="form">
+          <label>展示在首页公告卡（支持换行，留空则首页显示「暂无公告」）</label>
+          <textarea id="notice-text" rows="5" maxlength="2000"></textarea>
+          <div class="row"><button id="notice-save" class="primary">${icon("save")} 保存公告</button></div>
+          <div id="notice-msg" class="status"></div>
+        </div>
       </div>
+      <div class="card-box"><h3>服务信息</h3><div id="svc-info" class="small-out">读取中…</div></div>
+    </div>
+    <div class="card-box"><h3>说明</h3>
+      <ul class="guide">
+        <li>本机：<code>http://127.0.0.1:17880</code></li>
+        <li>公网：<code>https://soulbox.319274.xyz</code>（旧地址 openclaw.319274.xyz 同样可用）</li>
+        <li>开关：桌面「openclaw-shell 开关.bat」（已配开机自启）</li>
+        <li>数据全部在本机 <code>data/</code>，不上传</li>
+      </ul>
     </div>
   </div>`;
 }
 function initSettings() {
+  api.get("/api/announcement").then((a) => { $("#notice-text").value = a.text ?? ""; }).catch(() => {});
+  $("#notice-save").addEventListener("click", async () => {
+    try {
+      await api.send("/api/announcement", { method: "POST", body: JSON.stringify({ text: $("#notice-text").value }) });
+      $("#notice-msg").textContent = "✓ 已保存";
+      toast("✓ 公告已更新");
+    } catch (e) { $("#notice-msg").textContent = "保存失败：" + e.message; }
+  });
   api.get("/api/health").then((h) => {
-    $("#svc-info").textContent = `服务：openclaw-shell\n版本：${h.schema}\n数据目录：${h.dataDir ?? "—"}\n监听：127.0.0.1:${h.port ?? "—"}`;
-    $("#drawer-meta").textContent = `v${h.schema}`;
+    $("#svc-info").textContent = `服务：SoulBox（openclaw-shell）\n版本：${h.schema}\n数据目录：${h.dataDir ?? "—"}\n监听：127.0.0.1:${h.port ?? "—"}`;
+    $("#drawer-meta").textContent = `SoulBox v${h.schema}`;
     $("#svc-dot").classList.add("on");
   }).catch(() => {
     $("#svc-info").textContent = "无法连接服务";

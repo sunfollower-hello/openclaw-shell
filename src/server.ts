@@ -121,7 +121,7 @@ app.use("/tts", express.static(path.join(dataDir(), "tts")));
 
 // ---------- API ----------
 app.get("/api/health", (_req, res) => {
-  res.json({ ok: true, service: "openclaw-shell", schema: SCHEMA_VERSION, port: PORT, dataDir: dataDir() });
+  res.json({ ok: true, service: "soulbox", schema: SCHEMA_VERSION, port: PORT, dataDir: dataDir() });
 });
 
 // ---------- 用户资料（抽屉头像/昵称，可编辑） ----------
