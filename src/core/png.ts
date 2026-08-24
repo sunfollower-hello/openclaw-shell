@@ -73,8 +73,19 @@ export function solidPng(width: number, height: number, rgba: [number, number, n
   ]);
 }
 
-/** 把 tEXt 块（base64 或原始文本）注入已有 PNG，返回新 PNG */
-export function pngWithText(png: Buffer, keyword: string, text: string): Buffer {
+/** 角色卡元数据用的 tEXt 关键字（写入新卡前要把这些旧块全部清掉，否则读卡方可能优先读到旧数据） */
+const CARD_KEYWORDS = ["chara", "chara_card_v2", "ccv3"];
+
+/**
+ * 把一个或多个 tEXt 块写入 PNG（同时清掉所有角色卡旧元数据块），返回新 PNG。
+ * 块必须插在 IEND **之前**：IEND 是 PNG 终止块，标准解析器（SillyTavern 的 png-chunks-extract 等）
+ * 读到 IEND 就停止扫描，写在后面等于没写。
+ */
+export function pngWithTexts(png: Buffer, entries: { keyword: string; text: string }[]): Buffer {
+  const newChunks = entries.map((e) =>
+    chunk("tEXt", Buffer.concat([Buffer.from(e.keyword, "latin1"), Buffer.from([0]), Buffer.from(e.text, "latin1")]))
+  );
+  const writing = new Set(entries.map((e) => e.keyword));
   const chunks: Buffer[] = [PNG_SIG];
   let off = 8;
   let inserted = false;
@@ -85,30 +96,66 @@ export function pngWithText(png: Buffer, keyword: string, text: string): Buffer 
     if (type === "tEXt") {
       const nul = data.indexOf(0);
       const kw = nul > 0 ? data.toString("latin1", 0, nul) : "";
-      if (kw === keyword) {
+      // 去掉本次要写的关键字与其他角色卡元数据块（chara / chara_card_v2 / ccv3）
+      if (writing.has(kw) || CARD_KEYWORDS.includes(kw)) {
         off += 12 + len;
-        continue; // 去掉旧的同名块
+        continue;
       }
     }
-    chunks.push(png.subarray(off, off + 12 + len));
     if (type === "IEND" && !inserted) {
-      const textData = Buffer.concat([Buffer.from(keyword, "latin1"), Buffer.from([0]), Buffer.from(text, "latin1")]);
-      chunks.push(chunk("tEXt", textData));
+      chunks.push(...newChunks); // 先写元数据，再写终止块
       inserted = true;
     }
+    chunks.push(png.subarray(off, off + 12 + len));
     off += 12 + len;
   }
   if (!inserted) {
-    const textData = Buffer.concat([Buffer.from(keyword, "latin1"), Buffer.from([0]), Buffer.from(text, "latin1")]);
-    chunks.push(chunk("tEXt", textData));
+    // 源图没有 IEND（异常图）：补在末尾，至少保证数据不丢
+    chunks.push(...newChunks);
   }
   return Buffer.concat(chunks);
 }
 
-/** 从 tEXt 提取 CCv2 卡片 JSON（兼容 base64 与原始 JSON） */
+/** 单个 tEXt 块写入（保留旧签名，内部走 pngWithTexts） */
+export function pngWithText(png: Buffer, keyword: string, text: string): Buffer {
+  return pngWithTexts(png, [{ keyword, text }]);
+}
+
+/** 去掉 PNG 里的角色卡元数据块（导入时用：原图可能带原作者的 chara/ccv3） */
+export function pngStripCardMeta(png: Buffer): Buffer {
+  if (!png.subarray(0, 8).equals(PNG_SIG)) return png;
+  const chunks: Buffer[] = [PNG_SIG];
+  let off = 8;
+  while (off + 12 <= png.length) {
+    const len = png.readUInt32BE(off);
+    const type = png.toString("ascii", off + 4, off + 8);
+    const data = png.subarray(off + 8, off + 8 + len);
+    if (type === "tEXt") {
+      const nul = data.indexOf(0);
+      const kw = nul > 0 ? data.toString("latin1", 0, nul) : "";
+      if (CARD_KEYWORDS.includes(kw)) {
+        off += 12 + len;
+        continue;
+      }
+    }
+    chunks.push(png.subarray(off, off + 12 + len));
+    off += 12 + len;
+  }
+  return Buffer.concat(chunks);
+}
+
+/** 是否是真 PNG（按签名判断，防止 jpeg 被当 PNG 用导致导出文件损坏） */
+export function isPng(buf: Buffer): boolean {
+  return buf.length >= 8 && buf.subarray(0, 8).equals(PNG_SIG);
+}
+
+/**
+ * 从 tEXt 提取角色卡 JSON（兼容 base64 与原始 JSON）。
+ * 关键字顺序与酒馆一致：ccv3 优先于 chara，避免"自家读到旧 chara、对方读到新 ccv3"的口径分裂。
+ */
 export function extractCardJson(png: Buffer): unknown | null {
   const texts = pngExtractText(png);
-  for (const kw of ["chara", "chara_card_v2", "ccv3"]) {
+  for (const kw of ["ccv3", "chara", "chara_card_v2"]) {
     const raw = texts[kw];
     if (!raw) continue;
     try {

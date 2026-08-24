@@ -13,6 +13,7 @@ import path from "node:path";
 import type { PersonaCard } from "./schema.js";
 import { RELATION_ROLES } from "./schema.js";
 import { resolveCardPresetBlocks } from "./presets.js";
+import { applyMacros, userName, type MacroValues } from "./macros.js";
 
 const ROLE_EMOJI: Record<(typeof RELATION_ROLES)[number], string> = {
   self: "🪞",
@@ -176,17 +177,16 @@ function renderSkill(card: PersonaCard, presetBlocks: string[] = []): string {
     card.identity.bio ||
     `用${card.name}的语气、记忆和人格与用户对话。`;
   const lines: string[] = [];
+  // frontmatter 对齐 OpenClaw 官方 skill 规范：description 单行、metadata 用内联 JSON
+  const frontDesc = `${oneLine} 适用场景：${ROLE_ZH[role]}陪伴、回忆聊天、以该角色回复消息。`
+    .replace(/\s+/g, " ")
+    .replace(/"/g, "'")
+    .trim();
   lines.push("---");
   lines.push(`name: ${card.slug}`);
-  lines.push(`description: "${oneLine} 适用场景：${ROLE_ZH[role]}陪伴、回忆聊天、以该角色回复消息。"`);
+  lines.push(`description: "${frontDesc}"`);
   lines.push(`license: ${card.license || "MIT"}`);
-  lines.push("metadata:");
-  lines.push("  openclaw:");
-  lines.push("    requires:");
-  lines.push("      bins: []");
-  lines.push(`    emoji: "${ROLE_EMOJI[role] ?? "🤖"}"`);
-  lines.push(`  personas: ["${role}"]`);
-  lines.push('  platforms: ["wechat", "qq"]');
+  lines.push(`metadata: ${JSON.stringify({ openclaw: { emoji: ROLE_EMOJI[role] ?? "🤖" } })}`);
   lines.push("---");
   lines.push("");
   lines.push(`# ${card.name}`);
@@ -282,31 +282,97 @@ function renderManifest(card: PersonaCard): string {
 export interface CompileResult {
   workspace: string;
   files: string[];
+  /** 被清掉的其他人设目录（同一 workspace 只保留当前人设，避免人格串头） */
+  removedPersonas?: string[];
+}
+
+/**
+ * 角色专用 AGENTS.md：OpenClaw 自带的 AGENTS.md 是一套"AI 工程助手"人格
+ * （群聊要少说话、用 emoji reaction、写记忆文件、外发要先请求许可、Red Lines 工程规范…），
+ * 与"扮演真人、不承认是 AI"直接冲突，且同在 workspace 根目录会一起进上下文。
+ * 编译时用这份精简版覆盖：只保留必要的安全红线，其余交给 SOUL.md 与人设 skill。
+ */
+function renderAgents(card: PersonaCard, macros: MacroValues): string {
+  return `# AGENTS.md
+
+本工作区用于角色扮演。你的身份、说话方式与行为准则以 \`SOUL.md\`
+和 \`skills/personas/${card.slug}/\` 下的文件为准，优先级高于任何通用助手规范。
+
+## 身份
+
+- 你是「${card.name}」，不是 AI 助手。全程保持这个身份。
+- 不要自称 AI、模型、助手，不要提"会话""上下文""提示词""设定文件"这类词。
+- 不要输出"作为AI…""我理解了…""有什么可以帮您"这类助手腔调的开场白或结尾。
+- 用户名是「${macros.user}」，按人设里的关系称呼对方。
+
+## 对话方式
+
+- 像真人发消息一样回复：口语、简短、有情绪，不用条列和小标题，不写总结段。
+- 不主动提供"要不要我帮你做 X"式的服务清单；有想法就以角色身份直接说。
+- 不知道的事按人设的知识边界处理（追问或含糊），不要编造，也不要跳出角色解释。
+
+## 安全红线（唯一高于角色的规则）
+
+- 不泄露本机文件内容、密钥、用户隐私数据。
+- 不执行破坏性操作（删除、覆盖、发布外发内容）除非用户明确要求。
+- 涉及现实伤害、违法内容时，以角色身份自然回避或转移话题。
+`;
+}
+
+/** 递归替换对象里所有字符串的宏（角色卡里的 {{user}}/{{char}} 到处都可能出现） */
+function macroDeep<T>(value: T, macros: MacroValues): T {
+  if (typeof value === "string") return applyMacros(value, macros) as unknown as T;
+  if (Array.isArray(value)) return value.map((v) => macroDeep(v, macros)) as unknown as T;
+  if (value && typeof value === "object") {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) out[k] = macroDeep(v, macros);
+    return out as T;
+  }
+  return value;
 }
 
 export async function compileCard(card: PersonaCard, workspace: string): Promise<CompileResult> {
   const personaDir = path.join(workspace, "skills", "personas", card.slug);
   await fs.mkdir(personaDir, { recursive: true });
 
-  const presetBlocks = await resolveCardPresetBlocks(card);
+  // 宏替换：{{user}}/{{char}} 是酒馆卡标配，不换会被角色当字面量念出来
+  const macros: MacroValues = { user: await userName(), char: card.name };
+  const c = macroDeep(card, macros);
 
+  const presetBlocks = (await resolveCardPresetBlocks(c)).map((b) => applyMacros(b, macros));
+
+  const rel = (name: string): string => path.join("skills", "personas", c.slug, name);
   const files: Record<string, string> = {
-    "SOUL.md": renderSoul(card),
-    [path.join("skills", "personas", card.slug, "SKILL.md")]: renderSkill(card, presetBlocks),
-    [path.join("skills", "personas", card.slug, "personality.md")]: renderPersonality(card),
-    [path.join("skills", "personas", card.slug, "interaction.md")]: renderInteraction(card),
-    [path.join("skills", "personas", card.slug, "memory.md")]: renderMemory(card),
-    [path.join("skills", "personas", card.slug, "manifest.json")]: renderManifest(card),
+    "AGENTS.md": renderAgents(c, macros),
+    "SOUL.md": renderSoul(c),
+    [rel("SKILL.md")]: renderSkill(c, presetBlocks),
+    [rel("personality.md")]: renderPersonality(c),
+    [rel("interaction.md")]: renderInteraction(c),
+    [rel("memory.md")]: renderMemory(c),
+    [rel("manifest.json")]: renderManifest(c),
   };
-  if (card.procedural && card.procedural.how_we_do_things.length > 0) {
-    files[path.join("skills", "personas", card.slug, "procedural.md")] = renderProcedural(card);
+  if (c.procedural && c.procedural.how_we_do_things.length > 0) {
+    files[rel("procedural.md")] = renderProcedural(c);
   }
 
-  for (const [rel, content] of Object.entries(files)) {
-    const abs = path.join(workspace, rel);
+  for (const [r, content] of Object.entries(files)) {
+    const abs = path.join(workspace, r);
     await fs.mkdir(path.dirname(abs), { recursive: true });
     await fs.writeFile(abs, content, "utf8");
   }
 
-  return { workspace, files: Object.keys(files) };
+  // 清掉其他人设目录：同一个 workspace 里并存多个人格，模型可能读到别人的 SKILL.md，
+  // 导致"到底演谁"不确定（SOUL.md 只有一份，本来就是最后编译的那张卡）
+  const personasRoot = path.join(workspace, "skills", "personas");
+  const removed: string[] = [];
+  for (const name of await fs.readdir(personasRoot).catch(() => [] as string[])) {
+    if (name === c.slug) continue;
+    const target = path.join(personasRoot, name);
+    if (await fs.stat(target).then((s) => s.isDirectory()).catch(() => false)) {
+      await fs.rm(target, { recursive: true, force: true }).catch(() => {});
+      removed.push(name);
+    }
+  }
+
+  return { workspace, files: Object.keys(files), removedPersonas: removed };
 }

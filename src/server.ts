@@ -27,7 +27,7 @@ import {
 import { runDistill, saveDistilledCard } from "./distiller/pipeline.js";
 import { parsePlainText } from "./distiller/parser.js";
 import { RELATION_ROLES } from "./core/schema.js";
-import { buildChatSystem } from "./core/chatPrompt.js";
+import { buildChatSystemAsync } from "./core/chatPrompt.js";
 import {
   listPresets,
   addPreset,
@@ -48,7 +48,7 @@ import {
   type MCPServerConfig,
 } from "./tools/mcp.js";
 import { cardToCCv2, ccv2ToCard } from "./core/cardConvert.js";
-import { solidPng, pngWithText, extractCardJson } from "./core/png.js";
+import { solidPng, pngWithTexts, extractCardJson, pngStripCardMeta, isPng } from "./core/png.js";
 import { getImageConfig, saveImageConfig, maskKey, testNovelaiKey, testOpenAIImageKey } from "./core/imageConfig.js";
 import {
   getTtsConfig,
@@ -253,7 +253,18 @@ app.delete("/api/cards/:slug", async (req, res) => {
         fs.rm(path.join(root, sub, slug), { recursive: true, force: true }).catch(() => {})
       )
     );
-    res.json({ ok: true });
+    // 共享 workspace 里的人设产物（漏掉会留下"幽灵人格"，模型仍可能读到已删卡的 SKILL.md）
+    await fs.rm(path.join(root, "workspace", "skills", "personas", slug), { recursive: true, force: true }).catch(() => {});
+    // 绑定这张卡的机器人实例（卡没了 bot 就是死记录，还会占用"每卡一个"的名额）
+    let removedBots = 0;
+    for (const b of await listBots().catch(() => [])) {
+      if (b.cardSlug !== slug) continue;
+      await removeBot(b.id).catch(() => {});
+      removedBots++;
+      await runOpenclaw(["agents", "delete", b.agentId, "--force"], { timeoutMs: 60000 }).catch(() => {});
+    }
+    if (removedBots > 0) invalidateAgentsCache();
+    res.json({ ok: true, removedBots });
   } catch (e) {
     res.status(500).json({ error: String(e) });
   }
@@ -567,8 +578,8 @@ app.post("/api/cards/ai-draft", async (req, res) => {
           messages: [{ role: "system", content: sys }, { role: "user", content: userMsg }],
           temperature: 0.8,
           max_tokens: 4000,
-          signal: ctrl.signal,
         }),
+        signal: ctrl.signal, // 必须在 fetch options 层；放进 body 会被当成请求字段，超时永不生效
       });
     } catch (e) {
       clearTimeout(timer);
@@ -882,14 +893,20 @@ async function buildCardExport(card: PersonaCard, format: string): Promise<{ fil
       dataUrl: "data:application/json;charset=utf-8," + encodeURIComponent(json),
     };
   }
-  let png: Buffer;
+  let png: Buffer | null = null;
   const avatar = card.identity.avatar;
-  if (typeof avatar === "string" && avatar.startsWith("data:image/png;base64,")) {
-    png = Buffer.from(avatar.split(",")[1], "base64");
-  } else {
-    png = solidPng(512, 512, [24, 26, 36, 255]);
+  if (typeof avatar === "string" && avatar.startsWith("data:image/")) {
+    const raw = Buffer.from(avatar.split(",")[1] ?? "", "base64");
+    // 头像必须是真 PNG：把 jpeg 当 PNG 写会产出打不开的坏文件（上游生图可能返回 jpeg）
+    if (isPng(raw)) png = raw;
   }
-  const out = pngWithText(png, "chara", Buffer.from(json, "utf8").toString("base64"));
+  if (!png) png = solidPng(512, 512, [24, 26, 36, 255]);
+  const b64 = Buffer.from(json, "utf8").toString("base64");
+  // 一次写入 chara（CCv2 通用）与 ccv3（新版读卡方优先读它），保证对方读到的都是最新数据
+  const out = pngWithTexts(png, [
+    { keyword: "chara", text: b64 },
+    { keyword: "ccv3", text: b64 },
+  ]);
   return { filename: `${card.slug}.png`, dataUrl: "data:image/png;base64," + out.toString("base64") };
 }
 
@@ -917,24 +934,37 @@ app.post("/api/cards/export-card", async (req, res) => {
   }
 });
 
+// mode: "new"（默认，冲突则另存为 slug-2）/ "overwrite"（覆盖同 slug，旧卡进 versions/ 快照）
 app.post("/api/cards/import-card", async (req, res) => {
   try {
-    const { fileBase64, fileName } = req.body ?? {};
+    const { fileBase64, fileName, mode } = req.body ?? {};
     if (!fileBase64) return res.status(400).json({ error: "缺少文件内容" });
     const buf = Buffer.from(fileBase64, "base64");
+    const isPngFile = /\.png$/i.test(String(fileName ?? "")) || isPng(buf);
     let cc: unknown;
-    if (/\.png$/i.test(String(fileName ?? ""))) {
+    if (isPngFile) {
       cc = extractCardJson(buf);
-      if (!cc) return res.status(400).json({ error: "PNG 里未找到角色卡数据（chara 块）" });
+      if (!cc) return res.status(400).json({ error: "PNG 里未找到角色卡数据（chara / ccv3 块）" });
     } else {
       cc = JSON.parse(buf.toString("utf8"));
     }
-    const avatar = /\.png$/i.test(String(fileName ?? "")) ? "data:image/png;base64," + buf.toString("base64") : undefined;
+    // 头像存原图前先剥掉原作者的 chara/ccv3：否则再导出时对方可能优先读到旧数据，你的编辑全白做
+    const avatar = isPngFile ? "data:image/png;base64," + pngStripCardMeta(buf).toString("base64") : undefined;
     const card = ccv2ToCard(cc, avatar);
+    const conflict = await store.exists(card.slug);
+    if (conflict && mode !== "overwrite") {
+      // 默认不覆盖：另存为新 slug，并告知前端发生了改名
+      const original = card.slug;
+      card.slug = await store.freeSlug(card.slug);
+      const result = validateCard(card);
+      if (!result.ok) return res.status(400).json({ error: result.errors.join("; ") });
+      await store.save(card);
+      return res.json({ card, renamedFrom: original, hint: `已存在同名卡「${original}」，本次另存为「${card.slug}」` });
+    }
     const result = validateCard(card);
     if (!result.ok) return res.status(400).json({ error: result.errors.join("; ") });
     await store.save(card);
-    res.json({ card });
+    res.json({ card, overwrote: conflict === true });
   } catch (e) {
     res.status(500).json({ error: String(e) });
   }
@@ -1144,7 +1174,7 @@ app.post("/api/chat", async (req, res) => {
               ? "xhigh"
               : undefined;
     let system =
-      buildChatSystem(card, await resolveCardPresetBlocks(card)) +
+      (await buildChatSystemAsync(card, await resolveCardPresetBlocks(card))) +
       (toolDefs.length
         ? "\n\n你可以使用工具完成任务（写代码/沙箱文件/搜索/天气/时间/记忆/生图）。用户请求适合用工具完成时，调用工具而不是凭空编造；危险工具会先征得用户同意。"
         : "") +

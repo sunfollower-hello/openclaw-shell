@@ -1,5 +1,24 @@
 // 把人设卡编译成聊天 system prompt（网页试聊用，与 OpenClaw SOUL 风格一致）
 import type { PersonaCard } from "./schema.js";
+import { applyMacros, userName, type MacroValues } from "./macros.js";
+
+/** 递归替换卡里所有字符串的宏（{{user}}/{{char}}），与编译到通道时口径一致 */
+function macroDeep<T>(value: T, macros: MacroValues): T {
+  if (typeof value === "string") return applyMacros(value, macros) as unknown as T;
+  if (Array.isArray(value)) return value.map((v) => macroDeep(v, macros)) as unknown as T;
+  if (value && typeof value === "object") {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) out[k] = macroDeep(v, macros);
+    return out as T;
+  }
+  return value;
+}
+
+/** 网页试聊用：先做宏替换再拼 system prompt（不换会让角色把 {{user}} 当字面量念出来） */
+export async function buildChatSystemAsync(card: PersonaCard, presetBlocks: string[] = []): Promise<string> {
+  const macros: MacroValues = { user: await userName(), char: card.name };
+  return buildChatSystem(macroDeep(card, macros), presetBlocks.map((b) => applyMacros(b, macros)));
+}
 
 export function buildChatSystem(card: PersonaCard, presetBlocks: string[] = []): string {
   const lines: string[] = [];

@@ -258,7 +258,8 @@ const WB_POSITIONS = [
 ];
 
 // 世界书条目：表面只显示一行（名称 + 启用 + 编辑 + 删除），点「编辑」展开全部字段
-function wbRowHTML(e, expand) {
+// idx：对应原 entries 下标，保存时用它取回表单没暴露的字段（secondary_keys/extensions/selective 等），避免编辑一次就削掉酒馆卡数据
+function wbRowHTML(e, expand, idx) {
   const keys = Array.isArray(e?.keys) ? e.keys.join("、") : (e?.keys ?? "");
   const title = e?.comment || e?.name || "未命名条目";
   const pos = String(e?.position || "before_char");
@@ -268,7 +269,7 @@ function wbRowHTML(e, expand) {
     : keyList.length
       ? "触发：" + keyList.slice(0, 2).join("、") + (keyList.length > 2 ? "…" : "")
       : "";
-  return `<div class="wb-entry">
+  return `<div class="wb-entry"${Number.isInteger(idx) ? ` data-idx="${idx}"` : ""}>
     <div class="wb-summary">
       <span class="wb-title">${escapeHtml(title)}</span>
       ${summaryMeta ? `<span class="wb-summary-meta">${escapeHtml(summaryMeta)}</span>` : ""}
@@ -410,7 +411,7 @@ function fillFormFromCard(card, mode) {
   const entries = st.character_book?.entries?.length ? st.character_book.entries : [];
   // 表面只显示一行；空白条目（新卡/未填写）自动展开方便填写
   $("#cf-book").innerHTML = entries.length
-    ? entries.map((en, i) => wbRowHTML(en, i === 0 && !en.content)).join("")
+    ? entries.map((en, i) => wbRowHTML(en, i === 0 && !en.content, i)).join("")
     : wbRowHTML({}, true);
   $("#cf-regex").innerHTML = (st.regex_scripts ?? []).map(rxRowHTML).join("");
   if ($("#cf-rounds")) $("#cf-rounds").value = card.memoryConfig?.auto_rounds ?? 20;
@@ -446,26 +447,38 @@ function collectCardForm(card, mode) {
   st.description = bioText;                 // 完整档案（酒馆卡可能很长，原样保存）
   card.identity.bio = bioText.length <= 500 ? bioText : ""; // 一句话简介超长则留空（校验限制 500）
   st.first_mes = $("#cf-first").value.trim();
+  // 数值取值：允许 0（原来的 Number(x)||默认 会把 0 变成默认值，导致"概率 0%"反而 100% 触发）
+  const numOr = (el, def, min, max) => {
+    const n = Number(el?.value);
+    if (!Number.isFinite(n)) return def;
+    return Math.min(max, Math.max(min, n));
+  };
+  const prevEntries = st.character_book?.entries ?? [];
   st.character_book = {
     entries: [...$("#cf-book").querySelectorAll(".wb-entry")]
       .map((r) => {
         const comment = r.querySelector(".wb-comment").value.trim();
         const keys = r.querySelector(".wb-keys").value.split(/[,，、]/).map((s) => s.trim()).filter(Boolean);
+        // 增量覆盖：保住表单没暴露的酒馆字段（secondary_keys / selective / extensions / id / use_regex 等）
+        const idx = Number(r.dataset.idx);
+        const base = Number.isInteger(idx) && prevEntries[idx] ? prevEntries[idx] : {};
         return {
+          ...base,
           name: comment || undefined,
           comment: comment || undefined,
           keys,
           content: r.querySelector(".wb-content").value,
           constant: r.querySelector(".wb-constant").checked,
           enabled: r.querySelector(".wb-enabled").checked,
-          insertion_order: Number(r.querySelector(".wb-order").value) || 100,
-          priority: 10,
+          insertion_order: numOr(r.querySelector(".wb-order"), 100, 0, 9999),
+          priority: Number.isFinite(Number(base.priority)) ? Number(base.priority) : 10,
           position: r.querySelector(".wb-pos")?.value || "before_char",
-          probability: Math.min(100, Math.max(0, Number(r.querySelector(".wb-prob")?.value) || 100)),
-          depth: Math.max(0, Number(r.querySelector(".wb-depth")?.value) || 4),
+          probability: numOr(r.querySelector(".wb-prob"), 100, 0, 100),
+          depth: numOr(r.querySelector(".wb-depth"), 4, 0, 999),
         };
       })
-      .filter((e) => e.content.trim()),
+      // 名称/关键词/内容全空才算废弃条目（原来只看 content，会静默吞掉填了一半的条目）
+      .filter((e) => e.content.trim() || (e.comment ?? "").trim() || e.keys.length),
   };
   st.regex_scripts = [...$("#cf-regex").querySelectorAll(".rx-row")]
     .map((r) => ({
@@ -476,8 +489,14 @@ function collectCardForm(card, mode) {
     }))
     .filter((s) => s.findRegex);
   if (card.identity.avatar === undefined) card.identity.avatar = "";
-  card.model = { provider: $("#cf-provider")?.value || undefined, model: $("#cf-model")?.value || undefined };
-  card.memoryConfig = { auto_rounds: Math.min(50, Math.max(1, Number($("#cf-rounds")?.value) || 20)) };
+  // 模型：只有主表单里真有这两个控件时才覆盖（高级配置弹窗是另一套控件，否则会把刚设的每卡模型清掉）
+  if ($("#cf-provider")) {
+    card.model = { provider: $("#cf-provider").value || undefined, model: $("#cf-model")?.value || undefined };
+  }
+  if ($("#cf-rounds")) {
+    const n = Number($("#cf-rounds").value);
+    card.memoryConfig = { auto_rounds: Number.isFinite(n) ? Math.min(50, Math.max(1, n)) : 20 };
+  }
   return card;
 }
 
@@ -1387,7 +1406,8 @@ async function importCard() {
     const b64 = await fileToBase64(f);
     const r = await api.send("/api/cards/import-card", { method: "POST", body: JSON.stringify({ fileBase64: b64, fileName: f.name }) });
     $("#import-file").value = "";
-    toast(`✓ 已导入：${r.card.name}`);
+    // 同名卡默认另存不覆盖，告知用户实际入库的名字
+    toast(r.renamedFrom ? `✓ 已导入：${r.card.name} · ${r.hint}` : `✓ 已导入：${r.card.name}`);
     await loadCardList();
     loadCardIntoEditor(r.card.slug);
   } catch (e) { toast("导入失败：" + e.message, false); }
@@ -1471,7 +1491,7 @@ function applyDraftToForm(draft) {
   $("#cf-first").value = draft.sillytavern_v2?.first_mes || "";
   const entries = draft.sillytavern_v2?.character_book?.entries || [];
   $("#cf-book").innerHTML = entries.length
-    ? entries.map((en, i) => wbRowHTML(en, i === 0 && !en.content)).join("")
+    ? entries.map((en, i) => wbRowHTML(en, i === 0 && !en.content, i)).join("")
     : wbRowHTML({}, true);
   $("#cf-regex").innerHTML = (draft.sillytavern_v2?.regex_scripts || []).map(rxRowHTML).join("");
   removeCover(true);
