@@ -68,10 +68,16 @@ function capDefaults() {
 }
 function saveCapDefaults(d) { localStorage.setItem(DEFAULTS_KEY, JSON.stringify(d)); }
 
+// 工作模式总开关：开启后首页变为「工作台」（选卡当助手 + 聊天 + 工作区文件面板）
+const WORKBENCH_KEY = "ocs_workbench_on";
+function workbenchOn() { return localStorage.getItem(WORKBENCH_KEY) === "1"; }
+function setWorkbenchOn(v) { localStorage.setItem(WORKBENCH_KEY, v ? "1" : "0"); }
+
 // ================= 图标（内联 SVG，线性风格） =================
 const ICONS = {
   home: '<path d="M3 9.5 12 3l9 6.5V20a1.5 1.5 0 0 1-1.5 1.5h-15A1.5 1.5 0 0 1 3 20z"/><path d="M9 21.5v-7h6v7"/>',
   layers: '<path d="M12 2.5 2.5 7.5 12 12.5l9.5-5z"/><path d="M2.5 16.5 12 21.5l9.5-5"/><path d="M2.5 12 12 17l9.5-5"/>',
+  sliders: '<path d="M4 21v-7"/><path d="M4 10V3"/><path d="M12 21v-9"/><path d="M12 8V3"/><path d="M20 21v-5"/><path d="M20 12V3"/><path d="M1 14h6"/><path d="M9 8h6"/><path d="M17 16h6"/>',
   pen: '<path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"/>',
   flask: '<path d="M9.5 3h5"/><path d="M10 3v5.2L4.6 18.6A2 2 0 0 0 6.4 21.5h11.2a2 2 0 0 0 1.8-2.9L14 8.2V3"/><path d="M7.5 15h9"/>',
   chat: '<path d="M21 11.5a8.4 8.4 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.4 8.4 0 0 1-3.8-.9L3 21l1.9-5.7a8.4 8.4 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.4 8.4 0 0 1 3.8-.9h.5a8.5 8.5 0 0 1 8 7.95z"/>',
@@ -97,6 +103,7 @@ const ICONS = {
   message: '<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>',
   book: '<path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/>',
   send: '<path d="m22 2-7 20-4-9-9-4z"/><path d="M22 2 11 13"/>',
+  store: '<path d="M3 9.5 4.5 4h15L21 9.5"/><path d="M4 9.5V20h16V9.5"/><path d="M9 20v-6h6v6"/><path d="M2.5 9.5h19"/>',
 };
 function icon(name, size) {
   return `<svg class="ic${size ? " ic-" + size : ""}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICONS[name] ?? ""}</svg>`;
@@ -240,24 +247,87 @@ window.addEventListener("hashchange", router);
 // ============================================================
 //  卡片表单（做卡 / 编辑共用）
 // ============================================================
-function wbRowHTML(e) {
+const WB_POSITIONS = [
+  ["before_char", "角色设定前"],
+  ["after_char", "角色设定后"],
+  ["at_depth", "按深度插入"],
+  ["system_top", "系统顶部"],
+  ["global_note", "全局备注"],
+  ["user_top", "用户消息顶部"],
+  ["assistant_top", "助手消息顶部"],
+];
+
+// 世界书条目：表面只显示一行（名称 + 启用 + 编辑 + 删除），点「编辑」展开全部字段
+function wbRowHTML(e, expand) {
   const keys = Array.isArray(e?.keys) ? e.keys.join("、") : (e?.keys ?? "");
+  const title = e?.comment || e?.name || "未命名条目";
+  const pos = String(e?.position || "before_char");
+  const keyList = keys.split("、").filter(Boolean);
+  const summaryMeta = e?.constant
+    ? "常驻"
+    : keyList.length
+      ? "触发：" + keyList.slice(0, 2).join("、") + (keyList.length > 2 ? "…" : "")
+      : "";
   return `<div class="wb-entry">
-    <div class="wb-head">
-      <input class="wb-comment" placeholder="条目名称（如：人物形象 / 世界观 / 人物关系）" value="${escapeHtml(e?.comment || e?.name || "")}">
-      <span class="wb-flags">
-        <label title="常驻条目始终生效，不靠关键词触发"><input type="checkbox" class="wb-constant" ${e?.constant ? "checked" : ""}> 常驻</label>
-        <label><input type="checkbox" class="wb-enabled" ${e?.enabled !== false ? "checked" : ""}> 启用</label>
-        <label title="多条条目同时触发时的排序">顺序 <input type="number" class="wb-order" min="0" value="${e?.insertion_order ?? 100}" style="width:56px"></label>
-      </span>
-      <button class="wb-del danger small-btn" type="button">${icon("x")}</button>
+    <div class="wb-summary">
+      <span class="wb-title">${escapeHtml(title)}</span>
+      ${summaryMeta ? `<span class="wb-summary-meta">${escapeHtml(summaryMeta)}</span>` : ""}
+      <label class="wb-enable" title="启用 / 停用此条目"><input type="checkbox" class="wb-enabled" ${e?.enabled !== false ? "checked" : ""}> 启用</label>
+      <button class="wb-edit ghost small-btn" type="button" title="编辑条目">${icon("pen")}</button>
+      <button class="wb-del danger small-btn" type="button" title="删除条目">${icon("x")}</button>
     </div>
-    <input class="wb-keys" placeholder="触发关键词，逗号分隔（常驻条目可留空）" value="${escapeHtml(keys)}">
-    <textarea class="wb-content" rows="4" placeholder="条目内容……（角色的血肉都写在这里：外貌、性格、语言风格、背景、喜好、雷区……）">${escapeHtml(e?.content ?? "")}</textarea>
+    <div class="wb-detail" ${expand ? "" : "hidden"}>
+      <div class="wb-grid">
+        <div class="wb-field"><label>条目名称</label><input class="wb-comment" placeholder="如：人物形象 / 世界观 / 人物关系" value="${escapeHtml(title)}"></div>
+        <div class="wb-field"><label>触发关键词（逗号分隔，常驻条目可留空）</label><input class="wb-keys" placeholder="关键词1, 关键词2" value="${escapeHtml(keys)}"></div>
+      </div>
+      <div class="wb-field"><label>条目内容</label><textarea class="wb-content" rows="4" placeholder="角色设定：外貌、性格、语言风格、背景、喜好、雷区……">${escapeHtml(e?.content ?? "")}</textarea></div>
+      <div class="wb-grid wb-grid3">
+        <div class="wb-field"><label>插入位置</label>
+          <select class="wb-pos">${WB_POSITIONS.map(([v, l]) => `<option value="${v}" ${pos === v ? "selected" : ""}>${l}</option>`).join("")}</select>
+        </div>
+        <div class="wb-field"><label>触发概率 %</label><input type="number" class="wb-prob" min="0" max="100" value="${e?.probability ?? 100}"></div>
+        <div class="wb-field"><label>深度</label><input type="number" class="wb-depth" min="0" value="${e?.depth ?? 4}"></div>
+      </div>
+      <div class="wb-adv-row">
+        <label title="常驻条目始终生效，不靠关键词触发"><input type="checkbox" class="wb-constant" ${e?.constant ? "checked" : ""}> 常驻（始终生效）</label>
+        <label title="多条条目同时触发时的排序">顺序 <input type="number" class="wb-order" min="0" value="${e?.insertion_order ?? 100}" style="width:56px"></label>
+      </div>
+    </div>
+  </div>`;
+}
+
+function cardFormEditHandler(e) {
+  const btn = e.target.closest(".wb-edit");
+  if (!btn) return;
+  const detail = btn.closest(".wb-entry")?.querySelector(".wb-detail");
+  if (!detail) return;
+  detail.hidden = !detail.hidden;
+  btn.classList.toggle("open", !detail.hidden);
+}
+
+// 正则替换行（可留空；导入的酒馆卡自带正则也会显示在这里）
+function rxRowHTML(s) {
+  return `<div class="rx-row">
+    <input class="rx-name" placeholder="名称（如：去星号）" value="${escapeHtml(s?.scriptName ?? "")}">
+    <input class="rx-find" placeholder="查找（正则表达式）" value="${escapeHtml(s?.findRegex ?? "")}">
+    <input class="rx-rep" placeholder="替换为" value="${escapeHtml(s?.replaceString ?? "")}">
+    <button class="rx-del danger small-btn" type="button" title="删除此正则">${icon("x")}</button>
   </div>`;
 }
 
 function cardFormHTML(mode) {
+  // 模型/记忆只在卡库编辑页出现（做卡页保持专注）
+  const extra = mode === "edit" ? `
+  <div class="cf-section"><h3>${icon("zap")} 模型 <span class="hint">（此卡专用，留空跟随默认）</span></h3>
+    <div class="cf-grid2">
+      <div><label>API 提供商</label><select id="cf-provider"><option value="">（跟随默认）</option></select></div>
+      <div><label>模型</label><select id="cf-model"><option value="">（跟随默认）</option></select></div>
+    </div>
+  </div>
+  <div class="cf-section"><h3>${icon("database")} 记忆</h3>
+    <label>每 <input id="cf-rounds" type="number" min="1" max="50" value="20" style="width:64px;display:inline-block;text-align:center"> 轮对话自动总结一次（1-50）</label>
+  </div>` : "";
   return `
   <div class="cf-section"><h3>${icon("info")} 基本信息</h3>
     <div class="cf-grid">
@@ -285,21 +355,19 @@ function cardFormHTML(mode) {
     <div id="cf-book"></div>
     <button id="cf-book-add" class="ghost small-btn" type="button">${icon("plus")} 添加条目</button>
   </div>
-  <div class="cf-section"><h3>${icon("zap")} 模型 <span class="hint">（此卡专用，留空跟随默认）</span></h3>
-    <div class="cf-grid2">
-      <div><label>API 提供商</label><select id="cf-provider"><option value="">（跟随默认）</option></select></div>
-      <div><label>模型</label><select id="cf-model"><option value="">（跟随默认）</option></select></div>
-    </div>
+  <div class="cf-section"><h3>🔀 正则替换 <span class="hint">（可选；把聊天里的文本按规则替换，一般留空）</span></h3>
+    <div id="cf-regex"></div>
+    <button id="cf-regex-add" class="ghost small-btn" type="button">${icon("plus")} 添加正则</button>
   </div>
-  <div class="cf-section"><h3>${icon("database")} 记忆</h3>
-    <label>每 <input id="cf-rounds" type="number" min="1" max="50" value="20" style="width:64px;display:inline-block;text-align:center"> 轮对话自动总结一次（1-50）</label>
-  </div>`;
+  ${extra}`;
 }
 
 function bindCardForm(card, mode) {
   fillFormFromCard(card, mode);
-  $("#cf-book-add").addEventListener("click", () => $("#cf-book").insertAdjacentHTML("beforeend", wbRowHTML({})));
+  $("#cf-book-add").addEventListener("click", () => $("#cf-book").insertAdjacentHTML("beforeend", wbRowHTML({}, true)));
+  $("#cf-regex-add")?.addEventListener("click", () => $("#cf-regex")?.insertAdjacentHTML("beforeend", rxRowHTML({})));
   document.addEventListener("click", cardFormDelHandler);
+  document.addEventListener("click", cardFormEditHandler);
   $("#cf-avatar").addEventListener("change", async (e) => {
     const f = e.target.files[0];
     if (!f) return;
@@ -307,17 +375,21 @@ function bindCardForm(card, mode) {
     $("#cf-avatar-img").src = "data:image/png;base64," + b64;
     $("#cf-avatar-img").style.display = "block";
   });
-  fillProvidersIntoForm(card);
+  if (mode === "edit") fillProvidersIntoForm(card);
 }
 
 function cardFormDelHandler(e) {
-  if (e.target?.classList?.contains("wb-del")) {
-    const container = e.target.closest("#cf-book");
+  const del = e.target.closest(".wb-del, .rx-del");
+  if (!del) return;
+  if (del.classList.contains("wb-del")) {
+    const container = del.closest("#cf-book");
     if (container?.id === "cf-book" && container.querySelectorAll(".wb-entry").length <= 1) {
       toast("世界书至少保留一条条目", false);
       return;
     }
-    e.target.closest(".wb-entry")?.remove();
+    del.closest(".wb-entry")?.remove();
+  } else {
+    del.closest(".rx-row")?.remove();
   }
 }
 
@@ -336,14 +408,19 @@ function fillFormFromCard(card, mode) {
     $("#cf-avatar-img").style.display = "none";
   }
   const entries = st.character_book?.entries?.length ? st.character_book.entries : [];
-  $("#cf-book").innerHTML = entries.length ? entries.map(wbRowHTML).join("") : wbRowHTML({});
-  $("#cf-rounds").value = card.memoryConfig?.auto_rounds ?? 20;
+  // 表面只显示一行；空白条目（新卡/未填写）自动展开方便填写
+  $("#cf-book").innerHTML = entries.length
+    ? entries.map((en, i) => wbRowHTML(en, i === 0 && !en.content)).join("")
+    : wbRowHTML({}, true);
+  $("#cf-regex").innerHTML = (st.regex_scripts ?? []).map(rxRowHTML).join("");
+  if ($("#cf-rounds")) $("#cf-rounds").value = card.memoryConfig?.auto_rounds ?? 20;
 }
 
 async function fillProvidersIntoForm(card) {
   try {
     providersCache = await api.get("/api/providers");
     const sel = $("#cf-provider");
+    if (!sel) return;
     sel.innerHTML = '<option value="">（跟随默认）</option>' +
       providersCache.chat.map((p) => `<option value="${escapeHtml(p.name)}">${escapeHtml(p.name)}${p.isDefault ? "（默认）" : ""}</option>`).join("");
     const fillModels = () => {
@@ -383,14 +460,24 @@ function collectCardForm(card, mode) {
           enabled: r.querySelector(".wb-enabled").checked,
           insertion_order: Number(r.querySelector(".wb-order").value) || 100,
           priority: 10,
+          position: r.querySelector(".wb-pos")?.value || "before_char",
+          probability: Math.min(100, Math.max(0, Number(r.querySelector(".wb-prob")?.value) || 100)),
+          depth: Math.max(0, Number(r.querySelector(".wb-depth")?.value) || 4),
         };
       })
       .filter((e) => e.content.trim()),
   };
-  // 人格/语气/正则等结构化字段不在此编辑（写在世界书里），原样保留
+  st.regex_scripts = [...$("#cf-regex").querySelectorAll(".rx-row")]
+    .map((r) => ({
+      scriptName: r.querySelector(".rx-name").value.trim(),
+      findRegex: r.querySelector(".rx-find").value,
+      replaceString: r.querySelector(".rx-rep").value,
+      enabled: true,
+    }))
+    .filter((s) => s.findRegex);
   if (card.identity.avatar === undefined) card.identity.avatar = "";
   card.model = { provider: $("#cf-provider")?.value || undefined, model: $("#cf-model")?.value || undefined };
-  card.memoryConfig = { auto_rounds: Math.min(50, Math.max(1, Number($("#cf-rounds").value) || 20)) };
+  card.memoryConfig = { auto_rounds: Math.min(50, Math.max(1, Number($("#cf-rounds")?.value) || 20)) };
   return card;
 }
 
@@ -407,7 +494,7 @@ function greeting() {
 }
 
 function renderHome() {
-  return `
+  return workbenchOn() ? renderWorkbench() : `
   <div class="view home-view">
     <div class="home-hero">
       <div class="home-hero-main">
@@ -439,10 +526,12 @@ function renderHome() {
 }
 
 function initHome() {
+  if (workbenchOn()) { initWorkbench(); return; }
   refreshHome();
 }
 
 async function refreshHome() {
+  if (workbenchOn()) return; // 工作台形态不刷新欢迎页
   try {
     // 资料可能刚改过，横幅昵称/头像同步一次
     const hiName = $("#home-uname");
@@ -466,7 +555,7 @@ async function refreshHome() {
     const sub = $("#home-hero-sub");
     if (sub) {
       const n = cards.cards?.length ?? 0;
-      const persona = active?.active ? `当前人设「${active.active}」` : "还没有编译人设";
+      const persona = active?.active ? `当前人设「${active.active}」` : "还没有应用人设";
       sub.textContent = `${persona} · 卡库 ${n} 张`;
     }
     const grid = $("#home-card-grid");
@@ -489,6 +578,286 @@ async function refreshHome() {
       grid.appendChild(d);
     }
   } catch { /* 忽略 */ }
+}
+
+// ============================================================
+//  工作台（工作模式首页）：选卡当助手 + 聊天 + 工作区文件面板
+//  半独立式：普通用户默认纯聊天；开启工作模式后首页切换到这里
+//  助手直接用卡库的角色卡（模型/世界书跟卡走），无需另配
+// ============================================================
+let wbSlug = "";
+let wbCards = [];
+let wbCardObj = null;
+let wbChatHistory = [];
+let wbPending = null;
+let wbLastOpts = null;
+let wbDir = "";
+
+function renderWorkbench() {
+  return `
+  <div class="view workbench">
+    <div class="wb-top">
+      <label class="wb-pick">助手：
+        <select id="wb-card"><option value="">— 选择卡片 —</option></select>
+      </label>
+      <span class="wb-hint muted" id="wb-model-hint"></span>
+      <span class="wb-spacer"></span>
+      <button id="wb-exit" class="ghost small-btn">退出工作模式</button>
+    </div>
+    <div class="wb-main">
+      <div class="card-box wb-chat">
+        <div class="chat-head">
+          <h3>${icon("chat")} 工作台聊天 <span class="hint" id="wb-chat-hint"></span></h3>
+          <button id="wb-chat-clear" class="ghost small-btn">${icon("trash")} 清空</button>
+        </div>
+        <div id="chat-log" class="chat-log"></div>
+        <div class="row">
+          <input id="wb-input" placeholder="让助手干活：写代码、整理文件、查资料、画图…">
+          <button id="wb-send" class="primary">发送</button>
+        </div>
+      </div>
+      <div class="card-box wb-files">
+        <div class="wb-files-head">
+          <h3>${icon("package")} 工作区</h3>
+          <div class="row" style="gap:4px">
+            <button id="wb-refresh" class="ghost small-btn">刷新</button>
+            <button id="wb-new-file" class="ghost small-btn">文件</button>
+            <button id="wb-new-dir" class="ghost small-btn">目录</button>
+            <button id="wb-upload" class="ghost small-btn">上传</button>
+            <input type="file" id="wb-upload-input" style="display:none">
+          </div>
+        </div>
+        <div class="wb-crumb" id="wb-crumb"></div>
+        <div class="wb-list" id="wb-list"><span class="muted">（先选一张卡片）</span></div>
+      </div>
+    </div>
+  </div>`;
+}
+
+async function initWorkbench() {
+  const cards = await api.get("/api/cards").catch(() => ({ cards: [] }));
+  wbCards = cards.cards ?? [];
+  const sel = $("#wb-card");
+  sel.innerHTML = `<option value="">— 选择卡片 —</option>` + wbCards.map((c) => `<option value="${escapeHtml(c.slug)}">${escapeHtml(c.name)}</option>`).join("");
+  sel.addEventListener("change", () => wbPickCard(sel.value));
+  $("#wb-send").addEventListener("click", wbSend);
+  $("#wb-input").addEventListener("keydown", (e) => { if (e.key === "Enter") wbSend(); });
+  $("#wb-chat-clear").addEventListener("click", () => { wbChatHistory = []; wbPending = null; $("#chat-log").innerHTML = ""; });
+  $("#wb-exit").addEventListener("click", () => { setWorkbenchOn(false); location.reload(); });
+  $("#wb-refresh").addEventListener("click", wbLoadFiles);
+  $("#wb-new-file").addEventListener("click", wbNewFile);
+  $("#wb-new-dir").addEventListener("click", wbNewDir);
+  $("#wb-upload").addEventListener("click", () => $("#wb-upload-input").click());
+  $("#wb-upload-input").addEventListener("change", wbUpload);
+  $("#wb-list").addEventListener("click", wbFilesClick);
+  $("#wb-crumb").addEventListener("click", wbFilesClick);
+  const last = localStorage.getItem("ocs_workbench_slug");
+  if (last) { sel.value = last; await wbPickCard(last); }
+}
+
+async function wbPickCard(slug) {
+  wbSlug = slug;
+  wbCardObj = null;
+  wbChatHistory = [];
+  wbPending = null;
+  wbDir = "";
+  $("#chat-log").innerHTML = "";
+  localStorage.setItem("ocs_workbench_slug", slug);
+  if (slug) {
+    wbCardObj = await api.get(`/api/cards/${slug}`).catch(() => null);
+    const m = wbCardObj?.model;
+    $("#wb-chat-hint").textContent = m?.provider || m?.model ? `（${m.provider}${m.model ? "/" + m.model : ""}）` : "（跟随默认提供商）";
+  } else {
+    $("#wb-chat-hint").textContent = "";
+  }
+  wbLoadFiles();
+}
+
+async function wbSend() {
+  const input = $("#wb-input");
+  const message = input.value.trim();
+  if (!message) return;
+  if (!wbSlug) { addChatBubble("bot", "请先在顶部选一张卡片当助手。"); return; }
+  addChatBubble("user", message);
+  input.value = "";
+  wbChatHistory.push({ role: "user", content: message });
+  const btn = $("#wb-send");
+  btn.disabled = true;
+  const def = capDefaults();
+  wbLastOpts = { tools: def.tools ?? [], useMCP: true, skills: def.skills ?? [], thinking: def.thinking ?? "auto" };
+  try {
+    const r = await api.send("/api/chat", {
+      method: "POST",
+      body: JSON.stringify({ slug: wbSlug, message, history: wbChatHistory.slice(0, -1), ...wbLastOpts }),
+    });
+    await wbFinishTurn(r);
+  } catch (e) {
+    wbChatHistory.pop();
+    addChatBubble("bot", "⚠ " + e.message);
+  }
+  btn.disabled = false;
+}
+
+async function wbFinishTurn(r) {
+  if (r.type === "reply") {
+    addChatBubble("bot", r.reply);
+    wbChatHistory.push({ role: "assistant", content: r.reply });
+  } else if (r.type === "pending") {
+    const bubble = addChatBubble("bot", "需要确认：助手想调用\n" + r.pending.map((p) => "· " + p.name).join("\n"));
+    const row = document.createElement("div");
+    row.className = "approve-row";
+    const ok = document.createElement("button");
+    ok.className = "small-btn primary"; ok.textContent = "执行";
+    const no = document.createElement("button");
+    no.className = "small-btn danger"; no.textContent = "拒绝";
+    wbPending = { slug: wbSlug, messages: r.messages, tools: wbLastOpts?.tools ?? [], useMCP: true, approve: false };
+    ok.addEventListener("click", async () => { row.remove(); wbPending.approve = true; await wbApprove(); });
+    no.addEventListener("click", async () => { row.remove(); wbPending.approve = false; await wbApprove(); });
+    row.append(ok, no);
+    bubble.parentNode.appendChild(row);
+  }
+}
+
+async function wbApprove() {
+  const btn = $("#wb-send");
+  btn.disabled = true;
+  try {
+    const r = await api.send("/api/chat/approve", { method: "POST", body: JSON.stringify(wbPending) });
+    wbPending = null;
+    await wbFinishTurn(r);
+  } catch (e) { addChatBubble("bot", "⚠ " + e.message); }
+  btn.disabled = false;
+}
+
+function wbPath(name) { return wbDir ? wbDir + "/" + name : name; }
+
+async function wbLoadFiles() {
+  const list = $("#wb-list");
+  if (!wbSlug) { list.innerHTML = '<span class="muted">（先选一张卡片）</span>'; $("#wb-crumb").innerHTML = ""; return; }
+  try {
+    const r = await api.get(`/api/workspace/list?slug=${encodeURIComponent(wbSlug)}&dir=${encodeURIComponent(wbDir)}`);
+    wbRenderFiles(r);
+  } catch (e) {
+    list.innerHTML = '<span class="muted">读取失败：' + escapeHtml(e.message) + "</span>";
+  }
+}
+
+function wbRenderFiles(r) {
+  const crumb = $("#wb-crumb");
+  const parts = (r.dir || "").split("/").filter(Boolean);
+  let acc = "";
+  crumb.innerHTML = '<a class="wb-crumb-item" data-wb-goto="">根目录</a>' + parts.map((p) => {
+    acc += (acc ? "/" : "") + p;
+    return `<span class="wb-crumb-sep">/</span><a class="wb-crumb-item" data-wb-goto="${escapeHtml(acc)}">${escapeHtml(p)}</a>`;
+  }).join("");
+  const list = $("#wb-list");
+  list.innerHTML = "";
+  if (!r.items.length) { list.innerHTML = '<span class="muted">（空目录）</span>'; return; }
+  for (const it of r.items) {
+    const row = document.createElement("div");
+    row.className = "wb-file";
+    if (it.dir) {
+      row.innerHTML = `<span class="wb-file-ic">📁</span><a class="wb-file-name" data-wb-enter="${escapeHtml(it.name)}">${escapeHtml(it.name)}</a>`;
+    } else {
+      const size = it.size < 1024 ? it.size + " B" : (it.size / 1024).toFixed(1) + " KB";
+      row.innerHTML = `<span class="wb-file-ic">📄</span><a class="wb-file-name" data-wb-dl="${escapeHtml(it.name)}" title="下载">${escapeHtml(it.name)}</a>
+        <span class="wb-file-meta">${size}</span>
+        <button class="ghost small-btn" data-wb-view="${escapeHtml(it.name)}">预览</button>
+        <button class="ghost small-btn" data-wb-del="${escapeHtml(it.name)}">删除</button>`;
+    }
+    list.appendChild(row);
+  }
+}
+
+function wbFilesClick(e) {
+  const t = e.target.closest("[data-wb-enter],[data-wb-dl],[data-wb-view],[data-wb-del],[data-wb-goto]");
+  if (!t) return;
+  const tag = Object.keys(t.dataset).find((k) => k.startsWith("wb"));
+  if (tag === "wbGoto") { wbDir = t.dataset.wbGoto; wbLoadFiles(); }
+  else if (tag === "wbEnter") { wbDir = wbPath(t.dataset.wbEnter); wbLoadFiles(); }
+  else if (tag === "wbDl") { window.open(`/api/workspace/download?slug=${encodeURIComponent(wbSlug)}&file=${encodeURIComponent(wbPath(t.dataset.wbDl))}`); }
+  else if (tag === "wbView") { wbPreview(wbPath(t.dataset.wbView)); }
+  else if (tag === "wbDel") { wbDelete(wbPath(t.dataset.wbDel)); }
+}
+
+function wbModal(title, fieldsHtml, onOk) {
+  const ov = document.createElement("div");
+  ov.className = "wb-modal-overlay";
+  ov.innerHTML = `<div class="wb-modal">
+    <h3>${title}</h3>
+    ${fieldsHtml}
+    <div class="row" style="justify-content:flex-end;margin-top:10px">
+      <button class="ghost small-btn" data-wb-cancel>取消</button>
+      <button class="primary small-btn" data-wb-ok>确定</button>
+    </div>
+  </div>`;
+  document.body.appendChild(ov);
+  ov.addEventListener("click", (e) => {
+    if (e.target === ov || e.target.closest("[data-wb-cancel]")) { ov.remove(); return; }
+    if (e.target.closest("[data-wb-ok]")) { ov.remove(); onOk(); }
+  });
+}
+
+function wbNewFile() {
+  if (!wbSlug) return toast("先选一张卡片", false);
+  wbModal("新建文件", `
+    <label>文件名（相对路径，如 notes/日记.md）</label>
+    <input id="wb-nf-name" placeholder="文件名">
+    <label>内容</label>
+    <textarea id="wb-nf-content" rows="6"></textarea>`, async () => {
+    const name = $("#wb-nf-name").value.trim();
+    if (!name) return toast("文件名不能为空", false);
+    await api.send("/api/workspace/write", { method: "POST", body: JSON.stringify({ slug: wbSlug, file: wbPath(name), content: $("#wb-nf-content").value }) });
+    toast("✓ 已创建");
+    wbLoadFiles();
+  });
+}
+
+function wbNewDir() {
+  if (!wbSlug) return toast("先选一张卡片", false);
+  wbModal("新建文件夹", `<label>文件夹名</label><input id="wb-nd-name" placeholder="如 src">`, async () => {
+    const name = $("#wb-nd-name").value.trim();
+    if (!name) return toast("名称不能为空", false);
+    await api.send("/api/workspace/mkdir", { method: "POST", body: JSON.stringify({ slug: wbSlug, dir: wbPath(name) }) });
+    toast("✓ 已创建");
+    wbLoadFiles();
+  });
+}
+
+function wbUpload(e) {
+  const file = e.target.files?.[0];
+  e.target.value = "";
+  if (!file || !wbSlug) return;
+  if (file.size > 1.5 * 1024 * 1024) return toast("文件超过 1.5MB，暂不支持", false);
+  const reader = new FileReader();
+  reader.onload = async () => {
+    try {
+      await api.send("/api/workspace/upload", { method: "POST", body: JSON.stringify({ slug: wbSlug, file: wbPath(file.name), data: String(reader.result) }) });
+      toast("✓ 已上传");
+      wbLoadFiles();
+    } catch (err) { toast("上传失败：" + err.message, false); }
+  };
+  reader.readAsDataURL(file);
+}
+
+function wbDelete(p) {
+  if (!confirm(`删除 ${p}？不可恢复。`)) return;
+  api.send("/api/workspace/delete", { method: "POST", body: JSON.stringify({ slug: wbSlug, path: p }) })
+    .then(() => { toast("✓ 已删除"); wbLoadFiles(); })
+    .catch((e) => toast("删除失败：" + e.message, false));
+}
+
+async function wbPreview(p) {
+  try {
+    const r = await fetch(`/api/workspace/download?slug=${encodeURIComponent(wbSlug)}&file=${encodeURIComponent(p)}`);
+    if (!r.ok) throw new Error("读取失败 " + r.status);
+    const text = await r.text();
+    wbModal("预览：" + p, `<textarea id="wb-pv-content" rows="12" style="font-family:monospace">${escapeHtml(text.slice(0, 50000))}</textarea>`, async () => {
+      await api.send("/api/workspace/write", { method: "POST", body: JSON.stringify({ slug: wbSlug, file: p, content: $("#wb-pv-content").value }) });
+      toast("✓ 已保存");
+      wbLoadFiles();
+    });
+  } catch (e) { toast("预览失败：" + e.message, false); }
 }
 
 // ============================================================
@@ -521,7 +890,7 @@ function renderCards() {
           <button id="btn-adv-config" class="ghost small-btn">${icon("settings")} 高级配置</button>
           <button id="btn-export-png" class="ghost small-btn">PNG</button>
           <button id="btn-export-json" class="ghost small-btn">JSON</button>
-          <button id="btn-compile" class="small-btn">编译到通道</button>
+          <button id="btn-compile" class="small-btn">✅ 应用到通道</button>
           <button id="btn-del" class="danger small-btn">${icon("trash")} 删除</button>
           <button id="btn-save" class="primary small-btn">${icon("save")} 保存</button>
         </div>
@@ -754,7 +1123,7 @@ function renderBotBody(bot) {
     <div class="bot-login-area">
       <div class="row">
         <button id="bot-login" class="primary small-btn">扫码绑定此账号</button>
-        <button id="bot-recompile" class="ghost small-btn">重编译（卡更新后）</button>
+        <button id="bot-recompile" class="ghost small-btn">重新应用（卡更新后）</button>
         <button id="bot-delete" class="danger small-btn">删除机器人</button>
       </div>
       <p class="hint" id="bot-login-msg"></p>
@@ -764,8 +1133,8 @@ function renderBotBody(bot) {
   $("#bot-recompile").addEventListener("click", async () => {
     try {
       const r = await api.send(`/api/bots/${bot.id}/recompile`, { method: "POST" });
-      toast(`已重编译 ${r.files?.length ?? 0} 个文件到 agent workspace`);
-    } catch (e) { toast("重编译失败：" + e.message, false); }
+      toast(`已重新应用 ${r.files?.length ?? 0} 个文件到 agent workspace`);
+    } catch (e) { toast("重新应用失败：" + e.message, false); }
   });
   $("#bot-delete").addEventListener("click", async () => {
     if (!confirm("删除这个机器人和它的 agent（渠道账号在平台侧的绑定不受影响）？")) return;
@@ -818,6 +1187,7 @@ async function openAdvConfig() {
   const [prov, bots] = await Promise.all([
     api.get("/api/providers").catch(() => ({ chat: [] })),
     api.get("/api/bots?skipStatus=1").catch(() => ({ bots: [] })),
+    loadPresetStore(),
   ]);
   advChatProviders = prov.chat ?? [];
   botsData = bots;
@@ -832,6 +1202,13 @@ async function openAdvConfig() {
     .join("");
   const enabledTools = new Set(editingCard.tools?.enabled ?? []);
   const ab = editingCard.abilities ?? {};
+  const cardPresets = editingCard.presets ?? {};
+  const tierOpts = [`<option value="">（不使用档位）</option>`]
+    .concat(presetStoreData.tiers.map((t) => `<option value="${escapeHtml(t.id)}" ${cardPresets.tier === t.id ? "selected" : ""}>${escapeHtml(t.name)}</option>`))
+    .join("");
+  const styleOpts = [`<option value="">（不使用风格）</option>`]
+    .concat(presetStoreData.styles.map((s) => `<option value="${escapeHtml(s.id)}" ${cardPresets.style === s.id ? "selected" : ""}>${escapeHtml(s.name)}</option>`))
+    .join("");
   const toolSwitch = (id, label, desc) => `
     <label class="adv-switch"><input type="checkbox" data-adv-tool="${id}" ${enabledTools.has(id) ? "checked" : ""}>
       <span><b>${label}</b><small>${desc}</small></span></label>`;
@@ -867,6 +1244,15 @@ async function openAdvConfig() {
           <span><b>TTS 朗读</b><small>自动语音朗读回复（语音合成页配置）</small></span></label>
       </div>
       <p class="hint">网页「普通聊天」按这里的开关走；「工作模式」可临时手动勾选。</p>
+    </div>
+
+    <div class="adv-sec">
+      <h4>${icon("sliders")} 角色扮演预设（档位 × 风格）</h4>
+      <div class="bot-form">
+        <label>档位：<select id="adv-tier">${tierOpts}</select></label>
+        <label>风格：<select id="adv-style">${styleOpts}</select></label>
+      </div>
+      <p class="hint">档位定内容尺度（破甲用不用由你定），风格定心理/动作描写。预设文本在侧边栏「预设」页管理；改完网页试聊立即生效，QQ/微信机器人需在 🤖 里「重编译」。</p>
     </div>
 
     <div class="adv-sec">
@@ -909,6 +1295,11 @@ async function openAdvConfig() {
       editingCard.tools = editingCard.tools ?? { enabled: [], policy: "auto", deny: [] };
       editingCard.tools.enabled = [...document.querySelectorAll("[data-adv-tool]")].filter((c) => c.checked).map((c) => c.dataset.advTool);
       editingCard.abilities = { skills: $("#adv-skill").checked, tts: $("#adv-tts").checked };
+      editingCard.presets = {
+        ...(editingCard.presets ?? {}),
+        tier: $("#adv-tier").value || null,
+        style: $("#adv-style").value || null,
+      };
       const res = await api.send(`/api/cards/${editingCard.slug}`, { method: "PUT", body: JSON.stringify(editingCard) });
       editingCard = res.card ?? editingCard;
       toast("✓ 高级配置已保存 v" + editingCard.version);
@@ -925,7 +1316,9 @@ function cardChatOptions() {
   const c = editingCard ?? {};
   const tools = Array.isArray(c.tools?.enabled) ? [...c.tools.enabled] : [];
   const skills = c.abilities?.skills === false ? [] : ["code_expert", "translator", "writing", "companion"];
-  return { tools, useMCP: false, skills, thinking: "auto" };
+  // 思考深度跟随卡片配置（默认 auto），避免硬编码覆盖卡里的设置
+  const thinking = c.chat?.thinking ?? "auto";
+  return { tools, useMCP: false, skills, thinking };
 }
 
 function showCardsGrid() {
@@ -966,7 +1359,7 @@ async function compileCard() {
   await saveCard();
   try {
     const res = await api.send(`/api/cards/${editingCard.slug}/compile`, { method: "POST" });
-    toast(`✓ 已编译 ${res.files.length} 个文件到通道`);
+    toast(`✓ 已应用：${res.files.length} 个设定文件已生效到 QQ/微信`);
   } catch (e) { toast("编译失败：" + e.message, false); }
 }
 
@@ -1006,11 +1399,32 @@ async function importCard() {
 function renderCreate() {
   return `
   <div class="view create-view">
-    <div class="page-head"><h2>做卡</h2><p class="hint">填写卡片内容 → 保存进卡库 → 可导出 PNG/JSON 或直接编译到通道</p></div>
+    <div class="page-head"><h2>做卡</h2><p class="hint">让 AI 把你的想法变成角色卡草稿，再慢慢打磨 → 保存进卡库 → 应用或导出</p></div>
+    <div class="ai-draft-box">
+      <div class="ai-draft-head">${icon("zap")} AI 生成草稿</div>
+      <p class="hint">写下角色想法，AI 会自动生成：名称、简介、世界书（人物形象 / 世界观 / 人物关系）、开场白，甚至封面图（配置了生图时）。生成后下面所有内容都可以自由修改。</p>
+      <textarea id="ai-idea" rows="3" placeholder="如：想做一张古风剑客的角色卡，话少、冷面热心，身边有一只灵狐，背负着灭门之仇……"></textarea>
+      <div class="ai-draft-actions">
+        <select id="ai-role">
+          <option value="friend">朋友</option><option value="family">家人</option>
+          <option value="self">自己</option><option value="partner">前任/恋人</option>
+          <option value="colleague">同事</option><option value="public-figure">偶像/角色</option>
+        </select>
+        <button id="btn-ai-draft" class="primary">✨ 生成草稿</button>
+      </div>
+      <div id="ai-msg" class="status"></div>
+      <div id="ai-cover" class="ai-cover" hidden>
+        <img id="ai-cover-img" alt="角色封面">
+        <div class="ai-cover-actions">
+          <button id="btn-ai-cover" class="ghost small-btn">🎨 重新生成封面</button>
+          <button id="btn-ai-cover-remove" class="ghost small-btn">移除封面</button>
+        </div>
+      </div>
+    </div>
     <div id="card-form-area" class="card-form-area">${cardFormHTML("create")}</div>
     <div class="create-actions">
       <button id="btn-create-save" class="primary big">${icon("save")} 保存卡片</button>
-      <button id="btn-create-save-compile" class="big">保存并编译到通道</button>
+      <button id="btn-create-save-compile" class="big">${icon("check")} 保存并应用</button>
     </div>
   </div>`;
 }
@@ -1020,6 +1434,109 @@ function initCreate() {
   bindCardForm(editingCard, "create");
   $("#btn-create-save").addEventListener("click", () => saveNewCard(false));
   $("#btn-create-save-compile").addEventListener("click", () => saveNewCard(true));
+  $("#btn-ai-draft").addEventListener("click", aiDraft);
+  $("#btn-ai-cover").addEventListener("click", () => generateCover());
+  $("#btn-ai-cover-remove").addEventListener("click", removeCover);
+}
+
+// ---------- AI 辅助做卡 ----------
+async function aiDraft() {
+  const idea = $("#ai-idea").value.trim();
+  if (!idea) return toast("先写下你的想法", false);
+  const btn = $("#btn-ai-draft");
+  const msg = $("#ai-msg");
+  btn.disabled = true;
+  btn.textContent = "✨ 生成中…（约 1 分钟）";
+  msg.textContent = "";
+  try {
+    const r = await api.send("/api/cards/ai-draft", {
+      method: "POST",
+      body: JSON.stringify({ idea, role: $("#ai-role").value }),
+    });
+    applyDraftToForm(r.draft);
+    msg.textContent = "✓ 草稿已生成，下面表单里的内容都可以改";
+    await autoCover(r.draft);
+  } catch (e) {
+    msg.textContent = "生成失败：" + e.message;
+  }
+  btn.disabled = false;
+  btn.textContent = "✨ 生成草稿";
+}
+
+function applyDraftToForm(draft) {
+  editingCard = draft;
+  $("#cf-name").value = draft.name ?? "";
+  if ($("#cf-slug")) $("#cf-slug").value = draft.slug ?? "";
+  $("#cf-bio").value = draft.sillytavern_v2?.description || draft.identity?.bio || "";
+  $("#cf-first").value = draft.sillytavern_v2?.first_mes || "";
+  const entries = draft.sillytavern_v2?.character_book?.entries || [];
+  $("#cf-book").innerHTML = entries.length
+    ? entries.map((en, i) => wbRowHTML(en, i === 0 && !en.content)).join("")
+    : wbRowHTML({}, true);
+  $("#cf-regex").innerHTML = (draft.sillytavern_v2?.regex_scripts || []).map(rxRowHTML).join("");
+  removeCover(true);
+}
+
+async function checkImageReady() {
+  try {
+    const r = await api.get("/api/image/config");
+    const cfg = r.config ?? r;
+    const prov = cfg.provider;
+    return Boolean(
+      (prov === "novelai" && cfg.novelai?.key) ||
+      (prov === "openai" && cfg.openai?.baseUrl && cfg.openai?.key) ||
+      (prov === "local" && cfg.local?.baseUrl)
+    );
+  } catch { return false; }
+}
+
+// 自动判断能不能生图：能就生成封面，不能就先用文本
+async function autoCover(draft) {
+  const ready = await checkImageReady();
+  if (!ready) {
+    const msg = $("#ai-msg");
+    msg.textContent += "；未配置生图，封面先不生成（到「生图配置」页配好后，回来点「生成草稿」旁的重试或手动上传头像）";
+    return;
+  }
+  $("#ai-msg").textContent += "；生图可用，正在生成封面…";
+  await generateCover(draft);
+}
+
+async function generateCover(draft) {
+  const d = draft ?? editingCard;
+  if (!d) return toast("先生成草稿", false);
+  const name = d.name || "角色";
+  const bio = (d.sillytavern_v2?.description || d.identity?.bio || "").slice(0, 120);
+  const prompt = `角色封面插画：${name}。${bio}。半身像，精致画风，适合做聊天头像`;
+  const btn = $("#btn-ai-cover");
+  if (btn) btn.disabled = true;
+  try {
+    const r = await api.send("/api/cards/cover", { method: "POST", body: JSON.stringify({ prompt }) });
+    if (r.ok && r.dataUrl) {
+      editingCard.identity.avatar = r.dataUrl;
+      const img = $("#ai-cover-img");
+      if (img) img.src = r.dataUrl;
+      $("#ai-cover").hidden = false;
+      const avatar = $("#cf-avatar-img");
+      if (avatar) { avatar.src = r.dataUrl; avatar.style.display = "block"; }
+      $("#ai-msg").textContent = "✓ 封面已生成（可点「重新生成封面」换一张）";
+    } else {
+      $("#ai-msg").textContent = r.info || r.error || "封面生成失败";
+    }
+  } catch (e) {
+    $("#ai-msg").textContent = "封面生成失败：" + e.message;
+  }
+  if (btn) btn.disabled = false;
+}
+
+function removeCover(silent) {
+  if (editingCard?.identity) editingCard.identity.avatar = "";
+  $("#ai-cover").hidden = true;
+  const img = $("#ai-cover-img");
+  if (img) img.removeAttribute("src");
+  const avatar = $("#cf-avatar-img");
+  if (avatar) { avatar.style.display = "none"; avatar.removeAttribute("src"); }
+  if (!silent) toast("封面已移除");
 }
 
 async function saveNewCard(compile) {
@@ -1038,7 +1555,7 @@ async function saveNewCard(compile) {
     toast(`✓ 已保存：${r.card.name}`);
     if (compile) {
       await api.send(`/api/cards/${r.card.slug}/compile`, { method: "POST" });
-      toast("✓ 已编译到通道");
+      toast("✓ 已应用：角色设定已生效到 QQ/微信");
     }
     location.hash = "#/cards";
     setTimeout(() => loadCardIntoEditor(r.card.slug), 80);
@@ -1154,7 +1671,7 @@ function renderImgGenPage() {
         <div class="row">
           <label style="white-space:nowrap">自动清理：保留最近</label>
           <input id="ig-retention" type="number" min="0" max="365" step="1" style="width:90px">
-          <label style="white-space:nowrap">天的正式生图（0 = 不自动清理；试生图始终超 1 天即删）</label>
+          <label style="white-space:nowrap">天的正式生图（0 = 不自动清理；试生图保留 15 天）</label>
           <button id="ig-retention-save" class="ghost small-btn">保存</button>
         </div>
         <div id="ig-retention-status" class="status"></div>
@@ -2050,27 +2567,57 @@ async function clearMem() {
 //  聊天（模型由服务端按卡解析）
 // ============================================================
 const CHAT_IMG_RE = /(\/img\/[A-Za-z0-9_./-]+\.(?:png|jpe?g|webp|gif))/gi;
+const CHAT_EMOJI_RE = /\[表情:([^\]]+)\]/g;
+
+/** 当前聊天用的卡片：卡片编辑器里是 editingCard，工作台里是 wbCardObj */
+function curCard() { return editingCard || wbCardObj; }
+
+/** 把回复文本渲染进气泡：[表情:名字] → 该卡表情包图片；/img/... → 可点击放大的生图；其余纯文本 */
+function appendChatContent(div, text) {
+  const emojiParts = String(text).split(CHAT_EMOJI_RE);
+  for (let i = 0; i < emojiParts.length; i++) {
+    const seg = emojiParts[i];
+    if (!seg) continue;
+    if (i % 2 === 1) {
+      // 表情名（split 捕获组在奇数位）；卡里没有这个名字就按原文显示
+      const em = (curCard()?.emojis ?? []).find((e) => e.name === seg);
+      if (em && curCard()) {
+        const img = document.createElement("img");
+        img.src = `/emojis/${curCard().slug}/${em.file}`;
+        img.alt = em.name;
+        img.title = em.name;
+        img.style.cssText = "max-height:40px;vertical-align:middle;margin:0 2px";
+        div.appendChild(img);
+      } else {
+        div.appendChild(document.createTextNode("[表情:" + seg + "]"));
+      }
+      continue;
+    }
+    // 文本段里还可能混着生图路径
+    const imgParts = seg.split(CHAT_IMG_RE);
+    for (let j = 0; j < imgParts.length; j++) {
+      const p = imgParts[j];
+      if (!p) continue;
+      if (j % 2 === 1) {
+        const img = document.createElement("img");
+        img.src = p;
+        img.className = "chat-img";
+        img.alt = "AI 生成的图片";
+        img.loading = "lazy";
+        img.addEventListener("click", () => showLightbox(p));
+        div.appendChild(img);
+      } else {
+        div.appendChild(document.createTextNode(p));
+      }
+    }
+  }
+}
+
 function addChatBubble(role, text) {
   const log = $("#chat-log");
   const div = document.createElement("div");
   div.className = "bubble " + (role === "user" ? "me" : "bot");
-  // 生图工具返回的 /img/... 路径渲染成可点击放大的图片
-  const parts = String(text).split(CHAT_IMG_RE);
-  for (let i = 0; i < parts.length; i++) {
-    const seg = parts[i];
-    if (!seg) continue;
-    if (i % 2 === 1) {
-      const img = document.createElement("img");
-      img.src = seg;
-      img.className = "chat-img";
-      img.alt = "AI 生成的图片";
-      img.loading = "lazy";
-      img.addEventListener("click", () => showLightbox(seg));
-      div.appendChild(img);
-    } else {
-      div.appendChild(document.createTextNode(seg));
-    }
-  }
+  appendChatContent(div, String(text));
   if (role === "bot") {
     const btn = document.createElement("button");
     btn.className = "tts-speak-btn";
@@ -2412,13 +2959,30 @@ async function refreshQQ() {
 }
 
 // ---- 能力中心 ----
-function renderCapabilities() {
+// ============================================================
+//  视图：工作台设置（原「能力中心」）
+//  工作模式为半独立式：默认纯聊天；开启后首页变为工作台
+//  四块：开关 / 默认能力 / MCP 表单化配置 / 工作区概览
+// ============================================================
+function renderWorkbenchSettings() {
   return `
   <div class="view">
-    <div class="page-head"><h2>能力中心</h2><p class="hint">工作模式的默认开关；聊天测试时可临时覆盖</p></div>
+    <div class="page-head"><h2>工作台设置</h2><p class="hint">工作模式是半独立式：平时就是聊天；开启后首页变为工作台，直接选角色卡当助手干活</p></div>
+
+    <div class="card-box">
+      <h3>工作模式开关</h3>
+      <div class="form">
+        <label class="adv-switch"><input type="checkbox" id="wb-switch">
+          <span><b>开启工作模式</b><small>首页变为工作台：选卡当助手 + 聊天 + 工作区文件面板（助手直接用卡的世界书与模型，无需另配）</small></span></label>
+        <div class="row"><button id="wb-go" class="primary">去工作台 →</button></div>
+        <div id="wb-switch-msg" class="status"></div>
+      </div>
+    </div>
+
     <div class="two-col">
       <div class="card-box">
         <h3>默认能力</h3>
+        <p class="hint">工作台的助手与「聊天测试」的工作模式共用这套默认开关</p>
         <div class="form">
           <label>工具</label>
           <div class="cap-checks">
@@ -2446,17 +3010,51 @@ function renderCapabilities() {
         </div>
       </div>
       <div class="card-box">
-        <h3>MCP 服务器</h3>
-        <p class="hint">JSON 数组：{"name","command","args"}；工具默认需审批</p>
-        <textarea id="mcp-config" rows="6" spellcheck="false"></textarea>
-        <div class="row" style="margin-top:8px"><button id="btn-mcp-save" class="primary">保存并重连</button></div>
-        <div id="mcp-msg" class="status"></div>
+        <h3>工作区</h3>
+        <p class="hint">每个角色卡一个独立沙箱目录 <code>data/sandbox/&lt;slug&gt;</code>，助手通过工具读写；文件管理在首页工作台</p>
+        <div id="ws-overview" class="small-out">读取中…</div>
       </div>
+    </div>
+
+    <div class="card-box">
+      <h3>MCP 服务器</h3>
+      <p class="hint">连接外部工具服务器：本地程序（stdio）或远程 URL（SSE / StreamableHTTP）；工具调用默认需审批。表单化配置，按服务器启用、按工具勾选。</p>
+      <div id="mcp-list" class="mcp-list"></div>
+      <div class="row" style="margin-top:8px">
+        <button id="mcp-add" class="ghost small-btn">+ 添加服务器</button>
+      </div>
+      <div id="mcp-form-wrap" style="display:none"></div>
+      <details class="mcp-json">
+        <summary>JSON 导入 / 导出（高级）</summary>
+        <textarea id="mcp-config" rows="6" spellcheck="false"></textarea>
+        <div class="row" style="margin-top:8px">
+          <button id="btn-mcp-import" class="ghost small-btn">从 JSON 导入</button>
+          <button id="btn-mcp-export" class="ghost small-btn">导出为 JSON</button>
+        </div>
+        <div id="mcp-msg" class="status"></div>
+      </details>
     </div>
   </div>`;
 }
 
-function initCapabilities() {
+let mcpServers = [];
+let mcpEditing = -1; // >=0 编辑中；-1 新增
+let mcpTestTools = [];
+
+function initWorkbenchSettings() {
+  // ---- 工作模式开关 ----
+  $("#wb-switch").checked = workbenchOn();
+  $("#wb-switch").addEventListener("change", () => {
+    setWorkbenchOn($("#wb-switch").checked);
+    $("#wb-go").style.display = $("#wb-switch").checked ? "" : "none";
+    $("#wb-switch-msg").textContent = $("#wb-switch").checked
+      ? "已开启：首页将变为工作台"
+      : "已关闭：首页恢复普通样式";
+  });
+  $("#wb-go").addEventListener("click", () => { location.hash = "#/home"; location.reload(); });
+  $("#wb-go").style.display = workbenchOn() ? "" : "none";
+
+  // ---- 默认能力（沿用原逻辑） ----
   const def = capDefaults();
   const tools = def.tools ?? [];
   $("#cap-code").checked = tools.includes("code_exec");
@@ -2485,14 +3083,355 @@ function initCapabilities() {
     saveCapDefaults({ tools: t, skills: s, thinking: $("#cap-thinking").value });
     $("#cap-msg").textContent = "✓ 已保存";
   });
-  $("#btn-mcp-save").addEventListener("click", async () => {
-    try {
-      const servers = JSON.parse($("#mcp-config").value);
-      const r = await api.send("/api/mcp/config", { method: "POST", body: JSON.stringify({ servers }) });
-      $("#mcp-msg").textContent = "✓ 已保存并重连，" + r.servers + " 个服务器";
-    } catch (e) { $("#mcp-msg").textContent = "失败：" + e.message; }
+
+  // ---- MCP ----
+  $("#mcp-add").addEventListener("click", () => mcpEdit(-1));
+  $("#btn-mcp-export").addEventListener("click", () => {
+    $("#mcp-config").value = JSON.stringify(mcpServers, null, 2);
   });
-  api.get("/api/mcp/config").then((cfg) => { $("#mcp-config").value = JSON.stringify(cfg.servers, null, 2); }).catch(() => {});
+  $("#btn-mcp-import").addEventListener("click", async () => {
+    try {
+      const arr = JSON.parse($("#mcp-config").value);
+      if (!Array.isArray(arr)) throw new Error("需要 JSON 数组");
+      mcpServers = arr;
+      await mcpSave();
+      mcpRenderList();
+      $("#mcp-msg").textContent = "✓ 已导入并重连";
+    } catch (e) { $("#mcp-msg").textContent = "导入失败：" + e.message; }
+  });
+  mcpLoad();
+  wsLoadOverview();
+}
+
+function mcpHeadersText(s) {
+  return s?.headers ? Object.entries(s.headers).map(([k, v]) => `${k}: ${v}`).join("\n") : "";
+}
+function mcpParseHeaders(text) {
+  const out = {};
+  for (const line of String(text ?? "").split(/\r?\n/)) {
+    const m = line.match(/^([^:]+):\s*(.*)$/);
+    if (m && m[1].trim()) out[m[1].trim()] = m[2].trim();
+  }
+  return Object.keys(out).length ? out : undefined;
+}
+
+async function mcpLoad() {
+  try {
+    const cfg = await api.get("/api/mcp/config");
+    mcpServers = cfg.servers ?? [];
+  } catch { mcpServers = []; }
+  mcpRenderList();
+}
+
+async function mcpSave() {
+  try {
+    const r = await api.send("/api/mcp/config", { method: "POST", body: JSON.stringify({ servers: mcpServers }) });
+    const cfg = await api.get("/api/mcp/config").catch(() => null);
+    if (cfg) mcpServers = cfg.servers ?? [];
+    toast(`✓ MCP 已保存（${r.servers} 个服务器）`);
+  } catch (e) { toast("MCP 保存失败：" + e.message, false); }
+}
+
+function mcpRenderList() {
+  const el = $("#mcp-list");
+  if (!el) return;
+  el.innerHTML = "";
+  if (!mcpServers.length) { el.innerHTML = '<div class="muted">还没有配置 MCP 服务器</div>'; return; }
+  mcpServers.forEach((s, i) => {
+    const total = (s.tools ?? []).length;
+    const nTools = (s.tools ?? []).filter((t) => t.enabled).length;
+    const sum = s.type === "stdio" ? (s.command ?? "") + " " + (s.args ?? []).join(" ") : (s.url ?? "");
+    const div = document.createElement("div");
+    div.className = "mcp-item";
+    div.innerHTML = `
+      <label class="mcp-enable"><input type="checkbox" data-mcp-enable="${i}" ${s.enabled ? "checked" : ""}>${escapeHtml(s.name)}</label>
+      <span class="mcp-type">${s.type === "stdio" ? "stdio" : s.type === "sse" ? "SSE" : "StreamableHTTP"}</span>
+      <span class="mcp-sum" title="${escapeHtml(sum)}">${escapeHtml(sum || "—")}</span>
+      <span class="mcp-tools">${total ? nTools + "/" + total + " 工具" : "—"}</span>
+      <button class="ghost small-btn" data-mcp-edit="${i}">编辑</button>
+      <button class="ghost small-btn" data-mcp-del="${i}">删除</button>`;
+    el.appendChild(div);
+  });
+  el.querySelectorAll("[data-mcp-enable]").forEach((c) => c.addEventListener("change", async () => {
+    const i = Number(c.dataset.mcpEnable);
+    mcpServers[i].enabled = c.checked;
+    await mcpSave();
+    mcpRenderList();
+  }));
+  el.querySelectorAll("[data-mcp-edit]").forEach((b) => b.addEventListener("click", () => mcpEdit(Number(b.dataset.mcpEdit))));
+  el.querySelectorAll("[data-mcp-del]").forEach((b) => b.addEventListener("click", async () => {
+    const i = Number(b.dataset.mcpDel);
+    if (!confirm(`删除 MCP 服务器「${mcpServers[i].name}」？`)) return;
+    mcpServers.splice(i, 1);
+    await mcpSave();
+    mcpRenderList();
+  }));
+}
+
+function mcpEdit(idx) {
+  mcpEditing = idx;
+  const s = idx >= 0 ? mcpServers[idx] : { name: "", enabled: true, type: "stdio" };
+  mcpTestTools = [];
+  const wrap = $("#mcp-form-wrap");
+  wrap.style.display = "block";
+  wrap.innerHTML = `
+    <div class="mcp-form">
+      <h4>${idx >= 0 ? "编辑服务器" : "添加服务器"}</h4>
+      <div class="form">
+        <label>名称</label><input id="mcp-f-name" value="${escapeHtml(s.name ?? "")}" placeholder="如 文件系统">
+        <label>类型</label>
+        <select id="mcp-f-type">
+          <option value="stdio" ${(s.type ?? "stdio") === "stdio" ? "selected" : ""}>本地程序（stdio）</option>
+          <option value="sse" ${s.type === "sse" ? "selected" : ""}>远程 SSE</option>
+          <option value="streamable-http" ${s.type === "streamable-http" ? "selected" : ""}>远程 StreamableHTTP</option>
+        </select>
+        <div id="mcp-f-stdio">
+          <label>启动命令</label><input id="mcp-f-command" value="${escapeHtml(s.command ?? "")}" placeholder="如 npx">
+          <label>参数（空格分隔）</label><input id="mcp-f-args" value="${escapeHtml((s.args ?? []).join(" "))}" placeholder="如 -y @modelcontextprotocol/server-filesystem ./workspace">
+        </div>
+        <div id="mcp-f-http" style="display:none">
+          <label>连接 URL</label><input id="mcp-f-url" value="${escapeHtml(s.url ?? "")}" placeholder="如 https://mcp.example.com/sse">
+        </div>
+        <label>请求头（每行 Key: Value，可选）</label>
+        <textarea id="mcp-f-headers" rows="2" placeholder="Authorization: Bearer xxx">${escapeHtml(mcpHeadersText(s))}</textarea>
+        <div class="row" style="margin-top:8px">
+          <button id="mcp-f-test" class="ghost small-btn">测试连接</button>
+          <button id="mcp-f-save" class="primary small-btn">保存</button>
+          <button id="mcp-f-cancel" class="ghost small-btn">取消</button>
+        </div>
+        <div id="mcp-f-result" class="status"></div>
+        <div id="mcp-f-tools"></div>
+      </div>
+    </div>`;
+  const syncType = () => {
+    const t = $("#mcp-f-type").value;
+    $("#mcp-f-stdio").style.display = t === "stdio" ? "" : "none";
+    $("#mcp-f-http").style.display = t === "stdio" ? "none" : "";
+  };
+  $("#mcp-f-type").addEventListener("change", syncType);
+  syncType();
+  $("#mcp-f-cancel").addEventListener("click", () => { wrap.style.display = "none"; mcpEditing = -1; });
+  $("#mcp-f-test").addEventListener("click", mcpTestForm);
+  $("#mcp-f-save").addEventListener("click", mcpSaveForm);
+}
+
+function mcpCollectForm() {
+  const type = $("#mcp-f-type").value;
+  return {
+    name: $("#mcp-f-name").value.trim() || "未命名服务器",
+    enabled: mcpEditing >= 0 ? mcpServers[mcpEditing].enabled : true,
+    type,
+    command: type === "stdio" ? ($("#mcp-f-command").value.trim() || undefined) : undefined,
+    args: type === "stdio" && $("#mcp-f-args").value.trim()
+      ? $("#mcp-f-args").value.trim().split(/\s+/).map((x) => x.trim()).filter(Boolean)
+      : undefined,
+    url: type !== "stdio" ? ($("#mcp-f-url").value.trim() || undefined) : undefined,
+    headers: mcpParseHeaders($("#mcp-f-headers").value),
+  };
+}
+
+async function mcpTestForm() {
+  const res = $("#mcp-f-result");
+  const btn = $("#mcp-f-test");
+  btn.disabled = true;
+  res.textContent = "连接中…";
+  try {
+    const r = await api.send("/api/mcp/test", { method: "POST", body: JSON.stringify({ server: mcpCollectForm() }) });
+    if (!r.ok) { res.textContent = "✗ " + (r.error ?? "连接失败"); return; }
+    mcpTestTools = r.tools;
+    res.textContent = `✓ 连接成功，共 ${r.tools.length} 个工具，勾选要启用的（保存时生效）：`;
+    const box = $("#mcp-f-tools");
+    box.innerHTML = r.tools.length
+      ? r.tools.map((t) => `<label class="mcp-tool"><input type="checkbox" data-mcp-tool="${escapeHtml(t.name)}" checked> ${escapeHtml(t.name)}${t.description ? `<small>${escapeHtml(String(t.description).slice(0, 80))}</small>` : ""}</label>`).join("")
+      : '<span class="muted">（该服务器没有暴露工具）</span>';
+  } catch (e) { res.textContent = "✗ " + e.message; }
+  btn.disabled = false;
+}
+
+async function mcpSaveForm() {
+  const s = mcpCollectForm();
+  if (s.type === "stdio" && !s.command) return toast("启动命令不能为空", false);
+  if (s.type !== "stdio" && !s.url) return toast("连接 URL 不能为空", false);
+  const toolChecks = [...document.querySelectorAll("[data-mcp-tool]")];
+  if (toolChecks.length) s.tools = toolChecks.map((c) => ({ name: c.dataset.mcpTool, enabled: c.checked }));
+  if (mcpEditing >= 0) mcpServers[mcpEditing] = { ...mcpServers[mcpEditing], ...s };
+  else mcpServers.push(s);
+  await mcpSave();
+  mcpRenderList();
+  $("#mcp-form-wrap").style.display = "none";
+  mcpEditing = -1;
+  mcpTestTools = [];
+}
+
+async function wsLoadOverview() {
+  const el = $("#ws-overview");
+  try {
+    const r = await api.get("/api/workspace/overview");
+    const dirs = r.dirs ?? [];
+    if (!dirs.length) { el.innerHTML = '<span class="muted">还没有工作区（选卡聊过天后会自动创建）</span>'; return; }
+    el.innerHTML = dirs.map((d) => {
+      const size = d.size < 1024 * 1024 ? (d.size / 1024).toFixed(1) + " KB" : (d.size / 1024 / 1024).toFixed(1) + " MB";
+      return `<div class="ws-row"><code>${escapeHtml(d.slug)}</code><span class="ws-meta">${d.files} 文件 · ${size}</span></div>`;
+    }).join("");
+  } catch (e) { el.innerHTML = '<span class="muted">读取失败：' + escapeHtml(e.message) + "</span>"; }
+}
+
+// ============================================================
+//  视图：预设库（侧边栏「预设」）—— 档位/风格管理，卡片高级配置里引用
+// ============================================================
+let presetStoreData = { tiers: [], styles: [] };
+
+async function loadPresetStore() {
+  presetStoreData = await api.get("/api/presets").catch(() => ({ tiers: [], styles: [] }));
+  return presetStoreData;
+}
+
+function renderPresetEditor(kind, list) {
+  const title = kind === "tier" ? "档位（扮演模式与内容尺度）" : "风格（叙述风格）";
+  const hint =
+    kind === "tier"
+      ? "档位决定扮演模式：不破甲=标准沉浸（剧情内克制处理敏感内容）；破甲=深度沉浸（允许成人向虚构剧情）。由卡片选择是否启用。"
+      : "风格决定输出形式：纯对话（QQ聊天式）/ 轻描写 / 重描写（心理＋动作＋环境）。";
+  return `
+  <div class="card-box">
+    <h3>${icon("sliders")} ${title}</h3>
+    <p class="hint">${hint}</p>
+    <div class="preset-list" id="preset-${kind}-list">
+      ${list
+        .map(
+          (p) => `
+      <div class="preset-item" data-kind="${kind}" data-id="${escapeHtml(p.id)}">
+        <div class="preset-item-head">
+          <b>${escapeHtml(p.name)}</b>
+          <span class="preset-badge ${p.builtin ? "builtin" : "custom"}">${p.builtin ? "内置" : "自定义"}</span>
+          <div class="row" style="margin-left:auto">
+            <button class="ghost small-btn preset-edit" title="编辑">${icon("pen")}</button>
+            <button class="ghost small-btn preset-del" title="删除" ${p.builtin ? "disabled" : ""}>${icon("trash")}</button>
+          </div>
+        </div>
+        <pre class="preset-preview">${escapeHtml(p.content.slice(0, 220))}${p.content.length > 220 ? "…" : ""}</pre>
+      </div>`
+        )
+        .join("")}
+    </div>
+    <div class="row" style="margin-top:10px">
+      <button class="ghost small-btn preset-add" data-kind="${kind}">${icon("plus")} 新增自定义${kind === "tier" ? "档位" : "风格"}</button>
+      <button class="ghost small-btn preset-reset-all" data-kind="${kind}" style="margin-left:8px">恢复内置</button>
+    </div>
+  </div>`;
+}
+
+function renderPresets() {
+  const { tiers, styles } = presetStoreData;
+  return `
+  <div class="view">
+    <div class="page-head">
+      <h2>${icon("sliders")} 角色扮演预设</h2>
+      <p class="hint">预设 = 档位 × 风格。在每张卡的「高级配置」里选择启用（破甲用不用由你自己定）。网页试聊与 QQ/微信 机器人共用这套预设。</p>
+    </div>
+    ${renderPresetEditor("tier", tiers)}
+    <div style="height:12px"></div>
+    ${renderPresetEditor("style", styles)}
+    <div class="card-box" style="margin-top:12px">
+      <h3>${icon("info")} 说明</h3>
+      <ul class="guide">
+        <li>卡片高级配置（编辑卡 → 右上角 ⚙ 高级配置）里可选「档位」与「风格」，选了才生效，默认不启用。</li>
+        <li>档位不破甲/破甲可分别与三种风格自由组合（如 破甲×纯对话、不破甲×重描写）。</li>
+        <li>能力触发：卡开了「生图」能力后，AI 会在场景需要时主动生图发图（配置见 生图配置 页）。</li>
+        <li>改完预设文本后，网页试聊立即生效；QQ/微信 机器人需在卡片 🤖 机器人里点「重编译」。</li>
+      </ul>
+    </div>
+  </div>`;
+}
+
+async function initPresets() {
+  await loadPresetStore();
+  $("#view").innerHTML = renderPresets();
+  bindPresets();
+}
+
+function refreshPresetView() {
+  loadPresetStore().then(() => {
+    $("#view").innerHTML = renderPresets();
+    bindPresets();
+  });
+}
+
+function bindPresets() {
+  const openEditor = (kind, item, isNew) => {
+    const name = isNew ? "" : item.name;
+    const content = isNew ? "" : item.content;
+    const overlay = document.createElement("div");
+    overlay.className = "bot-overlay";
+    overlay.id = "preset-editor-overlay";
+    overlay.innerHTML = `<div class="bot-dialog adv-dialog" style="max-width:640px">
+      <div class="bot-dialog-head">
+        <h3>${isNew ? "新增" : "编辑"}${kind === "tier" ? "档位" : "风格"}${isNew ? "" : " · " + escapeHtml(item.name)}</h3>
+        <button class="ghost small-btn" id="pe-close">${icon("x")}</button>
+      </div>
+      <div class="bot-form">
+        <label>名称<input id="pe-name" value="${escapeHtml(name)}" placeholder="${kind === "tier" ? "如：我的档位" : "如：日记体"}"></label>
+        <label>内容（注入 system prompt 的文本，支持多行）<textarea id="pe-content" rows="14" placeholder="# 角色扮演模式（自定义）&#10;&#10;……">${escapeHtml(content)}</textarea></label>
+      </div>
+      <div class="row" style="justify-content:flex-end;margin-top:6px">
+        <button id="pe-save" class="primary">保存</button>
+      </div>
+    </div>`;
+    document.body.appendChild(overlay);
+    overlay.addEventListener("click", (e) => { if (e.target === overlay) overlay.remove(); });
+    overlay.querySelector("#pe-close").addEventListener("click", () => overlay.remove());
+    overlay.querySelector("#pe-save").addEventListener("click", async () => {
+      const name = overlay.querySelector("#pe-name").value.trim();
+      const content = overlay.querySelector("#pe-content").value;
+      try {
+        if (isNew) {
+          presetStoreData = await api.send("/api/presets", { method: "POST", body: JSON.stringify({ kind, name, content }) });
+        } else {
+          presetStoreData = await api.send(`/api/presets/${kind}/${item.id}`, { method: "PUT", body: JSON.stringify({ name, content }) });
+        }
+        overlay.remove();
+        refreshPresetView();
+        toast("✓ 预设已保存");
+      } catch (e) {
+        toast("保存失败：" + e.message, false);
+      }
+    });
+  };
+
+  const bindList = (kind) => {
+    $(`#preset-${kind}-list`)?.addEventListener("click", (e) => {
+      const edit = e.target.closest(".preset-edit");
+      const del = e.target.closest(".preset-del");
+      const itemEl = e.target.closest(".preset-item");
+      if (!itemEl) return;
+      const id = itemEl.dataset.id;
+      const item = presetStoreData[kind === "tier" ? "tiers" : "styles"].find((p) => p.id === id);
+      if (!item) return;
+      if (edit) openEditor(kind, item, false);
+      if (del) {
+        api.send(`/api/presets/${kind}/${id}`, { method: "DELETE" })
+          .then((data) => { presetStoreData = data; refreshPresetView(); toast("已删除"); })
+          .catch((err) => toast("删除失败：" + err.message, false));
+      }
+    });
+  };
+  bindList("tier");
+  bindList("style");
+  document.querySelectorAll(".preset-add").forEach((btn) => {
+    btn.addEventListener("click", () => openEditor(btn.dataset.kind, null, true));
+  });
+  document.querySelectorAll(".preset-reset-all").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      if (!confirm("恢复内置档位/风格？自定义条目保留，内置条目的文本会重置为代码默认。")) return;
+      try {
+        presetStoreData = await api.send("/api/presets/reset", { method: "POST" });
+        refreshPresetView();
+        toast("✓ 已恢复内置");
+      } catch (e) {
+        toast("恢复失败：" + e.message, false);
+      }
+    });
+  });
 }
 
 // ---- 数据 / 设置 ----
@@ -2576,11 +3515,279 @@ function initSettings() {
 }
 
 // ============================================================
+//  视图：插件商店（ClawHub 实时 + 精选/分享/付费目录）
+// ============================================================
+let pluginMarketData = { feeRate: 0.2, categories: [], plugins: [] };
+let pluginTab = "curated"; // curated | shared | paid | installed | search
+let pluginSearchQ = "";
+let pluginSearchResults = [];
+
+function renderPlugins() {
+  return `
+  <div class="view">
+    <div class="page-head" style="display:flex;justify-content:space-between;align-items:flex-start">
+      <div>
+        <h2>🧩 插件商店</h2>
+        <p class="hint">安装更多有趣能力：ClawHub 官方市场实时搜索 + 社区精选 + 用户分享/付费插件。装完需重启网关生效（多任务在跑可先攒着）。</p>
+      </div>
+      <div class="row" style="gap:8px">
+        <button id="btn-plug-share" class="ghost">＋ 分享免费插件</button>
+        <button id="btn-plug-sell" class="ghost">💰 上架付费插件</button>
+      </div>
+    </div>
+    <div class="row" style="gap:8px;margin:10px 0">
+      <input id="plug-search" placeholder="搜索 ClawHub 全库（如 werewolf / tts / image）…" style="flex:1">
+      <button id="btn-plug-search" class="primary">搜索</button>
+    </div>
+    <div class="plug-tabs">
+      <button data-plug-tab="curated" class="plug-tab">⭐ 精选</button>
+      <button data-plug-tab="shared" class="plug-tab">🧑‍🤝‍🧑 用户分享</button>
+      <button data-plug-tab="paid" class="plug-tab">💰 付费区</button>
+      <button data-plug-tab="installed" class="plug-tab">📦 已安装</button>
+    </div>
+    <div class="plug-cats" id="plug-cats"></div>
+    <div id="plug-grid" class="plug-grid"></div>
+  </div>`;
+}
+
+const PLUG_CAT_EMOJI = { image: "🎨", tts: "🔊", memory: "🧠", game: "🎲", tool: "🛠", channel: "💬", other: "📦" };
+
+function plugCard(p, opts = {}) {
+  const cat = opts.cat || p.category || "other";
+  const priceTag = p.price ? `<span class="plug-price">¥${p.price}</span>` : "";
+  const badge = opts.badge ? `<span class="plug-badge ${opts.badgeCls || ""}">${opts.badge}</span>` : "";
+  const actions = opts.actions || "";
+  return `
+  <div class="plug-card">
+    <div class="plug-card-top">
+      <div class="plug-emoji">${PLUG_CAT_EMOJI[cat] ?? "📦"}</div>
+      <div class="plug-main">
+        <div class="plug-name">${escapeHtml(p.name)} ${badge} ${priceTag}</div>
+        <div class="plug-desc">${escapeHtml(p.desc || p.descZh || "")}</div>
+        <div class="plug-meta">${escapeHtml(p.source || "")}${p.version ? " · v" + escapeHtml(p.version) : ""}${p.type === "paid" ? " · 卖家实得 ¥" + Math.round((p.price ?? 0) * (1 - pluginMarketData.feeRate) * 100) / 100 : ""}</div>
+      </div>
+    </div>
+    <div class="plug-actions">${actions}</div>
+  </div>`;
+}
+
+function plugActions(p, installedMap) {
+  const inst = installedMap[p.id] || installedMap[(p.pkg || "").replace("clawhub:", "").toLowerCase()];
+  if (p.type === "paid" && !inst) {
+    return `<button class="primary small-btn" data-plug-buy="${p.id}">购买 ¥${p.price}</button>`;
+  }
+  if (inst) {
+    return `<span class="ok-badge">已安装 v${escapeHtml(inst.version || "")}</span>
+      <button class="ghost small-btn" data-plug-uninstall="${escapeHtml(inst.id)}">卸载</button>`;
+  }
+  return `<button class="primary small-btn" data-plug-install="${escapeHtml(p.pkg || "bundle:" + p.id)}">安装</button>`;
+}
+
+async function loadPluginMarket() {
+  const grid = $("#plug-grid");
+  if (grid) grid.innerHTML = `<div class="muted">加载中…（首次需等已装插件列表）</div>`;
+  try {
+    const d = await api.get("/api/plugins/market");
+    pluginMarketData = d;
+    renderPluginsGrid();
+  } catch (e) { grid.innerHTML = `<div class="muted">读取失败：${escapeHtml(e.message)}</div>`; }
+}
+
+function renderPluginsGrid() {
+  const cats = pluginMarketData.categories ?? [];
+  const catSel = $("#plug-cats");
+  if (catSel) {
+    catSel.innerHTML = [`<button data-cat="" class="plug-cat on">全部</button>`]
+      .concat(cats.map((c) => `<button data-cat="${c.id}" class="plug-cat">${PLUG_CAT_EMOJI[c.id] ?? "📦"} ${c.label}</button>`))
+      .join("");
+  }
+  const grid = $("#plug-grid");
+  if (!grid) return;
+  const installedMap = {};
+  let list = [];
+  if (pluginTab === "search") {
+    list = pluginSearchResults;
+    if (!list.length) { grid.innerHTML = `<div class="muted">${pluginSearchQ ? "没有搜到结果" : "输入关键词搜索 ClawHub"}</div>`; return; }
+    grid.innerHTML = list.map((p) => plugCard(p, { actions: plugActions(p, {}) })).join("");
+    return;
+  }
+  if (pluginTab === "installed") {
+    list = pluginMarketData.plugins.filter((p) => p.installed);
+    if (!list.length) { grid.innerHTML = `<div class="muted">还没装任何目录里的插件</div>`; return; }
+    grid.innerHTML = list.map((p) => plugCard(p, { actions: plugActions(p, { [p.id]: { version: p.installedVersion, id: p.id } }) })).join("");
+    return;
+  }
+  const typeMap = { curated: "curated", shared: "userShared", paid: "paid" };
+  list = pluginMarketData.plugins.filter((p) => p.type === typeMap[pluginTab]);
+  if (!list.length) {
+    grid.innerHTML = `<div class="muted">${pluginTab === "curated" ? "暂无精选" : pluginTab === "shared" ? "还没有用户分享，点右上「＋ 分享免费插件」" : "还没有付费插件，点右上「💰 上架付费插件」"}</div>`;
+    return;
+  }
+  for (const p of pluginMarketData.plugins) if (p.installed) installedMap[p.id] = { version: p.installedVersion, id: p.id };
+  grid.innerHTML = list.map((p) => plugCard(p, { actions: plugActions(p, installedMap) })).join("");
+}
+
+function initPlugins() {
+  loadPluginMarket(); // 首次进入即加载市场目录
+  document.querySelectorAll("[data-plug-tab]").forEach((b) =>
+    b.addEventListener("click", () => {
+      pluginTab = b.dataset.plugTab;
+      document.querySelectorAll("[data-plug-tab]").forEach((x) => x.classList.toggle("on", x === b));
+      $("#plug-search").style.display = pluginTab === "search" ? "none" : "";
+      if (pluginTab === "search") renderPluginsGrid();
+      else loadPluginMarket();
+    })
+  );
+  $("#plug-cats").addEventListener("click", (e) => {
+    const btn = e.target.closest("[data-cat]");
+    if (!btn) return;
+    document.querySelectorAll(".plug-cat").forEach((x) => x.classList.toggle("on", x === btn));
+    const cat = btn.dataset.cat;
+    const grid = $("#plug-grid");
+    const typeMap = { curated: "curated", shared: "userShared", paid: "paid" };
+    const list = pluginMarketData.plugins.filter((p) => p.type === typeMap[pluginTab] && (!cat || p.category === cat));
+    if (!list.length) { grid.innerHTML = `<div class="muted">该分类下暂无</div>`; return; }
+    const installedMap = {};
+    for (const p of pluginMarketData.plugins) if (p.installed) installedMap[p.id] = { version: p.installedVersion, id: p.id };
+    grid.innerHTML = list.map((p) => plugCard(p, { actions: plugActions(p, installedMap) })).join("");
+  });
+  $("#plug-search").addEventListener("keydown", (e) => { if (e.key === "Enter") $("#btn-plug-search").click(); });
+  $("#btn-plug-search").addEventListener("click", async () => {
+    pluginSearchQ = $("#plug-search").value.trim();
+    const btn = $("#btn-plug-search");
+    btn.disabled = true; btn.textContent = "搜索中…";
+    try {
+      const r = await api.get("/api/plugins/search?q=" + encodeURIComponent(pluginSearchQ));
+      if (!r.ok) { toast("搜索失败：" + r.output, false); return; }
+      pluginTab = "search";
+      document.querySelectorAll("[data-plug-tab]").forEach((x) => x.classList.toggle("on", x.dataset.plugTab === "search"));
+      pluginSearchResults = r.results;
+      renderPluginsGrid();
+    } catch (e) { toast("搜索失败：" + e.message, false); }
+    finally { btn.disabled = false; btn.textContent = "搜索"; }
+  });
+  $("#btn-plug-share").addEventListener("click", () => openPlugUpload("share"));
+  $("#btn-plug-sell").addEventListener("click", () => openPlugUpload("sell"));
+
+  // 事件委托：安装/卸载/购买
+  $("#plug-grid").addEventListener("click", async (e) => {
+    const inst = e.target.closest("[data-plug-install]");
+    const uninst = e.target.closest("[data-plug-uninstall]");
+    const buy = e.target.closest("[data-plug-buy]");
+    if (inst) {
+      if (!confirm("⚠️ 插件 = 代码，安装后可能访问你的文件/网络。只安装你信任的插件。\n\n继续安装？")) return;
+      const btn = inst; btn.disabled = true; btn.textContent = "安装中…";
+      try {
+        const r = await api.send("/api/plugins/install", { method: "POST", body: JSON.stringify({ pkg: inst.dataset.plugInstall }) });
+        toast(r.ok ? "✓ 已安装。网关重启后生效（多任务在跑可先攒着）" : "安装失败：" + (r.output || ""), r.ok);
+      } catch (err) { toast("安装失败：" + err.message, false); }
+      finally { loadPluginMarket(); }
+    } else if (uninst) {
+      if (!confirm("确定卸载这个插件？")) return;
+      const btn = uninst; btn.disabled = true;
+      try {
+        const r = await api.send("/api/plugins/uninstall", { method: "POST", body: JSON.stringify({ id: uninst.dataset.plugUninstall }) });
+        toast(r.ok ? "✓ 已卸载" : "卸载失败：" + (r.output || ""), r.ok);
+      } catch (err) { toast("卸载失败：" + err.message, false); }
+      finally { loadPluginMarket(); }
+    } else if (buy) {
+      const p = (pluginMarketData.plugins ?? []).find((x) => x.id === buy.dataset.plugBuy);
+      if (!p) return;
+      const fee = Math.round(p.price * pluginMarketData.feeRate * 100) / 100;
+      if (!confirm(`购买「${p.name}」¥${p.price}（手续费 ¥${fee}）？\n\n当前为记账模式：支付通道待开通，购买后直接安装。`)) return;
+      const btn = buy; btn.disabled = true; btn.textContent = "购买中…";
+      try {
+        const r = await api.send("/api/plugins/purchase", { method: "POST", body: JSON.stringify({ id: p.id }) });
+        toast(r.ok ? `✓ 已购买并安装「${p.name}」` : "购买失败：" + (r.error || ""), r.ok);
+      } catch (err) { toast("购买失败：" + err.message, false); }
+      finally { loadPluginMarket(); }
+    }
+  });
+}
+
+async function openPlugUpload(mode) {
+  const isSell = mode === "sell";
+  const ov = document.createElement("div");
+  ov.id = "plug-upload-overlay";
+  ov.className = "bot-overlay";
+  ov.innerHTML = `<div class="bot-dialog">
+    <div class="bot-dialog-head">
+      <h3>${isSell ? "💰 上架付费插件" : "🧑‍🤝‍🧑 分享免费插件"}</h3>
+      <button class="ghost small-btn" id="plug-upload-close">✕</button>
+    </div>
+    <div class="bot-form">
+      <label>名称：<input id="pu-name" placeholder="插件名"></label>
+      <label>简介：<input id="pu-desc" placeholder="一句话说明它做什么（中文）"></label>
+      <label>分类：
+        <select id="pu-cat">
+          <option value="image">生图</option><option value="tts">语音</option>
+          <option value="memory">记忆</option><option value="game">游戏</option>
+          <option value="tool">工具</option><option value="channel">通道</option><option value="other">其他</option>
+        </select>
+      </label>
+      ${isSell ? `<label>定价（¥）：<input id="pu-price" type="number" min="1" step="0.01" placeholder="如 9.9"></label>` : ""}
+      <label class="adv-switch" style="border:1px solid var(--border);padding:8px;border-radius:8px">
+        <input type="checkbox" id="pu-uploadzip"> <span><b>上传自己的插件包（zip）</b><small>不勾选则填下面的 ClawHub 包名</small></span>
+      </label>
+      <label id="pu-pkg-row">ClawHub 包名：<input id="pu-pkg" placeholder="如 clawhub:openclaw-memory-graph"></label>
+      <label id="pu-file-row" style="display:none">插件包（zip）：<input type="file" id="pu-file" accept=".zip"></label>
+      ${isSell ? `<p class="hint">付费区只能上传你自己的插件 zip（转售他人插件有版权问题）。手续费 ${Math.round(pluginMarketData.feeRate * 100)}%，实得自动计算。</p>` : ""}
+    </div>
+    <div class="row" style="justify-content:flex-end">
+      <button id="pu-submit" class="primary">${isSell ? "上架" : "分享"}</button>
+    </div>
+  </div>`;
+  document.body.appendChild(ov);
+  ov.addEventListener("click", (e) => { if (e.target === ov) ov.remove(); });
+  $("#plug-upload-close").addEventListener("click", () => ov.remove());
+  $("#pu-uploadzip").addEventListener("change", (e) => {
+    const on = e.target.checked;
+    $("#pu-pkg-row").style.display = on ? "none" : "";
+    $("#pu-file-row").style.display = on ? "" : "none";
+  });
+  $("#pu-submit").addEventListener("click", async () => {
+    const btn = $("#pu-submit");
+    const name = $("#pu-name").value.trim(), desc = $("#pu-desc").value.trim();
+    if (!name || !desc) return toast("名称和简介必填", false);
+    btn.disabled = true; btn.textContent = "提交中…";
+    try {
+      const zipBase64 = await readZipBase64($("#pu-file").files[0]);
+      const body = { name, descZh: desc, category: $("#pu-cat").value };
+      if (zipBase64) body.zipBase64 = zipBase64;
+      else body.pkg = $("#pu-pkg").value.trim();
+      if (isSell) {
+        if (!zipBase64) { toast("付费插件必须上传 zip 包", false); btn.disabled = false; btn.textContent = "上架"; return; }
+        body.price = Number($("#pu-price").value);
+        const r = await api.send("/api/plugins/sell", { method: "POST", body: JSON.stringify(body) });
+        toast(`✓ 已上架，定价 ¥${body.price}，手续费 ¥${r.fee}，实得 ¥${r.sellerGets}`);
+      } else {
+        if (!zipBase64 && !body.pkg) { toast("填 ClawHub 包名或上传 zip", false); btn.disabled = false; btn.textContent = "分享"; return; }
+        const r = await api.send("/api/plugins/share", { method: "POST", body: JSON.stringify(body) });
+        toast("✓ 已分享到商店");
+      }
+      ov.remove();
+      loadPluginMarket();
+    } catch (e) { toast("提交失败：" + e.message, false); btn.disabled = false; btn.textContent = isSell ? "上架" : "分享"; }
+  });
+}
+function readZipBase64(file) {
+  if (!file) return Promise.resolve(null);
+  if (!file.name.endsWith(".zip")) { toast("请上传 .zip 文件", false); return Promise.resolve(null); }
+  return new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => resolve(String(r.result).split(",")[1]);
+    r.onerror = reject;
+    r.readAsDataURL(file);
+  });
+}
+
+// ============================================================
 //  路由表 + 启动
 // ============================================================
 const routes = {
   home: { render: renderHome, init: initHome },
   cards: { render: renderCards, init: initCards },
+  presets: { render: renderPresets, init: initPresets },
   create: { render: renderCreate, init: initCreate },
   distill: { render: renderDistill, init: initDistill },
   channels: { render: renderChannels, init: initChannels },
@@ -2588,7 +3795,9 @@ const routes = {
   imagegen: { render: renderImagegen, init: initImagegen },
   tts: { render: renderTtsPage, init: initTtsPage },
   memory: { render: renderMemory, init: initMemory },
-  capabilities: { render: renderCapabilities, init: initCapabilities },
+  plugins: { render: renderPlugins, init: initPlugins },
+  workbench: { render: renderWorkbenchSettings, init: initWorkbenchSettings },
+  capabilities: { render: renderWorkbenchSettings, init: initWorkbenchSettings }, // 旧地址 #/capabilities 兼容
   data: { render: renderData, init: initData },
   settings: { render: renderSettings, init: initSettings },
 };

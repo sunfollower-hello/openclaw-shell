@@ -48,6 +48,7 @@ openclaw-shell/
 │   │   ├── skills.ts     # 内置技能库（代码专家/翻译/写作/陪伴）
 │   │   ├── modelConfig.ts# 读改写 ~/.openclaw/openclaw.json 的 models.providers + 默认模型
 │   │   ├── botStore.ts    # 多机器人实例表 data/bots.json：卡×渠道账号×agent；上限 2 个/微信 1 个/每卡 1 个；每 agent 独立 workspace=data/agent-workspaces/<slug>/
+│   │   ├── pluginMarket.ts# 插件商店：目录 data/plugin-market/catalog.json（精选/用户分享/付费，feeRate 默认 0.2）+ sales.jsonl 购买记账 + uploads/ 上传 zip 管理
 │   │   ├── imageConfig.ts# data/imageConfig.json 生图配置（NovelAI/OpenAI 兼容/本地 SD WebUI）
 │   │   ├── imageGen.ts   # 生图核心：三 provider 统一生成逻辑（网页工具与 OpenClaw 插件共用同一配置）
 │   │   ├── ttsConfig.ts  # data/ttsConfig.json 语音合成：多上游聚合（kind: openai/minimax/volc，前端添加向导录入，默认不预置）+ 本地兜底（Edge 在线/SAPI 离线）
@@ -77,6 +78,7 @@ openclaw-shell/
 | API | 模型提供商配置+测试、默认模型、**生图配置（NovelAI/OpenAI 兼容/本地 SD WebUI，中文提示词自动翻译扩写、种子/采样器/负面预设可配、测试 Key/试生一张/图片库管理/自动清理保留 N 天）**、MCP 服务器、数据备份；**TTS 语音合成为独立页 #/tts（上游聚合 OpenAI 兼容/MiniMax/火山豆包，添加向导+自动拉取模型；用量记账；对外售卖接口）** |
 | 聊天能力 | 工具：沙箱写代码+文件（危险先问后做审批）/搜索/天气/时间/记忆/生图；**聊天气泡内直接渲染生成的图片（点击放大）**；技能库；思考深度 关闭/自动/低/中/高/极高（对齐 rikkahub，极高=xhigh 不支持自动降级）；**TTS 朗读（bot 气泡 hover 出 🔊，点击合成播放，走默认通道）**；普通聊天/工作模式分离 |
 | 记忆 | 每卡独立长期记忆（JSONL 结构化）；**相关召回注入**（关键词+新鲜度，不再一刀切取最后 N 条）、memory_save 工具去重+分类、每 N 轮自动总结（LLM 提取带分类）、**前端单条管理**（手动添加/编辑/删除/搜索/分类徽标/相对时间）、旧纯文本自动迁移、每卡 300 条上限自动淘汰、备份兼容 |
+| 插件商店 | **侧边栏「🧩 插件商店」（2026-08-24）**：ClawHub 官方市场实时搜索（跟着上游更新）+ 精选区（5 个中文简介内置精选）+ 用户免费分享（填 ClawHub 包名或上传 zip）+ 付费区（用户上传自研 zip 自主定价，feeRate 20% 手续费，购买记账 sales.jsonl，当前记账模式支付通道待开通）+ 已装管理（卸载/启停/更新，装完提示重启网关生效）；安装 zip 包校验 manifest（configSchema 必填）→ 解压到项目 plugins/<id>/ → `plugins install --link`；卸载自动清理目录+openclaw.json 条目；安装失败自动回滚 |
 | 基建 | 开机自启 + 桌面开关、Cloudflare 独立隧道公网、Basic 认证、数据全本地 |
 
 ## 5. 服务与依赖（关键路径/配置）
@@ -124,6 +126,7 @@ openclaw-shell/
 16. **openclaw CLI 并发跑会互相拖慢**：`agents add` 刚结束立刻 `agents list` 可能超时/输出不全 → GET /api/bots 的 agentExists 检测在 CLI 失败时返回 null（前端显示"状态未知"），别断言"缺失"；runOpenclaw 超时给足 60s
 17. **前端慢接口别挡主渲染**：/api/bots 内部要 spawn openclaw CLI（5-15s），卡片网格先渲染、机器人角标异步补——任何页面把慢接口和首屏绑 Promise.all 都会让页面"空白"被当成 bug
 18. **多机器人实测事实（2026-08-24）**：`agents add <slug> --workspace <dir> --model <p/m> --bind qqbot:<acc> --non-interactive --json` 全参数可用；`agents delete --force` 会把 workspace 目录移入回收站（重建时 compileCard 自动重生成，无碍）；qqbot 扫码输出含终端二维码 + `https://q.qq.com/qqbot/openclaw/connect.html?task_id=...` 链接，一次扫码只绑一个机器人；QQ 个体开发者一号最多 5 个机器人
+19. **插件商店踩坑（2026-08-24）**：① ClawHub 部分社区插件有包装问题（如 png-to-pdf 缺编译产物：`package install requires compiled runtime output`）——是上游问题不是我们 bug，安装失败提示即可；② `openclaw plugins uninstall` 不认 `--link` 本地装的插件（registry 无条目）也不删目录——卸载端点按 manifest id 扫描项目 plugins/ 目录删 + 清 openclaw.json 的 plugins.load.paths/entries；③ --link 安装 bundle 的目录名是 shareId（sp_xxx）不是插件 id，清理必须读 manifest 匹配；④ 本地插件包必须有 package.json 的 `openclaw.extensions` + manifest 的 `configSchema`（缺失报错 `plugin manifest requires configSchema`），上传校验已内置这两条；⑤ plugins list/agents list 都慢（5-15s），market/bots 端点都要缓存+并发合并，前端给"加载中"提示；⑥ 安装失败自动回滚（删目录+清 config）
 
 ## 9. 参考内容索引
 

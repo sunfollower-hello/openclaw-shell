@@ -164,7 +164,7 @@ const chatSchema = z.object({
     .default({}),
 });
 
-// ---------- 预设（RP-Hub 生态兼容） ----------
+// ---------- 预设（角色扮演：档位×风格引用预设库 data/presets.json；jailbreak 为旧卡兼容） ----------
 const presetsSchema = z.object({
   jailbreak: z.string().default(""),
   worldbook: z
@@ -175,6 +175,9 @@ const presetsSchema = z.object({
       })
     )
     .default([]),
+  // 引用 data/presets.json 里的档位/风格条目 id；null=不使用
+  tier: z.string().nullable().default(null),
+  style: z.string().nullable().default(null),
 });
 
 // ---------- SillyTavern Spec V2 兼容段（世界书/正则/简介/开场白） ----------
@@ -190,8 +193,10 @@ const worldbookEntry = z.object({
   insertion_order: z.number().default(100),
   priority: z.number().default(10),
   id: z.number().optional(),
-  // 酒馆卡(SillyTavern CCv2/v3)兼容字段：保留原样，编辑/导出不丢
-  position: z.string().optional(),
+  // 插入位置：默认「角色设定前」（对齐酒馆/RP-Hub）
+  position: z.string().default("before_char"),
+  probability: z.number().int().min(0).max(100).default(100),
+  depth: z.number().int().min(0).default(4),
   use_regex: z.boolean().optional(),
   extensions: z.record(z.string(), z.unknown()).optional(),
 });

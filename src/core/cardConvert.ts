@@ -7,6 +7,37 @@ function merge<T extends object>(base: T, extra?: Partial<T>): T {
   return extra ? { ...base, ...extra } : base;
 }
 
+/** 酒馆世界书条目归一化：把 ST 存在 extensions 里的概率/深度提取到顶层，供表单编辑显示 */
+function normalizeStEntry(raw: Record<string, unknown>): Record<string, unknown> {
+  const exts = (raw.extensions ?? {}) as Record<string, unknown>;
+  return {
+    ...raw,
+    position: String(raw.position ?? "before_char"),
+    probability:
+      typeof raw.probability === "number"
+        ? raw.probability
+        : typeof exts.probability === "number"
+          ? exts.probability
+          : 100,
+    depth:
+      typeof raw.depth === "number"
+        ? raw.depth
+        : typeof exts.position === "number"
+          ? exts.position // ST 的插入深度存在 extensions.position
+          : typeof exts.depth === "number"
+            ? exts.depth
+            : 4,
+  };
+}
+
+/** 导出前把顶层概率/深度写回 extensions（ST 兼容，不覆盖已有值） */
+function denormalizeStEntry(raw: Record<string, unknown>): Record<string, unknown> {
+  const exts = { ...((raw.extensions ?? {}) as Record<string, unknown>) };
+  if (typeof raw.probability === "number" && exts.probability === undefined) exts.probability = raw.probability;
+  if (typeof raw.depth === "number" && exts.depth === undefined) exts.depth = raw.depth;
+  return { ...raw, extensions: exts };
+}
+
 /** persona 卡 → CCv2 JSON（本软件扩展数据放 extensions.openclaw_shell，保证导出导入不丢东西） */
 export function cardToCCv2(card: PersonaCard): Record<string, unknown> {
   const st = card.sillytavern_v2 ?? {
@@ -52,7 +83,9 @@ export function cardToCCv2(card: PersonaCard): Record<string, unknown> {
         },
         regex_scripts: st.regex_scripts ?? [],
       },
-      character_book: st.character_book ?? { entries: [] },
+      character_book: {
+        entries: (st.character_book?.entries ?? []).map((e) => denormalizeStEntry(e as Record<string, unknown>) as never),
+      },
     },
   };
 }
@@ -106,7 +139,9 @@ export function ccv2ToCard(cc: unknown, avatarDataUrl?: string): PersonaCard {
       : [],
     regex_scripts: Array.isArray(exts.regex_scripts) ? (exts.regex_scripts as Record<string, unknown>[]) : [],
     character_book:
-      book && Array.isArray(book.entries) ? { entries: book.entries as never[] } : { entries: [] },
+      book && Array.isArray(book.entries)
+        ? { entries: book.entries.map((e) => normalizeStEntry((e ?? {}) as Record<string, unknown>) as never) }
+        : { entries: [] },
   };
   card.source = { kind: "import", inputs: [{ platform: "other", scope: "角色卡导入" }], consent: { granted: false } };
   return card;

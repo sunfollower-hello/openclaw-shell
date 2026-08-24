@@ -12,6 +12,7 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import type { PersonaCard } from "./schema.js";
 import { RELATION_ROLES } from "./schema.js";
+import { resolveCardPresetBlocks } from "./presets.js";
 
 const ROLE_EMOJI: Record<(typeof RELATION_ROLES)[number], string> = {
   self: "🪞",
@@ -169,7 +170,7 @@ function renderProcedural(card: PersonaCard): string {
 }
 
 // ---------- SKILL.md ----------
-function renderSkill(card: PersonaCard): string {
+function renderSkill(card: PersonaCard, presetBlocks: string[] = []): string {
   const role = card.identity.role;
   const oneLine =
     card.identity.bio ||
@@ -221,6 +222,13 @@ function renderSkill(card: PersonaCard): string {
     lines.push("");
     lines.push("## 人物档案");
     lines.push(desc);
+  }
+
+  // 角色扮演预设（档位/风格/能力触发，卡片高级配置里选的，全局生效）
+  if (presetBlocks.length > 0) {
+    lines.push("");
+    lines.push("## 角色扮演预设（以下预设约束本条角色的扮演模式与输出规范，优先于上文各节的表述细节）");
+    for (const block of presetBlocks) lines.push("", block);
   }
 
   // 世界书：常驻条目始终作为背景，关键词条目在出现关键词时注入相关内容
@@ -280,9 +288,11 @@ export async function compileCard(card: PersonaCard, workspace: string): Promise
   const personaDir = path.join(workspace, "skills", "personas", card.slug);
   await fs.mkdir(personaDir, { recursive: true });
 
+  const presetBlocks = await resolveCardPresetBlocks(card);
+
   const files: Record<string, string> = {
     "SOUL.md": renderSoul(card),
-    [path.join("skills", "personas", card.slug, "SKILL.md")]: renderSkill(card),
+    [path.join("skills", "personas", card.slug, "SKILL.md")]: renderSkill(card, presetBlocks),
     [path.join("skills", "personas", card.slug, "personality.md")]: renderPersonality(card),
     [path.join("skills", "personas", card.slug, "interaction.md")]: renderInteraction(card),
     [path.join("skills", "personas", card.slug, "memory.md")]: renderMemory(card),
