@@ -321,20 +321,57 @@ app.post("/api/channels/qq/install-plugin", async (_req, res) => {
 });
 
 // ---------- 多机器人：每卡一个独立 bot（卡 × 渠道账号 × OpenClaw agent） ----------
-app.get("/api/bots", async (_req, res) => {
+// agent 存活检测缓存：openclaw CLI 冷启动要 5-15s，不能每次开面板都现跑
+let agentsListCache: { text: string; at: number } | null = null;
+let agentsListInflight: Promise<{ text: string; ok: boolean }> | null = null;
+const AGENTS_CACHE_MS = 60000;
+
+async function getAgentsList(force = false): Promise<{ text: string; ok: boolean }> {
+  if (!force && agentsListCache && Date.now() - agentsListCache.at < AGENTS_CACHE_MS) {
+    return { text: agentsListCache.text, ok: true };
+  }
+  // 并发合并：多个请求同时来只跑一次 CLI（并行跑 openclaw 会互相拖慢到超时）
+  if (agentsListInflight) return agentsListInflight;
+  agentsListInflight = (async () => {
+    const r = await runOpenclaw(["agents", "list"], { timeoutMs: 60000 });
+    const text = stripAnsi(r.stdout + r.stderr);
+    const ok = r.code === 0 && /Agents:|main/i.test(text);
+    if (ok) agentsListCache = { text, at: Date.now() };
+    return { text, ok };
+  })();
+  try {
+    return await agentsListInflight;
+  } finally {
+    agentsListInflight = null;
+  }
+}
+
+function invalidateAgentsCache(): void {
+  agentsListCache = null;
+}
+
+app.get("/api/bots", async (req, res) => {
   try {
     const bots = await listBots();
-    const agents = await runOpenclaw(["agents", "list"], { timeoutMs: 60000 });
-    const agentsText = stripAnsi(agents.stdout + agents.stderr);
-    // CLI 跑挂/超时时输出不完整，不能断言"不存在"，返回 null 表示未知
-    const listOk = agents.code === 0 && /Agents:|main/i.test(agentsText);
+    const limits = { maxBots: MAX_BOTS, maxWeixin: MAX_WEIXIN_BOTS };
+    // 没有实例就不必查 agent 状态，省掉 CLI 冷启动
+    if (bots.length === 0) return res.json({ bots: [], limits });
+    // skipStatus=1：只要实例数据不查存活（前端开面板首屏用，秒回）
+    if (req.query.skipStatus === "1") {
+      return res.json({
+        bots: bots.map((b) => ({ ...b, channelLabel: CHANNEL_LABELS[b.channel], agentExists: null })),
+        limits,
+      });
+    }
+    const { text: agentsText, ok: listOk } = await getAgentsList(req.query.refresh === "1");
     res.json({
       bots: bots.map((b) => ({
         ...b,
         channelLabel: CHANNEL_LABELS[b.channel],
+        // CLI 跑挂/超时时输出不完整，不能断言"不存在"，返回 null 表示未知
         agentExists: listOk ? new RegExp(`^-\\s+${b.agentId}(\\s|$)`, "m").test(agentsText) : null,
       })),
-      limits: { maxBots: MAX_BOTS, maxWeixin: MAX_WEIXIN_BOTS },
+      limits,
     });
   } catch (e) {
     res.status(500).json({ error: String(e) });
@@ -379,6 +416,7 @@ app.post("/api/bots", async (req, res) => {
       ],
       { timeoutMs: 60000 }
     );
+    invalidateAgentsCache(); // agent 列表变了，缓存作废
     let addOutput = stripAnsi(add.stdout + add.stderr);
     if (add.code !== 0 && !/already exist|已存在/i.test(addOutput)) {
       await removeBot(bot.id);
@@ -398,6 +436,7 @@ app.post("/api/bots", async (req, res) => {
       model: `${llm.provider}/${llm.model}`,
       output: addOutput.slice(-1500),
       hint: "agent 已创建并绑定路由。下一步点「扫码绑定」完成渠道账号登录；网关在跑的话重启后生效（桌面开关）。",
+      agentExists: true, // 刚 add 成功，前端直接采信，不必再等 CLI 查一遍
     });
   } catch (e) {
     res.status(400).json({ error: String(e) });
@@ -442,6 +481,7 @@ app.delete("/api/bots/:id", async (req, res) => {
     const bot = await removeBot(req.params.id);
     if (!bot) return res.status(404).json({ error: "机器人实例不存在" });
     const del = await runOpenclaw(["agents", "delete", bot.agentId, "--force"], { timeoutMs: 60000 });
+    invalidateAgentsCache();
     res.json({
       ok: true,
       output: stripAnsi(del.stdout + del.stderr).slice(-800),
@@ -1218,6 +1258,7 @@ app.get("/api/image/config", async (_req, res) => {
     const cfg = await getImageConfig();
     res.json({
       provider: cfg.provider,
+      retentionDays: cfg.retentionDays,
       novelai: {
         key: maskKey(cfg.novelai.key),
         model: cfg.novelai.model,
@@ -1252,10 +1293,11 @@ app.get("/api/image/config", async (_req, res) => {
 
 app.post("/api/image/config", async (req, res) => {
   try {
-    const { provider, novelai, openai, local } = req.body ?? {};
+    const { provider, novelai, openai, local, retentionDays } = req.body ?? {};
     const cur = await getImageConfig();
     const next = {
       provider: ["novelai", "openai", "local"].includes(provider) ? provider : cur.provider,
+      retentionDays: Number.isFinite(Number(retentionDays)) ? Math.max(0, Math.floor(Number(retentionDays))) : cur.retentionDays,
       novelai: {
         key: novelai?.key ? String(novelai.key) : cur.novelai.key,
         model: novelai?.model ?? cur.novelai.model,
@@ -1377,9 +1419,10 @@ app.post("/api/image/generate", async (req, res) => {
   }
 });
 
-// 图片库：列出 data/images 下全部图片（按时间倒序），供管理/删除
+// 图片库：列出 data/images 下全部图片（按时间倒序），供管理/删除；先顺手清理过期图片
 app.get("/api/image/list", async (_req, res) => {
   try {
+    await cleanupImages();
     const root = path.join(dataDir(), "images");
     const out: { dir: string; file: string; url: string; size: number; mtime: number }[] = [];
     for (const dir of await fs.readdir(root).catch(() => [] as string[])) {
@@ -1415,6 +1458,36 @@ app.post("/api/image/delete", async (req, res) => {
     res.status(500).json({ error: String(e) });
   }
 });
+
+/** 图片自动清理：_test 试生图超 1 天即删；正式生图保留 retentionDays 天（0 = 不自动清理正式图） */
+async function cleanupImages(): Promise<{ removed: number }> {
+  try {
+    const { getImageConfig } = await import("./core/imageConfig.js");
+    const cfg = await getImageConfig();
+    const root = path.join(dataDir(), "images");
+    const now = Date.now();
+    const DAY = 24 * 3600 * 1000;
+    let removed = 0;
+    for (const dir of await fs.readdir(root).catch(() => [] as string[])) {
+      const full = path.join(root, dir);
+      const st = await fs.stat(full).catch(() => null);
+      if (!st?.isDirectory()) continue;
+      const maxAge = dir === "_test" ? DAY : cfg.retentionDays > 0 ? cfg.retentionDays * DAY : Infinity;
+      if (!Number.isFinite(maxAge)) continue;
+      for (const f of await fs.readdir(full).catch(() => [] as string[])) {
+        if (!/\.(png|jpe?g|webp|gif)$/i.test(f)) continue;
+        const fst = await fs.stat(path.join(full, f)).catch(() => null);
+        if (fst?.isFile() && now - fst.mtimeMs > maxAge) {
+          await fs.unlink(path.join(full, f)).catch(() => {});
+          removed++;
+        }
+      }
+    }
+    return { removed };
+  } catch {
+    return { removed: 0 };
+  }
+}
 
 // ---------- 语音合成（TTS）：上游聚合（OpenAI 兼容，可售卖）+ 本地兜底（Edge/SAPI） ----------
 app.get("/api/tts/config", async (_req, res) => {
@@ -1634,4 +1707,9 @@ app.get("/api/tts/usage", async (_req, res) => {
 app.listen(PORT, HOST, () => {
   console.log(`openclaw-shell 已启动: http://${HOST}:${PORT}`);
   console.log(`卡片目录: ${store["dir"]}`);
+  // 生图图片自动清理：启动清一次 + 每天清一次（_test 试生图超 1 天删；正式图超 retentionDays 删）
+  void cleanupImages().then((r) => {
+    if (r.removed > 0) console.log(`图片自动清理：已删除 ${r.removed} 张过期图片`);
+  });
+  setInterval(() => void cleanupImages(), 24 * 3600 * 1000);
 });

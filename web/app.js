@@ -610,12 +610,12 @@ async function loadCardsGrid() {
     cardsGridData = cards;
     renderCardsGrid();
   } catch (e) { $("#cards-grid").innerHTML = `<div class="muted">读取失败：${escapeHtml(e.message)}</div>`; }
-  // 机器人状态另走一步（后端要跑 openclaw CLI，较慢，别挡卡片渲染），到位后补角标
-  api.get("/api/bots").then((b) => { botsData = b; renderCardsGrid(); }).catch(() => {});
+  // 角标只需知道"有没有绑机器人"，用 skipStatus 快路径（不跑 openclaw CLI）
+  api.get("/api/bots?skipStatus=1").then((b) => { botsData = b; renderCardsGrid(); }).catch(() => {});
 }
 
 async function refreshBots() {
-  botsData = await api.get("/api/bots").catch(() => ({ bots: [] }));
+  botsData = await api.get("/api/bots?skipStatus=1").catch(() => ({ bots: [] }));
   renderCardsGrid();
 }
 
@@ -733,7 +733,8 @@ function renderBotBody(bot) {
           }),
         });
         toast("机器人已创建，接下来扫码绑定");
-        renderBotBody(r.bot);
+        // 后端刚 add 成功，直接采信 agentExists，省掉一次 CLI 查询
+        renderBotBody({ ...r.bot, channelLabel: r.bot.channel === "qqbot" ? "QQ 机器人" : "微信机器人", agentExists: r.agentExists ?? null });
         refreshBots();
       } catch (e) {
         toast("创建失败：" + e.message, false);
@@ -813,9 +814,13 @@ async function openAdvConfig() {
   closeAdvConfig();
   closeBotDialog();
   botDialogSlug = editingCard.slug;
-  const prov = await api.get("/api/providers").catch(() => ({ chat: [] }));
+  // 两个都走快路径：providers 读本地配置、bots 带 skipStatus 不跑 openclaw CLI（否则要等 5-15s）
+  const [prov, bots] = await Promise.all([
+    api.get("/api/providers").catch(() => ({ chat: [] })),
+    api.get("/api/bots?skipStatus=1").catch(() => ({ bots: [] })),
+  ]);
   advChatProviders = prov.chat ?? [];
-  botsData = await api.get("/api/bots").catch(() => ({ bots: [] }));
+  botsData = bots;
   const bot = (botsData.bots ?? []).find((b) => b.cardSlug === editingCard.slug);
   const cur = editingCard.model ?? {};
   const provOpts = [`<option value="">（跟随默认提供商）</option>`]
@@ -877,6 +882,15 @@ async function openAdvConfig() {
   ov.addEventListener("click", (e) => { if (e.target === ov) closeAdvConfig(); });
   $("#adv-close").addEventListener("click", closeAdvConfig);
   renderBotBody(bot ?? null);
+  // 有实例时后台补 agent 存活状态（这一步要跑 openclaw CLI，不能挡面板显示）
+  if (bot) {
+    api.get("/api/bots").then((full) => {
+      if (!$("#adv-overlay")) return; // 面板已关就别改 DOM
+      botsData = full;
+      const fresh = (full.bots ?? []).find((b) => b.cardSlug === botDialogSlug);
+      if (fresh && !botLoginTimer) renderBotBody(fresh); // 正在扫码时不要重绘掉二维码
+    }).catch(() => {});
+  }
 
   $("#adv-model-provider").addEventListener("change", (e) => {
     const p = advChatProviders.find((x) => x.name === e.target.value);
@@ -1136,6 +1150,15 @@ function renderImgGenPage() {
     </div>
     <div class="card-box">
       <h3>已生成图片</h3>
+      <div class="form" style="margin-bottom:8px">
+        <div class="row">
+          <label style="white-space:nowrap">自动清理：保留最近</label>
+          <input id="ig-retention" type="number" min="0" max="365" step="1" style="width:90px">
+          <label style="white-space:nowrap">天的正式生图（0 = 不自动清理；试生图始终超 1 天即删）</label>
+          <button id="ig-retention-save" class="ghost small-btn">保存</button>
+        </div>
+        <div id="ig-retention-status" class="status"></div>
+      </div>
       <div id="ig-gallery" class="ig-gallery"><div class="muted">加载中…</div></div>
     </div>
   </div>`;
@@ -1190,6 +1213,7 @@ function collectImgForm() {
   const v = (id) => { const el = $(id); return el ? el.value.trim() : ""; };
   return {
     provider: igRadio(),
+    retentionDays: Number($("#ig-retention")?.value) || 0,
     novelai: {
       key: v("#ig-nai-key"),
       model: v("#ig-nai-model"),
@@ -1222,6 +1246,7 @@ function fillImgForm(cfg) {
   document.querySelectorAll('input[name="ig-provider"]').forEach((r) => { r.checked = r.value === cfg.provider; });
   showIgPane(cfg.provider);
   const n = cfg.novelai || {}, o = cfg.openai || {}, l = cfg.local || {};
+  if ($("#ig-retention")) $("#ig-retention").value = cfg.retentionDays ?? 30;
   if ($("#ig-nai-key")) $("#ig-nai-key").value = "";
   if ($("#ig-nai-model")) $("#ig-nai-model").value = n.model ?? "";
   if ($("#ig-nai-steps")) $("#ig-nai-steps").value = n.steps ?? 28;
@@ -1263,6 +1288,17 @@ async function initImgGenPage() {
     setStatus("#ig-status", "测试中…");
     const r = await api.send("/api/image/test", { method: "POST", body: JSON.stringify(f) });
     setStatus("#ig-status", r.info ?? "无返回", r.ok);
+  });
+  $("#ig-retention-save").addEventListener("click", async () => {
+    const days = Number($("#ig-retention")?.value) || 0;
+    const r = await api.send("/api/image/config", {
+      method: "POST",
+      body: JSON.stringify({ retentionDays: days }),
+    });
+    if (r.ok) {
+      setStatus("#ig-retention-status", `✓ 已保存：正式生图保留 ${days} 天${days === 0 ? "（不自动清理）" : ""}`, true);
+      loadImgGallery();
+    } else setStatus("#ig-retention-status", "保存失败：" + (r.error ?? "未知错误"), false);
   });
   $("#ig-test-go").addEventListener("click", async () => {
     const prompt = $("#ig-test-prompt")?.value?.trim();

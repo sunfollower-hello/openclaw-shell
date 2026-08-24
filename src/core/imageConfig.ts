@@ -5,6 +5,8 @@ import { dataDir } from "./cardStore.js";
 
 export interface ImageConfig {
   provider: "novelai" | "openai" | "local";
+  /** 图片自动清理：保留最近 N 天的正式生图（0 = 不自动清理正式图；_test 试生图始终超 1 天即清） */
+  retentionDays: number;
   novelai: {
     key: string;
     model: string;
@@ -22,6 +24,7 @@ export interface ImageConfig {
 
 const DEFAULTS: ImageConfig = {
   provider: "novelai",
+  retentionDays: 30,
   novelai: {
     key: "",
     model: "nai-diffusion-4-5-full",
@@ -47,6 +50,7 @@ export async function getImageConfig(): Promise<ImageConfig> {
     return {
       ...DEFAULTS,
       ...c,
+      retentionDays: Number(c.retentionDays) || DEFAULTS.retentionDays,
       novelai: { ...DEFAULTS.novelai, ...(c.novelai ?? {}) },
       openai: { ...DEFAULTS.openai, ...(c.openai ?? {}) },
       local: { ...DEFAULTS.local, ...(c.local ?? {}) },
