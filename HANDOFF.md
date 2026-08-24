@@ -74,22 +74,22 @@ openclaw-shell/
 |---|---|
 | 人设卡 | 建/编/校验/编译、聊天测试（人设+工具+技能+记忆+语音+思考深度）、做卡向导（简介/开场白/世界书/正则/头像）、导出 PNG/JSON、导入 PNG/JSON（CCv2）、生效人设指示、**表情包（每卡≤120，带解释，AI 用 [表情:名字] 标记）**、**高级配置（编辑卡右上角 ⚙：每卡模型下拉 + 能力开关[联网搜索/生图/写代码/记忆/天气/时间/技能库/TTS 自动朗读，存 card.tools.enabled+card.abilities，普通聊天按此走] + 机器人接入）** |
 | 蒸馏 | WeFlow JSON 上传 / 粘贴「昵称: 内容」文本 / 直连本机 WeFlow(5031) → PII 脱敏 → 四维蒸馏（互动/人格/记忆，证据分级）→ 保存或直接导出 PNG |
-| 通道 | 微信官方插件扫码绑定（单聊，ClawBot 灰度）、QQ 官方开放平台扫码绑定（q.qq.com 机器人，单聊/群@/频道）、配对授权；**多机器人（2026-08-24）：卡库每卡右上角 🤖 → 建独立 bot（OpenClaw agents 多 agent + 渠道账号路由），上限 2 个实例（微信最多 1 个，每卡 1 个），每 agent 独立 workspace/模型/会话；创建=编译卡→agents add→扫码绑定该账号，卡片更新可一键重编译，入口保留旧通道页** |
+| 通道 | 微信官方插件扫码绑定（单聊，ClawBot 灰度）、QQ 官方开放平台扫码绑定（q.qq.com 机器人，单聊/群@/频道）、配对授权；**多机器人（2026-08-24）：卡库每卡右上角 🤖 → 建独立 bot（OpenClaw agents 多 agent + 渠道账号路由），上限 2 个实例（微信最多 1 个，每卡 1 个），每 agent 独立 workspace/模型/会话；创建=编译卡→agents add→扫码绑定该账号，卡片更新可一键重编译，入口保留旧通道页**；**快速接卡（2026-08-24）：通道页下方「🤖 机器人连接」区——已认证账号仓库（扫描 openclaw.json `channels.qqbot.accounts`+默认账号+微信 accounts.json）+ 可复用账号免扫码绑定（凭证落盘）+ 一键转移（账号被占用从旧卡顶到新卡，`POST /api/bots/transfer`）+ 创建冲突返 409 conflict+占用者，卡上弹窗引导转移** |
 | API | 模型提供商配置+测试、默认模型、**生图配置（NovelAI/OpenAI 兼容/本地 SD WebUI，中文提示词自动翻译扩写、种子/采样器/负面预设可配、测试 Key/试生一张/图片库管理/自动清理保留 N 天）**、MCP 服务器、数据备份；**TTS 语音合成为独立页 #/tts（上游聚合 OpenAI 兼容/MiniMax/火山豆包，添加向导+自动拉取模型；用量记账；对外售卖接口）** |
 | 聊天能力 | 工具：沙箱写代码+文件（危险先问后做审批）/搜索/天气/时间/记忆/生图；**聊天气泡内直接渲染生成的图片（点击放大）**；技能库；思考深度 关闭/自动/低/中/高/极高（对齐 rikkahub，极高=xhigh 不支持自动降级）；**TTS 朗读（bot 气泡 hover 出 🔊，点击合成播放，走默认通道）**；普通聊天/工作模式分离 |
-| 记忆 | 每卡独立长期记忆（JSONL 结构化）；**相关召回注入**（关键词+新鲜度，不再一刀切取最后 N 条）、memory_save 工具去重+分类、每 N 轮自动总结（LLM 提取带分类）、**前端单条管理**（手动添加/编辑/删除/搜索/分类徽标/相对时间）、旧纯文本自动迁移、每卡 300 条上限自动淘汰、备份兼容 |
+| 记忆 | 每卡独立长期记忆（JSONL 结构化）；**相关召回注入**（关键词+新鲜度，不再一刀切取最后 N 条）、memory_save 工具去重+分类、每 N 轮自动总结（LLM 提取带分类）、**前端单条管理**（手动添加/编辑/删除/搜索/分类徽标/相对时间）、旧纯文本自动迁移、每卡 300 条上限自动淘汰、备份兼容；**OpenClaw 端已打通（2026-08-24）**：记忆变更自动导出 `data/memory-export/<slug>.md` → `agents.defaults.memorySearch.extraPaths` 索引 → QQ/微信 可用 memory_search 召回；嵌入用本机 Ollama+nomic-embed-text（零 key，向量+关键词混合），配置脚本 `scripts/setup-openclaw-memory.mjs`（改配置后重启网关 + `openclaw memory index --force`） |
 | 插件商店 | **侧边栏「🧩 插件商店」（2026-08-24）**：ClawHub 官方市场实时搜索（跟着上游更新）+ 精选区（5 个中文简介内置精选）+ 用户免费分享（填 ClawHub 包名或上传 zip）+ 付费区（用户上传自研 zip 自主定价，feeRate 20% 手续费，购买记账 sales.jsonl，当前记账模式支付通道待开通）+ 已装管理（卸载/启停/更新，装完提示重启网关生效）；安装 zip 包校验 manifest（configSchema 必填）→ 解压到项目 plugins/<id>/ → `plugins install --link`；卸载自动清理目录+openclaw.json 条目；安装失败自动回滚 |
 | 基建 | 开机自启 + 桌面开关、Cloudflare 独立隧道公网、Basic 认证、数据全本地 |
 
 ## 5. 服务与依赖（关键路径/配置）
 
-- **OpenClaw 配置** `~/.openclaw/openclaw.json`：`gateway.mode=local` + `gateway.auth.token`；`agents.defaults.workspace = D:\ai_workspace\openclaw-shell\data\workspace`；`models.providers.agnes`（测试上游：`https://apihub.agnes-ai.cn/v1`，模型 ID **必须写 `agnes-2.0-flash`**，写 2.0Flash 会 503）
+- **OpenClaw 配置** `~/.openclaw/openclaw.json`：`gateway.mode=local` + `gateway.auth.token`；`agents.defaults.workspace = D:\ai_workspace\openclaw-shell\data\workspace`；`models.providers.agnes`（测试上游：`https://apihub.agnes-ai.cn/v1`，模型 ID **必须写 `agnes-2.0-flash`**，写 2.0Flash 会 503）；`agents.defaults.memorySearch` = `{ extraPaths: [data/memory-export], provider: "ollama", model: "nomic-embed-text" }`（记忆打通，见「记忆」行；Ollama 需已跑且已 `ollama pull nomic-embed-text`）
 - **插件**（~/.openclaw/npm/projects/）：`openclaw-weixin` v2.4.6（腾讯官方微信）、`openclaw-qqbot` v2.0.1（腾讯官方 QQ）；**自研插件 `openclaw-shell-imagegen`**（源码在项目 `plugins/openclaw-shell-imagegen/`，`openclaw plugins install --link` 已装，gateway 启动时自动加载）→ 给 OpenClaw agent（QQ/微信）注册 `image_gen` 生图工具，复用项目 `dist/core/imageGen.js`（同一份 data/imageConfig.json），图片存 `~/.openclaw/media`（QQ 插件白名单目录），返回文本带 `MEDIA:<路径>` 行 + 结构化 attachments（双保险投递）
 - **Cloudflare**：
   - 新隧道 `openclaw`（ID 74975232-d922-4337-9644-76fac4d04c26），配置 `C:\Users\followsun\.cloudflared\config-openclaw.yml`，用户账户运行（由 start-stack 托管）→ 子域名 `openclaw.319274.xyz` → 17880
   - 旧隧道 `fwq`（ID abbf0656-...）是系统服务（SYSTEM 身份，配置在 systemprofile 目录），**别动**，服务它自己的 8080
   - 死记录：`shell.319274.xyz` 指向旧隧道（404，无害，可在面板删）
-- **数据根** `data/`：cards、memory（`<slug>.mem` 为 **JSONL 结构化记忆**：每行 `{id,fact,cat,ts,src}`，含分类[信息/偏好/关系/事件/待定]、时间戳、来源[手动/自动/工具/旧数据]；旧纯文本格式首次读取自动迁移）、sandbox（每人设卡一个沙箱目录）、emojis、images、tts（朗读音频产物）、ttsConfig.json（TTS 配置）、tts-usage.jsonl（TTS 用量）、workspace（编译产物）
+- **数据根** `data/`：cards、memory（`<slug>.mem` 为 **JSONL 结构化记忆**：每行 `{id,fact,cat,ts,src}`，含分类[信息/偏好/关系/事件/待定]、时间戳、来源[手动/自动/工具/旧数据]；旧纯文本格式首次读取自动迁移）、**memory-export/（记忆导出的 md，供 OpenClaw memorySearch 索引）**、sandbox（每人设卡一个沙箱目录）、emojis、images、tts（朗读音频产物）、ttsConfig.json（TTS 配置）、tts-usage.jsonl（TTS 用量）、workspace（编译产物）
 - **TTS 售卖服务**（独立进程，按需启动）：`npm run tts-server`（或 build 后 `node dist/tts-server.js`）→ 0.0.0.0:17900，`POST /v1/audio/speech` 完全 OpenAI 兼容（客户用 OpenAI SDK 改 baseUrl 即可）；本机 127.0.0.1 免 key 自测，外部必须 Bearer key（`data/ttsKeys.json` 数组 `[{"key":"...","name":"客户A"}]` 或环境变量 `TTS_API_KEYS="k1,k2"`）；按 model 名路由上游（不填走默认上游）；每次调用记入 tts-usage.jsonl。部署到服务器时带 dist + data/ttsConfig.json + ttsKeys.json 即可
 - 登录凭据：项目 `.env`（gitignored）——⚠️ 若仓库转 public 必须改
 

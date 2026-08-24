@@ -1,5 +1,5 @@
 // OpenClaw CLI 封装：网页后端在本机执行 openclaw 命令（登录/状态/配对）
-import { spawn, execFile, type ChildProcess } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
 
@@ -91,41 +91,4 @@ export function getChannelLoginState(channel: string, accountId?: string): Chann
   return s ? { ...s } : { running: false, done: false, ok: false, output: "" };
 }
 
-/** 兼容旧名：微信登录 */
-export function startWechatLogin(): ChannelLoginState {
-  return startChannelLogin("openclaw-weixin");
-}
-export function getWechatLoginState(): ChannelLoginState {
-  return getChannelLoginState("openclaw-weixin");
-}
-
-// ---------- 进程/端口检测 ----------
-export function portListening(port: number): Promise<boolean> {
-  return new Promise((resolve) => {
-    execFile(
-      "powershell",
-      ["-NoProfile", "-Command", `$null -ne (Get-NetTCPConnection -LocalPort ${port} -State Listen -ErrorAction SilentlyContinue)`],
-      { windowsHide: true },
-      (err, stdout) => resolve(!err && stdout.trim().toLowerCase() === "true")
-    );
-  });
-}
-
-export function processCount(match: string): Promise<number> {
-  return new Promise((resolve) => {
-    execFile(
-      "powershell",
-      [
-        "-NoProfile",
-        "-Command",
-        `(Get-CimInstance Win32_Process | Where-Object { $_.ProcessId -ne $PID -and ($_.Name -match '${match}' -or $_.CommandLine -match '${match}') } | Measure-Object).Count`,
-      ],
-      { windowsHide: true },
-      (err, stdout) => {
-        if (err) return resolve(0);
-        const n = parseInt(stdout.trim(), 10);
-        resolve(Number.isFinite(n) ? n : 0);
-      }
-    );
-  });
-}
+// 端口/进程存活检测由 scripts/start-stack.ps1 负责（PowerShell 侧），这里不再重复实现

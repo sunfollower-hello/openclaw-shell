@@ -2,7 +2,6 @@
 // 运行上下文 ctx：sandboxDir = 该人设卡的工作区沙箱目录，memoryPath = 长期记忆文件
 import { execFile } from "node:child_process";
 import { promises as fs } from "node:fs";
-import os from "node:os";
 import path from "node:path";
 
 export interface ToolCtx {

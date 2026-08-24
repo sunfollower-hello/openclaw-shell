@@ -15,16 +15,14 @@ import {
   startChannelLogin,
   getChannelLoginState,
 } from "./core/openclawCli.js";
-import { getModelConfig, saveModelConfig, testModelEndpoint, getModelLLMConfig } from "./core/modelConfig.js";
 import {
   listProviders,
   saveProvider,
   deleteProvider,
-  renameProvider,
   fetchModels,
   resolveChatLLM,
 } from "./core/providers.js";
-import { runDistill, saveDistilledCard } from "./distiller/pipeline.js";
+import { runDistill } from "./distiller/pipeline.js";
 import { parsePlainText } from "./distiller/parser.js";
 import { RELATION_ROLES } from "./core/schema.js";
 import { buildChatSystemAsync } from "./core/chatPrompt.js";
@@ -63,13 +61,26 @@ import {
 } from "./core/ttsConfig.js";
 import { recordUsage, getUsageSummary } from "./core/ttsUsage.js";
 import {
+  listEmojis,
+  addEmoji,
+  updateEmoji,
+  removeEmoji,
+  emojiUrl,
+  buildEmojiPrompt,
+  migrateLegacyEmojis,
+  MAX_EMOJIS,
+} from "./core/emojiStore.js";
+import {
   listBots,
   addBot,
   removeBot,
   agentWorkspaceDir,
+  applyAgentHumanDelay,
   CHANNEL_LABELS,
   MAX_BOTS,
   MAX_WEIXIN_BOTS,
+  type BotChannel,
+  type BotInstance,
 } from "./core/botStore.js";
 import {
   recall,
@@ -78,8 +89,9 @@ import {
   updateEntry,
   clearMemory,
   readAllMemories,
+  exportMemoryToMarkdown,
+  exportAllMemoriesToMarkdown,
   MEMORY_CATEGORIES,
-  type MemEntry,
   type MemoryCategory,
 } from "./core/memoryStore.js";
 
@@ -377,6 +389,63 @@ function invalidateAgentsCache(): void {
   agentsListCache = null;
 }
 
+// ---------- 已认证渠道账号仓库（免扫码复用的依据） ----------
+interface KnownAccount {
+  channel: BotChannel;
+  accountId: string;
+  name?: string;
+  authed: boolean; // 凭证在 → 可免扫码复用
+}
+
+/** 扫描已认证渠道账号：QQ 读 openclaw.json channels.qqbot（默认+多账号），微信读插件账号索引 */
+async function scanKnownAccounts(): Promise<KnownAccount[]> {
+  const out: KnownAccount[] = [];
+  try {
+    const cfg = JSON.parse(await fs.readFile(path.join(os.homedir(), ".openclaw", "openclaw.json"), "utf8"));
+    const qq = cfg.channels?.qqbot ?? {};
+    // 默认账号（扫码绑定写到 channels.qqbot 根）
+    if (qq.appId) out.push({ channel: "qqbot", accountId: "default", name: qq.name ?? "QQ 默认机器人", authed: true });
+    // 多账号（channels.qqbot.accounts.<id>）
+    for (const [accountId, acc] of Object.entries(qq.accounts ?? {})) {
+      const a = acc as { appId?: string; name?: string };
+      if (a.appId) out.push({ channel: "qqbot", accountId, name: a.name ?? accountId, authed: true });
+    }
+  } catch { /* openclaw.json 读不到就跳过 QQ */ }
+  // 微信：账号索引（多账号现实很少用，但机制一致）
+  try {
+    const wxIdx = path.join(os.homedir(), ".openclaw", "openclaw-weixin", "accounts.json");
+    const list = JSON.parse(await fs.readFile(wxIdx, "utf8"));
+    if (Array.isArray(list)) {
+      for (const id of list) {
+        if (typeof id === "string" && id) out.push({ channel: "openclaw-weixin", accountId: id, name: id, authed: true });
+      }
+    }
+  } catch { /* 微信未登录过则无账号 */ }
+  return out;
+}
+
+/** 通道连接页数据：机器人实例 + 已知账号（含未绑定的可复用账号） */
+app.get("/api/channels/connections", async (_req, res) => {
+  try {
+    const bots = await listBots();
+    const accounts = await scanKnownAccounts();
+    // 关联：账号 → 绑定它的 bot
+    const boundByAccount = new Map<string, BotInstance>();
+    for (const b of bots) boundByAccount.set(`${b.channel}:${b.accountId}`, b);
+    const limits = { maxBots: MAX_BOTS, maxWeixin: MAX_WEIXIN_BOTS };
+    res.json({
+      bots,
+      accounts: accounts.map((a) => {
+        const bound = boundByAccount.get(`${a.channel}:${a.accountId}`);
+        return { ...a, boundBotId: bound?.id ?? null, boundCardSlug: bound?.cardSlug ?? null };
+      }),
+      limits,
+    });
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
+
 app.get("/api/bots", async (req, res) => {
   try {
     const bots = await listBots();
@@ -419,7 +488,26 @@ app.post("/api/bots", async (req, res) => {
       return res.status(400).json({ error: "卡 slug 不能用作 agent 名（仅字母数字横线）" });
     }
     const account = String(accountId ?? "").trim() || (channel === "qqbot" ? `qq-${Date.now().toString(36).slice(-4)}` : "wx-main");
-    const bot = await addBot({ cardSlug: card.slug, channel, accountId: account });
+    let bot: BotInstance;
+    try {
+      bot = await addBot({ cardSlug: card.slug, channel, accountId: account });
+    } catch (e) {
+      const msg = String(e);
+      // 账号被其他卡占用 → 409 + 占用者信息，前端引导"一键转移"
+      const occupied = /已被其他机器人占用/.test(msg) || /账号.*占用/.test(msg);
+      if (occupied) {
+        const occupier = (await listBots()).find((b) => b.channel === channel && b.accountId === account);
+        const occCard = occupier ? (await store.get(occupier.cardSlug).catch(() => null)) : null;
+        return res.status(409).json({
+          error: msg,
+          conflict: true,
+          occupiedBy: occupier ? { botId: occupier.id, cardSlug: occupier.cardSlug, cardName: occCard?.name ?? occupier.cardSlug } : null,
+          accountId: account,
+          channel,
+        });
+      }
+      return res.status(400).json({ error: msg });
+    }
 
     // ① 编译卡到该 agent 专属 workspace（每 agent 一份 SOUL.md，互不覆盖）
     // zod parse 补全默认字段，避免残缺卡（缺 voice 等）编译崩溃
@@ -444,6 +532,8 @@ app.post("/api/bots", async (req, res) => {
       { timeoutMs: 60000 }
     );
     invalidateAgentsCache(); // agent 列表变了，缓存作废
+    // 拟真节奏：用卡里的 chat.delay 配 OpenClaw 原生 humanDelay（分段回复之间自然停顿）
+    await applyAgentHumanDelay(bot.agentId, card.chat?.delay).catch(() => {});
     let addOutput = stripAnsi(add.stdout + add.stderr);
     if (add.code !== 0 && !/already exist|已存在/i.test(addOutput)) {
       await removeBot(bot.id);
@@ -467,6 +557,95 @@ app.post("/api/bots", async (req, res) => {
     });
   } catch (e) {
     res.status(400).json({ error: String(e) });
+  }
+});
+
+// 免扫码绑定：把已认证渠道账号（凭证在）绑到已有 bot 的 agent（换绑，不重新扫码）
+app.post("/api/bots/:id/bind", async (req, res) => {
+  try {
+    const bot = (await listBots()).find((b) => b.id === req.params.id);
+    if (!bot) return res.status(404).json({ error: "机器人实例不存在" });
+    const { channel, accountId } = req.body ?? {};
+    if (channel !== "qqbot" && channel !== "openclaw-weixin") return res.status(400).json({ error: "channel 不合法" });
+    const acc = String(accountId ?? "").trim();
+    if (!acc) return res.status(400).json({ error: "缺少 accountId" });
+    // 校验账号已认证（凭证在 → 免扫码）
+    const known = (await scanKnownAccounts()).find((a) => a.channel === channel && a.accountId === acc);
+    if (!known) return res.status(400).json({ error: "该账号还没扫码认证过，无法免扫码绑定（先用扫码绑定创建）" });
+    // 校验未被其他 bot 占用
+    const others = (await listBots()).filter((b) => b.id !== bot.id);
+    if (others.some((b) => b.channel === channel && b.accountId === acc)) {
+      return res.status(409).json({ error: "该账号已被其他卡占用，可先删除或一键转移", conflict: true });
+    }
+    // 换绑：先解旧绑定，再绑新账号
+    const unbind = await runOpenclaw(["agents", "unbind", "--agent", bot.agentId, "--bind", `${bot.channel}:${bot.accountId}`], { timeoutMs: 30000 });
+    const bind = await runOpenclaw(["agents", "bind", "--agent", bot.agentId, "--bind", `${channel}:${acc}`], { timeoutMs: 30000 });
+    if (bind.code !== 0) {
+      return res.status(500).json({ error: `换绑失败：${stripAnsi(bind.stdout + bind.stderr).slice(-500)}` });
+    }
+    // 更新实例记录
+    const bots = await listBots();
+    const idx = bots.findIndex((b) => b.id === bot.id);
+    bots[idx] = { ...bots[idx], channel, accountId: acc };
+    await fs.writeFile(path.join(dataDir(), "bots.json"), JSON.stringify({ bots }, null, 2), "utf8");
+    invalidateAgentsCache();
+    res.json({ ok: true, output: stripAnsi((unbind.stdout + bind.stdout + unbind.stderr + bind.stderr)).slice(-500), hint: "已换绑到已认证账号，网关重启后生效" });
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+// 一键转移：把某账号的绑定从旧卡顶到新卡（复用同一账号，不扫码）
+app.post("/api/bots/transfer", async (req, res) => {
+  try {
+    const { botId, toCardSlug } = req.body ?? {};
+    const oldBot = (await listBots()).find((b) => b.id === String(botId ?? ""));
+    if (!oldBot) return res.status(404).json({ error: "旧机器人实例不存在" });
+    if (oldBot.cardSlug === toCardSlug) return res.status(400).json({ error: "目标卡和当前卡相同，无需转移" });
+    const card = await store.get(String(toCardSlug)).catch(() => null);
+    if (!card) return res.status(400).json({ error: `人设卡 ${toCardSlug} 不存在` });
+    // 目标卡已有 bot？先顶掉它（以传入的 botId 为准）
+    const targetExisting = (await listBots()).find((b) => b.cardSlug === toCardSlug && b.id !== oldBot.id);
+    if (targetExisting) {
+      const del = await runOpenclaw(["agents", "delete", targetExisting.agentId, "--force"], { timeoutMs: 60000 });
+      if (del.code !== 0 && !/not found|no plugin/i.test(stripAnsi(del.stdout + del.stderr))) {
+        return res.status(500).json({ error: `清理目标卡旧 agent 失败：${stripAnsi(del.stdout + del.stderr).slice(-400)}` });
+      }
+    }
+    // ① 编译新卡
+    const compile = await compileCard(personaCardSchema.parse(card), agentWorkspaceDir(card.slug));
+    // ② 解析模型
+    const llm = await resolveChatLLM(card);
+    if (!llm) return res.status(400).json({ error: "没有可用模型（先在 API 页配置模型提供商）" });
+    // ③ 建新 agent（复用旧账号，免扫码）+ bind
+    const add = await runOpenclaw(
+      ["agents", "add", card.slug, "--workspace", agentWorkspaceDir(card.slug), "--model", `${llm.provider}/${llm.model}`, "--bind", `${oldBot.channel}:${oldBot.accountId}`, "--non-interactive", "--json"],
+      { timeoutMs: 60000 }
+    );
+    if (add.code !== 0 && !/already exist|已存在/i.test(stripAnsi(add.stdout + add.stderr))) {
+      return res.status(500).json({ error: `创建新 agent 失败：${stripAnsi(add.stdout + add.stderr).slice(-500)}` });
+    }
+    // ④ 删旧 agent（旧卡被顶掉）
+    const delOld = await runOpenclaw(["agents", "delete", oldBot.agentId, "--force"], { timeoutMs: 60000 });
+    invalidateAgentsCache();
+    // ⑤ 更新记录：旧 bot 记录改为新卡（同一 id，账号不变）
+    const bots = await listBots();
+    const idx = bots.findIndex((b) => b.id === oldBot.id);
+    if (idx >= 0) {
+      bots[idx] = { ...bots[idx], cardSlug: card.slug, agentId: card.slug };
+    }
+    // 目标卡原有 bot 记录移除（被顶掉）
+    const cleaned = bots.filter((b) => b.id !== targetExisting?.id);
+    await fs.writeFile(path.join(dataDir(), "bots.json"), JSON.stringify({ bots: cleaned }, null, 2), "utf8");
+    res.json({
+      ok: true,
+      bot: cleaned[idx],
+      compileFiles: compile.files,
+      output: stripAnsi((add.stdout + add.stderr + delOld.stdout + delOld.stderr)).slice(-600),
+      hint: `已将 ${oldBot.channel === "qqbot" ? "QQ" : "微信"} 账号 ${oldBot.accountId} 从旧卡转移到「${card.name}」，凭证复用未重新扫码，网关重启后生效`,
+    });
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
   }
 });
 
@@ -497,6 +676,8 @@ app.post("/api/bots/:id/recompile", async (req, res) => {
     if (!bot) return res.status(404).json({ error: "机器人实例不存在" });
     const card = personaCardSchema.parse(await store.get(bot.cardSlug));
     const out = await compileCard(card, agentWorkspaceDir(bot.cardSlug));
+    // 卡里的节奏改了也要同步到 agent（humanDelay 在 openclaw.json 里）
+    await applyAgentHumanDelay(bot.agentId, card.chat?.delay).catch(() => {});
     res.json({ ok: true, files: out.files, workspace: out.workspace });
   } catch (e) {
     res.status(500).json({ error: String(e) });
@@ -702,43 +883,6 @@ app.post("/api/cards/cover", async (req, res) => {
   }
 });
 
-// ---------- 模型配置 ----------
-app.get("/api/config/model", async (_req, res) => {
-  try {
-    res.json(await getModelConfig());
-  } catch (e) {
-    res.status(500).json({ error: String(e) });
-  }
-});
-
-app.post("/api/config/model", async (req, res) => {
-  try {
-    const { name, baseUrl, apiKey, modelId, setDefault } = req.body ?? {};
-    if (!name || !baseUrl || !modelId) {
-      return res.status(400).json({ error: "name / baseUrl / modelId 不能为空" });
-    }
-    if (!/^[a-z0-9-]+$/i.test(String(name))) {
-      return res.status(400).json({ error: "name 只能包含字母数字和连字符" });
-    }
-    await saveModelConfig({ name, baseUrl, apiKey, modelId, setDefault: !!setDefault });
-    res.json({ ok: true, hint: "已保存。若 gateway 正在运行，重启后生效（可用桌面开关）" });
-  } catch (e) {
-    res.status(500).json({ error: String(e) });
-  }
-});
-
-app.post("/api/config/model/test", async (req, res) => {
-  try {
-    const { baseUrl, apiKey, modelId } = req.body ?? {};
-    if (!baseUrl || !apiKey || !modelId) {
-      return res.status(400).json({ error: "baseUrl / apiKey / modelId 不能为空" });
-    }
-    res.json(await testModelEndpoint(baseUrl, apiKey, modelId));
-  } catch (e) {
-    res.status(500).json({ error: String(e) });
-  }
-});
-
 // ---------- API 提供商管理（对话 + 生图；第一个为默认，模型自动拉取） ----------
 app.get("/api/providers", async (_req, res) => {
   try {
@@ -771,19 +915,6 @@ app.post("/api/providers/delete", async (req, res) => {
     res.json({ ok: true });
   } catch (e) {
     res.status(500).json({ error: String(e) });
-  }
-});
-
-app.post("/api/providers/rename", async (req, res) => {
-  try {
-    const { type, oldName, newName } = req.body ?? {};
-    if ((type !== "chat" && type !== "image") || !oldName || !newName) {
-      return res.status(400).json({ error: "缺少 type / oldName / newName" });
-    }
-    await renameProvider(type, oldName, newName);
-    res.json({ ok: true });
-  } catch (e) {
-    res.status(400).json({ error: String(e) });
   }
 });
 
@@ -1173,8 +1304,13 @@ app.post("/api/chat", async (req, res) => {
             : level === "extreme"
               ? "xhigh"
               : undefined;
+    // 世界书关键词触发的检索文本：当前消息 + 最近几轮对话内容
+    const recentText = [
+      ...(Array.isArray(history) ? history.slice(-6) : []).map((m) => String((m as { content?: string })?.content ?? "")),
+      String(message),
+    ].join("\n");
     let system =
-      (await buildChatSystemAsync(card, await resolveCardPresetBlocks(card))) +
+      (await buildChatSystemAsync(card, await resolveCardPresetBlocks(card), recentText)) +
       (toolDefs.length
         ? "\n\n你可以使用工具完成任务（写代码/沙箱文件/搜索/天气/时间/记忆/生图）。用户请求适合用工具完成时，调用工具而不是凭空编造；危险工具会先征得用户同意。"
         : "") +
@@ -1182,20 +1318,8 @@ app.post("/api/chat", async (req, res) => {
       memoryBlock +
       (mcpErrors.length ? `\n\n（MCP 连接提示：${mcpErrors.join("；")}）` : "");
 
-    // 表情包注入（关闭档不注入）
-    const emojis = card.emojis ?? [];
-    const emojiLevel = card.voice?.message_style?.emoji ?? "克制";
-    if (emojis.length > 0 && emojiLevel !== "关闭") {
-      const emojiLines = emojis
-        .slice(0, 120)
-        .map((e) => `- ${e.name}：${e.explanation || "（无解释）"}`)
-        .join("\n");
-      const usage =
-        emojiLevel === "贴近原始" ? "尽量在合适位置使用" : emojiLevel === "克制" ? "偶尔在合适位置使用" : "少量使用";
-      system +=
-        `\n\n【表情包】你可以使用以下自定义表情包，${usage}。在回复中插入 [表情:名字] 标记（前端会渲染成图片），不要编造不存在的表情名字：\n` +
-        emojiLines;
-    }
+    // 表情包注入：全局共享库（关闭档不注入）
+    system += await buildEmojiPrompt(card.voice?.message_style?.emoji ?? "克制");
 
     const messages: unknown[] = [
       { role: "system", content: system },
@@ -1289,6 +1413,7 @@ async function autoMemorize(slug: string, card: { memoryConfig?: { auto_rounds?:
     for (const it of items) {
       await appendEntry(slug, { fact: it.fact, cat: it.cat, src: "auto" }).catch(() => {});
     }
+    void exportMemoryToMarkdown(slug).catch(() => {});
   } catch {
     /* 自动记忆失败不影响聊天 */
   }
@@ -1616,6 +1741,7 @@ app.post("/api/memory/clear", async (req, res) => {
         if (f.endsWith(".mem")) await clearMemory(f.replace(/\.mem$/, ""));
       }
     }
+    void exportAllMemoriesToMarkdown().catch(() => {});
     res.json({ ok: true });
   } catch (e) {
     res.status(500).json({ error: String(e) });
@@ -1632,6 +1758,7 @@ app.post("/api/memory/:slug", async (req, res) => {
       src: "manual",
     });
     if (!result.ok) return res.json({ ok: false, duplicate: result.duplicate === true });
+    void exportMemoryToMarkdown(req.params.slug).catch(() => {});
     res.json({ ok: true, entry: result.entry });
   } catch (e) {
     res.status(500).json({ error: String(e) });
@@ -1644,6 +1771,7 @@ app.post("/api/memory/:slug/delete", async (req, res) => {
     const id = String(req.body?.id ?? "");
     if (!id) return res.status(400).json({ error: "id 不能为空" });
     const removed = await deleteEntry(req.params.slug, id);
+    void exportMemoryToMarkdown(req.params.slug).catch(() => {});
     res.json({ ok: removed });
   } catch (e) {
     res.status(500).json({ error: String(e) });
@@ -1660,42 +1788,60 @@ app.post("/api/memory/:slug/update", async (req, res) => {
       cat: cat as MemoryCategory,
     });
     if (!entry) return res.status(404).json({ error: "记忆不存在" });
+    void exportMemoryToMarkdown(req.params.slug).catch(() => {});
     res.json({ ok: true, entry });
   } catch (e) {
     res.status(500).json({ error: String(e) });
   }
 });
 
-// ---------- 表情包（每人设卡最多 120 个，带解释） ----------
-app.post("/api/cards/:slug/emoji", async (req, res) => {
+// ---------- 表情包库（全局共享，所有角色卡共用一套） ----------
+let emojiMigrated = false;
+app.get("/api/emojis", async (_req, res) => {
   try {
-    const { name, explanation, imageBase64, ext } = req.body ?? {};
-    if (!name || !imageBase64) return res.status(400).json({ error: "name / imageBase64 不能为空" });
-    const card = await store.get(req.params.slug);
-    const emojis = card.emojis ?? [];
-    if (emojis.length >= 120) return res.status(400).json({ error: "最多 120 个自定义表情包" });
-    const id = `e${Date.now().toString(36)}${Math.random().toString(36).slice(2, 5)}`;
-    const extName = /^[a-z0-9]{2,5}$/i.test(String(ext ?? "")) ? String(ext) : "png";
-    const dir = path.join(dataDir(), "emojis", req.params.slug);
-    await fs.mkdir(dir, { recursive: true });
-    const file = `${id}.${extName}`;
-    await fs.writeFile(path.join(dir, file), Buffer.from(imageBase64, "base64"));
-    card.emojis = [...emojis, { id, name: String(name).slice(0, 40), file, explanation: String(explanation ?? "").slice(0, 200) }];
-    await store.save(card);
-    res.json({ card });
+    // 首次访问：把旧的「按卡表情」并进共享库（老卡里可能已经上传过）
+    if (!emojiMigrated) {
+      emojiMigrated = true;
+      const cards = [];
+      for (const meta of await store.list().catch(() => [])) {
+        const c = await store.get(meta.slug).catch(() => null);
+        if (c?.emojis?.length) cards.push({ slug: c.slug, emojis: c.emojis });
+      }
+      if (cards.length) await migrateLegacyEmojis(cards).catch(() => 0);
+    }
+    const emojis = await listEmojis();
+    res.json({ emojis: emojis.map((e) => ({ ...e, url: emojiUrl(e.file) })), max: MAX_EMOJIS });
   } catch (e) {
     res.status(500).json({ error: String(e) });
   }
 });
 
-app.delete("/api/cards/:slug/emoji/:id", async (req, res) => {
+app.post("/api/emojis", async (req, res) => {
   try {
-    const card = await store.get(req.params.slug);
-    const target = (card.emojis ?? []).find((e) => e.id === req.params.id);
-    card.emojis = (card.emojis ?? []).filter((e) => e.id !== req.params.id);
-    await store.save(card);
-    if (target) await fs.unlink(path.join(dataDir(), "emojis", req.params.slug, target.file)).catch(() => {});
-    res.json({ card });
+    const { name, explanation, imageBase64, ext } = req.body ?? {};
+    const item = await addEmoji({ name, explanation, imageBase64, ext });
+    res.json({ ok: true, emoji: { ...item, url: emojiUrl(item.file) } });
+  } catch (e) {
+    res.status(400).json({ error: e instanceof Error ? e.message : String(e) });
+  }
+});
+
+app.post("/api/emojis/:id", async (req, res) => {
+  try {
+    const { name, explanation } = req.body ?? {};
+    const item = await updateEmoji(req.params.id, { name, explanation });
+    if (!item) return res.status(404).json({ error: "表情不存在" });
+    res.json({ ok: true, emoji: { ...item, url: emojiUrl(item.file) } });
+  } catch (e) {
+    res.status(400).json({ error: e instanceof Error ? e.message : String(e) });
+  }
+});
+
+app.delete("/api/emojis/:id", async (req, res) => {
+  try {
+    const ok = await removeEmoji(req.params.id);
+    if (!ok) return res.status(404).json({ error: "表情不存在" });
+    res.json({ ok: true });
   } catch (e) {
     res.status(500).json({ error: String(e) });
   }
@@ -2161,11 +2307,9 @@ import {
   removeMarketPlugin,
   getMarketPlugin,
   saveUploadedZip,
-  uploadDir,
   recordSale,
   listSales,
   splitPrice,
-  DEFAULT_FEE_RATE,
   CATEGORY_LABELS,
   type MarketPlugin,
 } from "./core/pluginMarket.js";
@@ -2283,7 +2427,6 @@ app.get("/api/plugins/market", async (_req, res) => {
   try {
     const catalog = await readCatalog();
     const installed = await pluginInstalledMap();
-    const now = Date.now();
     res.json({
       feeRate: catalog.feeRate,
       categories: Object.entries(CATEGORY_LABELS).map(([id, label]) => ({ id, label })),
@@ -2422,7 +2565,7 @@ app.post("/api/plugins/toggle", async (req, res) => {
 // 免费分享：填 ClawHub 包名推荐，或上传自己的 zip 插件包
 app.post("/api/plugins/share", async (req, res) => {
   try {
-    const { name, descZh, category, pkg, zipBase64, fileName } = req.body ?? {};
+    const { name, descZh, category, pkg, zipBase64 } = req.body ?? {};
     if (!name || !descZh) return res.status(400).json({ error: "名称和简介必填" });
     const cat = CATEGORY_LABELS[category] ? category : "other";
     const id = "sp_" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
@@ -2444,7 +2587,7 @@ app.post("/api/plugins/share", async (req, res) => {
 // 付费上架：用户上传自己的插件 zip + 自主定价（我们按 feeRate 收手续费）
 app.post("/api/plugins/sell", async (req, res) => {
   try {
-    const { name, descZh, category, price, zipBase64, fileName } = req.body ?? {};
+    const { name, descZh, category, price, zipBase64 } = req.body ?? {};
     if (!name || !descZh || !zipBase64) return res.status(400).json({ error: "名称/简介/插件包(zip)必填" });
     const p = Number(price);
     if (!Number.isFinite(p) || p <= 0) return res.status(400).json({ error: "价格必须大于 0" });
@@ -2516,4 +2659,8 @@ app.listen(PORT, HOST, () => {
     if (r.removed > 0) console.log(`图片自动清理：已删除 ${r.removed} 张过期图片`);
   });
   setInterval(() => void cleanupImages(), 24 * 3600 * 1000);
+  // 记忆导出：启动时同步全部卡的记忆到 md（供 OpenClaw memorySearch.extraPaths 索引）
+  void exportAllMemoriesToMarkdown().then((slugs) => {
+    if (slugs.length) console.log(`记忆已导出 md：${slugs.join(", ")}`);
+  });
 });

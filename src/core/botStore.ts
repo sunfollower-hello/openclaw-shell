@@ -2,6 +2,7 @@
 // data/bots.json 持久化；每个 agent 的 workspace 编译到 data/agent-workspaces/<slug>/
 import { promises as fs } from "node:fs";
 import path from "node:path";
+import os from "node:os";
 import { dataDir } from "./cardStore.js";
 
 // 用户拍板的限制：同时最多 2 个机器人实例（减少服务器压力，两个渠道组合都能测到）
@@ -81,6 +82,35 @@ export async function addBot(input: {
   bots.push(bot);
   await saveBots(bots);
   return bot;
+}
+
+/**
+ * 把「像真人一样发消息」的节奏配置写进 openclaw.json 的该 agent 条目。
+ * OpenClaw 原生支持 humanDelay（分段回复之间的拟真停顿），不需要自己实现；
+ * CLI 的 agents add 没有这个参数，只能直接改配置文件。
+ */
+export async function applyAgentHumanDelay(
+  agentId: string,
+  delay: { base_ms?: number; variance?: number } | undefined
+): Promise<void> {
+  const cfgPath = path.join(os.homedir(), ".openclaw", "openclaw.json");
+  let cfg: Record<string, any>;
+  try {
+    cfg = JSON.parse(await fs.readFile(cfgPath, "utf8"));
+  } catch {
+    return; // 没有配置文件就不动（网关首启会生成）
+  }
+  const base = Math.max(200, Math.round(delay?.base_ms ?? 1500));
+  const variance = Math.min(1, Math.max(0, delay?.variance ?? 0.4));
+  const minMs = Math.max(200, Math.round(base * (1 - variance)));
+  const maxMs = Math.round(base * (1 + variance));
+  cfg.agents ??= {};
+  cfg.agents.list ??= [];
+  const entry = (cfg.agents.list as { id?: string; humanDelay?: unknown }[]).find((a) => a.id === agentId);
+  const humanDelay = { mode: "custom", minMs, maxMs };
+  if (entry) entry.humanDelay = humanDelay;
+  else cfg.agents.list.push({ id: agentId, humanDelay });
+  await fs.writeFile(cfgPath, JSON.stringify(cfg, null, 2), "utf8");
 }
 
 export async function removeBot(id: string): Promise<BotInstance | null> {

@@ -218,10 +218,11 @@ export function updateEntry(
   });
 }
 
-/** 清空某卡记忆文件（含旧计数器） */
+/** 清空某卡记忆文件（含旧计数器与导出 md） */
 export async function clearMemory(slug: string): Promise<void> {
   await fs.rm(memoryFile(slug), { force: true }).catch(() => {});
   await fs.rm(memoryFile(slug) + ".count", { force: true }).catch(() => {});
+  await fs.rm(path.join(memoryExportDir(), `${slug}.md`), { force: true }).catch(() => {});
 }
 
 /** 相关召回：按关键词重合 + 新鲜度打分取前 limit 条；query 为空时返回最新 limit 条 */
@@ -243,4 +244,54 @@ export async function readAllMemories(): Promise<Record<string, MemEntry[]>> {
     out[slug] = await readEntries(slug).catch(() => []);
   }
   return out;
+}
+
+// ---------- 导出为 Markdown（供 OpenClaw memorySearch.extraPaths 索引，QQ/微信可搜到这些事实） ----------
+export function memoryExportDir(): string {
+  return path.join(dataDir(), "memory-export");
+}
+
+/** 把某卡记忆导出为 <slug>.md：按分类分组，带记录时间；供 OpenClaw 索引 */
+export async function exportMemoryToMarkdown(slug: string): Promise<void> {
+  const entries = await readEntries(slug).catch(() => []);
+  const dir = memoryExportDir();
+  await fs.mkdir(dir, { recursive: true });
+  if (!entries.length) {
+    await fs.rm(path.join(dir, `${slug}.md`), { force: true }).catch(() => {});
+    return;
+  }
+  const lines: string[] = [
+    `# 用户长期记忆（${slug}）`,
+    "",
+    "> 由 openclaw-shell 自动同步自聊天记忆。仅在话题相关时引用；每条为关于用户的事实。",
+    "",
+  ];
+  for (const cat of MEMORY_CATEGORIES) {
+    const group = entries.filter((e) => e.cat === cat);
+    if (!group.length) continue;
+    lines.push(`## ${cat}`, "");
+    for (const e of group) {
+      const when = e.ts ? `（${e.ts.slice(0, 10)}）` : "";
+      lines.push(`- ${e.fact}${when}`);
+    }
+    lines.push("");
+  }
+  await fs.writeFile(path.join(dir, `${slug}.md`), lines.join("\n"), "utf8");
+}
+
+/** 导出全部卡的记忆；同时清理已无 .mem 文件的残留导出 */
+export async function exportAllMemoriesToMarkdown(): Promise<string[]> {
+  const all = await readAllMemories();
+  const exported: string[] = [];
+  for (const slug of Object.keys(all)) {
+    await exportMemoryToMarkdown(slug);
+    exported.push(slug);
+  }
+  const dir = memoryExportDir();
+  for (const f of await fs.readdir(dir).catch(() => [])) {
+    if (f.endsWith(".md") && !all[f.replace(/\.md$/, "")]) {
+      await fs.rm(path.join(dir, f), { force: true }).catch(() => {});
+    }
+  }
+  return exported;
 }

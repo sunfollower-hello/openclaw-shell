@@ -101,16 +101,6 @@ export async function deleteProvider(type: ProviderType, name: string): Promise<
   if (type === "chat") await syncToOpenclaw(data);
 }
 
-export async function renameProvider(type: ProviderType, oldName: string, newName: string): Promise<void> {
-  const data = await listProviders(false);
-  const p = data[type].find((x) => x.name === oldName);
-  if (!p) throw new Error(`找不到提供商 ${oldName}`);
-  if (data[type].some((x) => x.name === newName)) throw new Error(`名称 ${newName} 已存在`);
-  p.name = newName;
-  await writeProviders(data);
-  if (type === "chat") await syncToOpenclaw(data);
-}
-
 /** 把某个提供商移到第一位（成为默认） */
 export async function moveProviderDefault(type: ProviderType, name: string): Promise<void> {
   const data = await listProviders(false);

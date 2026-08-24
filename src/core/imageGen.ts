@@ -4,7 +4,8 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { getImageConfig, type ImageConfig } from "./imageConfig.js";
-import { getModelLLMConfig } from "./modelConfig.js";
+// 翻译走与聊天同一套提供商配置（data/providers.json），避免两条独立的模型读取路径
+import { resolveChatLLM } from "./providers.js";
 
 export const ASPECT_SIZES: Record<string, [number, number]> = {
   square: [1024, 1024],
@@ -48,7 +49,7 @@ function hasCjk(s: string): boolean {
 
 /** 中文 prompt → 英文 Danbooru 风格（用默认 chat 模型；失败返回 null 用原文） */
 async function translatePrompt(prompt: string): Promise<string | null> {
-  const llm = await getModelLLMConfig();
+  const llm = await resolveChatLLM();
   if (!llm?.baseUrl || !llm.apiKey || !llm.model) return null;
   try {
     const r = await fetch(`${llm.baseUrl.replace(/\/+$/, "")}/chat/completions`, {

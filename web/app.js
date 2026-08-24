@@ -1125,7 +1125,26 @@ function renderBotBody(bot) {
         renderBotBody({ ...r.bot, channelLabel: r.bot.channel === "qqbot" ? "QQ 机器人" : "微信机器人", agentExists: r.agentExists ?? null });
         refreshBots();
       } catch (e) {
-        toast("创建失败：" + e.message, false);
+        // 账号被其他卡占用 → 一键转移（凭证复用不重新扫码）
+        if (/占用/.test(e.message)) {
+          const chan = $("#bot-channel").value;
+          const acc = $("#bot-account").value.trim();
+          const conn = await api.get("/api/channels/connections").catch(() => null);
+          const occupier = conn?.bots?.find((b) => b.channel === chan && b.accountId === acc);
+          if (occupier && confirm(`该账号已被「${occupier.cardSlug}」占用。一键转移：把账号从旧卡顶到当前卡？（凭证复用，不重新扫码）`)) {
+            try {
+              const r = await api.send("/api/bots/transfer", { method: "POST", body: JSON.stringify({ botId: occupier.id, toCardSlug: botDialogSlug }) });
+              toast(r.ok ? "✓ 已转移" : "转移失败：" + (r.error ?? ""), r.ok);
+              if (r.bot) renderBotBody({ ...r.bot, agentExists: true });
+              refreshBots();
+              return;
+            } catch (err) { toast("转移失败：" + err.message, false); }
+          } else {
+            toast("创建失败：" + e.message, false);
+          }
+        } else {
+          toast("创建失败：" + e.message, false);
+        }
         btn.disabled = false; btn.textContent = "创建机器人";
       }
     });
@@ -2592,21 +2611,55 @@ const CHAT_EMOJI_RE = /\[表情:([^\]]+)\]/g;
 /** 当前聊天用的卡片：卡片编辑器里是 editingCard，工作台里是 wbCardObj */
 function curCard() { return editingCard || wbCardObj; }
 
-/** 把回复文本渲染进气泡：[表情:名字] → 该卡表情包图片；/img/... → 可点击放大的生图；其余纯文本 */
+/**
+ * 应用卡片里的正则替换（酒馆 regex_scripts）到 AI 回复上。
+ * 之前这些脚本只存不用，用户填了完全不生效。
+ * findRegex 支持酒馆的 /pattern/flags 写法；替换串里的 $1 等分组照常可用。
+ */
+function applyRegexScripts(text) {
+  const scripts = curCard()?.sillytavern_v2?.regex_scripts ?? [];
+  let out = String(text);
+  for (const s of scripts) {
+    if (!s || s.enabled === false || s.disabled === true) continue;
+    const raw = String(s.findRegex ?? "").trim();
+    if (!raw) continue;
+    try {
+      // /pattern/flags 或裸 pattern
+      const m = raw.match(/^\/(.*)\/([gimsuy]*)$/);
+      const re = m ? new RegExp(m[1], m[2] || "g") : new RegExp(raw, "g");
+      out = out.replace(re, String(s.replaceString ?? ""));
+    } catch {
+      // 正则写错就跳过这一条，不影响其他脚本和消息显示
+    }
+  }
+  return out;
+}
+
+// 全局共享表情库缓存（所有角色卡共用一套，聊天渲染 [表情:名字] 时按名字查）
+let emojiLib = [];
+async function loadEmojiLib() {
+  try {
+    const r = await api.get("/api/emojis");
+    emojiLib = r.emojis ?? [];
+  } catch { emojiLib = []; }
+  return emojiLib;
+}
+
+/** 把回复文本渲染进气泡：[表情:名字] → 共享表情库图片；/img/... → 可点击放大的生图；其余纯文本 */
 function appendChatContent(div, text) {
   const emojiParts = String(text).split(CHAT_EMOJI_RE);
   for (let i = 0; i < emojiParts.length; i++) {
     const seg = emojiParts[i];
     if (!seg) continue;
     if (i % 2 === 1) {
-      // 表情名（split 捕获组在奇数位）；卡里没有这个名字就按原文显示
-      const em = (curCard()?.emojis ?? []).find((e) => e.name === seg);
-      if (em && curCard()) {
+      // 表情名（split 捕获组在奇数位）；库里没有这个名字就按原文显示
+      const em = emojiLib.find((e) => e.name === seg);
+      if (em) {
         const img = document.createElement("img");
-        img.src = `/emojis/${curCard().slug}/${em.file}`;
+        img.src = em.url || `/emojis/_shared/${em.file}`;
         img.alt = em.name;
         img.title = em.name;
-        img.style.cssText = "max-height:40px;vertical-align:middle;margin:0 2px";
+        img.className = "chat-emoji";
         div.appendChild(img);
       } else {
         div.appendChild(document.createTextNode("[表情:" + seg + "]"));
@@ -2712,9 +2765,37 @@ async function sendChat() {
   }
   btn.disabled = false;
 }
+/**
+ * 像真人一样分条显示回复：按空行切段，逐条冒出来，每条之间按卡里的 chat.delay 停顿。
+ * 与通道端一致（OpenClaw 用 humanDelay 在 block 之间停顿）。
+ */
+async function addBotReplyHumanLike(rawText) {
+  const card = curCard();
+  const text = applyRegexScripts(rawText); // 卡里的正则替换（酒馆 regex_scripts）
+  const multi = card?.voice?.message_style?.multi_send === true;
+  const parts = multi
+    ? String(text).split(/\n{2,}/).map((s) => s.trim()).filter(Boolean)
+    : [String(text)];
+  if (parts.length <= 1) {
+    addChatBubble("bot", text);
+    return;
+  }
+  const base = Math.max(200, Number(card?.chat?.delay?.base_ms) || 1500);
+  const variance = Math.min(1, Math.max(0, Number(card?.chat?.delay?.variance ?? 0.4)));
+  for (let i = 0; i < parts.length; i++) {
+    if (i > 0) {
+      // 每条之间等一会儿，长句多等一点（模拟打字）
+      const jitter = 1 + (Math.random() * 2 - 1) * variance;
+      const wait = Math.min(4000, base * jitter * Math.min(2, 0.4 + parts[i].length / 30));
+      await new Promise((r) => setTimeout(r, wait));
+    }
+    addChatBubble("bot", parts[i]);
+  }
+}
+
 async function finishTurn(r) {
   if (r.type === "reply") {
-    addChatBubble("bot", r.reply);
+    await addBotReplyHumanLike(r.reply);
     chatHistory.push({ role: "assistant", content: r.reply });
     if (!workMode && editingCard?.abilities?.tts) speakText(r.reply); // 高级配置开了 TTS → 自动朗读
   } else if (r.type === "pending") {
@@ -2911,6 +2992,11 @@ function renderChannels() {
         <pre id="qq-out" class="small-out"></pre>
       </div>
     </div>
+    <div class="card-box" style="margin-top:14px">
+      <h3>🤖 机器人连接（多卡并存）</h3>
+      <p class="hint">每张卡一个独立机器人：已认证的账号凭证保存在本机，换卡/接卡不用重新扫码。</p>
+      <div id="conn-list"><div class="muted">加载中…</div></div>
+    </div>
   </div>`;
 }
 
@@ -2942,7 +3028,90 @@ function initChannels() {
   $("#btn-pair-approve").addEventListener("click", approvePairing);
   $("#btn-qq-login").addEventListener("click", () => startLogin("/api/channels/qq/login", "#qq-qr", "#qq-login-msg", refreshQQ));
   $("#btn-qq-refresh").addEventListener("click", refreshQQ);
-  refreshWechat(); refreshPairing(); refreshQQ();
+  refreshWechat(); refreshPairing(); refreshQQ(); refreshConnections();
+}
+async function refreshConnections() {
+  const box = $("#conn-list");
+  if (!box) return;
+  try {
+    const [conn, cards] = await Promise.all([
+      api.get("/api/channels/connections"),
+      api.get("/api/cards").catch(() => ({ cards: [] })),
+    ]);
+    const bots = conn.bots ?? [];
+    const accounts = conn.accounts ?? [];
+    const cardOpts = (cards.cards ?? []).map((c) => `<option value="${escapeHtml(c.slug)}">${escapeHtml(c.name)}</option>`).join("");
+    // 已绑定实例
+    let html = "";
+    if (bots.length) {
+      html += `<div class="conn-sub">已绑定（${bots.length}/${conn.limits?.maxBots ?? 2}）</div>`;
+      for (const b of bots) {
+        html += `<div class="conn-row">
+          <span class="conn-card">${escapeHtml(b.cardSlug)}</span>
+          <span class="chip">${b.channel === "qqbot" ? "QQ" : "微信"} · ${escapeHtml(b.accountId)}</span>
+          <select class="conn-target" data-bot="${b.id}" style="max-width:150px"><option value="">换卡到…</option>${cardOpts.replaceAll("<option value=\"" + b.cardSlug + "\"", "<option value=\"" + b.cardSlug + "\" disabled")}</select>
+          <button class="danger small-btn" data-conn-del="${b.id}">解绑</button>
+        </div>`;
+      }
+    } else {
+      html += `<div class="muted">还没有绑定任何机器人实例。在「人设卡库」点开卡 → 右上角 ⚙ 高级配置 → 机器人接入创建。</div>`;
+    }
+    // 可复用账号（未绑定）
+    const freeAccounts = accounts.filter((a) => !a.boundBotId);
+    if (freeAccounts.length) {
+      html += `<div class="conn-sub">可复用账号（凭证已认证，免扫码）</div>`;
+      for (const a of freeAccounts) {
+        html += `<div class="conn-row">
+          <span class="conn-card">${a.channel === "qqbot" ? "QQ" : "微信"} · ${escapeHtml(a.accountId)}${a.name ? "（" + escapeHtml(a.name) + "）" : ""}</span>
+          <span class="ok-badge">✓ 已认证</span>
+          <select class="conn-cardpick" data-acc="${a.channel}|${a.accountId}" style="max-width:150px"><option value="">绑到卡…</option>${cardOpts}</select>
+        </div>`;
+      }
+    }
+    html += `<p class="hint" style="margin-top:8px">账号上限：QQ 每号 5 个机器人（平台），微信 1 个；本机同时最多 ${conn.limits?.maxBots ?? 2} 个实例。换卡/绑卡都复用已有凭证，无需重新扫码。</p>`;
+    box.innerHTML = html;
+    // 事件
+    box.querySelectorAll("[data-conn-del]").forEach((b) =>
+      b.addEventListener("click", async () => {
+        if (!confirm("解绑这个机器人实例？（账号凭证保留，可复用）")) return;
+        const r = await api.send(`/api/bots/${b.dataset.connDel}`, { method: "DELETE" });
+        toast(r.ok ? "已解绑" : "解绑失败：" + (r.error ?? ""), r.ok);
+        refreshConnections();
+      })
+    );
+    box.querySelectorAll(".conn-target").forEach((sel) =>
+      sel.addEventListener("change", async () => {
+        if (!sel.value) return;
+        if (!confirm("把该账号从当前卡转移到这张卡？旧卡会被顶掉，账号凭证复用不重新扫码。")) return;
+        try {
+          const r = await api.send("/api/bots/transfer", { method: "POST", body: JSON.stringify({ botId: sel.dataset.bot, toCardSlug: sel.value }) });
+          toast(r.ok ? "✓ 已转移" : "转移失败：" + (r.error ?? ""), r.ok);
+        } catch (e) { toast("转移失败：" + e.message, false); }
+        refreshConnections();
+      })
+    );
+    box.querySelectorAll(".conn-cardpick").forEach((sel) =>
+      sel.addEventListener("change", async () => {
+        if (!sel.value) return;
+        const [channel, accountId] = sel.dataset.acc.split("|");
+        try {
+          const r = await api.send("/api/bots", { method: "POST", body: JSON.stringify({ cardSlug: sel.value, channel, accountId }) });
+          if (r.conflict) {
+            toast(`账号已被「${r.occupiedBy?.cardName ?? r.occupiedBy?.cardSlug}」占用，先去那边换卡或解绑`, false);
+          } else {
+            toast("✓ 已绑定（账号凭证复用，网关重启后生效）");
+          }
+        } catch (e) {
+          const msg = e.message || "";
+          if (msg.includes("占用")) toast("账号已被占用，可先在旧卡上「换卡」", false);
+          else toast("绑定失败：" + msg, false);
+        }
+        refreshConnections();
+      })
+    );
+  } catch (e) {
+    box.innerHTML = `<div class="muted">读取失败：${escapeHtml(e.message)}</div>`;
+  }
 }
 async function refreshWechat() {
   try {
@@ -3802,6 +3971,131 @@ function readZipBase64(file) {
 }
 
 // ============================================================
+//  视图：表情包库（全局共享，所有角色卡共用）
+// ============================================================
+function renderEmojis() {
+  return `
+  <div class="view">
+    <div class="page-head">
+      <h2>表情包库</h2>
+      <p class="hint">全部角色卡共用这一套表情。AI 想发表情时会写 [表情:名字]，聊天里渲染成图片；名字和解释会告诉 AI，所以解释要写清楚什么场合用</p>
+    </div>
+    <div class="card-box">
+      <h3>添加表情</h3>
+      <div class="form">
+        <div class="cf-grid2">
+          <div><label>表情名（AI 用它引用，唯一）</label><input id="em-name" placeholder="如：得意、无语、抱抱"></div>
+          <div><label>什么场合用（给 AI 看）</label><input id="em-exp" placeholder="如：调皮得意，占了上风的时候"></div>
+        </div>
+        <label>图片（png / jpg / gif / webp）</label>
+        <input type="file" id="em-file" accept=".png,.jpg,.jpeg,.gif,.webp">
+        <div class="row">
+          <button id="em-add" class="primary">${icon("plus")} 添加到库</button>
+          <span id="em-msg" class="status"></span>
+        </div>
+      </div>
+    </div>
+    <div class="card-box">
+      <h3>库里的表情 <span id="em-count" class="hint"></span></h3>
+      <div id="em-list" class="emoji-grid"></div>
+    </div>
+  </div>`;
+}
+
+function initEmojis() {
+  $("#em-add").addEventListener("click", addEmojiToLib);
+  loadEmojiList();
+}
+
+async function loadEmojiList() {
+  const box = $("#em-list");
+  if (!box) return;
+  try {
+    const r = await api.get("/api/emojis");
+    emojiLib = r.emojis ?? [];
+    if ($("#em-count")) $("#em-count").textContent = `${emojiLib.length} / ${r.max ?? 200}`;
+    if (!emojiLib.length) {
+      box.innerHTML = '<div class="muted">库里还没有表情，上面添加第一个</div>';
+      return;
+    }
+    box.innerHTML = emojiLib
+      .map(
+        (e) => `<div class="emoji-item" data-id="${escapeHtml(e.id)}">
+          <img src="${escapeHtml(e.url)}" alt="${escapeHtml(e.name)}" loading="lazy">
+          <div class="emoji-name">${escapeHtml(e.name)}</div>
+          <div class="emoji-exp">${escapeHtml(e.explanation || "（未写用法）")}</div>
+          <div class="row">
+            <button class="ghost small-btn" data-act="edit">编辑</button>
+            <button class="danger small-btn" data-act="del">删除</button>
+          </div>
+        </div>`
+      )
+      .join("");
+    box.querySelectorAll("button[data-act]").forEach((b) =>
+      b.addEventListener("click", () => {
+        const id = b.closest(".emoji-item").dataset.id;
+        const item = emojiLib.find((x) => x.id === id);
+        if (!item) return;
+        if (b.dataset.act === "del") return delEmoji(item);
+        editEmoji(item);
+      })
+    );
+  } catch (e) {
+    box.innerHTML = `<div class="muted">读取失败：${escapeHtml(e.message)}</div>`;
+  }
+}
+
+async function addEmojiToLib() {
+  const name = $("#em-name").value.trim();
+  const f = $("#em-file").files[0];
+  if (!name) return toast("请填表情名", false);
+  if (!f) return toast("请选择图片", false);
+  const btn = $("#em-add");
+  btn.disabled = true;
+  try {
+    const b64 = await fileToBase64(f);
+    const ext = (f.name.split(".").pop() || "png").toLowerCase();
+    await api.send("/api/emojis", {
+      method: "POST",
+      body: JSON.stringify({ name, explanation: $("#em-exp").value.trim(), imageBase64: b64, ext }),
+    });
+    $("#em-name").value = "";
+    $("#em-exp").value = "";
+    $("#em-file").value = "";
+    toast("✓ 已添加");
+    await loadEmojiList();
+  } catch (e) {
+    toast("添加失败：" + e.message, false);
+  }
+  btn.disabled = false;
+}
+
+async function editEmoji(item) {
+  const name = prompt("表情名（AI 用它引用）", item.name);
+  if (name === null) return;
+  const explanation = prompt("什么场合用（给 AI 看）", item.explanation || "");
+  if (explanation === null) return;
+  try {
+    await api.send(`/api/emojis/${item.id}`, { method: "POST", body: JSON.stringify({ name, explanation }) });
+    toast("✓ 已保存");
+    await loadEmojiList();
+  } catch (e) {
+    toast("保存失败：" + e.message, false);
+  }
+}
+
+async function delEmoji(item) {
+  if (!confirm(`删除表情「${item.name}」？`)) return;
+  try {
+    await api.send(`/api/emojis/${item.id}`, { method: "DELETE" });
+    toast("✓ 已删除");
+    await loadEmojiList();
+  } catch (e) {
+    toast("删除失败：" + e.message, false);
+  }
+}
+
+// ============================================================
 //  路由表 + 启动
 // ============================================================
 const routes = {
@@ -3815,6 +4109,7 @@ const routes = {
   imagegen: { render: renderImagegen, init: initImagegen },
   tts: { render: renderTtsPage, init: initTtsPage },
   memory: { render: renderMemory, init: initMemory },
+  emojis: { render: renderEmojis, init: initEmojis },
   plugins: { render: renderPlugins, init: initPlugins },
   workbench: { render: renderWorkbenchSettings, init: initWorkbenchSettings },
   capabilities: { render: renderWorkbenchSettings, init: initWorkbenchSettings }, // 旧地址 #/capabilities 兼容
@@ -3831,4 +4126,8 @@ document.querySelectorAll(".drawer-nav a").forEach((a) => {
   a.insertAdjacentHTML("afterbegin", icon(a.dataset.icon));
 });
 // 先拿用户资料再渲染首页（横幅昵称/头像一次到位），失败不阻塞
-loadProfile().finally(() => router());
+// 同时预载共享表情库：聊天气泡渲染 [表情:名字] 要靠它查图
+loadProfile().finally(() => {
+  void loadEmojiLib();
+  router();
+});
