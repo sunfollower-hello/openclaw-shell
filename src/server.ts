@@ -1338,7 +1338,14 @@ app.post("/api/chat", async (req, res) => {
 });
 
 // ---------- 每 N 轮自动记忆（参考 rphub 群聊定期总结思路） ----------
-async function autoMemorize(slug: string, card: { memoryConfig?: { auto_rounds?: number } }, messages: unknown[]): Promise<void> {
+async function autoMemorize(
+  slug: string,
+  card: {
+    model?: { provider?: string; model?: string };
+    memoryConfig?: { auto_rounds?: number; provider?: string; model?: string };
+  },
+  messages: unknown[]
+): Promise<void> {
   const rounds = card.memoryConfig?.auto_rounds ?? 20;
   if (!rounds || rounds < 1) return;
   const ctx = chatCtx(slug);
@@ -1350,7 +1357,11 @@ async function autoMemorize(slug: string, card: { memoryConfig?: { auto_rounds?:
     return;
   }
   await fs.writeFile(countFile, "0", "utf8");
-  const llm = await resolveChatLLM(card as never);
+  // 记忆总结可指定独立模型；留空则跟随此卡的对话模型
+  const memTarget = card.memoryConfig?.provider
+    ? { model: { provider: card.memoryConfig.provider, model: card.memoryConfig.model } }
+    : card;
+  const llm = await resolveChatLLM(memTarget as never);
   if (!llm?.apiKey) return;
   // 已记住的只带最近 100 条给 LLM，避免 token 随文件膨胀
   const existing = (await readAllMemories().then((m) => m[slug] ?? []).catch(() => []))

@@ -104,6 +104,7 @@ const ICONS = {
   book: '<path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/>',
   send: '<path d="m22 2-7 20-4-9-9-4z"/><path d="M22 2 11 13"/>',
   store: '<path d="M3 9.5 4.5 4h15L21 9.5"/><path d="M4 9.5V20h16V9.5"/><path d="M9 20v-6h6v6"/><path d="M2.5 9.5h19"/>',
+  chevron: '<path d="m9 18 6-6-6-6"/>',
 };
 function icon(name, size) {
   return `<svg class="ic${size ? " ic-" + size : ""}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICONS[name] ?? ""}</svg>`;
@@ -269,12 +270,15 @@ function wbRowHTML(e, expand, idx) {
     : keyList.length
       ? "触发：" + keyList.slice(0, 2).join("、") + (keyList.length > 2 ? "…" : "")
       : "";
+  const preview = String(e?.content ?? "").replace(/\s+/g, " ").trim().slice(0, 60);
   return `<div class="wb-entry"${Number.isInteger(idx) ? ` data-idx="${idx}"` : ""}>
     <div class="wb-summary">
+      <span class="wb-caret">${icon("chevron")}</span>
       <span class="wb-title">${escapeHtml(title)}</span>
       ${summaryMeta ? `<span class="wb-summary-meta">${escapeHtml(summaryMeta)}</span>` : ""}
+      ${preview ? `<span class="wb-preview">${escapeHtml(preview)}</span>` : ""}
       <label class="wb-enable" title="启用 / 停用此条目"><input type="checkbox" class="wb-enabled" ${e?.enabled !== false ? "checked" : ""}> 启用</label>
-      <button class="wb-edit ghost small-btn" type="button" title="编辑条目">${icon("pen")}</button>
+      <button class="wb-edit ghost small-btn" type="button" title="编辑条目">${icon("pen")} 编辑</button>
       <button class="wb-del danger small-btn" type="button" title="删除条目">${icon("x")}</button>
     </div>
     <div class="wb-detail" ${expand ? "" : "hidden"}>
@@ -298,13 +302,18 @@ function wbRowHTML(e, expand, idx) {
   </div>`;
 }
 
+// 点「编辑」按钮或摘要行任意空白处都能展开/收起（RP-Hub 式折叠）
 function cardFormEditHandler(e) {
+  if (e.target.closest(".wb-del") || e.target.closest(".wb-enable")) return;
   const btn = e.target.closest(".wb-edit");
-  if (!btn) return;
-  const detail = btn.closest(".wb-entry")?.querySelector(".wb-detail");
+  const summary = btn ? null : e.target.closest(".wb-summary");
+  const entry = (btn || summary)?.closest(".wb-entry");
+  if (!entry) return;
+  const detail = entry.querySelector(".wb-detail");
   if (!detail) return;
   detail.hidden = !detail.hidden;
-  btn.classList.toggle("open", !detail.hidden);
+  entry.classList.toggle("open", !detail.hidden);
+  entry.querySelector(".wb-edit")?.classList.toggle("open", !detail.hidden);
 }
 
 // 正则替换行（可留空；导入的酒馆卡自带正则也会显示在这里）
@@ -318,65 +327,73 @@ function rxRowHTML(s) {
 }
 
 function cardFormHTML(mode) {
-  // 模型/记忆只在卡库编辑页出现（做卡页保持专注）
-  const extra = mode === "edit" ? `
-  <div class="cf-section"><h3>${icon("zap")} 模型 <span class="hint">（此卡专用，留空跟随默认）</span></h3>
-    <div class="cf-grid2">
-      <div><label>API 提供商</label><select id="cf-provider"><option value="">（跟随默认）</option></select></div>
-      <div><label>模型</label><select id="cf-model"><option value="">（跟随默认）</option></select></div>
-    </div>
-  </div>
-  <div class="cf-section"><h3>${icon("database")} 记忆</h3>
-    <label>每 <input id="cf-rounds" type="number" min="1" max="50" value="20" style="width:64px;display:inline-block;text-align:center"> 轮对话自动总结一次（1-50）</label>
-  </div>` : "";
+  // 编辑已有卡：不要头像（卡库里的卡头像不在这改）、不要模型/记忆（都在「高级配置」里）
+  const isCreate = mode === "create";
   return `
   <div class="cf-section"><h3>${icon("info")} 基本信息</h3>
     <div class="cf-grid">
       <div><label>名称</label><input id="cf-name" placeholder="如：许桃"></div>
-      ${mode === "create" ? `<div><label>slug（留空自动）</label><input id="cf-slug" placeholder="xutao"></div>` : ""}
-      ${mode === "create" ? `<div><label>关系类型</label>
+      ${isCreate ? `<div><label>slug（留空自动）</label><input id="cf-slug" placeholder="xutao"></div>` : ""}
+      ${isCreate ? `<div><label>关系类型</label>
         <select id="cf-role">
           <option value="friend">朋友</option><option value="family">家人</option>
           <option value="self">自己</option><option value="partner">前任/恋人</option>
           <option value="colleague">同事</option><option value="public-figure">偶像/角色</option>
         </select></div>` : ""}
     </div>
-    <label>简介（一句话介绍角色，选填）</label>
-    <textarea id="cf-bio" rows="2" placeholder="如：开甜品铺的 26 岁姑娘，嘴上凶巴巴，心里软乎乎的"></textarea>
-    <label>头像（PNG，可选）</label>
+    <label>简介</label>
+    <textarea id="cf-bio" class="cf-autogrow" rows="3" placeholder="如：开甜品铺的 26 岁姑娘，嘴上凶巴巴，心里软乎乎的"></textarea>
+    ${isCreate ? `<label>头像（PNG，可选）</label>
     <div class="cf-avatar-row">
       <img id="cf-avatar-img" class="cf-avatar" style="display:none" alt="头像">
       <input type="file" id="cf-avatar" accept=".png">
-    </div>
+    </div>` : ""}
   </div>
   <div class="cf-section"><h3>${icon("message")} 开场白</h3>
-    <textarea id="cf-first" rows="3" placeholder="新对话开始时，角色说/做的第一段话。写成一个有画面感的小场景，别只写一句问候"></textarea>
+    <textarea id="cf-first" class="cf-autogrow" rows="3" placeholder="新对话开始时，角色说/做的第一段话。写成一个有画面感的小场景"></textarea>
   </div>
-  <div class="cf-section"><h3>${icon("book")} 世界书 <span class="hint">（角色的血肉都在这里；常驻条目始终生效，带关键词的条目被触发时注入）</span></h3>
+  <div class="cf-section"><h3>${icon("book")} 世界书</h3>
     <div id="cf-book"></div>
     <button id="cf-book-add" class="ghost small-btn" type="button">${icon("plus")} 添加条目</button>
   </div>
-  <div class="cf-section"><h3>🔀 正则替换 <span class="hint">（可选；把聊天里的文本按规则替换，一般留空）</span></h3>
+  <details class="cf-section cf-fold">
+    <summary>正则替换<span class="hint">（可选，一般留空）</span></summary>
     <div id="cf-regex"></div>
     <button id="cf-regex-add" class="ghost small-btn" type="button">${icon("plus")} 添加正则</button>
-  </div>
-  ${extra}`;
+  </details>`;
+}
+
+/** 简介/开场白按内容自动撑高，保证一眼看完不用滚动内框 */
+function autoGrow(el) {
+  if (!el) return;
+  const fit = () => {
+    el.style.height = "auto";
+    el.style.height = Math.min(el.scrollHeight + 2, 900) + "px";
+  };
+  el.addEventListener("input", fit);
+  fit();
 }
 
 function bindCardForm(card, mode) {
   fillFormFromCard(card, mode);
-  $("#cf-book-add").addEventListener("click", () => $("#cf-book").insertAdjacentHTML("beforeend", wbRowHTML({}, true)));
+  $("#cf-book-add").addEventListener("click", () => {
+    $("#cf-book").insertAdjacentHTML("beforeend", wbRowHTML({}, true));
+    const last = $("#cf-book").lastElementChild?.querySelector(".wb-edit");
+    last?.classList.add("open");
+  });
   $("#cf-regex-add")?.addEventListener("click", () => $("#cf-regex")?.insertAdjacentHTML("beforeend", rxRowHTML({})));
   document.addEventListener("click", cardFormDelHandler);
   document.addEventListener("click", cardFormEditHandler);
-  $("#cf-avatar").addEventListener("change", async (e) => {
+  // 头像只在「做卡」时可传；卡库里的卡不在这改头像
+  $("#cf-avatar")?.addEventListener("change", async (e) => {
     const f = e.target.files[0];
     if (!f) return;
     const b64 = await fileToBase64(f);
     $("#cf-avatar-img").src = "data:image/png;base64," + b64;
     $("#cf-avatar-img").style.display = "block";
   });
-  if (mode === "edit") fillProvidersIntoForm(card);
+  autoGrow($("#cf-bio"));
+  autoGrow($("#cf-first"));
 }
 
 function cardFormDelHandler(e) {
@@ -402,39 +419,22 @@ function fillFormFromCard(card, mode) {
   // 简介框承载「一句话简介」；导入的酒馆卡如有完整角色档案（description），原样显示、原样保存
   $("#cf-bio").value = st.description || card.identity?.bio || "";
   $("#cf-first").value = st.first_mes ?? "";
-  if (card.identity?.avatar) {
-    $("#cf-avatar-img").src = card.identity.avatar;
-    $("#cf-avatar-img").style.display = "block";
-  } else {
-    $("#cf-avatar-img").style.display = "none";
+  // 头像只在「做卡」页存在；卡库编辑页没有这个控件
+  const avatarImg = $("#cf-avatar-img");
+  if (avatarImg) {
+    if (card.identity?.avatar) {
+      avatarImg.src = card.identity.avatar;
+      avatarImg.style.display = "block";
+    } else {
+      avatarImg.style.display = "none";
+    }
   }
   const entries = st.character_book?.entries?.length ? st.character_book.entries : [];
-  // 表面只显示一行；空白条目（新卡/未填写）自动展开方便填写
+  // 全部折叠：表面只有一行摘要，点「编辑」才展开（参考 RP-Hub）；只有全新空条目才自动展开
   $("#cf-book").innerHTML = entries.length
-    ? entries.map((en, i) => wbRowHTML(en, i === 0 && !en.content, i)).join("")
+    ? entries.map((en, i) => wbRowHTML(en, false, i)).join("")
     : wbRowHTML({}, true);
-  $("#cf-regex").innerHTML = (st.regex_scripts ?? []).map(rxRowHTML).join("");
-  if ($("#cf-rounds")) $("#cf-rounds").value = card.memoryConfig?.auto_rounds ?? 20;
-}
-
-async function fillProvidersIntoForm(card) {
-  try {
-    providersCache = await api.get("/api/providers");
-    const sel = $("#cf-provider");
-    if (!sel) return;
-    sel.innerHTML = '<option value="">（跟随默认）</option>' +
-      providersCache.chat.map((p) => `<option value="${escapeHtml(p.name)}">${escapeHtml(p.name)}${p.isDefault ? "（默认）" : ""}</option>`).join("");
-    const fillModels = () => {
-      const p = providersCache.chat.find((x) => x.name === sel.value);
-      const ms = $("#cf-model");
-      ms.innerHTML = '<option value="">（跟随默认）</option>' +
-        (p ? p.models.map((m) => `<option value="${escapeHtml(m)}">${escapeHtml(m)}</option>`).join("") : "");
-      ms.value = card?.model?.model && p?.models.includes(card.model.model) ? card.model.model : "";
-    };
-    sel.value = card?.model?.provider || "";
-    fillModels();
-    sel.addEventListener("change", fillModels);
-  } catch { /* providers 未配置 */ }
+  if ($("#cf-regex")) $("#cf-regex").innerHTML = (st.regex_scripts ?? []).map(rxRowHTML).join("");
 }
 
 function collectCardForm(card, mode) {
@@ -489,14 +489,7 @@ function collectCardForm(card, mode) {
     }))
     .filter((s) => s.findRegex);
   if (card.identity.avatar === undefined) card.identity.avatar = "";
-  // 模型：只有主表单里真有这两个控件时才覆盖（高级配置弹窗是另一套控件，否则会把刚设的每卡模型清掉）
-  if ($("#cf-provider")) {
-    card.model = { provider: $("#cf-provider").value || undefined, model: $("#cf-model")?.value || undefined };
-  }
-  if ($("#cf-rounds")) {
-    const n = Number($("#cf-rounds").value);
-    card.memoryConfig = { auto_rounds: Number.isFinite(n) ? Math.min(50, Math.max(1, n)) : 20 };
-  }
+  // 模型与记忆一律走「高级配置」弹窗，这里不碰（避免把弹窗刚设的值清掉）
   return card;
 }
 
@@ -906,71 +899,17 @@ function renderCards() {
         <button id="btn-back-grid" class="ghost">← 返回卡库</button>
         <h2 id="editor-title"></h2>
         <div class="editor-actions">
+          <button id="btn-local-chat" class="ghost small-btn">${icon("chat")} 本地聊天</button>
           <button id="btn-adv-config" class="ghost small-btn">${icon("settings")} 高级配置</button>
-          <button id="btn-export-png" class="ghost small-btn">PNG</button>
-          <button id="btn-export-json" class="ghost small-btn">JSON</button>
-          <button id="btn-compile" class="small-btn">✅ 应用到通道</button>
-          <button id="btn-del" class="danger small-btn">${icon("trash")} 删除</button>
           <button id="btn-save" class="primary small-btn">${icon("save")} 保存</button>
         </div>
       </div>
       <div id="card-form-area" class="card-form-area"></div>
-      <div class="chat-test">
-        <div class="chat-head">
-          <h3>${icon("chat")} 聊天测试 <span id="chat-head-hint" class="hint">普通聊天</span></h3>
-          <div>
-            <button id="btn-work-mode" class="ghost small-btn">${icon("tool")} 工作模式</button>
-            <button id="btn-chat-clear" class="ghost small-btn">清空</button>
-          </div>
-        </div>
-        <div class="chat-opts" style="display:none">
-          <span class="opt-group">工具：
-            <label><input type="checkbox" id="tool-code"> 写代码*</label>
-            <label><input type="checkbox" id="tool-file"> 文件</label>
-            <label><input type="checkbox" id="tool-search"> 搜索</label>
-            <label><input type="checkbox" id="tool-weather"> 天气</label>
-            <label><input type="checkbox" id="tool-memory"> 记忆</label>
-            <label><input type="checkbox" id="tool-mcp"> MCP</label>
-          </span>
-          <span class="opt-group">技能：
-            <label><input type="checkbox" id="skill-code"> 代码</label>
-            <label><input type="checkbox" id="skill-trans"> 翻译</label>
-            <label><input type="checkbox" id="skill-write"> 写作</label>
-            <label><input type="checkbox" id="skill-companion"> 陪伴</label>
-          </span>
-          <span class="opt-group">深度：
-            <select id="chat-thinking">
-              <option value="off">关闭</option><option value="auto" selected>自动</option>
-              <option value="low">低</option><option value="medium">中</option>
-              <option value="high">高</option><option value="extreme">极高</option>
-            </select>
-          </span>
-        </div>
-        <div id="chat-log" class="chat-log"></div>
-        <div class="row">
-          <input id="chat-input" placeholder="对这个人设说点什么…">
-          <button id="btn-chat-send" class="primary">发送</button>
-        </div>
-      </div>
     </div>
   </div>`;
 }
 
 function initCards() {
-  const def = capDefaults();
-  const tools = def.tools ?? [];
-  $("#tool-code").checked = tools.includes("code_exec");
-  $("#tool-file").checked = tools.includes("sandbox_list");
-  $("#tool-search").checked = tools.includes("web_search");
-  $("#tool-weather").checked = tools.includes("weather");
-  $("#tool-memory").checked = tools.includes("memory_save");
-  const skills = def.skills ?? [];
-  $("#skill-code").checked = skills.includes("code_expert");
-  $("#skill-trans").checked = skills.includes("translator");
-  $("#skill-write").checked = skills.includes("writing");
-  $("#skill-companion").checked = skills.includes("companion");
-  $("#chat-thinking").value = def.thinking ?? "auto";
-
   $("#btn-import-card").addEventListener("click", () => $("#import-file").click());
   $("#import-file").addEventListener("change", importCard);
   $("#card-search").addEventListener("input", (e) => {
@@ -979,17 +918,20 @@ function initCards() {
   });
   $("#btn-back-grid").addEventListener("click", showCardsGrid);
   $("#btn-adv-config").addEventListener("click", () => openAdvConfig());
-  $("#btn-export-png").addEventListener("click", () => exportCard("png"));
-  $("#btn-export-json").addEventListener("click", () => exportCard("json"));
-  $("#btn-compile").addEventListener("click", compileCard);
-  $("#btn-del").addEventListener("click", deleteCard);
+  $("#btn-local-chat").addEventListener("click", openLocalChat);
   $("#btn-save").addEventListener("click", saveCard);
-  $("#btn-chat-send").addEventListener("click", sendChat);
-  $("#btn-chat-clear").addEventListener("click", clearChat);
-  $("#btn-work-mode").addEventListener("click", toggleWorkMode);
-  $("#chat-input").addEventListener("keydown", (e) => { if (e.key === "Enter") sendChat(); });
 
   loadCardsGrid();
+}
+
+/** 本地聊天：以这张卡为形象，直接进工作模式（保存后跳转） */
+async function openLocalChat() {
+  if (!editingCard) return;
+  await saveCard();
+  localStorage.setItem("ocs_workbench_slug", editingCard.slug);
+  setWorkbenchOn(true);
+  location.hash = "#/home";
+  location.reload();
 }
 
 async function loadCardsGrid() {
@@ -1028,6 +970,11 @@ function renderCardsGrid() {
       <div class="char-card-img">
         ${c.avatar ? `<img src="${c.avatar}" alt="" loading="lazy">` : `<div class="char-card-ph">${escapeHtml(c.name.slice(0, 1))}</div>`}
         <button class="char-card-bot ${bot ? "on" : ""}" title="机器人配置（QQ/微信）">${icon("bot")}</button>
+        <div class="char-card-ops">
+          <button class="cc-op" data-op="png" title="导出 PNG 角色卡">${icon("download")}</button>
+          <button class="cc-op" data-op="json" title="导出 JSON">${icon("clipboard")}</button>
+          <button class="cc-op cc-del" data-op="del" title="删除这张卡">${icon("trash")}</button>
+        </div>
       </div>
       <div class="char-card-info">
         <div class="char-card-name">${escapeHtml(c.name)}</div>
@@ -1038,6 +985,14 @@ function renderCardsGrid() {
       e.stopPropagation();
       openBotDialog(c.slug);
     });
+    d.querySelectorAll(".cc-op").forEach((b) =>
+      b.addEventListener("click", async (e) => {
+        e.stopPropagation();
+        const op = b.dataset.op;
+        if (op === "del") return deleteCardBySlug(c.slug, c.name);
+        exportCardBySlug(c.slug, op);
+      })
+    );
     grid.appendChild(d);
   }
 }
@@ -1231,12 +1186,25 @@ async function openAdvConfig() {
   botsData = bots;
   const bot = (botsData.bots ?? []).find((b) => b.cardSlug === editingCard.slug);
   const cur = editingCard.model ?? {};
-  const provOpts = [`<option value="">（跟随默认提供商）</option>`]
-    .concat(advChatProviders.map((p) => `<option value="${escapeHtml(p.name)}" ${p.name === cur.provider ? "selected" : ""}>${escapeHtml(p.name)}${p.isDefault ? "（默认）" : ""}</option>`))
+  // 未指定时，直接落到真实默认值（第一个提供商 + 它的第一个模型），不显示空括号
+  const fallbackProv = advChatProviders[0];
+  const curProvName = cur.provider || fallbackProv?.name || "";
+  const provOpts = advChatProviders
+    .map((p) => `<option value="${escapeHtml(p.name)}" ${p.name === curProvName ? "selected" : ""}>${escapeHtml(p.name)}</option>`)
+    .join("") || `<option value="">（还没配 API 提供商）</option>`;
+  const curProv = advChatProviders.find((p) => p.name === curProvName);
+  const curModel = cur.model || curProv?.models?.[0] || "";
+  const modelOpts = (curProv?.models ?? [])
+    .map((m) => `<option value="${escapeHtml(m)}" ${m === curModel ? "selected" : ""}>${escapeHtml(m)}</option>`)
+    .join("") || `<option value="">（该提供商未拉取模型）</option>`;
+  // 记忆总结模型：留空=跟随上面的对话模型
+  const memCfg = editingCard.memoryConfig ?? {};
+  const memProvOpts = [`<option value="">跟随对话模型</option>`]
+    .concat(advChatProviders.map((p) => `<option value="${escapeHtml(p.name)}" ${p.name === memCfg.provider ? "selected" : ""}>${escapeHtml(p.name)}</option>`))
     .join("");
-  const curProv = advChatProviders.find((p) => p.name === cur.provider);
-  const modelOpts = [`<option value="">（用提供商第一个模型）</option>`]
-    .concat((curProv?.models ?? []).map((m) => `<option value="${escapeHtml(m)}" ${m === cur.model ? "selected" : ""}>${escapeHtml(m)}</option>`))
+  const memProv = advChatProviders.find((p) => p.name === memCfg.provider);
+  const memModelOpts = [`<option value="">默认</option>`]
+    .concat((memProv?.models ?? []).map((m) => `<option value="${escapeHtml(m)}" ${m === memCfg.model ? "selected" : ""}>${escapeHtml(m)}</option>`))
     .join("");
   const enabledTools = new Set(editingCard.tools?.enabled ?? []);
   const ab = editingCard.abilities ?? {};
@@ -1247,9 +1215,9 @@ async function openAdvConfig() {
   const styleOpts = [`<option value="">（不使用风格）</option>`]
     .concat(presetStoreData.styles.map((s) => `<option value="${escapeHtml(s.id)}" ${cardPresets.style === s.id ? "selected" : ""}>${escapeHtml(s.name)}</option>`))
     .join("");
-  const toolSwitch = (id, label, desc) => `
-    <label class="adv-switch"><input type="checkbox" data-adv-tool="${id}" ${enabledTools.has(id) ? "checked" : ""}>
-      <span><b>${label}</b><small>${desc}</small></span></label>`;
+  // 能力开关：高亮按钮式（不用勾选框，不写说明文字）
+  const capBtn = (key, label, on) =>
+    `<button type="button" class="cap-toggle${on ? " on" : ""}" data-cap="${key}">${label}</button>`;
   const ov = document.createElement("div");
   ov.id = "adv-overlay";
   ov.className = "bot-overlay";
@@ -1260,41 +1228,42 @@ async function openAdvConfig() {
     </div>
 
     <div class="adv-sec">
-      <h4>${icon("zap")} 模型（这张卡单独用哪个模型）</h4>
-      <div class="bot-form">
-        <label>提供商：<select id="adv-model-provider">${provOpts}</select></label>
-        <label>模型：<select id="adv-model-id">${modelOpts}</select></label>
+      <h4>${icon("zap")} 模型</h4>
+      <div class="adv-grid2">
+        <label>提供商<select id="adv-model-provider">${provOpts}</select></label>
+        <label>模型<select id="adv-model-id">${modelOpts}</select></label>
       </div>
     </div>
 
     <div class="adv-sec">
-      <h4>${icon("tool")} 能力开关（普通聊天与机器人的默认行为）</h4>
-      <div class="adv-abilities">
-        ${toolSwitch("web_search", "联网搜索", "可搜索实时信息")}
-        ${toolSwitch("image_gen", "生图", "AI 画图（需在生图配置页设置上游）")}
-        ${toolSwitch("code_exec", "写代码", "沙箱运行代码")}
-        ${toolSwitch("memory_save", "长期记忆", "记住关于你和它的事")}
-        ${toolSwitch("weather", "天气", "查天气预报")}
-        ${toolSwitch("datetime", "时间", "报日期时间")}
-        <label class="adv-switch"><input type="checkbox" id="adv-skill" ${ab.skills !== false ? "checked" : ""}>
-          <span><b>技能库</b><small>代码专家/翻译/写作/陪伴</small></span></label>
-        <label class="adv-switch"><input type="checkbox" id="adv-tts" ${ab.tts === true ? "checked" : ""}>
-          <span><b>TTS 朗读</b><small>自动语音朗读回复（语音合成页配置）</small></span></label>
+      <h4>${icon("tool")} 能力</h4>
+      <div class="cap-toggles">
+        ${capBtn("web_search", "联网搜索", enabledTools.has("web_search"))}
+        ${capBtn("image_gen", "生图", enabledTools.has("image_gen"))}
+        ${capBtn("memory_save", "记忆", enabledTools.has("memory_save"))}
+        ${capBtn("tts", "TTS 朗读", ab.tts === true)}
       </div>
-      <p class="hint">网页「普通聊天」按这里的开关走；「工作模式」可临时手动勾选。</p>
     </div>
 
     <div class="adv-sec">
-      <h4>${icon("sliders")} 角色扮演预设（档位 × 风格）</h4>
-      <div class="bot-form">
-        <label>档位：<select id="adv-tier">${tierOpts}</select></label>
-        <label>风格：<select id="adv-style">${styleOpts}</select></label>
+      <h4>${icon("database")} 记忆</h4>
+      <div class="adv-grid3">
+        <label>每几轮总结<input id="adv-mem-rounds" type="number" min="1" max="50" value="${memCfg.auto_rounds ?? 20}"></label>
+        <label>总结模型<select id="adv-mem-provider">${memProvOpts}</select></label>
+        <label>模型<select id="adv-mem-model">${memModelOpts}</select></label>
       </div>
-      <p class="hint">档位定内容尺度（破甲用不用由你定），风格定心理/动作描写。预设文本在侧边栏「预设」页管理；改完网页试聊立即生效，QQ/微信机器人需在 🤖 里「重编译」。</p>
     </div>
 
     <div class="adv-sec">
-      <h4>${icon("bot")} 机器人接入（这张卡单独接 QQ / 微信）</h4>
+      <h4>${icon("sliders")} 角色扮演预设</h4>
+      <div class="adv-grid2">
+        <label>档位<select id="adv-tier">${tierOpts}</select></label>
+        <label>风格<select id="adv-style">${styleOpts}</select></label>
+      </div>
+    </div>
+
+    <div class="adv-sec">
+      <h4>${icon("bot")} 接入 QQ / 微信</h4>
       <div id="bot-dialog-body"></div>
     </div>
 
@@ -1318,10 +1287,20 @@ async function openAdvConfig() {
 
   $("#adv-model-provider").addEventListener("change", (e) => {
     const p = advChatProviders.find((x) => x.name === e.target.value);
-    $("#adv-model-id").innerHTML = [`<option value="">（用提供商第一个模型）</option>`]
+    $("#adv-model-id").innerHTML = (p?.models ?? [])
+      .map((m) => `<option value="${escapeHtml(m)}">${escapeHtml(m)}</option>`)
+      .join("") || `<option value="">（该提供商未拉取模型）</option>`;
+  });
+  $("#adv-mem-provider").addEventListener("change", (e) => {
+    const p = advChatProviders.find((x) => x.name === e.target.value);
+    $("#adv-mem-model").innerHTML = [`<option value="">默认</option>`]
       .concat((p?.models ?? []).map((m) => `<option value="${escapeHtml(m)}">${escapeHtml(m)}</option>`))
       .join("");
   });
+  // 能力：点一下切换高亮
+  ov.querySelectorAll(".cap-toggle").forEach((b) =>
+    b.addEventListener("click", () => b.classList.toggle("on"))
+  );
 
   $("#adv-save").addEventListener("click", async () => {
     const btn = $("#adv-save");
@@ -1330,9 +1309,16 @@ async function openAdvConfig() {
       const provider = $("#adv-model-provider").value;
       const model = $("#adv-model-id").value;
       editingCard.model = provider ? { provider, ...(model ? { model } : {}) } : {};
+      // 能力：高亮的即启用（tts 归 abilities，其余归 tools.enabled）
+      const onCaps = [...ov.querySelectorAll(".cap-toggle.on")].map((b) => b.dataset.cap);
       editingCard.tools = editingCard.tools ?? { enabled: [], policy: "auto", deny: [] };
-      editingCard.tools.enabled = [...document.querySelectorAll("[data-adv-tool]")].filter((c) => c.checked).map((c) => c.dataset.advTool);
-      editingCard.abilities = { skills: $("#adv-skill").checked, tts: $("#adv-tts").checked };
+      editingCard.tools.enabled = onCaps.filter((c) => c !== "tts");
+      editingCard.abilities = { ...(editingCard.abilities ?? {}), tts: onCaps.includes("tts") };
+      editingCard.memoryConfig = {
+        auto_rounds: Math.min(50, Math.max(1, Number($("#adv-mem-rounds").value) || 20)),
+        provider: $("#adv-mem-provider").value || undefined,
+        model: $("#adv-mem-model").value || undefined,
+      };
       editingCard.presets = {
         ...(editingCard.presets ?? {}),
         tier: $("#adv-tier").value || null,
@@ -1349,14 +1335,12 @@ async function openAdvConfig() {
   });
 }
 
-/** 普通聊天的默认行为来自卡「高级配置」 */
+/** 聊天默认行为来自卡「高级配置」的能力开关 */
 function cardChatOptions() {
   const c = editingCard ?? {};
   const tools = Array.isArray(c.tools?.enabled) ? [...c.tools.enabled] : [];
-  const skills = c.abilities?.skills === false ? [] : ["code_expert", "translator", "writing", "companion"];
-  // 思考深度跟随卡片配置（默认 auto），避免硬编码覆盖卡里的设置
   const thinking = c.chat?.thinking ?? "auto";
-  return { tools, useMCP: false, skills, thinking };
+  return { tools, useMCP: false, skills: [], thinking };
 }
 
 function showCardsGrid() {
@@ -1370,7 +1354,6 @@ async function loadCardIntoEditor(slug) {
   try {
     editingCard = await api.get(`/api/cards/${slug}`);
     chatHistory = [];
-    $("#chat-log").innerHTML = "";
     $("#cards-grid-view").style.display = "none";
     $("#card-edit-view").style.display = "block";
     $("#editor-title").textContent = `编辑：${editingCard.name}`;
@@ -1392,29 +1375,22 @@ async function saveCard() {
   } catch (e) { toast("保存失败：" + e.message, false); }
 }
 
-async function compileCard() {
-  if (!editingCard) return toast("先选择一张卡片", false);
-  await saveCard();
+/** 卡库卡片上的删除（RP-Hub 式，直接在卡上操作） */
+async function deleteCardBySlug(slug, name) {
+  if (!confirm(`确定删除「${name}」？不可恢复。`)) return;
   try {
-    const res = await api.send(`/api/cards/${editingCard.slug}/compile`, { method: "POST" });
-    toast(`✓ 已应用：${res.files.length} 个设定文件已生效到 QQ/微信`);
-  } catch (e) { toast("编译失败：" + e.message, false); }
+    await api.send(`/api/cards/${slug}`, { method: "DELETE" });
+    toast("已删除");
+    loadCardsGrid();
+  } catch (e) { toast("删除失败：" + e.message, false); }
 }
 
-async function deleteCard() {
-  if (!editingCard) return;
-  if (!confirm(`确定删除 ${editingCard.name}？不可恢复。`)) return;
-  await api.send(`/api/cards/${editingCard.slug}`, { method: "DELETE" });
-  showCardsGrid();
-}
-
-async function exportCard(format) {
-  if (!editingCard) return toast("先选择一张卡片", false);
-  await saveCard();
+/** 卡库卡片上的导出（png / json） */
+async function exportCardBySlug(slug, format) {
   try {
-    const r = await api.send(`/api/cards/${editingCard.slug}/export`, { method: "POST", body: JSON.stringify({ format }) });
+    const r = await api.send(`/api/cards/${slug}/export`, { method: "POST", body: JSON.stringify({ format }) });
     downloadDataUrl(r.dataUrl, r.filename);
-    toast("✓ 已导出 " + r.filename);
+    toast("已导出 " + r.filename);
   } catch (e) { toast("导出失败：" + e.message, false); }
 }
 
@@ -2717,54 +2693,6 @@ async function speakText(text) {
     toast("朗读失败：" + e.message, false);
   }
 }
-function gatherChatOptions() {
-  const tools = [];
-  if ($("#tool-code")?.checked) tools.push("code_exec");
-  if ($("#tool-file")?.checked) tools.push("sandbox_list", "sandbox_read", "sandbox_write", "sandbox_grep");
-  if ($("#tool-search")?.checked) tools.push("web_search");
-  if ($("#tool-weather")?.checked) tools.push("weather");
-  if ($("#tool-memory")?.checked) tools.push("memory_save");
-  const skills = [];
-  if ($("#skill-code")?.checked) skills.push("code_expert");
-  if ($("#skill-trans")?.checked) skills.push("translator");
-  if ($("#skill-write")?.checked) skills.push("writing");
-  if ($("#skill-companion")?.checked) skills.push("companion");
-  return { tools, useMCP: $("#tool-mcp")?.checked, skills, thinking: $("#chat-thinking")?.value ?? "auto" };
-}
-function toggleWorkMode() {
-  workMode = !workMode;
-  const btn = $("#btn-work-mode");
-  btn.innerHTML = workMode ? `${icon("chat")} 聊天模式` : `${icon("tool")} 工作模式`;
-  btn.classList.toggle("active", workMode);
-  $(".chat-opts").style.display = workMode ? "flex" : "none";
-  $("#chat-head-hint").textContent = workMode ? "工作模式：手动勾选工具/技能" : "普通聊天";
-}
-let lastChatOpts = null;
-async function sendChat() {
-  const input = $("#chat-input");
-  const message = input.value.trim();
-  if (!message) return;
-  if (!editingCard) { addChatBubble("bot", "请先选择一张人设卡。"); return; }
-  addChatBubble("user", message);
-  input.value = "";
-  chatHistory.push({ role: "user", content: message });
-  const btn = $("#btn-chat-send");
-  btn.disabled = true;
-  // 工作模式=手动勾选；普通聊天=卡「高级配置」的模型工具技能
-  lastChatOpts = workMode ? gatherChatOptions() : cardChatOptions();
-  const opts = lastChatOpts;
-  try {
-    const r = await api.send("/api/chat", {
-      method: "POST",
-      body: JSON.stringify({ slug: editingCard.slug, message, history: chatHistory.slice(0, -1), ...opts }),
-    });
-    await finishTurn(r);
-  } catch (e) {
-    chatHistory.pop();
-    addChatBubble("bot", "⚠ " + e.message);
-  }
-  btn.disabled = false;
-}
 /**
  * 像真人一样分条显示回复：按空行切段，逐条冒出来，每条之间按卡里的 chat.delay 停顿。
  * 与通道端一致（OpenClaw 用 humanDelay 在 block 之间停顿）。
@@ -2793,37 +2721,6 @@ async function addBotReplyHumanLike(rawText) {
   }
 }
 
-async function finishTurn(r) {
-  if (r.type === "reply") {
-    await addBotReplyHumanLike(r.reply);
-    chatHistory.push({ role: "assistant", content: r.reply });
-    if (!workMode && editingCard?.abilities?.tts) speakText(r.reply); // 高级配置开了 TTS → 自动朗读
-  } else if (r.type === "pending") {
-    const bubble = addChatBubble("bot", "需要确认：机器人想调用\n" + r.pending.map((p) => "· " + p.name).join("\n"));
-    const row = document.createElement("div");
-    row.className = "approve-row";
-    const ok = document.createElement("button");
-    ok.className = "small-btn primary"; ok.textContent = "执行";
-    const no = document.createElement("button");
-    no.className = "small-btn danger"; no.textContent = "拒绝";
-    pendingData = { slug: editingCard.slug, messages: r.messages, tools: lastChatOpts?.tools ?? gatherChatOptions().tools, useMCP: lastChatOpts?.useMCP ?? $("#tool-mcp").checked, approve: false };
-    ok.addEventListener("click", async () => { row.remove(); pendingData.approve = true; await sendApprove(); });
-    no.addEventListener("click", async () => { row.remove(); pendingData.approve = false; await sendApprove(); });
-    row.append(ok, no);
-    bubble.parentNode.appendChild(row);
-  }
-}
-async function sendApprove() {
-  const btn = $("#btn-chat-send");
-  btn.disabled = true;
-  try {
-    const r = await api.send("/api/chat/approve", { method: "POST", body: JSON.stringify(pendingData) });
-    pendingData = null;
-    await finishTurn(r);
-  } catch (e) { addChatBubble("bot", "⚠ " + e.message); }
-  btn.disabled = false;
-}
-function clearChat() { chatHistory = []; pendingData = null; $("#chat-log").innerHTML = ""; }
 
 // ============================================================
 //  视图：蒸馏 / 通道 / 能力 / 数据 / 设置

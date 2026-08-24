@@ -34,14 +34,32 @@ $gwPid     = Start-Component 'gateway' 'node.exe' @("$env:APPDATA\npm\node_modul
 $tunnelPid = Start-Component 'tunnel' 'D:\ai_workspace\cloudflared\cloudflared.exe' `
     @('tunnel', '--config', 'C:\Users\followsun\.cloudflared\config-openclaw.yml', 'run', '74975232-d922-4337-9644-76fac4d04c26') 'tunnel' { Test-TunnelRunning }
 
-# 记录实际在跑的 PID（供 stop-stack 使用）
-$entries = @()
+# Record real PIDs (for stop-stack). If a component is already running, look up its PID by port/process.
+# NOTE: keep this file pure ASCII (Chinese comments get misread as GBK and can break parsing on PS5.1).
+function Get-PortPid([int]$port) {
+  $conn = Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1
+  if ($conn) { return $conn.OwningProcess }
+  return 0
+}
+function Get-TunnelPid() {
+  $proc = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+          Where-Object { $_.Name -eq 'cloudflared.exe' -and $_.CommandLine -like '*config-openclaw*' } |
+          Select-Object -First 1
+  if ($proc) { return $proc.ProcessId }
+  return 0
+}
+
+$entries = New-Object System.Collections.ArrayList
 foreach ($pair in @(
-    @{ key = 'server';  pid = $serverPid },
-    @{ key = 'gateway'; pid = $gwPid },
-    @{ key = 'tunnel';  pid = $tunnelPid }
+    @{ key = 'server';  pid = $serverPid; port = 17880 },
+    @{ key = 'gateway'; pid = $gwPid;    port = 18789 },
+    @{ key = 'tunnel';  pid = $tunnelPid; port = 0 }
   )) {
-  if ($pair.pid -gt 0) { $entries += [pscustomobject]@{ key = $pair.key; pid = $pair.pid } }
+  $pidActual = $pair.pid
+  if ($pidActual -le 0) {
+    if ($pair.port -gt 0) { $pidActual = Get-PortPid $pair.port } else { $pidActual = Get-TunnelPid }
+  }
+  if ($pidActual -gt 0) { [void]$entries.Add([pscustomobject]@{ key = $pair.key; pid = $pidActual }) }
 }
 if ($entries.Count -gt 0) {
   [IO.File]::WriteAllText($pidFile, ($entries | ConvertTo-Json))
