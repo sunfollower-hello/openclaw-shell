@@ -77,20 +77,27 @@ export class CardStore {
 
   async save(card: PersonaCard): Promise<PersonaCard> {
     await this.ensure();
-    // 版本快照：覆盖前先留一份旧卡（原来只在 version 变化时存，而 version 从不递增 → 快照永远不生成）
+    // 先落盘正式卡（这一步决定用户看到的"保存完成"快慢）
     const prev = await this.get(card.slug).catch(() => null);
-    if (prev) {
-      await fs.mkdir(this.versionsDir(card.slug), { recursive: true });
-      const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-      await fs.writeFile(
-        path.join(this.versionsDir(card.slug), `v${prev.version}-${stamp}.json`),
-        JSON.stringify(prev, null, 2),
-        "utf8"
-      );
-      await this.pruneVersions(card.slug);
-    }
     await fs.mkdir(path.dirname(this.cardPath(card.slug)), { recursive: true });
     await fs.writeFile(this.cardPath(card.slug), JSON.stringify(card, null, 2), "utf8");
+    // 版本快照放到后台做：卡里可能带 base64 头像（~1MB），同步写会让保存明显变慢
+    if (prev) {
+      void (async () => {
+        try {
+          await fs.mkdir(this.versionsDir(card.slug), { recursive: true });
+          const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+          await fs.writeFile(
+            path.join(this.versionsDir(card.slug), `v${prev.version}-${stamp}.json`),
+            JSON.stringify(prev),
+            "utf8"
+          );
+          await this.pruneVersions(card.slug);
+        } catch {
+          // 快照失败不影响正式保存
+        }
+      })();
+    }
     return card;
   }
 

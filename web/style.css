@@ -1,4 +1,4 @@
-/* 魂匣 SoulBox · 暖纸编辑风（warm paper editorial）· 移动优先 */
+/* SoulBox · 暖纸编辑风（warm paper editorial）· 移动优先 */
 * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
 
 :root {
@@ -519,13 +519,18 @@ button:disabled { opacity: 0.4; cursor: not-allowed; transform: none; }
   box-shadow: 0 4px 14px rgba(0,0,0,.12);
 }
 .ai-cover-actions { display: flex; flex-direction: column; gap: 6px; }
-/* 正则替换行 */
-.rx-row { display: flex; gap: 6px; margin-bottom: 6px; align-items: flex-start; flex-wrap: wrap; }
-.rx-row input { min-width: 0; }
-.rx-name { flex: 1; }
-.rx-find { flex: 1.5; }
-.rx-rep { flex: 1.5; }
-.rx-row .rx-del { flex-shrink: 0; }
+/* 正则行：与世界书条目同款折叠 */
+.rx-row {
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  margin-bottom: 8px;
+  background: var(--card);
+  overflow: hidden;
+}
+.rx-summary { display: flex; gap: 9px; align-items: center; padding: 11px 13px; }
+.rx-title { font-weight: 650; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex-shrink: 0; }
+.rx-summary-meta { font-size: 11.5px; color: var(--faint); font-family: "SF Mono", ui-monospace, Consolas, monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rx-detail { border-top: 1px solid var(--border); padding: 13px; display: flex; flex-direction: column; gap: 10px; }
 .wb-entry {
   border: 1px solid var(--border);
   border-radius: 12px;
@@ -537,20 +542,19 @@ button:disabled { opacity: 0.4; cursor: not-allowed; transform: none; }
   display: flex; gap: 9px; align-items: center;
   padding: 11px 13px;
 }
-.wb-summary:hover { background: var(--panel); }
-.wb-summary { cursor: pointer; transition: background 0.15s; }
-.wb-caret { display: inline-flex; color: var(--faint); transition: transform 0.2s; flex-shrink: 0; }
-.wb-caret .ic { width: 14px; height: 14px; }
-.wb-entry.open .wb-caret { transform: rotate(90deg); color: var(--accent); }
-.wb-title { font-weight: 650; flex-shrink: 0; max-width: 34%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.wb-summary-meta { font-size: 11px; color: var(--accent-dark); background: var(--accent-soft); padding: 1px 8px; border-radius: 20px; white-space: nowrap; flex-shrink: 0; }
-.wb-preview { font-size: 12px; color: var(--faint); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; min-width: 0; }
-.wb-enable { margin-left: auto; display: inline-flex; align-items: center; gap: 4px; font-size: 12px; color: var(--muted); cursor: pointer; white-space: nowrap; flex-shrink: 0; }
-.wb-edit { padding: 3px 10px; flex-shrink: 0; }
-.wb-edit.open { background: var(--ink); border-color: var(--ink); color: #f3efe6; }
-@media (max-width: 700px) {
-  .wb-preview { display: none; }
-  .wb-title { max-width: none; flex: 1; }
+.wb-title { font-weight: 650; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex-shrink: 0; }
+.wb-summary-meta { font-size: 11px; color: var(--accent-dark); background: var(--accent-soft); padding: 2px 9px; border-radius: 20px; white-space: nowrap; flex-shrink: 0; }
+.wb-spacer-flex { flex: 1; min-width: 8px; }
+.wb-enable { display: inline-flex; align-items: center; gap: 4px; font-size: 12px; color: var(--muted); cursor: pointer; white-space: nowrap; flex-shrink: 0; }
+.wb-edit, .rx-edit { padding: 4px 11px; flex-shrink: 0; }
+/* 展开态：整条微微抬起，摘要行成为标题栏 */
+.wb-entry.open, .rx-row.open { border-color: var(--border-strong); box-shadow: var(--shadow); }
+.wb-entry.open .wb-summary, .rx-row.open .rx-summary { background: var(--panel); }
+/* 展开后底部的 保存/取消 */
+.wb-foot {
+  display: flex; justify-content: flex-end; gap: 8px;
+  padding-top: 11px;
+  border-top: 1px solid var(--border);
 }
 
 /* 折叠区块（正则等次要配置） */

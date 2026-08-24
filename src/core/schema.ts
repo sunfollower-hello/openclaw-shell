@@ -264,13 +264,10 @@ const cardModelSchema = z
   })
   .default({});
 
-// ---------- 记忆配置（每 N 轮自动总结一次，默认 20，1-50；可指定独立模型） ----------
+// ---------- 记忆配置（每 N 轮自动总结一次，默认 20，1-50；总结固定用此卡的聊天模型） ----------
 const memoryConfigSchema = z
   .object({
     auto_rounds: z.number().int().min(1).max(50).default(20),
-    // 总结用的模型：留空 = 跟随此卡的对话模型
-    provider: z.string().max(60).optional(),
-    model: z.string().max(120).optional(),
   })
   .default({});
 

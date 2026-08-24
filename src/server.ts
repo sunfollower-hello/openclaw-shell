@@ -156,17 +156,20 @@ app.get("/api/health", (_req, res) => {
 const PROFILE_FILE = () => path.join(dataDir(), "user-profile.json");
 app.get("/api/profile", async (_req, res) => {
   try {
-    res.json(JSON.parse(await fs.readFile(PROFILE_FILE(), "utf8")));
+    const p = JSON.parse(await fs.readFile(PROFILE_FILE(), "utf8"));
+    res.json({ name: p.name ?? "本地用户", avatar: p.avatar ?? "", bio: p.bio ?? "" });
   } catch {
-    res.json({ name: "本地用户", avatar: "" });
+    res.json({ name: "本地用户", avatar: "", bio: "" });
   }
 });
 app.post("/api/profile", async (req, res) => {
   try {
-    const { name, avatar } = req.body ?? {};
+    const { name, avatar, bio } = req.body ?? {};
     const profile = {
       name: String(name ?? "").trim().slice(0, 40) || "本地用户",
       avatar: typeof avatar === "string" && avatar.startsWith("data:image/") && avatar.length < 1_500_000 ? avatar : "",
+      // 用户自我简介：注入聊天 prompt，让 AI 知道"你是谁"（可留空）
+      bio: String(bio ?? "").trim().slice(0, 800),
     };
     await fs.writeFile(PROFILE_FILE(), JSON.stringify(profile), "utf8");
     res.json({ ok: true, profile });
@@ -174,6 +177,16 @@ app.post("/api/profile", async (req, res) => {
     res.status(500).json({ error: String(e) });
   }
 });
+
+/** 读用户资料（供聊天 prompt 注入用户身份） */
+async function readUserProfile(): Promise<{ name: string; bio: string }> {
+  try {
+    const p = JSON.parse(await fs.readFile(PROFILE_FILE(), "utf8"));
+    return { name: String(p.name ?? "").trim(), bio: String(p.bio ?? "").trim() };
+  } catch {
+    return { name: "", bio: "" };
+  }
+}
 
 // ---------- 首页公告 ----------
 const ANNOUNCEMENT_FILE = () => path.join(dataDir(), "announcement.json");
@@ -1309,8 +1322,15 @@ app.post("/api/chat", async (req, res) => {
       ...(Array.isArray(history) ? history.slice(-6) : []).map((m) => String((m as { content?: string })?.content ?? "")),
       String(message),
     ].join("\n");
+    // 用户身份：让 AI 知道"对面是谁"（设置里的昵称/简介，留空则不注入）
+    const me = await readUserProfile();
+    const userBlock =
+      me.name || me.bio
+        ? `\n\n【和你说话的人】${me.name ? `称呼：${me.name}。` : ""}${me.bio ? `\n${me.bio}` : ""}`
+        : "";
     let system =
       (await buildChatSystemAsync(card, await resolveCardPresetBlocks(card), recentText)) +
+      userBlock +
       (toolDefs.length
         ? "\n\n你可以使用工具完成任务（写代码/沙箱文件/搜索/天气/时间/记忆/生图）。用户请求适合用工具完成时，调用工具而不是凭空编造；危险工具会先征得用户同意。"
         : "") +
@@ -1340,10 +1360,7 @@ app.post("/api/chat", async (req, res) => {
 // ---------- 每 N 轮自动记忆（参考 rphub 群聊定期总结思路） ----------
 async function autoMemorize(
   slug: string,
-  card: {
-    model?: { provider?: string; model?: string };
-    memoryConfig?: { auto_rounds?: number; provider?: string; model?: string };
-  },
+  card: { model?: { provider?: string; model?: string }; memoryConfig?: { auto_rounds?: number } },
   messages: unknown[]
 ): Promise<void> {
   const rounds = card.memoryConfig?.auto_rounds ?? 20;
@@ -1357,11 +1374,8 @@ async function autoMemorize(
     return;
   }
   await fs.writeFile(countFile, "0", "utf8");
-  // 记忆总结可指定独立模型；留空则跟随此卡的对话模型
-  const memTarget = card.memoryConfig?.provider
-    ? { model: { provider: card.memoryConfig.provider, model: card.memoryConfig.model } }
-    : card;
-  const llm = await resolveChatLLM(memTarget as never);
+  // 记忆总结固定用这张卡的聊天模型
+  const llm = await resolveChatLLM(card as never);
   if (!llm?.apiKey) return;
   // 已记住的只带最近 100 条给 LLM，避免 token 随文件膨胀
   const existing = (await readAllMemories().then((m) => m[slug] ?? []).catch(() => []))

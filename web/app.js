@@ -158,7 +158,9 @@ function openProfileDialog() {
         </div>
       </div>
       <label>昵称</label>
-      <input id="profile-name" maxlength="40" value="${escapeHtml(userProfile.name)}" placeholder="给自己起个名字">
+      <input id="profile-name" maxlength="40" value="${escapeHtml(userProfile.name)}" placeholder="AI 该怎么称呼你">
+      <label>我的简介<span class="hint">（可留空；填了 AI 聊天时会知道你是谁）</span></label>
+      <textarea id="profile-bio" class="cf-autogrow" rows="4" maxlength="800" placeholder="如：程序员，31 岁，喜欢机械和折腾自建服务；怕吵，说话直接一点没关系">${escapeHtml(userProfile.bio ?? "")}</textarea>
       <div class="row" style="justify-content:flex-end;margin-top:8px">
         <button id="profile-save" class="primary">${icon("check")} 保存</button>
       </div>
@@ -183,11 +185,13 @@ function openProfileDialog() {
   $("#profile-name").addEventListener("input", (e) => {
     if (!newAvatar) $("#profile-avatar-box").textContent = (e.target.value || "本").slice(0, 1);
   });
+  autoGrow($("#profile-bio"));
   $("#profile-save").addEventListener("click", async () => {
     const name = $("#profile-name").value.trim();
     if (!name) return toast("昵称不能为空", false);
     try {
-      const r = await api.send("/api/profile", { method: "POST", body: JSON.stringify({ name, avatar: newAvatar }) });
+      const bio = $("#profile-bio").value.trim();
+      const r = await api.send("/api/profile", { method: "POST", body: JSON.stringify({ name, avatar: newAvatar, bio }) });
       userProfile = r.profile;
       applyProfileToUI();
       ov.remove();
@@ -270,23 +274,21 @@ function wbRowHTML(e, expand, idx) {
     : keyList.length
       ? "触发：" + keyList.slice(0, 2).join("、") + (keyList.length > 2 ? "…" : "")
       : "";
-  const preview = String(e?.content ?? "").replace(/\s+/g, " ").trim().slice(0, 60);
-  return `<div class="wb-entry"${Number.isInteger(idx) ? ` data-idx="${idx}"` : ""}>
+  return `<div class="wb-entry${expand ? " open" : ""}"${Number.isInteger(idx) ? ` data-idx="${idx}"` : ""}>
     <div class="wb-summary">
-      <span class="wb-caret">${icon("chevron")}</span>
       <span class="wb-title">${escapeHtml(title)}</span>
       ${summaryMeta ? `<span class="wb-summary-meta">${escapeHtml(summaryMeta)}</span>` : ""}
-      ${preview ? `<span class="wb-preview">${escapeHtml(preview)}</span>` : ""}
+      <span class="wb-spacer-flex"></span>
       <label class="wb-enable" title="启用 / 停用此条目"><input type="checkbox" class="wb-enabled" ${e?.enabled !== false ? "checked" : ""}> 启用</label>
       <button class="wb-edit ghost small-btn" type="button" title="编辑条目">${icon("pen")} 编辑</button>
-      <button class="wb-del danger small-btn" type="button" title="删除条目">${icon("x")}</button>
+      <button class="wb-del danger small-btn" type="button" title="删除条目">${icon("trash")}</button>
     </div>
     <div class="wb-detail" ${expand ? "" : "hidden"}>
       <div class="wb-grid">
         <div class="wb-field"><label>条目名称</label><input class="wb-comment" placeholder="如：人物形象 / 世界观 / 人物关系" value="${escapeHtml(title)}"></div>
         <div class="wb-field"><label>触发关键词（逗号分隔，常驻条目可留空）</label><input class="wb-keys" placeholder="关键词1, 关键词2" value="${escapeHtml(keys)}"></div>
       </div>
-      <div class="wb-field"><label>条目内容</label><textarea class="wb-content" rows="4" placeholder="角色设定：外貌、性格、语言风格、背景、喜好、雷区……">${escapeHtml(e?.content ?? "")}</textarea></div>
+      <div class="wb-field"><label>条目内容</label><textarea class="wb-content" rows="6" placeholder="角色设定：外貌、性格、语言风格、背景、喜好、雷区……">${escapeHtml(e?.content ?? "")}</textarea></div>
       <div class="wb-grid wb-grid3">
         <div class="wb-field"><label>插入位置</label>
           <select class="wb-pos">${WB_POSITIONS.map(([v, l]) => `<option value="${v}" ${pos === v ? "selected" : ""}>${l}</option>`).join("")}</select>
@@ -298,31 +300,114 @@ function wbRowHTML(e, expand, idx) {
         <label title="常驻条目始终生效，不靠关键词触发"><input type="checkbox" class="wb-constant" ${e?.constant ? "checked" : ""}> 常驻（始终生效）</label>
         <label title="多条条目同时触发时的排序">顺序 <input type="number" class="wb-order" min="0" value="${e?.insertion_order ?? 100}" style="width:56px"></label>
       </div>
+      <div class="wb-foot">
+        <button class="wb-cancel ghost small-btn" type="button">取消</button>
+        <button class="wb-save primary small-btn" type="button">${icon("check")} 保存条目</button>
+      </div>
     </div>
   </div>`;
 }
 
-// 点「编辑」按钮或摘要行任意空白处都能展开/收起（RP-Hub 式折叠）
-function cardFormEditHandler(e) {
-  if (e.target.closest(".wb-del") || e.target.closest(".wb-enable")) return;
-  const btn = e.target.closest(".wb-edit");
-  const summary = btn ? null : e.target.closest(".wb-summary");
-  const entry = (btn || summary)?.closest(".wb-entry");
-  if (!entry) return;
-  const detail = entry.querySelector(".wb-detail");
+/** 读取一个条目/正则行里所有输入控件的当前值（用于「取消」回退） */
+function snapshotFields(root) {
+  return [...root.querySelectorAll("input, textarea, select")].map((el) =>
+    el.type === "checkbox" ? el.checked : el.value
+  );
+}
+function restoreFields(root, snap) {
+  [...root.querySelectorAll("input, textarea, select")].forEach((el, i) => {
+    if (snap[i] === undefined) return;
+    if (el.type === "checkbox") el.checked = snap[i];
+    else el.value = snap[i];
+  });
+}
+
+/** 折叠行展开时把原值存起来，「取消」能回退（世界书 + 正则通用） */
+const foldSnapshots = new WeakMap();
+
+function openFoldRow(row) {
+  const detail = row.querySelector(".wb-detail, .rx-detail");
   if (!detail) return;
-  detail.hidden = !detail.hidden;
-  entry.classList.toggle("open", !detail.hidden);
-  entry.querySelector(".wb-edit")?.classList.toggle("open", !detail.hidden);
+  foldSnapshots.set(row, snapshotFields(detail));
+  detail.hidden = false;
+  row.classList.add("open");
+}
+function closeFoldRow(row) {
+  const detail = row.querySelector(".wb-detail, .rx-detail");
+  if (!detail) return;
+  detail.hidden = true;
+  row.classList.remove("open");
+}
+
+// 世界书/正则折叠：编辑展开，保存收起并刷新摘要，取消回退原值
+function cardFormEditHandler(e) {
+  const row = e.target.closest(".wb-entry, .rx-row");
+  if (!row) return;
+  if (e.target.closest(".wb-edit, .rx-edit")) {
+    if (row.classList.contains("open")) closeFoldRow(row);
+    else openFoldRow(row);
+    return;
+  }
+  if (e.target.closest(".wb-save, .rx-save")) {
+    refreshFoldSummary(row);
+    closeFoldRow(row);
+    toast("条目已更新，记得点右上「保存」写入卡片");
+    return;
+  }
+  if (e.target.closest(".wb-cancel, .rx-cancel")) {
+    const snap = foldSnapshots.get(row);
+    const detail = row.querySelector(".wb-detail, .rx-detail");
+    if (snap && detail) restoreFields(detail, snap);
+    closeFoldRow(row);
+    return;
+  }
+}
+
+/** 保存条目后刷新折叠行上的摘要文字（名称 / 常驻或触发词） */
+function refreshFoldSummary(row) {
+  if (row.classList.contains("wb-entry")) {
+    const name = row.querySelector(".wb-comment")?.value.trim() || "未命名条目";
+    const keys = (row.querySelector(".wb-keys")?.value ?? "").split(/[,，、]/).map((s) => s.trim()).filter(Boolean);
+    const constant = row.querySelector(".wb-constant")?.checked;
+    row.querySelector(".wb-title").textContent = name;
+    const meta = row.querySelector(".wb-summary-meta");
+    const metaText = constant ? "常驻" : keys.length ? "触发：" + keys.slice(0, 2).join("、") + (keys.length > 2 ? "…" : "") : "";
+    if (meta) {
+      meta.textContent = metaText;
+      meta.style.display = metaText ? "" : "none";
+    } else if (metaText) {
+      row.querySelector(".wb-title").insertAdjacentHTML("afterend", `<span class="wb-summary-meta">${escapeHtml(metaText)}</span>`);
+    }
+  } else {
+    const name = row.querySelector(".rx-name")?.value.trim() || "未命名正则";
+    const find = row.querySelector(".rx-find")?.value.trim() || "";
+    row.querySelector(".rx-title").textContent = name;
+    const meta = row.querySelector(".rx-summary-meta");
+    if (meta) meta.textContent = find ? find.slice(0, 24) : "";
+  }
 }
 
 // 正则替换行（可留空；导入的酒馆卡自带正则也会显示在这里）
-function rxRowHTML(s) {
-  return `<div class="rx-row">
-    <input class="rx-name" placeholder="名称（如：去星号）" value="${escapeHtml(s?.scriptName ?? "")}">
-    <input class="rx-find" placeholder="查找（正则表达式）" value="${escapeHtml(s?.findRegex ?? "")}">
-    <input class="rx-rep" placeholder="替换为" value="${escapeHtml(s?.replaceString ?? "")}">
-    <button class="rx-del danger small-btn" type="button" title="删除此正则">${icon("x")}</button>
+function rxRowHTML(s, expand) {
+  const name = s?.scriptName || "未命名正则";
+  const find = s?.findRegex ?? "";
+  return `<div class="rx-row${expand ? " open" : ""}">
+    <div class="rx-summary">
+      <span class="rx-title">${escapeHtml(name)}</span>
+      <span class="rx-summary-meta">${escapeHtml(find.slice(0, 24))}</span>
+      <span class="wb-spacer-flex"></span>
+      <button class="rx-edit ghost small-btn" type="button" title="编辑正则">${icon("pen")} 编辑</button>
+      <button class="rx-del danger small-btn" type="button" title="删除此正则">${icon("trash")}</button>
+    </div>
+    <div class="rx-detail" ${expand ? "" : "hidden"}>
+      <div class="wb-field"><label>名称</label><input class="rx-name" placeholder="如：去星号" value="${escapeHtml(s?.scriptName ?? "")}"></div>
+      <div class="wb-field"><label>查找（正则表达式）</label><input class="rx-find" placeholder="/\\*.*?\\*/g" value="${escapeHtml(find)}"></div>
+      <div class="wb-field"><label>替换为</label><input class="rx-rep" placeholder="留空 = 删除匹配内容" value="${escapeHtml(s?.replaceString ?? "")}"></div>
+      <div class="wb-foot">
+        <button class="rx-cancel ghost small-btn" type="button">取消</button>
+        <button class="rx-save primary small-btn" type="button">${icon("check")} 保存条目</button>
+      </div>
+    </div>
   </div>`;
 }
 
@@ -381,7 +466,7 @@ function bindCardForm(card, mode) {
     const last = $("#cf-book").lastElementChild?.querySelector(".wb-edit");
     last?.classList.add("open");
   });
-  $("#cf-regex-add")?.addEventListener("click", () => $("#cf-regex")?.insertAdjacentHTML("beforeend", rxRowHTML({})));
+  $("#cf-regex-add")?.addEventListener("click", () => $("#cf-regex")?.insertAdjacentHTML("beforeend", rxRowHTML({}, true)));
   document.addEventListener("click", cardFormDelHandler);
   document.addEventListener("click", cardFormEditHandler);
   // 头像只在「做卡」时可传；卡库里的卡不在这改头像
@@ -1147,17 +1232,30 @@ async function startBotLogin(botId) {
   qr.style.display = "block";
   msg.textContent = "二维码生成中…";
   if (botLoginTimer) clearInterval(botLoginTimer);
-  botLoginTimer = setInterval(async () => {
+  // 二维码出现前用 300ms 快轮询抢首帧，拿到码后降到 1.5s 省资源
+  let gotQr = false;
+  const poll = async () => {
     try {
       const s = await api.get(`/api/bots/${botId}/login`);
-      if (s.output) { qr.textContent = s.output; qr.style.display = "block"; }
+      if (s.output) {
+        qr.textContent = s.output;
+        qr.style.display = "block";
+        if (!gotQr) {
+          gotQr = true;
+          msg.textContent = "请用手机扫码";
+          clearInterval(botLoginTimer);
+          botLoginTimer = setInterval(poll, 1500);
+        }
+      }
       if (s.done) {
         clearInterval(botLoginTimer); botLoginTimer = null;
-        msg.textContent = s.ok ? "✓ 扫码成功，账号已绑定！网关重启后路由生效" : "✗ 未成功，检查输出后重试";
+        msg.textContent = s.ok ? "扫码成功，账号已绑定（网关重启后路由生效）" : "未成功，检查输出后重试";
         refreshBots();
       }
     } catch { /* 轮询失败忽略 */ }
-  }, 1500);
+  };
+  poll();
+  botLoginTimer = setInterval(poll, 300);
 }
 
 // ============================================================
@@ -1197,15 +1295,7 @@ async function openAdvConfig() {
   const modelOpts = (curProv?.models ?? [])
     .map((m) => `<option value="${escapeHtml(m)}" ${m === curModel ? "selected" : ""}>${escapeHtml(m)}</option>`)
     .join("") || `<option value="">（该提供商未拉取模型）</option>`;
-  // 记忆总结模型：留空=跟随上面的对话模型
   const memCfg = editingCard.memoryConfig ?? {};
-  const memProvOpts = [`<option value="">跟随对话模型</option>`]
-    .concat(advChatProviders.map((p) => `<option value="${escapeHtml(p.name)}" ${p.name === memCfg.provider ? "selected" : ""}>${escapeHtml(p.name)}</option>`))
-    .join("");
-  const memProv = advChatProviders.find((p) => p.name === memCfg.provider);
-  const memModelOpts = [`<option value="">默认</option>`]
-    .concat((memProv?.models ?? []).map((m) => `<option value="${escapeHtml(m)}" ${m === memCfg.model ? "selected" : ""}>${escapeHtml(m)}</option>`))
-    .join("");
   const enabledTools = new Set(editingCard.tools?.enabled ?? []);
   const ab = editingCard.abilities ?? {};
   const cardPresets = editingCard.presets ?? {};
@@ -1247,10 +1337,8 @@ async function openAdvConfig() {
 
     <div class="adv-sec">
       <h4>${icon("database")} 记忆</h4>
-      <div class="adv-grid3">
-        <label>每几轮总结<input id="adv-mem-rounds" type="number" min="1" max="50" value="${memCfg.auto_rounds ?? 20}"></label>
-        <label>总结模型<select id="adv-mem-provider">${memProvOpts}</select></label>
-        <label>模型<select id="adv-mem-model">${memModelOpts}</select></label>
+      <div class="adv-grid2">
+        <label>每几轮总结一次<input id="adv-mem-rounds" type="number" min="1" max="50" value="${memCfg.auto_rounds ?? 20}"></label>
       </div>
     </div>
 
@@ -1291,12 +1379,6 @@ async function openAdvConfig() {
       .map((m) => `<option value="${escapeHtml(m)}">${escapeHtml(m)}</option>`)
       .join("") || `<option value="">（该提供商未拉取模型）</option>`;
   });
-  $("#adv-mem-provider").addEventListener("change", (e) => {
-    const p = advChatProviders.find((x) => x.name === e.target.value);
-    $("#adv-mem-model").innerHTML = [`<option value="">默认</option>`]
-      .concat((p?.models ?? []).map((m) => `<option value="${escapeHtml(m)}">${escapeHtml(m)}</option>`))
-      .join("");
-  });
   // 能力：点一下切换高亮
   ov.querySelectorAll(".cap-toggle").forEach((b) =>
     b.addEventListener("click", () => b.classList.toggle("on"))
@@ -1316,8 +1398,6 @@ async function openAdvConfig() {
       editingCard.abilities = { ...(editingCard.abilities ?? {}), tts: onCaps.includes("tts") };
       editingCard.memoryConfig = {
         auto_rounds: Math.min(50, Math.max(1, Number($("#adv-mem-rounds").value) || 20)),
-        provider: $("#adv-mem-provider").value || undefined,
-        model: $("#adv-mem-model").value || undefined,
       };
       editingCard.presets = {
         ...(editingCard.presets ?? {}),

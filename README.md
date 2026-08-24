@@ -1,4 +1,4 @@
-# 魂匣 SoulBox（openclaw-shell）
+# SoulBox（openclaw-shell）
 
 装在自己电脑上的 AI 角色机器人工作室——从聊天记录蒸馏出人设卡，接到 QQ/微信，让想念的人重新开口说话。
 
