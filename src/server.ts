@@ -37,6 +37,8 @@ import {
 } from "./core/presets.js";
 import { TOOL_REGISTRY, toolsToOpenAI, resolveInSandbox, type ToolDef, type ToolCtx } from "./tools/registry.js";
 import { SKILL_LIBRARY } from "./core/skills.js";
+import { allSkills, saveUserSkills, skillPromptsByIds, type UserSkill } from "./core/skillStore.js";
+import { FEATURES, filterDisabledTools } from "./core/features.js";
 import {
   getMCPTools,
   loadMCPConfig,
@@ -60,6 +62,7 @@ import {
   type TtsProvider,
 } from "./core/ttsConfig.js";
 import { recordUsage, getUsageSummary } from "./core/ttsUsage.js";
+import QRCode from "qrcode";
 import {
   listEmojis,
   addEmoji,
@@ -91,6 +94,7 @@ import {
   readAllMemories,
   exportMemoryToMarkdown,
   exportAllMemoriesToMarkdown,
+  pushChatRound,
   MEMORY_CATEGORIES,
   type MemoryCategory,
 } from "./core/memoryStore.js";
@@ -273,6 +277,7 @@ app.delete("/api/cards/:slug", async (req, res) => {
     const root = dataDir();
     await fs.rm(path.join(root, "memory", `${slug}.mem`), { force: true }).catch(() => {});
     await fs.rm(path.join(root, "memory", `${slug}.mem.count`), { force: true }).catch(() => {});
+    // 工作区文件是所有卡共享的，删卡不动它；只清这张卡专属的目录
     await Promise.all(
       ["sandbox", "emojis", "images", "agent-workspaces"].map((sub) =>
         fs.rm(path.join(root, sub, slug), { recursive: true, force: true }).catch(() => {})
@@ -323,8 +328,38 @@ app.post("/api/channels/wechat/login", (_req, res) => {
   res.json(startChannelLogin("openclaw-weixin"));
 });
 
-app.get("/api/channels/wechat/login", (_req, res) => {
-  res.json(getChannelLoginState("openclaw-weixin"));
+// 从 CLI 登录输出里揪出二维码链接（微信 weixin.qq.com/q/xxx，QQ q.qq.com/... 或带 qrcode= 的 URL），
+// 后端用 qrcode 库渲染成高清 PNG dataURL，前端 <img> 直接显示——不再靠终端 ASCII 二维码（糊且会被容器裁切）
+function extractQrUrl(output: string): string | null {
+  if (!output) return null;
+  const patterns = [
+    /https?:\/\/[^\s"'）)]*qrcode=[^\s"'）)]+/i,
+    /https?:\/\/(?:short\.)?weixin\.qq\.com\/[^\s"'）)]+/i,
+    /https?:\/\/q\.qq\.com\/[^\s"'）)]+/i,
+    /https?:\/\/[^\s"'）)]*(?:qr|login|bind)[^\s"'）)]*/i,
+  ];
+  for (const re of patterns) {
+    const m = output.match(re);
+    if (m) return m[0].replace(/[.,;：。]+$/, "");
+  }
+  return null;
+}
+async function loginStateWithQr(state: import("./core/openclawCli.js").ChannelLoginState) {
+  const url = extractQrUrl(state.output);
+  let qrDataUrl: string | undefined;
+  if (url) {
+    qrDataUrl = await QRCode.toDataURL(url, {
+      width: 320,
+      margin: 2,
+      errorCorrectionLevel: "M",
+      color: { dark: "#201d18", light: "#ffffff" },
+    }).catch(() => undefined);
+  }
+  return { ...state, qrUrl: url ?? undefined, qrDataUrl };
+}
+
+app.get("/api/channels/wechat/login", async (_req, res) => {
+  res.json(await loginStateWithQr(getChannelLoginState("openclaw-weixin")));
 });
 
 app.get("/api/channels/wechat/pairing", async (_req, res) => {
@@ -368,8 +403,8 @@ app.post("/api/channels/qq/login", (_req, res) => {
   res.json(startChannelLogin("qqbot"));
 });
 
-app.get("/api/channels/qq/login", (_req, res) => {
-  res.json(getChannelLoginState("qqbot"));
+app.get("/api/channels/qq/login", async (_req, res) => {
+  res.json(await loginStateWithQr(getChannelLoginState("qqbot")));
 });
 
 // ---------- 多机器人：每卡一个独立 bot（卡 × 渠道账号 × OpenClaw agent） ----------
@@ -676,7 +711,7 @@ app.get("/api/bots/:id/login", async (req, res) => {
   try {
     const bot = (await listBots()).find((b) => b.id === req.params.id);
     if (!bot) return res.status(404).json({ error: "机器人实例不存在" });
-    res.json(getChannelLoginState(bot.channel, bot.accountId));
+    res.json(await loginStateWithQr(getChannelLoginState(bot.channel, bot.accountId)));
   } catch (e) {
     res.status(500).json({ error: String(e) });
   }
@@ -881,8 +916,7 @@ app.post("/api/cards/cover", async (req, res) => {
     const cfg = await getImageConfig();
     const ready =
       (cfg.provider === "novelai" && cfg.novelai.key) ||
-      (cfg.provider === "openai" && cfg.openai.baseUrl && cfg.openai.key) ||
-      (cfg.provider === "local" && cfg.local.baseUrl);
+      (cfg.provider === "openai" && cfg.openai.baseUrl && cfg.openai.key);
     if (!ready) {
       return res.json({ ok: false, info: "未配置生图：到「生图配置」页填好 Key 后回来一键生成封面" });
     }
@@ -966,6 +1000,19 @@ app.post("/api/providers/set-default", async (req, res) => {
   }
 });
 
+// 停用 / 启用某个提供商（配置保留，不参与选择与解析）
+app.post("/api/providers/toggle", async (req, res) => {
+  try {
+    const { type, name, enabled } = req.body ?? {};
+    if ((type !== "chat" && type !== "image") || !name) return res.status(400).json({ error: "缺少 type / name" });
+    const { setProviderEnabled } = await import("./core/providers.js");
+    const p = await setProviderEnabled(type, name, enabled !== false);
+    res.json({ ok: true, name: p.name, enabled: p.enabled });
+  } catch (e) {
+    res.status(400).json({ error: String(e) });
+  }
+});
+
 // ---------- 蒸馏工厂 ----------
 app.post("/api/distill", async (req, res) => {
   try {
@@ -1028,12 +1075,38 @@ app.post("/api/cards/import", async (req, res) => {
 });
 
 // ---------- 角色卡导出 / 导入（PNG / JSON，CCv2 标准） ----------
+/** 导出文件名：用角色原名（去 Windows 非法字符），不用内部 slug */
+function exportBaseName(card: PersonaCard): string {
+  const n = (card.name || card.slug || "角色卡").replace(/[\\/:*?"<>|\r\n]+/g, "-").trim().slice(0, 60);
+  return n || "角色卡";
+}
+
 async function buildCardExport(card: PersonaCard, format: string): Promise<{ filename: string; dataUrl: string }> {
+  if (format === "chatlog") {
+    // 聊天记录导出：data/memory/<slug>.chatlog.jsonl → 可读 JSON
+    const logFile = path.join(dataDir(), "memory", `${card.slug}.chatlog.jsonl`);
+    const raw = await fs.readFile(logFile, "utf8").catch(() => "");
+    const messages = raw
+      .split(/\r?\n/)
+      .filter(Boolean)
+      .map((l) => {
+        try {
+          const m = JSON.parse(l) as { u?: string; a?: string; t?: string };
+          return { user: m.u ?? "", assistant: m.a ?? "", time: m.t ?? "" };
+        } catch { return null; }
+      })
+      .filter((x): x is { user: string; assistant: string; time: string } => Boolean(x?.user || x?.assistant));
+    const json = JSON.stringify({ card: card.name, exported_at: new Date().toISOString(), messages }, null, 2);
+    return {
+      filename: `${exportBaseName(card)}-聊天记录.json`,
+      dataUrl: "data:application/json;charset=utf-8," + encodeURIComponent(json),
+    };
+  }
   const cc = cardToCCv2(card);
   const json = JSON.stringify(cc, null, 2);
   if (format === "json") {
     return {
-      filename: `${card.slug}.json`,
+      filename: `${exportBaseName(card)}.json`,
       dataUrl: "data:application/json;charset=utf-8," + encodeURIComponent(json),
     };
   }
@@ -1051,14 +1124,15 @@ async function buildCardExport(card: PersonaCard, format: string): Promise<{ fil
     { keyword: "chara", text: b64 },
     { keyword: "ccv3", text: b64 },
   ]);
-  return { filename: `${card.slug}.png`, dataUrl: "data:image/png;base64," + out.toString("base64") };
+  return { filename: `${exportBaseName(card)}.png`, dataUrl: "data:image/png;base64," + out.toString("base64") };
 }
 
 app.post("/api/cards/:slug/export", async (req, res) => {
   try {
     const card = await store.get(req.params.slug);
-    const out = await buildCardExport(card, req.body?.format === "json" ? "json" : "png");
-    res.json({ format: req.body?.format === "json" ? "json" : "png", ...out });
+    const format = ["json", "chatlog"].includes(req.body?.format) ? req.body.format : "png";
+    const out = await buildCardExport(card, format);
+    res.json({ format, ...out });
   } catch (e) {
     res.status(500).json({ error: String(e) });
   }
@@ -1263,9 +1337,11 @@ async function runToolLoop(
 }
 
 async function resolveChatTools(enabledTools: string[], useMCP: boolean): Promise<{ defs: ToolDef[]; mcpErrors: string[] }> {
-  const defs = TOOL_REGISTRY.filter((t) => enabledTools.includes(t.id));
+  // 未启用的功能在这里统一拦掉：即使请求里带了这些工具/开关也不会生效
+  const allowed = filterDisabledTools(enabledTools);
+  const defs = TOOL_REGISTRY.filter((t) => allowed.includes(t.id));
   let mcpErrors: string[] = [];
-  if (useMCP) {
+  if (useMCP && FEATURES.mcp) {
     const m = await getMCPTools();
     defs.push(...m.tools);
     mcpErrors = m.errors;
@@ -1273,10 +1349,30 @@ async function resolveChatTools(enabledTools: string[], useMCP: boolean): Promis
   return { defs, mcpErrors };
 }
 
+/**
+ * 临时换模型：请求里的 "提供商::模型" 覆盖卡片自己的模型设置（只影响这一次请求）。
+ * 传空或格式不对就原样返回，回落到卡片配置。
+ */
+function overrideCardModel<T extends { model?: { provider?: string; model?: string } }>(card: T, raw: unknown): T {
+  const s = typeof raw === "string" ? raw.trim() : "";
+  if (!s.includes("::")) return card;
+  const [provider, modelId] = s.split("::");
+  if (!provider || !modelId) return card;
+  return { ...card, model: { provider, model: modelId } };
+}
+
+/**
+ * 共享工作区：所有卡片共用同一个文件目录（换卡=换对话，文件不换）。
+ * 聊天记录与长期记忆仍按卡隔离，只有文件系统是共享的。
+ */
+function workspaceFilesDir(): string {
+  return path.join(dataDir(), "workspace-files");
+}
+
 function chatCtx(slug: string): ToolCtx {
   return {
     slug,
-    sandboxDir: path.join(dataDir(), "sandbox", slug),
+    sandboxDir: workspaceFilesDir(),
     memoryPath: path.join(dataDir(), "memory", `${slug}.mem`),
     imagesDir: path.join(dataDir(), "images", slug),
   };
@@ -1284,18 +1380,20 @@ function chatCtx(slug: string): ToolCtx {
 
 app.post("/api/chat", async (req, res) => {
   try {
-    const { slug, message, history, tools, skills, thinking, useMCP } = req.body ?? {};
+    const { slug, message, history, tools, skills, thinking, useMCP, model } = req.body ?? {};
     if (!slug || !message) return res.status(400).json({ error: "slug / message 不能为空" });
     const card = await store.get(slug).catch(() => null);
     if (!card) return res.status(404).json({ error: `卡片不存在: ${slug}` });
-    const llm = await resolveChatLLM(card);
+    // 本次聊天可临时换模型（"提供商::模型" 形式），不传则用卡片自己的设置
+    const llm = await resolveChatLLM(overrideCardModel(card, model));
     if (!llm || !llm.apiKey) return res.status(400).json({ error: "未配置模型 API（API 页）" });
     const enabledTools = Array.isArray(tools) ? (tools as string[]) : [];
     const { defs: toolDefs, mcpErrors } = await resolveChatTools(enabledTools, useMCP === true);
 
-    const skillPrompts = (Array.isArray(skills) ? (skills as string[]) : [])
-      .map((id) => SKILL_LIBRARY.find((s) => s.id === id)?.prompt)
-      .filter(Boolean) as string[];
+    // 内置技能 + 用户在设置页自定义的技能都能按 id 命中（技能功能关闭时不注入任何提示词）
+    const skillPrompts = FEATURES.skills
+      ? await skillPromptsByIds(Array.isArray(skills) ? (skills as string[]) : [])
+      : [];
 
     // 相关召回：按关键词重合 + 新鲜度取与当前话题最相关的记忆（最多 30 条）
     const memories = await recall(slug, message, 30).catch(() => []);
@@ -1332,7 +1430,7 @@ app.post("/api/chat", async (req, res) => {
       (await buildChatSystemAsync(card, await resolveCardPresetBlocks(card), recentText)) +
       userBlock +
       (toolDefs.length
-        ? "\n\n你可以使用工具完成任务（写代码/沙箱文件/搜索/天气/时间/记忆/生图）。用户请求适合用工具完成时，调用工具而不是凭空编造；危险工具会先征得用户同意。"
+        ? `\n\n你可以使用以下工具完成任务：${toolDefs.map((t) => t.name).join("、")}。用户请求适合用工具完成时，调用工具而不是凭空编造；危险工具会先征得用户同意。`
         : "") +
       skillPrompts.map((p) => "\n" + p).join("") +
       memoryBlock +
@@ -1348,8 +1446,8 @@ app.post("/api/chat", async (req, res) => {
     ];
     const result = await runToolLoop(llm, messages, toolDefs, chatCtx(slug), card.tools?.policy === "ask", reasoning);
     if (result.type === "reply") {
-      // 每 N 轮自动总结记忆（后台执行，不阻塞回复）
-      void autoMemorize(slug, card, messages).catch(() => {});
+      // 滑动分批自动总结记忆（后台执行，不阻塞回复）
+      void autoMemorize(slug, card, message, (result as { reply?: string }).reply ?? "").catch(() => {});
     }
     res.json(result);
   } catch (e) {
@@ -1357,23 +1455,22 @@ app.post("/api/chat", async (req, res) => {
   }
 });
 
-// ---------- 每 N 轮自动记忆（参考 rphub 群聊定期总结思路） ----------
+// ---------- 每 N 轮自动记忆（滑动分批总结：最近 N 轮保留不总结，攒够 2N 轮总结最早 N 轮，每段只处理一次） ----------
 async function autoMemorize(
   slug: string,
   card: { model?: { provider?: string; model?: string }; memoryConfig?: { auto_rounds?: number } },
-  messages: unknown[]
+  userMsg: string,
+  reply: string
 ): Promise<void> {
   const rounds = card.memoryConfig?.auto_rounds ?? 20;
   if (!rounds || rounds < 1) return;
-  const ctx = chatCtx(slug);
-  const countFile = ctx.memoryPath + ".count";
-  let count = Number(await fs.readFile(countFile, "utf8").catch(() => "0")) || 0;
-  count++;
-  if (count < rounds) {
-    await fs.writeFile(countFile, String(count), "utf8");
-    return;
-  }
-  await fs.writeFile(countFile, "0", "utf8");
+  // 追加本轮并取回「最早的一段」（若未到 2N 轮则返回空，最近 N 轮不受影响）
+  const segment = await pushChatRound(
+    slug,
+    { u: String(userMsg ?? "").slice(0, 500), a: String(reply ?? "").slice(0, 500), t: new Date().toISOString() },
+    rounds
+  ).catch(() => []);
+  if (!segment.length) return;
   // 记忆总结固定用这张卡的聊天模型
   const llm = await resolveChatLLM(card as never);
   if (!llm?.apiKey) return;
@@ -1382,16 +1479,8 @@ async function autoMemorize(
     .slice(-100)
     .map((e) => `- [${e.cat}] ${e.fact}`)
     .join("\n");
-  const recent = messages
-    .filter((m) => {
-      const role = (m as { role?: string }).role;
-      return role === "user" || role === "assistant";
-    })
-    .slice(-(rounds * 2))
-    .map((m) => {
-      const r = m as { role?: string; content?: string };
-      return `${r.role === "user" ? "用户" : "角色"}: ${String(r.content ?? "").slice(0, 500)}`;
-    })
+  const recent = segment
+    .map((r) => `用户: ${r.u}\n角色: ${r.a}`)
     .join("\n");
   if (!recent.trim()) return;
   try {
@@ -1446,12 +1535,12 @@ async function autoMemorize(
 
 app.post("/api/chat/approve", async (req, res) => {
   try {
-    const { slug, messages, approve, tools, useMCP } = req.body ?? {};
+    const { slug, messages, approve, tools, useMCP, model } = req.body ?? {};
     if (!slug || !Array.isArray(messages)) return res.status(400).json({ error: "slug / messages 不能为空" });
     // 与 /api/chat 保持一致：用卡片单独配置的模型（否则审批续聊会静默换回默认模型）
     const card = await store.get(slug).catch(() => null);
     if (!card) return res.status(404).json({ error: `卡片不存在: ${slug}` });
-    const llm = await resolveChatLLM(card);
+    const llm = await resolveChatLLM(overrideCardModel(card, model));
     if (!llm || !llm.apiKey) return res.status(400).json({ error: "未配置模型 API（API 页）" });
     const enabledTools = Array.isArray(tools) ? (tools as string[]) : [];
     const { defs: toolDefs } = await resolveChatTools(enabledTools, useMCP === true);
@@ -1466,8 +1555,14 @@ app.post("/api/chat/approve", async (req, res) => {
     }
     const result = await runToolLoop(llm, messages, toolDefs, chatCtx(slug), card.tools?.policy === "ask");
     if (result.type === "reply") {
-      // 与 /api/chat 一致：审批续聊后的回复同样计入自动记忆轮数
-      void autoMemorize(slug, card, messages).catch(() => {});
+      // 与 /api/chat 一致：审批续聊后的回复同样计入自动记忆（用户消息取 messages 里最后一条 user）
+      const lastUser = [...messages].reverse().find((m) => (m as { role?: string }).role === "user");
+      void autoMemorize(
+        slug,
+        card,
+        String((lastUser as { content?: string } | undefined)?.content ?? ""),
+        (result as { reply?: string }).reply ?? ""
+      ).catch(() => {});
     }
     res.json(result);
   } catch (e) {
@@ -1528,7 +1623,7 @@ app.post("/api/presets/reset", async (_req, res) => {
 });
 
 // ---------- MCP 配置 ----------
-app.get("/api/mcp/config", async (_req, res) => {
+app.get("/api/mcp/config", requireFeature("mcp"), async (_req, res) => {
   try {
     res.json(await loadMCPConfig());
   } catch (e) {
@@ -1536,7 +1631,7 @@ app.get("/api/mcp/config", async (_req, res) => {
   }
 });
 
-app.post("/api/mcp/config", async (req, res) => {
+app.post("/api/mcp/config", requireFeature("mcp"), async (req, res) => {
   try {
     const servers = req.body?.servers;
     if (!Array.isArray(servers)) return res.status(400).json({ error: "servers 必须是数组" });
@@ -1548,8 +1643,37 @@ app.post("/api/mcp/config", async (req, res) => {
   }
 });
 
+/** 功能未启用时挡在 API 层：前端藏了界面，这里保证接口也不生效 */
+function requireFeature(name: keyof typeof FEATURES): express.RequestHandler {
+  return (_req, res, next) => {
+    if (FEATURES[name]) return next();
+    res.status(404).json({ error: `该功能当前未启用（${name}）` });
+  };
+}
+
+// ---------- 技能库（内置 + 用户自定义） ----------
+app.get("/api/skills", requireFeature("skills"), async (_req, res) => {
+  try {
+    res.json({ skills: await allSkills() });
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+// 只保存用户自定义的部分（内置技能不可改）
+app.post("/api/skills", requireFeature("skills"), async (req, res) => {
+  try {
+    const skills = req.body?.skills;
+    if (!Array.isArray(skills)) return res.status(400).json({ error: "skills 必须是数组" });
+    const saved = await saveUserSkills(skills as Array<Partial<UserSkill>>);
+    res.json({ ok: true, count: saved.length, skills: saved });
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
+
 // 测试单个 MCP 服务器：连接 + 拉取工具列表（不保存），供配置表单的「测试连接」用
-app.post("/api/mcp/test", async (req, res) => {
+app.post("/api/mcp/test", requireFeature("mcp"), async (req, res) => {
   try {
     const server = req.body?.server;
     if (!server || typeof server !== "object") return res.status(400).json({ error: "server 不能为空" });
@@ -1559,18 +1683,46 @@ app.post("/api/mcp/test", async (req, res) => {
   }
 });
 
-// ---------- 工作区文件管理（沙箱 data/sandbox/<slug>，供工作台文件面板用） ----------
-const SLUG_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/;
-function sandboxOf(slug: string): string | null {
-  if (!SLUG_RE.test(slug)) return null;
-  return path.join(dataDir(), "sandbox", slug);
+// ---------- 工作区文件管理（共享单目录 data/workspace-files） ----------
+// 所有卡片共用同一份文件；换卡只换对话，不换工作区。请求里的 slug 已不再决定目录，
+// 保留参数只为兼容旧前端调用。
+async function wsBase(): Promise<string> {
+  const base = workspaceFilesDir();
+  await fs.mkdir(base, { recursive: true });
+  await migrateLegacySandboxes(base);
+  return base;
 }
 
-app.get("/api/workspace/list", async (req, res) => {
+/**
+ * 一次性迁移：把旧的每卡沙箱 data/sandbox/<slug>/* 合并进共享工作区。
+ * 同名文件加 <slug>- 前缀避免互相覆盖；迁移完留下 .migrated 标记不再重复执行。
+ */
+let legacyMigrated = false;
+async function migrateLegacySandboxes(base: string): Promise<void> {
+  if (legacyMigrated) return;
+  legacyMigrated = true;
+  const legacyRoot = path.join(dataDir(), "sandbox");
+  const marker = path.join(legacyRoot, ".migrated");
+  if (await fs.stat(marker).then(() => true).catch(() => false)) return;
+  const entries = await fs.readdir(legacyRoot, { withFileTypes: true }).catch(() => []);
+  if (!entries.length) return;
+  for (const e of entries) {
+    if (!e.isDirectory()) continue;
+    const src = path.join(legacyRoot, e.name);
+    const items = await fs.readdir(src, { withFileTypes: true }).catch(() => []);
+    for (const it of items) {
+      const from = path.join(src, it.name);
+      let to = path.join(base, it.name);
+      if (await fs.stat(to).then(() => true).catch(() => false)) to = path.join(base, `${e.name}-${it.name}`);
+      await fs.rename(from, to).catch(() => {});
+    }
+  }
+  await fs.writeFile(marker, new Date().toISOString(), "utf8").catch(() => {});
+}
+
+app.get("/api/workspace/list", requireFeature("workspace"), async (req, res) => {
   try {
-    const slug = String(req.query.slug ?? "");
-    const base = sandboxOf(slug);
-    if (!base) return res.status(400).json({ error: "slug 无效" });
+    const base = await wsBase();
     const dir = resolveInSandbox(base, String(req.query.dir ?? ""));
     if (!dir) return res.status(400).json({ error: "路径越界" });
     const items = await fs.readdir(dir, { withFileTypes: true }).catch(() => null);
@@ -1588,33 +1740,29 @@ app.get("/api/workspace/list", async (req, res) => {
       out.push({ name: it.name, dir: it.isDirectory(), size, mtime });
     }
     out.sort((a, b) => (a.dir === b.dir ? a.name.localeCompare(b.name) : a.dir ? -1 : 1));
-    res.json({ slug, dir: String(req.query.dir ?? ""), items: out });
+    res.json({ dir: String(req.query.dir ?? ""), items: out });
   } catch (e) {
     res.status(500).json({ error: String(e) });
   }
 });
 
-app.post("/api/workspace/write", async (req, res) => {
+app.post("/api/workspace/write", requireFeature("workspace"), async (req, res) => {
   try {
-    const { slug, file, content } = req.body ?? {};
-    const base = sandboxOf(String(slug ?? ""));
-    if (!base) return res.status(400).json({ error: "slug 无效" });
-    const abs = resolveInSandbox(base, String(file ?? ""));
+    const base = await wsBase();
+    const abs = resolveInSandbox(base, String(req.body?.file ?? ""));
     if (!abs) return res.status(400).json({ error: "路径越界" });
     await fs.mkdir(path.dirname(abs), { recursive: true });
-    await fs.writeFile(abs, String(content ?? ""), "utf8");
+    await fs.writeFile(abs, String(req.body?.content ?? ""), "utf8");
     res.json({ ok: true });
   } catch (e) {
     res.status(500).json({ error: String(e) });
   }
 });
 
-app.post("/api/workspace/mkdir", async (req, res) => {
+app.post("/api/workspace/mkdir", requireFeature("workspace"), async (req, res) => {
   try {
-    const { slug, dir } = req.body ?? {};
-    const base = sandboxOf(String(slug ?? ""));
-    if (!base) return res.status(400).json({ error: "slug 无效" });
-    const abs = resolveInSandbox(base, String(dir ?? ""));
+    const base = await wsBase();
+    const abs = resolveInSandbox(base, String(req.body?.dir ?? ""));
     if (!abs) return res.status(400).json({ error: "路径越界" });
     await fs.mkdir(abs, { recursive: true });
     res.json({ ok: true });
@@ -1623,12 +1771,10 @@ app.post("/api/workspace/mkdir", async (req, res) => {
   }
 });
 
-app.post("/api/workspace/delete", async (req, res) => {
+app.post("/api/workspace/delete", requireFeature("workspace"), async (req, res) => {
   try {
-    const { slug, path: rel } = req.body ?? {};
-    const base = sandboxOf(String(slug ?? ""));
-    if (!base) return res.status(400).json({ error: "slug 无效" });
-    const abs = resolveInSandbox(base, String(rel ?? ""));
+    const base = await wsBase();
+    const abs = resolveInSandbox(base, String(req.body?.path ?? ""));
     if (!abs) return res.status(400).json({ error: "路径越界" });
     if (abs === base) return res.status(400).json({ error: "不能删除工作区根目录" });
     await fs.rm(abs, { recursive: true, force: true });
@@ -1638,11 +1784,9 @@ app.post("/api/workspace/delete", async (req, res) => {
   }
 });
 
-app.get("/api/workspace/download", async (req, res) => {
+app.get("/api/workspace/download", requireFeature("workspace"), async (req, res) => {
   try {
-    const slug = String(req.query.slug ?? "");
-    const base = sandboxOf(slug);
-    if (!base) return res.status(400).json({ error: "slug 无效" });
+    const base = await wsBase();
     const abs = resolveInSandbox(base, String(req.query.file ?? ""));
     if (!abs) return res.status(400).json({ error: "路径越界" });
     const st = await fs.stat(abs).catch(() => null);
@@ -1653,14 +1797,12 @@ app.get("/api/workspace/download", async (req, res) => {
   }
 });
 
-app.post("/api/workspace/upload", async (req, res) => {
+app.post("/api/workspace/upload", requireFeature("workspace"), async (req, res) => {
   try {
-    const { slug, file, data } = req.body ?? {};
-    const base = sandboxOf(String(slug ?? ""));
-    if (!base) return res.status(400).json({ error: "slug 无效" });
-    const abs = resolveInSandbox(base, String(file ?? ""));
+    const base = await wsBase();
+    const abs = resolveInSandbox(base, String(req.body?.file ?? ""));
     if (!abs) return res.status(400).json({ error: "路径越界" });
-    let b64 = String(data ?? "");
+    let b64 = String(req.body?.data ?? "");
     if (b64.includes(",")) b64 = b64.slice(b64.indexOf(",") + 1);
     await fs.mkdir(path.dirname(abs), { recursive: true });
     await fs.writeFile(abs, Buffer.from(b64, "base64"));
@@ -1671,32 +1813,25 @@ app.post("/api/workspace/upload", async (req, res) => {
 });
 
 // 工作区概览：所有沙箱目录的文件数与大小（工作台设置页用）
-app.get("/api/workspace/overview", async (_req, res) => {
+// 工作区概览：共享工作区的文件数与总大小
+app.get("/api/workspace/overview", requireFeature("workspace"), async (_req, res) => {
   try {
-    const base = path.join(dataDir(), "sandbox");
-    const entries = await fs.readdir(base, { withFileTypes: true }).catch(() => []);
-    const out = [];
-    for (const e of entries) {
-      if (!e.isDirectory()) continue;
-      const abs = path.join(base, e.name);
-      let files = 0;
-      let size = 0;
-      const walk = async (d: string): Promise<void> => {
-        const items = await fs.readdir(d, { withFileTypes: true }).catch(() => []);
-        for (const it of items) {
-          const p = path.join(d, it.name);
-          if (it.isDirectory()) await walk(p);
-          else {
-            files++;
-            try { size += (await fs.stat(p)).size; } catch { /* 忽略 */ }
-          }
+    const base = await wsBase();
+    let files = 0;
+    let size = 0;
+    const walk = async (d: string): Promise<void> => {
+      const items = await fs.readdir(d, { withFileTypes: true }).catch(() => []);
+      for (const it of items) {
+        const p = path.join(d, it.name);
+        if (it.isDirectory()) await walk(p);
+        else {
+          files++;
+          try { size += (await fs.stat(p)).size; } catch { /* 忽略 */ }
         }
-      };
-      await walk(abs);
-      out.push({ slug: e.name, files, size });
-    }
-    out.sort((a, b) => a.slug.localeCompare(b.slug));
-    res.json({ dirs: out });
+      }
+    };
+    await walk(base);
+    res.json({ path: base, files, size });
   } catch (e) {
     res.status(500).json({ error: String(e) });
   }
@@ -1879,32 +2014,10 @@ app.get("/api/image/config", async (_req, res) => {
     res.json({
       provider: cfg.provider,
       retentionDays: cfg.retentionDays,
-      novelai: {
-        key: maskKey(cfg.novelai.key),
-        model: cfg.novelai.model,
-        steps: cfg.novelai.steps,
-        scale: cfg.novelai.scale,
-        negative: cfg.novelai.negative,
-        sampler: cfg.novelai.sampler,
-        seed: cfg.novelai.seed,
-        ucPreset: cfg.novelai.ucPreset,
-        translate: cfg.novelai.translate,
-      },
-      openai: {
-        baseUrl: cfg.openai.baseUrl,
-        key: maskKey(cfg.openai.key),
-        model: cfg.openai.model,
-        size: cfg.openai.size,
-        translate: cfg.openai.translate,
-      },
-      local: {
-        baseUrl: cfg.local.baseUrl,
-        model: cfg.local.model,
-        steps: cfg.local.steps,
-        cfg: cfg.local.cfg,
-        sampler: cfg.local.sampler,
-        negative: cfg.local.negative,
-      },
+      novelai: { key: maskKey(cfg.novelai.key) },
+      openai: { baseUrl: cfg.openai.baseUrl, key: maskKey(cfg.openai.key) },
+      artists: cfg.artists,
+      activeArtist: cfg.activeArtist,
     });
   } catch (e) {
     res.status(500).json({ error: String(e) });
@@ -1913,37 +2026,25 @@ app.get("/api/image/config", async (_req, res) => {
 
 app.post("/api/image/config", async (req, res) => {
   try {
-    const { provider, novelai, openai, local, retentionDays } = req.body ?? {};
+    const { provider, novelai, openai, artists, activeArtist, retentionDays } = req.body ?? {};
     const cur = await getImageConfig();
+    // 画师串列表：name/content 去空白过滤
+    const nextArtists = Array.isArray(artists)
+      ? (artists as { name?: string; content?: string }[])
+          .map((a) => ({ name: String(a?.name ?? "").trim(), content: String(a?.content ?? "").trim() }))
+          .filter((a) => a.name && a.content)
+      : cur.artists;
     const next = {
-      provider: ["novelai", "openai", "local"].includes(provider) ? provider : cur.provider,
+      provider: provider === "openai" ? "openai" : provider === "novelai" ? "novelai" : cur.provider,
       retentionDays: Number.isFinite(Number(retentionDays)) ? Math.max(0, Math.floor(Number(retentionDays))) : cur.retentionDays,
-      novelai: {
-        key: novelai?.key ? String(novelai.key) : cur.novelai.key,
-        model: novelai?.model ?? cur.novelai.model,
-        steps: Number(novelai?.steps) || cur.novelai.steps,
-        scale: Number(novelai?.scale) || cur.novelai.scale,
-        negative: novelai?.negative ?? cur.novelai.negative,
-        sampler: novelai?.sampler ?? cur.novelai.sampler,
-        seed: typeof novelai?.seed === "number" ? novelai.seed : cur.novelai.seed,
-        ucPreset: ["none", "light", "heavy"].includes(novelai?.ucPreset) ? novelai.ucPreset : cur.novelai.ucPreset,
-        translate: novelai?.translate !== undefined ? Boolean(novelai.translate) : cur.novelai.translate,
-      },
+      novelai: { key: novelai?.key ? String(novelai.key) : cur.novelai.key },
       openai: {
-        baseUrl: openai?.baseUrl ?? cur.openai.baseUrl,
+        baseUrl: openai?.baseUrl !== undefined ? String(openai.baseUrl) : cur.openai.baseUrl,
         key: openai?.key ? String(openai.key) : cur.openai.key,
-        model: openai?.model ?? cur.openai.model,
-        size: openai?.size ?? cur.openai.size,
-        translate: openai?.translate !== undefined ? Boolean(openai.translate) : cur.openai.translate,
       },
-      local: {
-        baseUrl: local?.baseUrl ?? cur.local.baseUrl,
-        model: local?.model ?? cur.local.model,
-        steps: Number(local?.steps) || cur.local.steps,
-        cfg: Number(local?.cfg) || cur.local.cfg,
-        sampler: local?.sampler ?? cur.local.sampler,
-        negative: local?.negative ?? cur.local.negative,
-      },
+      artists: nextArtists,
+      activeArtist:
+        typeof activeArtist === "string" && nextArtists.some((a) => a.name === activeArtist) ? activeArtist : "",
     };
     await saveImageConfig(next);
     res.json({ ok: true, hint: "已保存。工作模式勾选「生图」工具即可让 AI 生成图片" });
@@ -1954,7 +2055,7 @@ app.post("/api/image/config", async (req, res) => {
 
 app.post("/api/image/test", async (req, res) => {
   try {
-    const { provider, novelai, openai, local } = req.body ?? {};
+    const { provider, novelai, openai } = req.body ?? {};
     if (provider === "novelai") {
       const key = novelai?.key ?? (await getImageConfig()).novelai.key;
       if (!key) return res.json({ ok: false, info: "未填 NovelAI Key" });
@@ -1968,17 +2069,6 @@ app.post("/api/image/test", async (req, res) => {
       res.json(await testOpenAIImageKey(String(baseUrl), String(key)));
       return;
     }
-    if (provider === "local") {
-      const baseUrl = local?.baseUrl ?? (await getImageConfig()).local.baseUrl;
-      if (!baseUrl) return res.json({ ok: false, info: "未填本地生图 Base URL" });
-      try {
-        const r = await fetch(`${String(baseUrl).replace(/\/+$/, "")}/sdapi/v1/options`, { signal: AbortSignal.timeout(10000) });
-        res.json({ ok: r.ok, info: r.ok ? "本地服务可达（/sdapi/v1/options 正常）" : `HTTP ${r.status}` });
-      } catch (e) {
-        res.json({ ok: false, info: "本地服务不可达：" + String(e) });
-      }
-      return;
-    }
     res.json({ ok: false, info: "未知提供商" });
   } catch (e) {
     res.status(500).json({ error: String(e) });
@@ -1988,37 +2078,22 @@ app.post("/api/image/test", async (req, res) => {
 // 真实生成一张测试图（保存到 data/images/_test/），配置页「试生一张」用
 app.post("/api/image/generate", async (req, res) => {
   try {
-    const { prompt, negative, aspect, provider, novelai, openai, local } = req.body ?? {};
+    const { prompt, negative, aspect, provider, novelai, openai } = req.body ?? {};
     const { generateImage } = await import("./core/imageGen.js");
     const { getImageConfig } = await import("./core/imageConfig.js");
     const cfg = await getImageConfig();
     // 页面表单可能未保存，用提交值覆盖本次生成
     const override = {
       ...cfg,
-      provider: ["novelai", "openai", "local"].includes(provider) ? provider : cfg.provider,
+      provider: provider === "openai" ? "openai" : provider === "novelai" ? "novelai" : cfg.provider,
       novelai: {
         ...cfg.novelai,
         key: novelai?.key ? String(novelai.key) : cfg.novelai.key,
-        model: novelai?.model ?? cfg.novelai.model,
-        steps: Number(novelai?.steps) || cfg.novelai.steps,
-        scale: Number(novelai?.scale) || cfg.novelai.scale,
-        negative: novelai?.negative ?? cfg.novelai.negative,
-        sampler: novelai?.sampler ?? cfg.novelai.sampler,
       },
       openai: {
         ...cfg.openai,
-        baseUrl: openai?.baseUrl ?? cfg.openai.baseUrl,
+        baseUrl: openai?.baseUrl !== undefined ? String(openai.baseUrl) : cfg.openai.baseUrl,
         key: openai?.key ? String(openai.key) : cfg.openai.key,
-        model: openai?.model ?? cfg.openai.model,
-        size: openai?.size ?? cfg.openai.size,
-      },
-      local: {
-        ...cfg.local,
-        baseUrl: local?.baseUrl ?? cfg.local.baseUrl,
-        steps: Number(local?.steps) || cfg.local.steps,
-        cfg: Number(local?.cfg) || cfg.local.cfg,
-        sampler: local?.sampler ?? cfg.local.sampler,
-        negative: local?.negative ?? cfg.local.negative,
       },
     };
     const saveDir = path.join(dataDir(), "images", "_test");
@@ -2033,7 +2108,7 @@ app.post("/api/image/generate", async (req, res) => {
     );
     if (!r.ok) return res.json({ ok: false, error: r.error });
     const file = r.file ? path.basename(r.file) : "gen.png";
-    res.json({ ok: true, url: `/img/_test/${file}`, promptUsed: r.promptUsed, width: r.width, height: r.height });
+    res.json({ ok: true, url: `/img/_test/${file}`, width: r.width, height: r.height });
   } catch (e) {
     res.status(500).json({ ok: false, error: String(e) });
   }

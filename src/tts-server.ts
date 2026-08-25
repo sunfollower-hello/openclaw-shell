@@ -11,6 +11,8 @@ import { recordUsage } from "./core/ttsUsage.js";
 
 const PORT = Number(process.env.TTS_PORT ?? 17900);
 const HOST = process.env.TTS_HOST ?? "0.0.0.0";
+/** 允许本机自用时的本地兜底合成（售卖部署请勿设置，避免把本地音质卖给客户） */
+const ALLOW_LOCAL = String(process.env.TTS_ALLOW_LOCAL ?? "0") === "1";
 const app = express();
 app.use(express.json({ limit: "2mb" }));
 
@@ -62,6 +64,8 @@ app.post("/v1/audio/speech", async (req, res) => {
     const matched = cfg.providers.find((p) => p.enabled && (p.model === askedModel || askedModel.includes(p.model.split("/").pop() ?? "____")));
     if (matched) providerId = matched.id;
     if (!providerId && cfg.defaultProvider !== "local") providerId = cfg.defaultProvider;
+    // 本机自用允许本地兜底（OpenClaw 调本服务、无上游时用 SAPI/Edge）；售卖部署不设 TTS_ALLOW_LOCAL 则保持不卖本地音质
+    if (!providerId && ALLOW_LOCAL) providerId = "local";
     if (!providerId) {
       res.status(503).json({ error: "服务端未配置可用的 TTS 上游（请先在上游供应商里填写并启用，或设置默认上游）" });
       return;

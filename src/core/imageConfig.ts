@@ -1,43 +1,32 @@
-// 生图配置：NovelAI / OpenAI 兼容 / 本地 SD WebUI（A1111/Forge）
+// 生图配置：NovelAI / OpenAI 兼容（只保留这两家；参数用默认值不开放配置）
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { dataDir } from "./cardStore.js";
 
+export interface ArtistPreset {
+  name: string;
+  content: string;
+}
+
 export interface ImageConfig {
-  provider: "novelai" | "openai" | "local";
-  /** 图片自动清理：保留最近 N 天的正式生图（0 = 不自动清理正式图；_test 试生图始终超 1 天即清） */
+  provider: "novelai" | "openai";
+  /** 图片自动清理：保留最近 N 天的正式生图（0 = 不自动清理） */
   retentionDays: number;
-  novelai: {
-    key: string;
-    model: string;
-    steps: number;
-    scale: number;
-    negative: string;
-    sampler: string;
-    seed: number;
-    ucPreset: "none" | "light" | "heavy";
-    translate: boolean; // 中文 prompt 自动翻译扩写为英文（用默认 chat 模型）
-  };
-  openai: { baseUrl: string; key: string; model: string; size: string; translate: boolean };
-  local: { baseUrl: string; model: string; steps: number; cfg: number; sampler: string; negative: string };
+  novelai: { key: string };
+  openai: { baseUrl: string; key: string };
+  /** 画师串列表（用户可增删改），生成时拼到提示词末尾 */
+  artists: ArtistPreset[];
+  /** 当前生效的画师串名（空 = 不用画师串） */
+  activeArtist: string;
 }
 
 const DEFAULTS: ImageConfig = {
   provider: "novelai",
   retentionDays: 30,
-  novelai: {
-    key: "",
-    model: "nai-diffusion-4-5-full",
-    steps: 28,
-    scale: 6,
-    negative: "bad anatomy,bad hands,bad proportions,blurry,low quality,worst quality,watermark,text",
-    sampler: "k_dpmpp_2m_sde",
-    seed: 0,
-    ucPreset: "heavy",
-    translate: true,
-  },
-  openai: { baseUrl: "", key: "", model: "agnes-image-2.0-flash", size: "1024x1024", translate: true },
-  local: { baseUrl: "", model: "", steps: 24, cfg: 7, sampler: "Euler a", negative: "bad anatomy,bad hands,bad proportions,blurry,low quality,worst quality,watermark,text" },
+  novelai: { key: "" },
+  openai: { baseUrl: "", key: "" },
+  artists: [],
+  activeArtist: "",
 };
 
 async function cfgPath(): Promise<string> {
@@ -47,13 +36,22 @@ async function cfgPath(): Promise<string> {
 export async function getImageConfig(): Promise<ImageConfig> {
   try {
     const c = JSON.parse(await fs.readFile(await cfgPath(), "utf8"));
+    const artists = Array.isArray(c.artists)
+      ? (c.artists as unknown[])
+          .filter((a) => a && typeof a === "object")
+          .map((a) => {
+            const o = a as Record<string, unknown>;
+            return { name: String(o.name ?? "").trim(), content: String(o.content ?? "").trim() };
+          })
+          .filter((a) => a.name && a.content)
+      : [];
     return {
-      ...DEFAULTS,
-      ...c,
+      provider: c.provider === "openai" ? "openai" : "novelai",
       retentionDays: Number(c.retentionDays) || DEFAULTS.retentionDays,
-      novelai: { ...DEFAULTS.novelai, ...(c.novelai ?? {}) },
-      openai: { ...DEFAULTS.openai, ...(c.openai ?? {}) },
-      local: { ...DEFAULTS.local, ...(c.local ?? {}) },
+      novelai: { key: String(c.novelai?.key ?? "") },
+      openai: { baseUrl: String(c.openai?.baseUrl ?? ""), key: String(c.openai?.key ?? "") },
+      artists,
+      activeArtist: artists.some((a) => a.name === c.activeArtist) ? String(c.activeArtist) : "",
     };
   } catch {
     return structuredClone(DEFAULTS);

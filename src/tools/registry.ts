@@ -254,13 +254,13 @@ const imageGen: ToolDef = {
   id: "image_gen",
   name: "生图（AI 绘画）",
   description:
-    "根据文字描述生成图片并发送（需先在「生图配置」页配置提供商与 Key）。参数 prompt 为绘画提示词（中文会自动翻译扩写为英文），negative 为负面词（可选），aspect 为比例（square/portrait/landscape/tall/wide，可选），seed 为随机种子（可选，相同种子可复现）。",
+    "根据文字描述生成图片并发送（需先在「生图配置」页配置提供商与 Key）。参数 prompt 为绘画提示词（必须用英文 Danbooru 标签风格：逗号分隔、含角色/服饰/动作/场景/光线/画质词，不要用自然语言），negative 为负面词（可选），aspect 为比例（square 方图/portrait 竖图/landscape 横图，可选，默认方图），seed 为随机种子（可选，相同种子可复现）。内容尺度：图片必须得体（SFW），即使对话氛围开放也绝不使用裸体/性相关标签（nude、nsfw、nipples、explicit 等），用完整衣着与含蓄描述表达。",
   parameters: {
     type: "object",
     properties: {
-      prompt: { type: "string", description: "绘画提示词（中文自动翻译为英文）" },
+      prompt: { type: "string", description: "绘画提示词" },
       negative: { type: "string", description: "负面提示词（可选）" },
-      aspect: { type: "string", description: "square/portrait/landscape/tall/wide" },
+      aspect: { type: "string", description: "square/portrait/landscape（方图/竖图/横图）" },
       seed: { type: "number", description: "随机种子（可选，固定可复现同一张图）" },
     },
     required: ["prompt"],
@@ -281,8 +281,7 @@ const imageGen: ToolDef = {
     if (!res.ok) return res.error ?? "生图失败";
     const file = res.file ? path.basename(res.file) : "gen.png";
     const url = `/img/${path.basename(ctx.imagesDir)}/${file}`;
-    const translated = res.promptUsed && res.promptUsed !== prompt ? "（中文提示词已自动翻译扩写为英文）" : "";
-    return `已生成图片：${url}${translated}\n实际提示词：${res.promptUsed ?? prompt}`;
+    return `已生成图片：${url}\n提示词：${prompt}`;
   },
 };
 

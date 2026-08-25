@@ -1,19 +1,38 @@
-// 生图核心：NovelAI / OpenAI 兼容 / 本地 SD WebUI（A1111/Forge）
-// 供网页 image_gen 工具与 OpenClaw 端插件复用：统一读 data/imageConfig.json，
-// 调用方只需传 prompt 与保存目录，返回结构化结果（含已保存文件路径）
+// 生图核心：NovelAI / OpenAI 兼容——供网页 image_gen 工具与 OpenClaw 端插件复用
+// 统一读 data/imageConfig.json；调用方只需传 prompt 与保存目录
+// 三档比例（NAI 标准普通分辨率）：方 1024x1024 / 竖 832x1216 / 横 1216x832
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { getImageConfig, type ImageConfig } from "./imageConfig.js";
-// 翻译走与聊天同一套提供商配置（data/providers.json），避免两条独立的模型读取路径
-import { resolveChatLLM } from "./providers.js";
 
 export const ASPECT_SIZES: Record<string, [number, number]> = {
   square: [1024, 1024],
   portrait: [832, 1216],
   landscape: [1216, 832],
-  tall: [768, 1344],
-  wide: [1344, 768],
 };
+
+// NovelAI 固定默认参数（不对用户开放；对齐 RP-Hub：steps 40 / scale 6 / k_dpmpp_2m_sde / karras）
+const NAI_MODEL = "nai-diffusion-4-5-full";
+const NAI_STEPS = 40;
+const NAI_SCALE = 6;
+const NAI_SAMPLER = "k_dpmpp_2m_sde";
+const NAI_NOISE_SCHEDULE = "karras";
+const NAI_UC_PRESET = 2; // heavy
+// 负面提示词：由用户两套常用负面合并去重而来（保留 NAI 权重语法）
+const NAI_NEGATIVE =
+  "worst quality, bad quality, low quality, lowres, blurry, jpeg artifacts, film grain, scan artifacts, chromatic aberration, dithering, disorganized colors, unfinished, incomplete, sloppiness, cheesy, artistic error, " +
+  "text, logo, signature, watermark, too many watermarks, username, 1990s (style), " +
+  "oekaki, halftone, screentone, multiple views, negative space, blank page, variant set, large variant set, " +
+  "artist:gaoo (frpjx283), artist:matsunaga kouyou, artist:nameo (judgemasterkou), artist:bb (baalbuddy), " +
+  "{{{bad anatomy}}}, {bad hands}, {{{too many fingers}}}, extra fingers, extra digits, fewer digits, {{{fused fingers}}}, interlocked fingers, badly drawn hands, anatomically incorrect hands, poorly drawn hands, malformed limbs, " +
+  "{{{extra arms}}}, {{{extra legs}}}, extra limbs, {{missing arms}}, {missing fingers}, {{missing legs}}, {{{long neck}}}, gross proportions, {{{bad proportions}}}, {bad feet}, " +
+  "{{{deformed}}}, {{{disfigured}}}, {{{mutation}}}, cloned face, poorly drawn face, undetailed eyes, very displeasing, colored inner hair, " +
+  // 内容尺度：图片一律 SFW（至少不露三点）。破甲档只管聊天文字，生图全局禁露骨标签
+  "nsfw, {nudity}, {nude}, {naked}, topless, bottomless, exposed breasts, bare breasts, nipples, areola, crotch, pussy, penis, genitals, pubic hair, sex, sexual, intercourse, penetration, porn, hentai, uncensored, no clothes, undressing";
+
+// OpenAI 兼容固定默认（不对用户开放）
+const OAI_MODEL = "agnes-image-2.0-flash";
+const OAI_FALLBACK_SIZE = "1024x1024";
 
 export interface GenParams {
   prompt: string;
@@ -22,8 +41,6 @@ export interface GenParams {
   seed?: number;
   /** 覆盖配置（配置页测试场景可注入）；默认读 data/imageConfig.json */
   cfg?: ImageConfig;
-  /** 显式要求翻译（配置开启或工具参数要求时生效） */
-  translate?: boolean;
 }
 
 export interface GenResult {
@@ -35,51 +52,10 @@ export interface GenResult {
   height?: number;
   /** saveDir 提供时，保存后的文件绝对路径 */
   file?: string;
-  /** 实际使用的提示词（翻译后，未翻译时同原 prompt） */
-  promptUsed?: string;
   provider?: string;
 }
 
 const GEN_TIMEOUT = 180_000;
-const HAS_CJK = /[\u4e00-\u9fff]/;
-
-function hasCjk(s: string): boolean {
-  return HAS_CJK.test(s);
-}
-
-/** 中文 prompt → 英文 Danbooru 风格（用默认 chat 模型；失败返回 null 用原文） */
-async function translatePrompt(prompt: string): Promise<string | null> {
-  const llm = await resolveChatLLM();
-  if (!llm?.baseUrl || !llm.apiKey || !llm.model) return null;
-  try {
-    const r = await fetch(`${llm.baseUrl.replace(/\/+$/, "")}/chat/completions`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${llm.apiKey}` },
-      body: JSON.stringify({
-        model: llm.model,
-        messages: [
-          {
-            role: "system",
-            content:
-              "你是绘画提示词翻译助手。把用户的中文绘画描述翻译并扩写成英文 Danbooru 风格提示词（逗号分隔、含人物/服饰/动作/场景/光线/画质词），只输出提示词本身，不要任何解释或前言。",
-          },
-          { role: "user", content: prompt },
-        ],
-        temperature: 0.8,
-        max_tokens: 600,
-      }),
-      signal: AbortSignal.timeout(30_000),
-    });
-    if (!r.ok) return null;
-    const j = (await r.json()) as { choices?: { message?: { content?: string } }[] };
-    const text = j.choices?.[0]?.message?.content?.trim();
-    return text || null;
-  } catch {
-    return null;
-  }
-}
-
-const UC_PRESETS: Record<string, number> = { none: 0, light: 1, heavy: 2 };
 
 function httpError(service: string, status: number, body: string): string {
   const b = body.slice(0, 160);
@@ -104,14 +80,9 @@ export async function generateImage(params: GenParams, saveDir?: string): Promis
   const aspect = params.aspect && ASPECT_SIZES[params.aspect] ? params.aspect : "square";
   const [w, h] = ASPECT_SIZES[aspect];
 
-  // prompt 翻译：配置开启或显式要求，且 prompt 含中文时才调模型（英文直接跳过）
-  let usedPrompt = prompt;
-  const wantTranslate = params.translate ?? false;
-  const translateOn = cfg.novelai.translate || cfg.openai.translate;
-  if ((wantTranslate || translateOn) && hasCjk(prompt)) {
-    const t = await translatePrompt(prompt);
-    if (t) usedPrompt = t;
-  }
+  // 画师串：当前生效的画师串拼到提示词末尾
+  const artist = cfg.artists.find((a) => a.name === cfg.activeArtist)?.content ?? "";
+  const usedPrompt = artist ? `${prompt}, ${artist}` : prompt;
 
   let buf: Buffer | null = null;
   let mimeType = "image/png";
@@ -119,28 +90,24 @@ export async function generateImage(params: GenParams, saveDir?: string): Promis
 
   try {
     if (provider === "novelai" && cfg.novelai.key) {
-      const negative = String(params.negative ?? cfg.novelai.negative ?? "");
-      const sampler = cfg.novelai.sampler || "k_dpmpp_2m_sde";
-      const seed = params.seed ?? cfg.novelai.seed ?? 0;
-      const ucPreset = UC_PRESETS[String(cfg.novelai.ucPreset ?? "heavy")] ?? 2;
       const r = await fetch("https://image.novelai.net/ai/generate-image", {
         method: "POST",
         headers: { Authorization: `Bearer ${cfg.novelai.key}`, "Content-Type": "application/json" },
         body: JSON.stringify({
           input: usedPrompt,
-          model: cfg.novelai.model || "nai-diffusion-4-5-full",
+          model: NAI_MODEL,
           action: "generate",
           parameters: {
             width: w,
             height: h,
-            scale: cfg.novelai.scale || 6,
-            negative_prompt: negative,
-            steps: cfg.novelai.steps || 28,
-            sampler,
-            seed,
+            scale: NAI_SCALE,
+            negative_prompt: String(params.negative ?? NAI_NEGATIVE),
+            steps: NAI_STEPS,
+            sampler: NAI_SAMPLER,
+            seed: params.seed ?? 0,
             n_samples: 1,
-            noise_schedule: "karras",
-            ucPreset,
+            noise_schedule: NAI_NOISE_SCHEDULE,
+            ucPreset: NAI_UC_PRESET,
           },
         }),
         signal: AbortSignal.timeout(GEN_TIMEOUT),
@@ -149,55 +116,32 @@ export async function generateImage(params: GenParams, saveDir?: string): Promis
       const ct = r.headers.get("content-type") ?? "";
       if (/jpeg|jpg/i.test(ct)) mimeType = "image/jpeg";
       buf = Buffer.from(await r.arrayBuffer());
-    } else if (provider === "openai" && cfg.openai.key) {
+    } else if (provider === "openai" && cfg.openai.baseUrl && cfg.openai.key) {
       const size = `${w}x${h}`;
       const call = (sz: string): Promise<Response> =>
         fetch(`${cfg.openai.baseUrl.replace(/\/+$/, "")}/images/generations`, {
           method: "POST",
           headers: { "Content-Type": "application/json", Authorization: `Bearer ${cfg.openai.key}` },
-          body: JSON.stringify({ model: cfg.openai.model, prompt: usedPrompt, n: 1, size: sz, response_format: "b64_json" }),
+          body: JSON.stringify({ model: OAI_MODEL, prompt: usedPrompt, n: 1, size: sz, response_format: "b64_json" }),
           signal: AbortSignal.timeout(GEN_TIMEOUT),
         });
       let r = await call(size);
-      // 部分兼容端点不支持任意尺寸：非正方形时失败可退回配置里的默认尺寸
-      if (!r.ok && aspect !== "square" && cfg.openai.size && cfg.openai.size !== size) {
-        r = await call(cfg.openai.size);
+      // 部分兼容端点不支持高分辨率尺寸：失败可退回 1024x1024
+      if (!r.ok && size !== OAI_FALLBACK_SIZE) {
+        r = await call(OAI_FALLBACK_SIZE);
       }
       if (!r.ok) return { ok: false, error: httpError("生图 API", r.status, await r.text().catch(() => "")) };
       const j = (await r.json()) as { data?: { b64_json?: string }[] };
       const b64 = j.data?.[0]?.b64_json;
       if (!b64) return { ok: false, error: "生图 API 返回里没有图片数据" };
       buf = Buffer.from(b64, "base64");
-    } else if (provider === "local" && cfg.local.baseUrl) {
-      const negative = String(params.negative ?? cfg.local.negative ?? "");
-      const r = await fetch(`${cfg.local.baseUrl.replace(/\/+$/, "")}/sdapi/v1/txt2img`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          prompt: usedPrompt,
-          negative_prompt: negative,
-          steps: cfg.local.steps || 24,
-          cfg_scale: cfg.local.cfg || 7,
-          sampler_name: cfg.local.sampler || "Euler a",
-          width: w,
-          height: h,
-          seed: params.seed ?? -1,
-          save_images: false,
-        }),
-        signal: AbortSignal.timeout(GEN_TIMEOUT),
-      });
-      if (!r.ok) return { ok: false, error: httpError("本地生图", r.status, await r.text().catch(() => "")) };
-      const j = (await r.json()) as { images?: string[] };
-      const b64 = j.images?.[0];
-      if (!b64) return { ok: false, error: "本地生图未返回图片数据" };
-      buf = Buffer.from(b64, "base64");
     } else {
       return {
         ok: false,
         error:
-          provider === "local"
-            ? "本地生图未配置地址（「生图配置」页填 Base URL 后启用）"
-            : "未配置生图：请到「生图配置」页填写 Key 并选择提供商",
+          provider === "openai"
+            ? "未配置生图：请到「生图配置」页填写 OpenAI 兼容的 Base URL 与 Key"
+            : "未配置生图：请到「生图配置」页填写 NovelAI Key",
       };
     }
   } catch (e) {
@@ -217,5 +161,5 @@ export async function generateImage(params: GenParams, saveDir?: string): Promis
     }
   }
 
-  return { ok: true, buffer: buf, mimeType, width: w, height: h, file, promptUsed: usedPrompt, provider };
+  return { ok: true, buffer: buf, mimeType, width: w, height: h, file, provider };
 }

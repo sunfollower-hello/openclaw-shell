@@ -22,12 +22,12 @@ export default definePluginEntry({
       name: "image_gen",
       label: "生图（AI 绘画）",
       description:
-        "根据文字描述生成图片并发送给用户（需先在 openclaw-shell 网页「生图配置」页配置提供商与 Key）。参数 prompt 为绘画提示词（中文会自动翻译扩写为英文），negative 为负面词（可选），aspect 为比例（square/portrait/landscape/tall/wide，可选），seed 为随机种子（可选）。生成成功后图片会随你的回复发送出去。",
+        "根据文字描述生成图片并发送给用户（需先在 openclaw-shell 网页「生图配置」页配置提供商与 Key）。参数 prompt 为绘画提示词（必须用英文 Danbooru 标签风格：逗号分隔、含角色/服饰/动作/场景/光线/画质词，不要用自然语言），negative 为负面词（可选），aspect 为比例（square 方图/portrait 竖图/landscape 横图，可选），seed 为随机种子（可选）。内容尺度：图片必须得体（SFW），即使对话氛围开放也绝不使用裸体/性相关标签（nude、nsfw、nipples、explicit 等），用完整衣着与含蓄描述表达。生成成功后图片会随你的回复发送出去。",
       parameters: Type.Object({
-        prompt: Type.String({ description: "绘画提示词（中文自动翻译为英文）" }),
+        prompt: Type.String({ description: "绘画提示词" }),
         negative: Type.Optional(Type.String({ description: "负面提示词（可选）" })),
         aspect: Type.Optional(
-          Type.String({ description: "比例：square/portrait/landscape/tall/wide（可选）" })
+          Type.String({ description: "比例：square/portrait/landscape（方图/竖图/横图）" })
         ),
         seed: Type.Optional(Type.Number({ description: "随机种子（可选，固定可复现同一张图）" })),
       }),

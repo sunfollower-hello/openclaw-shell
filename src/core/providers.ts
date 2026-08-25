@@ -12,6 +12,8 @@ export interface Provider {
   baseUrl: string;
   apiKey: string;
   models: string[];
+  /** false = 停用（配置留着但不参与选择/解析）；缺省视为启用 */
+  enabled?: boolean;
 }
 
 export interface ProvidersFile {
@@ -56,6 +58,10 @@ export async function listProviders(maskKey = true): Promise<ProvidersFile> {
   data = await migrateFromOpenclaw(data);
   data.chat ??= [];
   data.image ??= [];
+  // 老数据没有 enabled 字段，一律视为启用
+  for (const arr of [data.chat, data.image]) {
+    for (const p of arr) p.enabled = p.enabled !== false;
+  }
   if (maskKey) {
     const mask = (p: Provider): Provider => ({ ...p, apiKey: p.apiKey ? p.apiKey.slice(0, 6) + "…" : "" });
     return { chat: data.chat.map(mask), image: data.image.map(mask) };
@@ -85,6 +91,7 @@ export async function saveProvider(
     baseUrl: String(input.baseUrl ?? "").trim(),
     apiKey: input.apiKey?.trim() ? input.apiKey.trim() : (prev?.apiKey ?? ""),
     models: input.models?.length ? input.models : (prev?.models ?? []),
+    enabled: prev ? prev.enabled !== false : true, // 编辑不改停用状态，新建默认启用
   };
   if (!entry.baseUrl) throw new Error("Base URL 不能为空");
   if (i >= 0) arr[i] = entry;
@@ -99,6 +106,17 @@ export async function deleteProvider(type: ProviderType, name: string): Promise<
   data[type] = data[type].filter((p) => p.name !== name);
   await writeProviders(data);
   if (type === "chat") await syncToOpenclaw(data);
+}
+
+/** 启用 / 停用某个提供商（配置保留，只是不再参与选择与解析） */
+export async function setProviderEnabled(type: ProviderType, name: string, enabled: boolean): Promise<Provider> {
+  const data = await listProviders(false);
+  const p = data[type].find((x) => x.name === name);
+  if (!p) throw new Error(`找不到提供商 ${name}`);
+  p.enabled = enabled;
+  await writeProviders(data);
+  if (type === "chat") await syncToOpenclaw(data);
+  return p;
 }
 
 /** 把某个提供商移到第一位（成为默认） */
@@ -129,7 +147,9 @@ export async function fetchModels(baseUrl: string, apiKey: string): Promise<stri
 
 /** 把 chat 提供商同步到 openclaw.json（第一个 = 默认 API，其第一个模型 = 默认模型） */
 export async function syncToOpenclaw(data?: ProvidersFile): Promise<void> {
-  const d = data ?? (await listProviders(false));
+  const all = data ?? (await listProviders(false));
+  // 停用的提供商不写进 openclaw.json（否则通道端仍会用到它）
+  const d: ProvidersFile = { chat: all.chat.filter((p) => p.enabled !== false), image: all.image };
   if (d.chat.length === 0) return;
   let cfg: Record<string, any>;
   try {
@@ -160,15 +180,19 @@ export async function syncToOpenclaw(data?: ProvidersFile): Promise<void> {
   await fs.writeFile(openclawConfigPath(), JSON.stringify(cfg, null, 2), "utf8");
 }
 
-/** 解析聊天用的 LLM 配置：卡片单独配置优先，否则第一个 chat 提供商 */
+/**
+ * 解析聊天用的 LLM 配置：卡片单独配置优先，否则第一个「启用中」的 chat 提供商。
+ * 卡片指定的提供商若已被停用，同样回落到默认，避免聊天直接失败。
+ */
 export async function resolveChatLLM(
   card?: { model?: { provider?: string; model?: string } }
 ): Promise<{ baseUrl: string; apiKey: string; model: string; provider: string } | null> {
   const d = await listProviders(false);
-  let p = card?.model?.provider ? d.chat.find((x) => x.name === card.model?.provider) : undefined;
+  const usable = d.chat.filter((x) => x.enabled !== false);
+  let p = card?.model?.provider ? usable.find((x) => x.name === card.model?.provider) : undefined;
   let modelId = card?.model?.model;
   if (!p) {
-    p = d.chat[0];
+    p = usable[0];
     modelId = undefined;
   }
   if (!p || !p.apiKey) return null;

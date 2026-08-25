@@ -62,6 +62,15 @@ function toast(msg, ok = true) {
   t._timer = setTimeout(() => t.classList.remove("show"), 2600);
 }
 
+// ================= 功能开关 =================
+// 有争议或暂时难做好的能力先整体关掉：界面不显示、逻辑不启用（代码保留，将来想开只改这里）。
+// 后端也有一份同名开关（src/core/features.ts），两边都关才算真的没启用。
+const FEATURES = {
+  skills: false,     // 技能库（内置 + 自定义）
+  mcp: false,        // MCP 工具服务器
+  workspace: false,  // 工作区文件面板 / 沙箱读写 / 代码执行
+};
+
 const DEFAULTS_KEY = "ocs_cap_defaults";
 function capDefaults() {
   try { return JSON.parse(localStorage.getItem(DEFAULTS_KEY) || "{}"); } catch { return {}; }
@@ -89,6 +98,7 @@ const ICONS = {
   package: '<path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><path d="m3.3 7 8.7 5 8.7-5"/><path d="M12 22V12"/>',
   settings: '<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33h.08a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51h.08a1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82v.08a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>',
   download: '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="m7 10 5 5 5-5"/><path d="M12 15V3"/>',
+  export: '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="m12 3 5 5h-4v7h-2V8H7z"/>',
   plus: '<path d="M12 5v14"/><path d="M5 12h14"/>',
   save: '<path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><path d="M17 21v-8H7v8"/><path d="M7 3v5h8"/>',
   bot: '<rect x="4" y="8.5" width="16" height="11.5" rx="2.5"/><path d="M12 8.5V5.5"/><circle cx="12" cy="3.8" r="1.3"/><path d="M9 14.5h.01M15 14.5h.01" stroke-width="2.4"/>',
@@ -173,10 +183,20 @@ function openProfileDialog() {
   $("#profile-avatar-file").addEventListener("change", async (e) => {
     const f = e.target.files[0];
     if (!f) return;
-    if (f.size > 1_000_000) return toast("头像请小于 1MB", false);
+    if (f.size > 15_000_000) return toast("图片太大了（最大 15MB）", false);
     const b64 = await fileToBase64(f);
-    newAvatar = `data:${f.type || "image/png"};base64,${b64}`;
-    $("#profile-avatar-box").innerHTML = `<img src="${newAvatar}" alt="">`;
+    // 1:1 裁切 + 压缩（程序内压缩，不再要求用户手动压小）
+    openImageCropper({
+      dataUrl: `data:${f.type || "image/png"};base64,${b64}`,
+      targetSize: 256,
+      format: "image/jpeg",
+      quality: 0.85,
+      title: "裁切头像",
+      onDone: (dataUrl) => {
+        newAvatar = dataUrl;
+        $("#profile-avatar-box").innerHTML = `<img src="${dataUrl}" alt="">`;
+      },
+    });
   });
   $("#profile-avatar-remove").addEventListener("click", () => {
     newAvatar = "";
@@ -242,6 +262,8 @@ function router() {
   $("#view").innerHTML = route.render();
   closeDrawer();
   $("#view").scrollTop = 0;
+  // 本地聊天是整页布局（自己内部滚动），容器要去掉内边距与外层滚动，避免双滚动条
+  $("#view").classList.toggle("lc-host", hash === "home" && workbenchOn());
   document.querySelectorAll(".drawer-nav a").forEach((a) =>
     a.classList.toggle("active", a.dataset.route === hash)
   );
@@ -412,39 +434,29 @@ function rxRowHTML(s, expand) {
 }
 
 function cardFormHTML(mode) {
-  // 编辑已有卡：不要头像（卡库里的卡头像不在这改）、不要模型/记忆（都在「高级配置」里）
+  // 编辑已有卡：名称/简介在下方展示；做卡页的名称/简介/封面在顶部大图区
   const isCreate = mode === "create";
-  return `
-  <div class="cf-section"><h3>${icon("info")} 基本信息</h3>
+  const base = isCreate ? "" : `
+  <div class="cf-section"><h3>基本信息</h3>
     <div class="cf-grid">
       <div><label>名称</label><input id="cf-name" placeholder="如：许桃"></div>
-      ${isCreate ? `<div><label>slug（留空自动）</label><input id="cf-slug" placeholder="xutao"></div>` : ""}
-      ${isCreate ? `<div><label>关系类型</label>
-        <select id="cf-role">
-          <option value="friend">朋友</option><option value="family">家人</option>
-          <option value="self">自己</option><option value="partner">前任/恋人</option>
-          <option value="colleague">同事</option><option value="public-figure">偶像/角色</option>
-        </select></div>` : ""}
     </div>
     <label>简介</label>
     <textarea id="cf-bio" class="cf-autogrow" rows="3" placeholder="如：开甜品铺的 26 岁姑娘，嘴上凶巴巴，心里软乎乎的"></textarea>
-    ${isCreate ? `<label>头像（PNG，可选）</label>
-    <div class="cf-avatar-row">
-      <img id="cf-avatar-img" class="cf-avatar" style="display:none" alt="头像">
-      <input type="file" id="cf-avatar" accept=".png">
-    </div>` : ""}
-  </div>
-  <div class="cf-section"><h3>${icon("message")} 开场白</h3>
+  </div>`;
+  return `
+  ${base}
+  <div class="cf-section"><h3>开场白</h3>
     <textarea id="cf-first" class="cf-autogrow" rows="3" placeholder="新对话开始时，角色说/做的第一段话。写成一个有画面感的小场景"></textarea>
   </div>
-  <div class="cf-section"><h3>${icon("book")} 世界书</h3>
+  <div class="cf-section"><h3>世界书</h3>
     <div id="cf-book"></div>
-    <button id="cf-book-add" class="ghost small-btn" type="button">${icon("plus")} 添加条目</button>
+    <button id="cf-book-add" class="ghost small-btn" type="button">＋ 添加条目</button>
   </div>
   <details class="cf-section cf-fold">
     <summary>正则替换<span class="hint">（可选，一般留空）</span></summary>
     <div id="cf-regex"></div>
-    <button id="cf-regex-add" class="ghost small-btn" type="button">${icon("plus")} 添加正则</button>
+    <button id="cf-regex-add" class="ghost small-btn" type="button">＋ 添加正则</button>
   </details>`;
 }
 
@@ -499,7 +511,6 @@ function cardFormDelHandler(e) {
 function fillFormFromCard(card, mode) {
   const st = card.sillytavern_v2 ?? {};
   $("#cf-name").value = card.name ?? "";
-  if (mode === "create" && $("#cf-slug")) $("#cf-slug").value = card.slug ?? "";
   if (mode === "create" && $("#cf-role")) $("#cf-role").value = card.identity?.role ?? "friend";
   // 简介框承载「一句话简介」；导入的酒馆卡如有完整角色档案（description），原样显示、原样保存
   $("#cf-bio").value = st.description || card.identity?.bio || "";
@@ -524,7 +535,6 @@ function fillFormFromCard(card, mode) {
 
 function collectCardForm(card, mode) {
   card.name = $("#cf-name").value.trim() || card.name;
-  if (mode === "create" && $("#cf-slug")) card.slug = $("#cf-slug").value.trim();
   card.identity = card.identity ?? {};
   card.sillytavern_v2 = card.sillytavern_v2 ?? {};
   const st = card.sillytavern_v2;
@@ -590,13 +600,35 @@ function greeting() {
   return "晚上好";
 }
 
+/** 今天的日期 + 一句应景的诗词（按月份选，副标题用） */
+function todayLine() {
+  const d = new Date();
+  const weeks = ["日", "一", "二", "三", "四", "五", "六"];
+  const dateStr = `${d.getFullYear()}年${d.getMonth() + 1}月${d.getDate()}日 星期${weeks[d.getDay()]}`;
+  const poems = {
+    1: "爆竹声中一岁除，春风送暖入屠苏。",
+    2: "碧玉妆成一树高，万条垂下绿丝绦。",
+    3: "等闲识得东风面，万紫千红总是春。",
+    4: "人间四月芳菲尽，山寺桃花始盛开。",
+    5: "小荷才露尖尖角，早有蜻蜓立上头。",
+    6: "接天莲叶无穷碧，映日荷花别样红。",
+    7: "绿树阴浓夏日长，楼台倒影入池塘。",
+    8: "云天收夏色，木叶动秋声。",
+    9: "自古逢秋悲寂寥，我言秋日胜春朝。",
+    10: "停车坐爱枫林晚，霜叶红于二月花。",
+    11: "落红不是无情物，化作春泥更护花。",
+    12: "墙角数枝梅，凌寒独自开。",
+  };
+  return `${dateStr} · ${poems[d.getMonth() + 1] ?? ""}`;
+}
+
 function renderHome() {
   return workbenchOn() ? renderWorkbench() : `
   <div class="view home-view">
     <div class="home-hero">
       <div class="home-hero-main">
         <div class="home-hero-hi">${greeting()}，<span id="home-uname">${escapeHtml(userProfile.name)}</span></div>
-        <div class="home-hero-sub" id="home-hero-sub">正在读取工作台状态…</div>
+        <div class="home-hero-sub" id="home-hero-sub">—</div>
       </div>
       <div class="home-hero-avatar" id="home-avatar">${userProfile.avatar ? `<img src="${userProfile.avatar}" alt="">` : escapeHtml((userProfile.name || "本").slice(0, 1))}</div>
     </div>
@@ -639,21 +671,19 @@ async function refreshHome() {
         ? `<img src="${userProfile.avatar}" alt="">`
         : escapeHtml((userProfile.name || "本").slice(0, 1));
     }
-    const [ann, cards, active] = await Promise.all([
+    const [ann, cards] = await Promise.all([
       api.get("/api/announcement").catch(() => ({ text: "" })),
       api.get("/api/cards").catch(() => ({ cards: [] })),
-      api.get("/api/active-persona").catch(() => null),
     ]);
     const noticeBody = $("#home-notice-body");
     if (noticeBody) {
       noticeBody.classList.toggle("muted", !ann.text);
       noticeBody.textContent = ann.text || "暂无公告";
     }
+    // 副标题 = 今天的日期 + 一句应景诗词（不再显示"当前人设"：共享 workspace 无法准确判断谁在生效）
     const sub = $("#home-hero-sub");
     if (sub) {
-      const n = cards.cards?.length ?? 0;
-      const persona = active?.active ? `当前人设「${active.active}」` : "还没有应用人设";
-      sub.textContent = `${persona} · 卡库 ${n} 张`;
+      sub.textContent = `${todayLine()}`;
     }
     const grid = $("#home-card-grid");
     if (!grid) return;
@@ -692,40 +722,51 @@ let wbDir = "";
 
 function renderWorkbench() {
   return `
-  <div class="view workbench">
-    <div class="wb-top">
-      <label class="wb-pick">助手：
-        <select id="wb-card"><option value="">— 选择卡片 —</option></select>
-      </label>
-      <span class="wb-hint muted" id="wb-model-hint"></span>
-      <span class="wb-spacer"></span>
-      <button id="wb-exit" class="ghost small-btn">退出工作模式</button>
-    </div>
-    <div class="wb-main">
-      <div class="card-box wb-chat">
-        <div class="chat-head">
-          <h3>${icon("chat")} 工作台聊天 <span class="hint" id="wb-chat-hint"></span></h3>
-          <button id="wb-chat-clear" class="ghost small-btn">${icon("trash")} 清空</button>
-        </div>
-        <div id="chat-log" class="chat-log"></div>
-        <div class="row">
-          <input id="wb-input" placeholder="让助手干活：写代码、整理文件、查资料、画图…">
-          <button id="wb-send" class="primary">发送</button>
+  <div class="lc-root">
+    <!-- 顶栏：头像 + 角色名 + 切卡 / 清空 / 退出 -->
+    <div class="lc-top">
+      <div class="lc-who" id="lc-who">
+        <div class="lc-avatar" id="lc-avatar"></div>
+        <div class="lc-who-text">
+          <div class="lc-name" id="lc-name">选择角色卡</div>
+          <div class="lc-sub" id="lc-sub">本地聊天</div>
         </div>
       </div>
-      <div class="card-box wb-files">
-        <div class="wb-files-head">
-          <h3>${icon("package")} 工作区</h3>
-          <div class="row" style="gap:4px">
-            <button id="wb-refresh" class="ghost small-btn">刷新</button>
-            <button id="wb-new-file" class="ghost small-btn">文件</button>
-            <button id="wb-new-dir" class="ghost small-btn">目录</button>
-            <button id="wb-upload" class="ghost small-btn">上传</button>
-            <input type="file" id="wb-upload-input" style="display:none">
-          </div>
+      <div class="lc-top-actions">
+        <select id="wb-card" class="lc-card-sel"><option value="">— 选择卡片 —</option></select>
+        <button id="wb-chat-clear" class="ghost small-btn" title="清空对话">${icon("trash")}</button>
+        <button id="wb-exit" class="ghost small-btn">退出本地聊天</button>
+      </div>
+    </div>
+
+    <!-- 消息区 -->
+    <div id="chat-log" class="lc-log"></div>
+
+    <!-- 底部输入浮岛：工具行（联网搜索/思考深度/模型） + 输入行 -->
+    <div class="lc-dock">
+      <div class="lc-island">
+        <div class="lc-tools">
+          <button type="button" id="wb-websearch" class="lc-icon-btn" title="联网搜索" aria-pressed="false">${icon("search")}</button>
+          <label class="lc-chip lc-chip-sel" title="思考深度">
+            ${icon("zap")}
+            <select id="wb-thinking">
+              <option value="off">不思考</option><option value="auto" selected>自动</option>
+              <option value="low">浅</option><option value="medium">中</option>
+              <option value="high">深</option><option value="extreme">极深</option>
+            </select>
+          </label>
+          <span class="lc-tools-gap"></span>
+          <label class="lc-chip lc-chip-sel" title="模型商">
+            <select id="lc-provider"><option value="">跟随卡片</option></select>
+          </label>
+          <label class="lc-chip lc-chip-sel lc-model-chip" title="模型">
+            <select id="lc-model"><option value="">—</option></select>
+          </label>
         </div>
-        <div class="wb-crumb" id="wb-crumb"></div>
-        <div class="wb-list" id="wb-list"><span class="muted">（先选一张卡片）</span></div>
+        <div class="lc-input-row">
+          <textarea id="wb-input" rows="1" placeholder="回车换行，双击回车发送…"></textarea>
+          <button id="wb-send" class="lc-send" title="发送">${icon("send")}</button>
+        </div>
       </div>
     </div>
   </div>`;
@@ -738,16 +779,45 @@ async function initWorkbench() {
   sel.innerHTML = `<option value="">— 选择卡片 —</option>` + wbCards.map((c) => `<option value="${escapeHtml(c.slug)}">${escapeHtml(c.name)}</option>`).join("");
   sel.addEventListener("change", () => wbPickCard(sel.value));
   $("#wb-send").addEventListener("click", wbSend);
-  $("#wb-input").addEventListener("keydown", (e) => { if (e.key === "Enter") wbSend(); });
-  $("#wb-chat-clear").addEventListener("click", () => { wbChatHistory = []; wbPending = null; $("#chat-log").innerHTML = ""; });
-  $("#wb-exit").addEventListener("click", () => { setWorkbenchOn(false); location.reload(); });
-  $("#wb-refresh").addEventListener("click", wbLoadFiles);
-  $("#wb-new-file").addEventListener("click", wbNewFile);
-  $("#wb-new-dir").addEventListener("click", wbNewDir);
-  $("#wb-upload").addEventListener("click", () => $("#wb-upload-input").click());
-  $("#wb-upload-input").addEventListener("change", wbUpload);
-  $("#wb-list").addEventListener("click", wbFilesClick);
-  $("#wb-crumb").addEventListener("click", wbFilesClick);
+  // 单击回车换行、双击回车发送（对齐 RP-Hub；中文输入法组字中不拦截）
+  const input = $("#wb-input");
+  input.addEventListener("keydown", wbInputEnter);
+  input.addEventListener("input", () => wbAutoGrow(input));
+  $("#wb-chat-clear").addEventListener("click", () => {
+    if (wbChatHistory.length && !confirm("清空当前对话？")) return;
+    wbChatHistory = []; wbPending = null; $("#chat-log").innerHTML = "";
+  });
+  // 退出走 SPA 内部切换，不整页重载（重载会重新拉 200KB 脚本，明显卡顿）
+  $("#wb-exit").addEventListener("click", () => { setWorkbenchOn(false); router(); });
+  // 聊天选项记住上次的选择
+  const wbOpts = wbChatOpts();
+  // 联网搜索：纯图标按钮，高亮即开启
+  const ws = $("#wb-websearch");
+  ws.classList.toggle("on", wbOpts.websearch === true);
+  ws.setAttribute("aria-pressed", wbOpts.websearch === true ? "true" : "false");
+  ws.addEventListener("click", () => {
+    const on = !ws.classList.contains("on");
+    ws.classList.toggle("on", on);
+    ws.setAttribute("aria-pressed", on ? "true" : "false");
+    saveWbChatOpts();
+  });
+  $("#wb-thinking").value = wbOpts.thinking ?? "auto";
+  $("#wb-thinking").addEventListener("change", saveWbChatOpts);
+  // 模型两级联动：先选模型商，再选它的模型
+  $("#lc-provider").addEventListener("change", () => { fillLcModelOptions(""); saveWbChatOpts(); });
+  $("#lc-model").addEventListener("change", saveWbChatOpts);
+  await loadLcProviders(wbOpts.provider ?? "", wbOpts.model ?? "");
+  // 工作区文件面板（FEATURES.workspace 关闭时不渲染，跳过绑定）
+  if (FEATURES.workspace) {
+    $("#wb-refresh").addEventListener("click", wbLoadFiles);
+    $("#wb-new-file").addEventListener("click", wbNewFile);
+    $("#wb-new-dir").addEventListener("click", wbNewDir);
+    $("#wb-upload").addEventListener("click", () => $("#wb-upload-input").click());
+    $("#wb-upload-input").addEventListener("change", wbUpload);
+    $("#wb-list").addEventListener("click", wbFilesClick);
+    $("#wb-crumb").addEventListener("click", wbFilesClick);
+    wbLoadFiles(); // 工作区共享，不等选卡
+  }
   const last = localStorage.getItem("ocs_workbench_slug");
   if (last) { sel.value = last; await wbPickCard(last); }
 }
@@ -760,14 +830,109 @@ async function wbPickCard(slug) {
   wbDir = "";
   $("#chat-log").innerHTML = "";
   localStorage.setItem("ocs_workbench_slug", slug);
+  const nameEl = $("#lc-name");
+  const subEl = $("#lc-sub");
+  const avEl = $("#lc-avatar");
   if (slug) {
     wbCardObj = await api.get(`/api/cards/${slug}`).catch(() => null);
-    const m = wbCardObj?.model;
-    $("#wb-chat-hint").textContent = m?.provider || m?.model ? `（${m.provider}${m.model ? "/" + m.model : ""}）` : "（跟随默认提供商）";
+    const c = wbCardObj;
+    if (nameEl) nameEl.textContent = c?.name ?? slug;
+    if (avEl) {
+      avEl.innerHTML = c?.identity?.avatar
+        ? `<img src="${c.identity.avatar}" alt="">`
+        : `<span>${escapeHtml((c?.name ?? "?").slice(0, 1))}</span>`;
+    }
+    const m = c?.model;
+    if (subEl) subEl.textContent = m?.provider || m?.model ? `${m.provider ?? ""}${m.model ? " / " + m.model : ""}` : "跟随默认提供商";
+    // 有开场白且还没聊过 → 先把开场白显示出来（不入历史，避免影响上下文）
+    const first = c?.sillytavern_v2?.first_mes?.trim();
+    if (first && !wbChatHistory.length) addChatBubble("bot", first);
   } else {
-    $("#wb-chat-hint").textContent = "";
+    if (nameEl) nameEl.textContent = "选择角色卡";
+    if (subEl) subEl.textContent = "本地聊天";
+    if (avEl) avEl.innerHTML = "";
   }
-  wbLoadFiles();
+  if (FEATURES.workspace) wbLoadFiles();
+}
+
+// 本地聊天可用的模型商（已过滤停用项）
+let lcProviders = [];
+
+/** 模型商下拉：只列启用中的；选「跟随卡片」则用卡自己的模型设置 */
+async function loadLcProviders(curProvider, curModel) {
+  const sel = $("#lc-provider");
+  if (!sel) return;
+  try {
+    const prov = await api.get("/api/providers");
+    lcProviders = (prov.chat ?? []).filter((p) => p.enabled !== false);
+  } catch { lcProviders = []; }
+  const has = lcProviders.some((p) => p.name === curProvider);
+  sel.innerHTML = [`<option value="">跟随卡片</option>`]
+    .concat(lcProviders.map((p) => `<option value="${escapeHtml(p.name)}" ${has && p.name === curProvider ? "selected" : ""}>${escapeHtml(p.name)}</option>`))
+    .join("");
+  fillLcModelOptions(has ? curModel : "");
+}
+
+/** 按当前模型商填充模型下拉 */
+function fillLcModelOptions(curModel) {
+  const sel = $("#lc-model");
+  if (!sel) return;
+  const p = lcProviders.find((x) => x.name === $("#lc-provider")?.value);
+  if (!p) { sel.innerHTML = `<option value="">—</option>`; sel.disabled = true; return; }
+  sel.disabled = false;
+  const models = p.models ?? [];
+  sel.innerHTML = models.length
+    ? models.map((m) => `<option value="${escapeHtml(m)}" ${m === curModel ? "selected" : ""}>${escapeHtml(m)}</option>`).join("")
+    : `<option value="">—</option>`;
+}
+
+/** 输入框随内容长高（上限 160px） */
+function wbAutoGrow(el) {
+  el.style.height = "auto";
+  el.style.height = Math.min(el.scrollHeight, 160) + "px";
+}
+
+// 双击回车发送：420ms 内连按两次算发送，单击只换行
+let lcEnterPending = false;
+let lcEnterTimer = null;
+function wbInputEnter(e) {
+  if (e.key !== "Enter") return;
+  if (e.isComposing || e.keyCode === 229) return; // 中文输入法组字中，别当发送
+  if (e.shiftKey) return;                          // Shift+Enter 只换行
+  if (lcEnterPending) {
+    lcEnterPending = false;
+    if (lcEnterTimer) { clearTimeout(lcEnterTimer); lcEnterTimer = null; }
+    e.preventDefault();
+    const el = $("#wb-input");
+    el.value = el.value.replace(/(?:\r?\n)+$/, "").replace(/[ \t]+$/, ""); // 去掉第一次回车留下的空行
+    if (el.value.trim()) wbSend();
+    return;
+  }
+  lcEnterPending = true;
+  if (lcEnterTimer) clearTimeout(lcEnterTimer);
+  lcEnterTimer = setTimeout(() => { lcEnterPending = false; lcEnterTimer = null; }, 420);
+  setTimeout(() => wbAutoGrow($("#wb-input")), 0);
+}
+
+// 工作台聊天选项（联网搜索 + 思考深度 + 模型），记在本地
+const WB_OPTS_KEY = "ocs_wb_chat_opts";
+function wbChatOpts() {
+  try { return JSON.parse(localStorage.getItem(WB_OPTS_KEY) || "{}"); } catch { return {}; }
+}
+function saveWbChatOpts() {
+  localStorage.setItem(WB_OPTS_KEY, JSON.stringify({
+    websearch: $("#wb-websearch")?.classList.contains("on") === true,
+    thinking: $("#wb-thinking")?.value ?? "auto",
+    provider: $("#lc-provider")?.value ?? "",
+    model: $("#lc-model")?.value ?? "",
+  }));
+}
+
+/** 本次聊天的模型覆盖："提供商::模型"；选「跟随卡片」返回空串 */
+function lcModelOverride() {
+  const p = $("#lc-provider")?.value ?? "";
+  const m = $("#lc-model")?.value ?? "";
+  return p && m ? `${p}::${m}` : "";
 }
 
 async function wbSend() {
@@ -780,8 +945,18 @@ async function wbSend() {
   wbChatHistory.push({ role: "user", content: message });
   const btn = $("#wb-send");
   btn.disabled = true;
-  const def = capDefaults();
-  wbLastOpts = { tools: def.tools ?? [], useMCP: true, skills: def.skills ?? [], thinking: def.thinking ?? "auto" };
+  wbAutoGrow(input); // 清空后收回高度
+  // 能力跟随这张卡的「高级配置」；联网搜索由输入框旁的按钮临时叠加
+  const cardTools = Array.isArray(wbCardObj?.tools?.enabled) ? [...wbCardObj.tools.enabled] : [];
+  const tools = FEATURES.workspace ? cardTools : cardTools.filter((t) => !WORKSPACE_TOOL_IDS.includes(t));
+  if ($("#wb-websearch")?.classList.contains("on") && !tools.includes("web_search")) tools.push("web_search");
+  wbLastOpts = {
+    tools,
+    useMCP: false,
+    skills: [],
+    thinking: $("#wb-thinking")?.value ?? wbCardObj?.chat?.thinking ?? "auto",
+    model: lcModelOverride(),
+  };
   try {
     const r = await api.send("/api/chat", {
       method: "POST",
@@ -799,6 +974,7 @@ async function wbFinishTurn(r) {
   if (r.type === "reply") {
     addChatBubble("bot", r.reply);
     wbChatHistory.push({ role: "assistant", content: r.reply });
+    if (wbCardObj?.abilities?.tts) speakText(r.reply); // 卡的高级配置开了 TTS → 自动朗读
   } else if (r.type === "pending") {
     const bubble = addChatBubble("bot", "需要确认：助手想调用\n" + r.pending.map((p) => "· " + p.name).join("\n"));
     const row = document.createElement("div");
@@ -807,7 +983,7 @@ async function wbFinishTurn(r) {
     ok.className = "small-btn primary"; ok.textContent = "执行";
     const no = document.createElement("button");
     no.className = "small-btn danger"; no.textContent = "拒绝";
-    wbPending = { slug: wbSlug, messages: r.messages, tools: wbLastOpts?.tools ?? [], useMCP: true, approve: false };
+    wbPending = { slug: wbSlug, messages: r.messages, tools: wbLastOpts?.tools ?? [], useMCP: false, model: wbLastOpts?.model ?? "", approve: false };
     ok.addEventListener("click", async () => { row.remove(); wbPending.approve = true; await wbApprove(); });
     no.addEventListener("click", async () => { row.remove(); wbPending.approve = false; await wbApprove(); });
     row.append(ok, no);
@@ -828,11 +1004,11 @@ async function wbApprove() {
 
 function wbPath(name) { return wbDir ? wbDir + "/" + name : name; }
 
+// 工作区是所有卡共享的，不依赖当前选了哪张卡
 async function wbLoadFiles() {
   const list = $("#wb-list");
-  if (!wbSlug) { list.innerHTML = '<span class="muted">（先选一张卡片）</span>'; $("#wb-crumb").innerHTML = ""; return; }
   try {
-    const r = await api.get(`/api/workspace/list?slug=${encodeURIComponent(wbSlug)}&dir=${encodeURIComponent(wbDir)}`);
+    const r = await api.get(`/api/workspace/list?dir=${encodeURIComponent(wbDir)}`);
     wbRenderFiles(r);
   } catch (e) {
     list.innerHTML = '<span class="muted">读取失败：' + escapeHtml(e.message) + "</span>";
@@ -896,7 +1072,6 @@ function wbModal(title, fieldsHtml, onOk) {
 }
 
 function wbNewFile() {
-  if (!wbSlug) return toast("先选一张卡片", false);
   wbModal("新建文件", `
     <label>文件名（相对路径，如 notes/日记.md）</label>
     <input id="wb-nf-name" placeholder="文件名">
@@ -911,7 +1086,6 @@ function wbNewFile() {
 }
 
 function wbNewDir() {
-  if (!wbSlug) return toast("先选一张卡片", false);
   wbModal("新建文件夹", `<label>文件夹名</label><input id="wb-nd-name" placeholder="如 src">`, async () => {
     const name = $("#wb-nd-name").value.trim();
     if (!name) return toast("名称不能为空", false);
@@ -924,7 +1098,7 @@ function wbNewDir() {
 function wbUpload(e) {
   const file = e.target.files?.[0];
   e.target.value = "";
-  if (!file || !wbSlug) return;
+  if (!file) return;
   if (file.size > 1.5 * 1024 * 1024) return toast("文件超过 1.5MB，暂不支持", false);
   const reader = new FileReader();
   reader.onload = async () => {
@@ -956,6 +1130,7 @@ async function wbPreview(p) {
     });
   } catch (e) { toast("预览失败：" + e.message, false); }
 }
+
 
 // ============================================================
 //  视图：人设卡库（RP-Hub 式头像卡片网格 + 编辑表单）
@@ -1009,14 +1184,15 @@ function initCards() {
   loadCardsGrid();
 }
 
-/** 本地聊天：以这张卡为形象，直接进工作模式（保存后跳转） */
+/** 本地聊天：以这张卡为形象进入聊天视图（SPA 内部切换，不整页重载） */
 async function openLocalChat() {
   if (!editingCard) return;
   await saveCard();
   localStorage.setItem("ocs_workbench_slug", editingCard.slug);
   setWorkbenchOn(true);
-  location.hash = "#/home";
-  location.reload();
+  // 已经在 #/home 时 hashchange 不会触发，直接手动走一次路由
+  if ((location.hash || "").replace(/^#\/?/, "") === "home") router();
+  else location.hash = "#/home";
 }
 
 async function loadCardsGrid() {
@@ -1056,8 +1232,9 @@ function renderCardsGrid() {
         ${c.avatar ? `<img src="${c.avatar}" alt="" loading="lazy">` : `<div class="char-card-ph">${escapeHtml(c.name.slice(0, 1))}</div>`}
         <button class="char-card-bot ${bot ? "on" : ""}" title="机器人配置（QQ/微信）">${icon("bot")}</button>
         <div class="char-card-ops">
-          <button class="cc-op" data-op="png" title="导出 PNG 角色卡">${icon("download")}</button>
-          <button class="cc-op" data-op="json" title="导出 JSON">${icon("clipboard")}</button>
+          <button class="cc-op" data-op="png" title="导出 PNG 角色卡">${icon("export")}</button>
+          <button class="cc-op" data-op="json" title="导出 JSON 角色卡">${icon("clipboard")}</button>
+          <button class="cc-op" data-op="chatlog" title="导出聊天记录">${icon("chat")}</button>
           <button class="cc-op cc-del" data-op="del" title="删除这张卡">${icon("trash")}</button>
         </div>
       </div>
@@ -1206,6 +1383,8 @@ function renderBotBody(bot) {
       </div>
       <p class="hint" id="bot-login-msg"></p>
       <pre id="bot-qr" class="qr-box" style="display:none"></pre>
+      <div id="bot-qr-img" class="qr-img" style="display:none"></div>
+      <a id="bot-qr-link" class="qr-link" target="_blank" style="display:none">扫不了？点这里在浏览器打开链接</a>
     </div>`;
   $("#bot-login").addEventListener("click", () => startBotLogin(bot.id));
   $("#bot-recompile").addEventListener("click", async () => {
@@ -1227,9 +1406,9 @@ function renderBotBody(bot) {
 
 async function startBotLogin(botId) {
   const qr = $("#bot-qr"), msg = $("#bot-login-msg");
+  const qrImg = $("#bot-qr-img"), qrLink = $("#bot-qr-link");
   if (!qr || !msg) return;
   try { await api.send(`/api/bots/${botId}/login`, { method: "POST" }); } catch (e) { msg.textContent = "发起失败：" + e.message; return; }
-  qr.style.display = "block";
   msg.textContent = "二维码生成中…";
   if (botLoginTimer) clearInterval(botLoginTimer);
   // 二维码出现前用 300ms 快轮询抢首帧，拿到码后降到 1.5s 省资源
@@ -1237,15 +1416,21 @@ async function startBotLogin(botId) {
   const poll = async () => {
     try {
       const s = await api.get(`/api/bots/${botId}/login`);
-      if (s.output) {
+      // 优先用后端渲染的高清二维码图片；拿不到 URL 再退回终端 ASCII 码
+      if (s.qrDataUrl && qrImg) {
+        qrImg.innerHTML = `<img src="${s.qrDataUrl}" alt="扫码二维码">`;
+        qrImg.style.display = "block";
+        qr.style.display = "none";
+        if (qrLink && s.qrUrl) { qrLink.href = s.qrUrl; qrLink.style.display = "block"; }
+      } else if (s.output) {
         qr.textContent = s.output;
         qr.style.display = "block";
-        if (!gotQr) {
-          gotQr = true;
-          msg.textContent = "请用手机扫码";
-          clearInterval(botLoginTimer);
-          botLoginTimer = setInterval(poll, 1500);
-        }
+      }
+      if ((s.qrDataUrl || s.output) && !gotQr) {
+        gotQr = true;
+        msg.textContent = "请用手机扫码";
+        clearInterval(botLoginTimer);
+        botLoginTimer = setInterval(poll, 1500);
       }
       if (s.done) {
         clearInterval(botLoginTimer); botLoginTimer = null;
@@ -1280,21 +1465,25 @@ async function openAdvConfig() {
     api.get("/api/bots?skipStatus=1").catch(() => ({ bots: [] })),
     loadPresetStore(),
   ]);
-  advChatProviders = prov.chat ?? [];
+  // 停用的提供商不出现在选择框里
+  advChatProviders = (prov.chat ?? []).filter((p) => p.enabled !== false);
   botsData = bots;
   const bot = (botsData.bots ?? []).find((b) => b.cardSlug === editingCard.slug);
   const cur = editingCard.model ?? {};
-  // 未指定时，直接落到真实默认值（第一个提供商 + 它的第一个模型），不显示空括号
+  // 未指定时，直接落到真实默认值（第一个启用的提供商 + 它的第一个模型），不显示"默认…"之类提示
   const fallbackProv = advChatProviders[0];
-  const curProvName = cur.provider || fallbackProv?.name || "";
+  // 卡里选的提供商若已被停用/删除，就落回默认那个（用它的真实名字填充，不写提示语）
+  const curProvName = advChatProviders.some((p) => p.name === cur.provider)
+    ? cur.provider
+    : (fallbackProv?.name ?? "");
   const provOpts = advChatProviders
     .map((p) => `<option value="${escapeHtml(p.name)}" ${p.name === curProvName ? "selected" : ""}>${escapeHtml(p.name)}</option>`)
-    .join("") || `<option value="">（还没配 API 提供商）</option>`;
+    .join("") || `<option value=""></option>`;
   const curProv = advChatProviders.find((p) => p.name === curProvName);
-  const curModel = cur.model || curProv?.models?.[0] || "";
+  const curModel = curProv?.models?.includes(cur.model) ? cur.model : (curProv?.models?.[0] ?? "");
   const modelOpts = (curProv?.models ?? [])
     .map((m) => `<option value="${escapeHtml(m)}" ${m === curModel ? "selected" : ""}>${escapeHtml(m)}</option>`)
-    .join("") || `<option value="">（该提供商未拉取模型）</option>`;
+    .join("") || `<option value=""></option>`;
   const memCfg = editingCard.memoryConfig ?? {};
   const enabledTools = new Set(editingCard.tools?.enabled ?? []);
   const ab = editingCard.abilities ?? {};
@@ -1338,7 +1527,7 @@ async function openAdvConfig() {
     <div class="adv-sec">
       <h4>${icon("database")} 记忆</h4>
       <div class="adv-grid2">
-        <label>每几轮总结一次<input id="adv-mem-rounds" type="number" min="1" max="50" value="${memCfg.auto_rounds ?? 20}"></label>
+        <label>每几轮总结一次<input id="adv-mem-rounds" type="number" min="1" max="50" value="${memCfg.auto_rounds ?? 20}">（最近 30 轮保护，超额攒够 N 轮总结最早 N 轮）</label>
       </div>
     </div>
 
@@ -1377,7 +1566,7 @@ async function openAdvConfig() {
     const p = advChatProviders.find((x) => x.name === e.target.value);
     $("#adv-model-id").innerHTML = (p?.models ?? [])
       .map((m) => `<option value="${escapeHtml(m)}">${escapeHtml(m)}</option>`)
-      .join("") || `<option value="">（该提供商未拉取模型）</option>`;
+      .join("") || `<option value=""></option>`;
   });
   // 能力：点一下切换高亮
   ov.querySelectorAll(".cap-toggle").forEach((b) =>
@@ -1415,10 +1604,14 @@ async function openAdvConfig() {
   });
 }
 
+// 工作区未启用时要停掉的工具（卡里可能存着历史配置，后端也会再挡一层）
+const WORKSPACE_TOOL_IDS = ["code_exec", "sandbox_list", "sandbox_read", "sandbox_write", "sandbox_grep"];
+
 /** 聊天默认行为来自卡「高级配置」的能力开关 */
 function cardChatOptions() {
   const c = editingCard ?? {};
-  const tools = Array.isArray(c.tools?.enabled) ? [...c.tools.enabled] : [];
+  let tools = Array.isArray(c.tools?.enabled) ? [...c.tools.enabled] : [];
+  if (!FEATURES.workspace) tools = tools.filter((t) => !WORKSPACE_TOOL_IDS.includes(t));
   const thinking = c.chat?.thinking ?? "auto";
   return { tools, useMCP: false, skills: [], thinking };
 }
@@ -1494,32 +1687,36 @@ async function importCard() {
 function renderCreate() {
   return `
   <div class="view create-view">
-    <div class="page-head"><h2>做卡</h2><p class="hint">让 AI 把你的想法变成角色卡草稿，再慢慢打磨 → 保存进卡库 → 应用或导出</p></div>
-    <div class="ai-draft-box">
-      <div class="ai-draft-head">${icon("zap")} AI 生成草稿</div>
-      <p class="hint">写下角色想法，AI 会自动生成：名称、简介、世界书（人物形象 / 世界观 / 人物关系）、开场白，甚至封面图（配置了生图时）。生成后下面所有内容都可以自由修改。</p>
-      <textarea id="ai-idea" rows="3" placeholder="如：想做一张古风剑客的角色卡，话少、冷面热心，身边有一只灵狐，背负着灭门之仇……"></textarea>
-      <div class="ai-draft-actions">
-        <select id="ai-role">
-          <option value="friend">朋友</option><option value="family">家人</option>
-          <option value="self">自己</option><option value="partner">前任/恋人</option>
-          <option value="colleague">同事</option><option value="public-figure">偶像/角色</option>
-        </select>
-        <button id="btn-ai-draft" class="primary">✨ 生成草稿</button>
-      </div>
-      <div id="ai-msg" class="status"></div>
-      <div id="ai-cover" class="ai-cover" hidden>
-        <img id="ai-cover-img" alt="角色封面">
-        <div class="ai-cover-actions">
-          <button id="btn-ai-cover" class="ghost small-btn">🎨 重新生成封面</button>
-          <button id="btn-ai-cover-remove" class="ghost small-btn">移除封面</button>
+    <div class="page-head"><h2>做卡</h2></div>
+    <div class="cf-hero">
+      <div class="cf-cover">
+        <div class="cf-cover-frame" id="cover-frame">
+          <img id="cf-cover-img" alt="角色封面" hidden>
+          <div class="cf-cover-empty">角色封面</div>
+        </div>
+        <div class="cf-cover-actions">
+          <label class="btn-like ghost">上传图片<input type="file" id="cf-cover-file" accept=".png,.jpg,.jpeg,.webp" hidden></label>
+          <button id="btn-ai-cover" class="ghost small-btn">AI 生成</button>
+          <button id="btn-cover-remove" class="ghost small-btn" hidden>移除</button>
         </div>
       </div>
+      <div class="cf-hero-info">
+        <div><label>名称</label><input id="cf-name" placeholder="角色名称"></div>
+        <div><label>简介</label><textarea id="cf-bio" class="cf-autogrow" rows="3" placeholder="一句话介绍角色（选填），如：开甜品铺的 26 岁姑娘，嘴上凶巴巴，心里软乎乎的"></textarea></div>
+      </div>
+    </div>
+    <div class="ai-draft-box">
+      <div class="ai-draft-head">AI 生成草稿</div>
+      <textarea id="ai-idea" rows="3" placeholder="描述你的角色想法，如：一个傲娇的猫娘咖啡店店员……"></textarea>
+      <div class="ai-draft-actions">
+        <button id="btn-ai-draft" class="primary">生成草稿</button>
+      </div>
+      <div id="ai-msg" class="status"></div>
     </div>
     <div id="card-form-area" class="card-form-area">${cardFormHTML("create")}</div>
     <div class="create-actions">
-      <button id="btn-create-save" class="primary big">${icon("save")} 保存卡片</button>
-      <button id="btn-create-save-compile" class="big">${icon("check")} 保存并应用</button>
+      <button id="btn-create-save" class="primary big">保存卡片</button>
+      <button id="btn-create-export" class="big">导出</button>
     </div>
   </div>`;
 }
@@ -1527,11 +1724,54 @@ function renderCreate() {
 function initCreate() {
   editingCard = blankCard("", "");
   bindCardForm(editingCard, "create");
-  $("#btn-create-save").addEventListener("click", () => saveNewCard(false));
-  $("#btn-create-save-compile").addEventListener("click", () => saveNewCard(true));
+  $("#btn-create-save").addEventListener("click", saveNewCard);
+  $("#btn-create-export").addEventListener("click", exportCreateCard);
   $("#btn-ai-draft").addEventListener("click", aiDraft);
   $("#btn-ai-cover").addEventListener("click", () => generateCover());
-  $("#btn-ai-cover-remove").addEventListener("click", removeCover);
+  $("#btn-cover-remove").addEventListener("click", () => removeCover());
+  $("#cf-cover-file").addEventListener("change", async (e) => {
+    const f = e.target.files[0];
+    if (!f) return;
+    if (f.size > 15_000_000) return toast("图片太大了（最大 15MB）", false);
+    const b64 = await fileToBase64(f);
+    // 1:1 裁切 + 压缩输出 PNG（封面导出角色卡时需要真 PNG）
+    openImageCropper({
+      dataUrl: `data:${f.type || "image/png"};base64,${b64}`,
+      targetSize: 512,
+      format: "image/png",
+      quality: 0.9,
+      title: "裁切角色封面",
+      onDone: (dataUrl) => showCover(dataUrl),
+    });
+  });
+  // 生图没配置时，AI 生成按钮给出提示
+  checkImageReady().then((ok) => {
+    const b = $("#btn-ai-cover");
+    if (b && !ok) b.title = "未配置生图：到「生图配置」页填好 Key 后可用";
+  });
+}
+
+// ---------- 封面（大图展示；上传与 AI 生成共用） ----------
+function showCover(dataUrl) {
+  editingCard.identity = editingCard.identity ?? {};
+  editingCard.identity.avatar = dataUrl;
+  const img = $("#cf-cover-img");
+  const empty = $(".cf-cover-empty");
+  if (img) { img.src = dataUrl; img.hidden = false; }
+  if (empty) empty.style.display = "none";
+  const rm = $("#btn-cover-remove");
+  if (rm) rm.hidden = false;
+}
+
+function removeCover(silent) {
+  if (editingCard?.identity) editingCard.identity.avatar = "";
+  const img = $("#cf-cover-img");
+  if (img) { img.hidden = true; img.removeAttribute("src"); }
+  const empty = $(".cf-cover-empty");
+  if (empty) empty.style.display = "";
+  const rm = $("#btn-cover-remove");
+  if (rm) rm.hidden = true;
+  if (!silent) toast("封面已移除");
 }
 
 // ---------- AI 辅助做卡 ----------
@@ -1541,27 +1781,26 @@ async function aiDraft() {
   const btn = $("#btn-ai-draft");
   const msg = $("#ai-msg");
   btn.disabled = true;
-  btn.textContent = "✨ 生成中…（约 1 分钟）";
+  btn.textContent = "生成中…（约 1 分钟）";
   msg.textContent = "";
   try {
     const r = await api.send("/api/cards/ai-draft", {
       method: "POST",
-      body: JSON.stringify({ idea, role: $("#ai-role").value }),
+      body: JSON.stringify({ idea }),
     });
     applyDraftToForm(r.draft);
-    msg.textContent = "✓ 草稿已生成，下面表单里的内容都可以改";
+    msg.textContent = "✓ 草稿已生成，下面内容都可以改";
     await autoCover(r.draft);
   } catch (e) {
     msg.textContent = "生成失败：" + e.message;
   }
   btn.disabled = false;
-  btn.textContent = "✨ 生成草稿";
+  btn.textContent = "生成草稿";
 }
 
 function applyDraftToForm(draft) {
   editingCard = draft;
   $("#cf-name").value = draft.name ?? "";
-  if ($("#cf-slug")) $("#cf-slug").value = draft.slug ?? "";
   $("#cf-bio").value = draft.sillytavern_v2?.description || draft.identity?.bio || "";
   $("#cf-first").value = draft.sillytavern_v2?.first_mes || "";
   const entries = draft.sillytavern_v2?.character_book?.entries || [];
@@ -1585,12 +1824,12 @@ async function checkImageReady() {
   } catch { return false; }
 }
 
-// 自动判断能不能生图：能就生成封面，不能就先用文本
+// 自动判断能不能生图：能就生成封面，不能就留空由用户自己填
 async function autoCover(draft) {
   const ready = await checkImageReady();
   if (!ready) {
     const msg = $("#ai-msg");
-    msg.textContent += "；未配置生图，封面先不生成（到「生图配置」页配好后，回来点「生成草稿」旁的重试或手动上传头像）";
+    msg.textContent += "；未配置生图，封面留空——可直接「上传图片」放自己的图";
     return;
   }
   $("#ai-msg").textContent += "；生图可用，正在生成封面…";
@@ -1599,7 +1838,7 @@ async function autoCover(draft) {
 
 async function generateCover(draft) {
   const d = draft ?? editingCard;
-  if (!d) return toast("先生成草稿", false);
+  if (!d) return toast("先填写名称或生成草稿", false);
   const name = d.name || "角色";
   const bio = (d.sillytavern_v2?.description || d.identity?.bio || "").slice(0, 120);
   const prompt = `角色封面插画：${name}。${bio}。半身像，精致画风，适合做聊天头像`;
@@ -1608,13 +1847,8 @@ async function generateCover(draft) {
   try {
     const r = await api.send("/api/cards/cover", { method: "POST", body: JSON.stringify({ prompt }) });
     if (r.ok && r.dataUrl) {
-      editingCard.identity.avatar = r.dataUrl;
-      const img = $("#ai-cover-img");
-      if (img) img.src = r.dataUrl;
-      $("#ai-cover").hidden = false;
-      const avatar = $("#cf-avatar-img");
-      if (avatar) { avatar.src = r.dataUrl; avatar.style.display = "block"; }
-      $("#ai-msg").textContent = "✓ 封面已生成（可点「重新生成封面」换一张）";
+      showCover(r.dataUrl);
+      $("#ai-msg").textContent = "✓ 封面已生成（不满意可再点「AI 生成」或上传自己的图）";
     } else {
       $("#ai-msg").textContent = r.info || r.error || "封面生成失败";
     }
@@ -1624,17 +1858,7 @@ async function generateCover(draft) {
   if (btn) btn.disabled = false;
 }
 
-function removeCover(silent) {
-  if (editingCard?.identity) editingCard.identity.avatar = "";
-  $("#ai-cover").hidden = true;
-  const img = $("#ai-cover-img");
-  if (img) img.removeAttribute("src");
-  const avatar = $("#cf-avatar-img");
-  if (avatar) { avatar.style.display = "none"; avatar.removeAttribute("src"); }
-  if (!silent) toast("封面已移除");
-}
-
-async function saveNewCard(compile) {
+async function saveNewCard() {
   collectCardForm(editingCard, "create");
   if (!editingCard.name) return toast("请填写名称", false);
   if (!editingCard.slug) {
@@ -1642,19 +1866,147 @@ async function saveNewCard(compile) {
       ? editingCard.name.toLowerCase()
       : "card-" + Date.now().toString(36);
   }
-  const avatarSrc = $("#cf-avatar-img")?.src;
-  if (avatarSrc?.startsWith("data:image/png")) editingCard.identity.avatar = avatarSrc;
   editingCard.identity.relation = editingCard.name;
   try {
     const r = await api.send("/api/cards/import", { method: "POST", body: JSON.stringify({ card: editingCard }) });
-    toast(`✓ 已保存：${r.card.name}`);
-    if (compile) {
-      await api.send(`/api/cards/${r.card.slug}/compile`, { method: "POST" });
-      toast("✓ 已应用：角色设定已生效到 QQ/微信");
-    }
+    toast(`✓ 已保存到卡库：${r.card.name}`);
     location.hash = "#/cards";
     setTimeout(() => loadCardIntoEditor(r.card.slug), 80);
   } catch (e) { toast("保存失败：" + e.message, false); }
+}
+
+// 导出：有封面 → PNG 角色卡（嵌图），没封面 → JSON（更轻）
+async function exportCreateCard() {
+  collectCardForm(editingCard, "create");
+  if (!editingCard.name) return toast("请填写名称", false);
+  const format = editingCard.identity?.avatar ? "png" : "json";
+  try {
+    const r = await api.send("/api/cards/export-card", { method: "POST", body: JSON.stringify({ card: editingCard, format }) });
+    downloadDataUrl(r.dataUrl, r.filename);
+    toast(format === "png" ? "✓ 已导出 PNG 角色卡" : "✓ 已导出 JSON 角色卡（没封面时导出 JSON 更轻）");
+  } catch (e) { toast("导出失败：" + e.message, false); }
+}
+
+// ============================================================
+//  图片裁切（1:1 方格，可调大小/位置）+ 压缩输出
+// ============================================================
+function openImageCropper({ dataUrl, targetSize = 256, format = "image/jpeg", quality = 0.85, title = "裁切图片", onDone }) {
+  const old = $("#crop-overlay");
+  if (old) old.remove();
+  const ov = document.createElement("div");
+  ov.id = "crop-overlay";
+  ov.className = "crop-overlay";
+  ov.innerHTML = `
+  <div class="crop-dialog">
+    <div class="crop-head"><span>${escapeHtml(title)}（1:1）</span><button class="ghost small-btn" id="crop-close" title="关闭">${icon("x")}</button></div>
+    <div class="crop-stage"><canvas id="crop-canvas"></canvas></div>
+    <div class="crop-controls">
+      <label>裁切框大小 <input type="range" id="crop-size" min="30" max="100" value="100"></label>
+    </div>
+    <p class="hint">拖动方框调整位置，用滑块调整裁切框大小</p>
+    <div class="crop-foot">
+      <button class="ghost" id="crop-cancel">取消</button>
+      <button class="primary" id="crop-ok">确认</button>
+    </div>
+  </div>`;
+  document.body.appendChild(ov);
+  ov.addEventListener("click", (e) => { if (e.target === ov) close(); });
+  $("#crop-close").addEventListener("click", close);
+  $("#crop-cancel").addEventListener("click", close);
+
+  const canvas = $("#crop-canvas");
+  const ctx = canvas.getContext("2d");
+  const img = new Image();
+  let closed = false;
+  function close() { if (closed) return; closed = true; ov.remove(); }
+
+  img.onload = () => {
+    const STAGE = 320;
+    canvas.width = STAGE; canvas.height = STAGE;
+    const scale = Math.max(STAGE / img.naturalWidth, STAGE / img.naturalHeight);
+    const dw = img.naturalWidth * scale;
+    const dh = img.naturalHeight * scale;
+    const ox = (STAGE - dw) / 2;
+    const oy = (STAGE - dh) / 2;
+    const box = { x: 0, y: 0, s: STAGE };
+    const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
+
+    const draw = () => {
+      ctx.clearRect(0, 0, STAGE, STAGE);
+      ctx.fillStyle = "#111";
+      ctx.fillRect(0, 0, STAGE, STAGE);
+      ctx.drawImage(img, ox, oy, dw, dh);
+      ctx.fillStyle = "rgba(0,0,0,0.55)";
+      ctx.fillRect(0, 0, STAGE, box.y);
+      ctx.fillRect(0, box.y + box.s, STAGE, STAGE - box.y - box.s);
+      ctx.fillRect(0, box.y, box.x, box.s);
+      ctx.fillRect(box.x + box.s, box.y, STAGE - box.x - box.s, box.s);
+      ctx.strokeStyle = "#fff";
+      ctx.lineWidth = 2;
+      ctx.strokeRect(box.x, box.y, box.s, box.s);
+      ctx.strokeStyle = "rgba(255,255,255,0.45)";
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      for (let i = 1; i <= 2; i++) {
+        ctx.moveTo(box.x + (box.s * i) / 3, box.y); ctx.lineTo(box.x + (box.s * i) / 3, box.y + box.s);
+        ctx.moveTo(box.x, box.y + (box.s * i) / 3); ctx.lineTo(box.x + box.s, box.y + (box.s * i) / 3);
+      }
+      ctx.stroke();
+    };
+
+    let drag = null;
+    const toStage = (e) => {
+      const r = canvas.getBoundingClientRect();
+      return { x: ((e.clientX - r.left) / r.width) * STAGE, y: ((e.clientY - r.top) / r.height) * STAGE };
+    };
+    const onDown = (e) => {
+      const p = toStage(e);
+      if (p.x >= box.x && p.x <= box.x + box.s && p.y >= box.y && p.y <= box.y + box.s) {
+        drag = { sx: p.x - box.x, sy: p.y - box.y };
+        canvas.style.cursor = "grabbing";
+      }
+    };
+    const onMove = (e) => {
+      if (!drag) return;
+      const p = toStage(e);
+      box.x = clamp(p.x - drag.sx, 0, STAGE - box.s);
+      box.y = clamp(p.y - drag.sy, 0, STAGE - box.s);
+      draw();
+    };
+    const onUp = () => { drag = null; canvas.style.cursor = "grab"; };
+    canvas.addEventListener("mousedown", onDown);
+    canvas.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+    canvas.addEventListener("touchstart", (e) => { e.preventDefault(); onDown(e.touches[0]); }, { passive: false });
+    canvas.addEventListener("touchmove", (e) => { e.preventDefault(); onMove(e.touches[0]); }, { passive: false });
+    canvas.addEventListener("touchend", onUp);
+
+    $("#crop-size").addEventListener("input", (e) => {
+      const s = STAGE * (Number(e.target.value) / 100);
+      const cx = box.x + box.s / 2;
+      const cy = box.y + box.s / 2;
+      box.s = s;
+      box.x = clamp(cx - s / 2, 0, STAGE - s);
+      box.y = clamp(cy - s / 2, 0, STAGE - s);
+      draw();
+    });
+
+    $("#crop-ok").addEventListener("click", () => {
+      const sx = (box.x - ox) / scale;
+      const sy = (box.y - oy) / scale;
+      const sw = box.s / scale;
+      const out = document.createElement("canvas");
+      out.width = targetSize; out.height = targetSize;
+      out.getContext("2d").drawImage(img, sx, sy, sw, sw, 0, 0, targetSize, targetSize);
+      const result = out.toDataURL(format, quality);
+      close();
+      onDone(result);
+    });
+
+    draw();
+  };
+  img.onerror = () => { toast("图片加载失败", false); close(); };
+  img.src = dataUrl;
 }
 
 // ============================================================
@@ -1674,65 +2026,29 @@ function renderImgGenPage() {
         <div class="img-provider-row">
           <label class="radio"><input type="radio" name="ig-provider" value="novelai"> NovelAI（角色卡最佳）</label>
           <label class="radio"><input type="radio" name="ig-provider" value="openai"> OpenAI 兼容</label>
-          <label class="radio"><input type="radio" name="ig-provider" value="local"> 本地 SD WebUI</label>
         </div>
         <div id="ig-pane-novelai" class="ig-pane">
           <label>API Key（留空 = 保留原值）</label>
           <input id="ig-nai-key" type="password" placeholder="sk-...">
-          <div class="cf-grid2">
-            <div><label>模型</label><input id="ig-nai-model" placeholder="nai-diffusion-4-5-full"></div>
-            <div><label>采样器</label><select id="ig-nai-sampler">
-              <option value="k_dpmpp_2m_sde">k_dpmpp_2m_sde（默认）</option>
-              <option value="k_euler_ancestral">k_euler_ancestral</option>
-              <option value="k_euler">k_euler</option>
-              <option value="k_dpmpp_2m">k_dpmpp_2m</option>
-              <option value="k_dpmpp_3m_sde">k_dpmpp_3m_sde</option>
-              <option value="k_dpmpp_sde">k_dpmpp_sde</option>
-              <option value="k_dpm_2">k_dpm_2</option>
-              <option value="k_dpm_fast">k_dpm_fast</option>
-            </select></div>
-            <div><label>步数 Steps</label><input id="ig-nai-steps" type="number" min="1" max="50" step="1"></div>
-            <div><label>尺度 Scale（CFG）</label><input id="ig-nai-scale" type="number" min="1" max="15" step="0.5"></div>
-            <div><label>种子（0 = 随机）</label><input id="ig-nai-seed" type="number" step="1"></div>
-            <div><label>负面预设</label><select id="ig-nai-ucpreset">
-              <option value="heavy">Heavy（强负面）</option>
-              <option value="light">Light（轻负面）</option>
-              <option value="none">None（不加预设）</option>
-            </select></div>
+          <div class="artists-box" style="margin-top:10px">
+            <label>画师串（生成时自动拼到提示词末尾；可添加多个、改名、修改、删除，点圆点设为当前生效）</label>
+            <div id="ig-artists-list"></div>
+            <button id="ig-artist-add" class="ghost small-btn" style="margin-top:6px">${icon("plus")} 添加画师串</button>
+            <div id="ig-artist-edit" style="display:none;margin-top:6px;border:1px dashed var(--border);border-radius:8px;padding:8px">
+              <input id="ig-artist-name" placeholder="画师串名称（如：默认画风）">
+              <textarea id="ig-artist-content" rows="2" style="margin-top:6px" placeholder="画师串内容，如 masterpiece, best quality, [artist:ciloranko], ..."></textarea>
+              <div class="row" style="margin-top:6px">
+                <button id="ig-artist-save" class="small-btn primary">保存</button>
+                <button id="ig-artist-cancel" class="small-btn ghost">取消</button>
+              </div>
+            </div>
           </div>
-          <label class="check"><input id="ig-nai-translate" type="checkbox"> 中文提示词自动翻译扩写为英文</label>
-          <label>负面提示词（追加在预设之后）</label>
-          <textarea id="ig-nai-negative" rows="2"></textarea>
         </div>
         <div id="ig-pane-openai" class="ig-pane" style="display:none">
-          <div class="cf-grid2">
-            <div><label>Base URL（以 /v1 结尾）</label><input id="ig-oai-url" placeholder="https://api.example.com/v1"></div>
-            <div><label>模型</label><input id="ig-oai-model" placeholder="agnes-image-2.0-flash"></div>
-          </div>
-          <label>API Key（留空 = 保留原值）</label>
+          <label>Base URL（以 /v1 结尾）</label>
+          <input id="ig-oai-url" placeholder="https://api.example.com/v1">
+          <label style="margin-top:8px">API Key（留空 = 保留原值）</label>
           <input id="ig-oai-key" type="password" placeholder="sk-...">
-          <div class="cf-grid2">
-            <div><label>默认尺寸</label><select id="ig-oai-size">
-              <option value="1024x1024">1:1 方形</option>
-              <option value="832x1216">2:3 竖版</option>
-              <option value="1216x832">3:2 横版</option>
-              <option value="768x1344">9:16 长竖版</option>
-              <option value="1344x768">16:9 长横版</option>
-            </select></div>
-            <div></div>
-          </div>
-          <label class="check"><input id="ig-oai-translate" type="checkbox"> 中文提示词自动翻译扩写为英文</label>
-        </div>
-        <div id="ig-pane-local" class="ig-pane" style="display:none">
-          <div class="cf-grid2">
-            <div><label>Base URL（A1111/Forge，如 http://127.0.0.1:7860）</label><input id="ig-local-url" placeholder="http://127.0.0.1:7860"></div>
-            <div><label>模型（可留空用默认）</label><input id="ig-local-model" placeholder=""></div>
-            <div><label>步数</label><input id="ig-local-steps" type="number" min="1" max="60"></div>
-            <div><label>CFG</label><input id="ig-local-cfg" type="number" min="1" max="30" step="0.5"></div>
-            <div><label>采样器</label><input id="ig-local-sampler" placeholder="Euler a"></div>
-          </div>
-          <label>负面提示词</label>
-          <textarea id="ig-local-negative" rows="2"></textarea>
         </div>
         <div class="row" style="margin-top:12px">
           <button id="ig-save" class="primary">${icon("save")} 保存配置</button>
@@ -1748,30 +2064,15 @@ function renderImgGenPage() {
         <textarea id="ig-test-prompt" rows="2" placeholder="如：一个穿和服的少女，樱花树下，黄昏光线，精致细节"></textarea>
         <div class="row">
           <select id="ig-test-aspect">
-            <option value="square">1:1 方形</option>
-            <option value="portrait">2:3 竖版</option>
-            <option value="landscape">3:2 横版</option>
-            <option value="tall">9:16 长竖版</option>
-            <option value="wide">16:9 长横版</option>
+            <option value="square">方图 1024×1024</option>
+            <option value="portrait">竖图 832×1216</option>
+            <option value="landscape">横图 1216×832</option>
           </select>
           <button id="ig-test-go" class="primary">生成</button>
         </div>
         <div id="ig-test-status" class="status"></div>
         <div id="ig-test-img"></div>
       </div>
-    </div>
-    <div class="card-box">
-      <h3>已生成图片</h3>
-      <div class="form" style="margin-bottom:8px">
-        <div class="row">
-          <label style="white-space:nowrap">自动清理：保留最近</label>
-          <input id="ig-retention" type="number" min="0" max="365" step="1" style="width:90px">
-          <label style="white-space:nowrap">天的正式生图（0 = 不自动清理；试生图保留 15 天）</label>
-          <button id="ig-retention-save" class="ghost small-btn">保存</button>
-        </div>
-        <div id="ig-retention-status" class="status"></div>
-      </div>
-      <div id="ig-gallery" class="ig-gallery"><div class="muted">加载中…</div></div>
     </div>
   </div>`;
 }
@@ -1815,8 +2116,11 @@ function initImagegen() { initImgGenPage(); }
 function igRadio() {
   return document.querySelector('input[name="ig-provider"]:checked')?.value ?? "novelai";
 }
+let imgState = { artists: [], activeArtist: "" };
+let artistEditing = null; // 正在编辑的画师串下标（null = 新增）
+
 function showIgPane(provider) {
-  for (const p of ["novelai", "openai", "local"]) {
+  for (const p of ["novelai", "openai"]) {
     const pane = $("#ig-pane-" + p);
     if (pane) pane.style.display = p === provider ? "block" : "none";
   }
@@ -1825,65 +2129,86 @@ function collectImgForm() {
   const v = (id) => { const el = $(id); return el ? el.value.trim() : ""; };
   return {
     provider: igRadio(),
-    retentionDays: Number($("#ig-retention")?.value) || 0,
-    novelai: {
-      key: v("#ig-nai-key"),
-      model: v("#ig-nai-model"),
-      steps: Number(v("#ig-nai-steps")) || undefined,
-      scale: Number(v("#ig-nai-scale")) || undefined,
-      negative: v("#ig-nai-negative"),
-      sampler: v("#ig-nai-sampler"),
-      seed: Number(v("#ig-nai-seed")) || 0,
-      ucPreset: v("#ig-nai-ucpreset") || "heavy",
-      translate: !!$("#ig-nai-translate")?.checked,
-    },
-    openai: {
-      baseUrl: v("#ig-oai-url"),
-      key: v("#ig-oai-key"),
-      model: v("#ig-oai-model"),
-      size: v("#ig-oai-size"),
-      translate: !!$("#ig-oai-translate")?.checked,
-    },
-    local: {
-      baseUrl: v("#ig-local-url"),
-      model: v("#ig-local-model"),
-      steps: Number(v("#ig-local-steps")) || undefined,
-      cfg: Number(v("#ig-local-cfg")) || undefined,
-      sampler: v("#ig-local-sampler"),
-      negative: v("#ig-local-negative"),
-    },
+    novelai: { key: v("#ig-nai-key") },
+    openai: { baseUrl: v("#ig-oai-url"), key: v("#ig-oai-key") },
+    artists: imgState.artists,
+    activeArtist: imgState.activeArtist,
   };
 }
 function fillImgForm(cfg) {
   document.querySelectorAll('input[name="ig-provider"]').forEach((r) => { r.checked = r.value === cfg.provider; });
   showIgPane(cfg.provider);
-  const n = cfg.novelai || {}, o = cfg.openai || {}, l = cfg.local || {};
-  if ($("#ig-retention")) $("#ig-retention").value = cfg.retentionDays ?? 30;
   if ($("#ig-nai-key")) $("#ig-nai-key").value = "";
-  if ($("#ig-nai-model")) $("#ig-nai-model").value = n.model ?? "";
-  if ($("#ig-nai-steps")) $("#ig-nai-steps").value = n.steps ?? 28;
-  if ($("#ig-nai-scale")) $("#ig-nai-scale").value = n.scale ?? 6;
-  if ($("#ig-nai-negative")) $("#ig-nai-negative").value = n.negative ?? "";
-  if ($("#ig-nai-sampler")) $("#ig-nai-sampler").value = n.sampler ?? "k_dpmpp_2m_sde";
-  if ($("#ig-nai-seed")) $("#ig-nai-seed").value = n.seed ?? 0;
-  if ($("#ig-nai-ucpreset")) $("#ig-nai-ucpreset").value = n.ucPreset ?? "heavy";
-  if ($("#ig-nai-translate")) $("#ig-nai-translate").checked = !!n.translate;
-  if ($("#ig-oai-url")) $("#ig-oai-url").value = o.baseUrl ?? "";
+  if ($("#ig-oai-url")) $("#ig-oai-url").value = cfg.openai?.baseUrl ?? "";
   if ($("#ig-oai-key")) $("#ig-oai-key").value = "";
-  if ($("#ig-oai-model")) $("#ig-oai-model").value = o.model ?? "";
-  if ($("#ig-oai-size")) $("#ig-oai-size").value = o.size ?? "1024x1024";
-  if ($("#ig-oai-translate")) $("#ig-oai-translate").checked = !!o.translate;
-  if ($("#ig-local-url")) $("#ig-local-url").value = l.baseUrl ?? "";
-  if ($("#ig-local-model")) $("#ig-local-model").value = l.model ?? "";
-  if ($("#ig-local-steps")) $("#ig-local-steps").value = l.steps ?? 24;
-  if ($("#ig-local-cfg")) $("#ig-local-cfg").value = l.cfg ?? 7;
-  if ($("#ig-local-sampler")) $("#ig-local-sampler").value = l.sampler ?? "Euler a";
-  if ($("#ig-local-negative")) $("#ig-local-negative").value = l.negative ?? "";
-  const keyHint = n.key || o.key ? "（已有 Key，留空保留）" : "";
-  if ($("#ig-nai-key")) $("#ig-nai-key").placeholder = "sk-..." + keyHint;
-  if ($("#ig-oai-key")) $("#ig-oai-key").placeholder = "sk-..." + keyHint;
+  imgState.artists = (cfg.artists ?? []).map((a) => ({ name: a.name, content: a.content }));
+  imgState.activeArtist = cfg.activeArtist ?? "";
+  renderArtistsList();
+  // 已设置密钥的输入框用点提示（留空保存 = 保留原值），避免用户以为密钥丢了
+  if ($("#ig-nai-key")) $("#ig-nai-key").placeholder = cfg.novelai?.key ? "•••••• 已设置（留空保留）" : "sk-...";
+  if ($("#ig-oai-key")) $("#ig-oai-key").placeholder = cfg.openai?.key ? "•••••• 已设置（留空保留）" : "sk-...";
+}
+function renderArtistsList() {
+  const box = $("#ig-artists-list");
+  if (!box) return;
+  if (!imgState.artists.length) {
+    box.innerHTML = `<div class="muted">还没有画师串。添加一个后，生成图片时会自动拼到提示词末尾。</div>`;
+    return;
+  }
+  box.innerHTML = imgState.artists.map((a, i) => `
+    <div class="artists-item" style="display:flex;align-items:center;gap:8px;padding:5px 0;border-bottom:1px dashed var(--border)">
+      <input type="radio" name="ig-artist-active" data-i="${i}" ${a.name === imgState.activeArtist ? "checked" : ""} title="设为当前生效">
+      <div style="flex:1;min-width:0">
+        <div style="font-weight:600">${escapeHtml(a.name)}${a.name === imgState.activeArtist ? ' <span class="mem-badge">当前</span>' : ""}</div>
+        <div class="muted" style="font-size:12px;word-break:break-all">${escapeHtml(a.content.slice(0, 80))}${a.content.length > 80 ? "…" : ""}</div>
+      </div>
+      <button class="ghost small-btn" data-edit="${i}">编辑</button>
+      <button class="danger small-btn" data-del="${i}">删除</button>
+    </div>`).join("");
+  box.querySelectorAll("[data-edit]").forEach((b) =>
+    b.addEventListener("click", () => openArtistEdit(Number(b.dataset.edit)))
+  );
+  box.querySelectorAll("[data-del]").forEach((b) =>
+    b.addEventListener("click", () => deleteArtist(Number(b.dataset.del)))
+  );
+  box.querySelectorAll('input[name="ig-artist-active"]').forEach((r) =>
+    r.addEventListener("change", () => {
+      const i = Number(r.dataset.i);
+      imgState.activeArtist = imgState.artists[i]?.name ?? "";
+      renderArtistsList();
+      saveImgConfig();
+    })
+  );
+}
+function openArtistEdit(i) {
+  artistEditing = i;
+  const a = i === null ? null : imgState.artists[i];
+  $("#ig-artist-name").value = a?.name ?? "";
+  $("#ig-artist-content").value = a?.content ?? "";
+  $("#ig-artist-edit").style.display = "block";
+  $("#ig-artist-name").focus();
+}
+function closeArtistEdit() {
+  artistEditing = null;
+  $("#ig-artist-edit").style.display = "none";
+}
+function deleteArtist(i) {
+  const a = imgState.artists[i];
+  if (!a || !confirm(`删除画师串「${a.name}」？`)) return;
+  imgState.artists.splice(i, 1);
+  if (imgState.activeArtist === a.name) imgState.activeArtist = "";
+  renderArtistsList();
+  saveImgConfig();
+}
+async function saveImgConfig() {
+  const f = collectImgForm();
+  const r = await api.send("/api/image/config", { method: "POST", body: JSON.stringify(f) });
+  if (r.ok) setStatus("#ig-status", "✓ 已保存", true);
+  else setStatus("#ig-status", "保存失败：" + (r.error ?? "未知错误"), false);
 }
 async function initImgGenPage() {
+  imgState = { artists: [], activeArtist: "" };
+  artistEditing = null;
   document.querySelectorAll('input[name="ig-provider"]').forEach((r) =>
     r.addEventListener("change", () => showIgPane(igRadio()))
   );
@@ -1901,16 +2226,26 @@ async function initImgGenPage() {
     const r = await api.send("/api/image/test", { method: "POST", body: JSON.stringify(f) });
     setStatus("#ig-status", r.info ?? "无返回", r.ok);
   });
-  $("#ig-retention-save").addEventListener("click", async () => {
-    const days = Number($("#ig-retention")?.value) || 0;
-    const r = await api.send("/api/image/config", {
-      method: "POST",
-      body: JSON.stringify({ retentionDays: days }),
-    });
-    if (r.ok) {
-      setStatus("#ig-retention-status", `✓ 已保存：正式生图保留 ${days} 天${days === 0 ? "（不自动清理）" : ""}`, true);
-      loadImgGallery();
-    } else setStatus("#ig-retention-status", "保存失败：" + (r.error ?? "未知错误"), false);
+  $("#ig-artist-add").addEventListener("click", () => openArtistEdit(null));
+  $("#ig-artist-cancel").addEventListener("click", closeArtistEdit);
+  $("#ig-artist-save").addEventListener("click", () => {
+    const name = $("#ig-artist-name").value.trim();
+    const content = $("#ig-artist-content").value.trim();
+    if (!name || !content) return toast("名称和内容都要填", false);
+    if (imgState.artists.some((a) => a.name === name && (artistEditing === null || imgState.artists[artistEditing].name !== name))) {
+      return toast("同名画师串已存在", false);
+    }
+    if (artistEditing === null) {
+      imgState.artists.push({ name, content });
+      if (!imgState.activeArtist) imgState.activeArtist = name;
+    } else {
+      const old = imgState.artists[artistEditing];
+      if (imgState.activeArtist === old.name) imgState.activeArtist = name;
+      imgState.artists[artistEditing] = { name, content };
+    }
+    closeArtistEdit();
+    renderArtistsList();
+    saveImgConfig();
   });
   $("#ig-test-go").addEventListener("click", async () => {
     const prompt = $("#ig-test-prompt")?.value?.trim();
@@ -1928,9 +2263,8 @@ async function initImgGenPage() {
       if (!r.ok || r.ok === false) {
         setStatus("#ig-test-status", "生成失败：" + (r.error ?? "未知错误"), false);
       } else {
-        setStatus("#ig-test-status", `✓ 生成完成${r.promptUsed && r.promptUsed !== prompt ? "（提示词已翻译）" : ""}（${r.width}×${r.height}）`, true);
+        setStatus("#ig-test-status", `✓ 生成完成（${r.width}×${r.height}）`, true);
         $("#ig-test-img").innerHTML = `<img src="${r.url}" alt="测试图" onclick="showLightbox('${r.url}')">`;
-        loadImgGallery();
       }
     } catch (e) {
       setStatus("#ig-test-status", "生成失败：" + e.message, false);
@@ -1938,7 +2272,6 @@ async function initImgGenPage() {
       btn.disabled = false;
     }
   });
-  loadImgGallery();
   try {
     const cfg = await api.get("/api/image/config");
     fillImgForm(cfg);
@@ -2010,20 +2343,26 @@ async function loadProvList() {
       box.innerHTML = '<div class="card-box muted">还没有提供商，点下方按钮添加</div>';
       return;
     }
-    list.forEach((p, i) => {
+    // 默认 = 第一个「启用中」的提供商（第一个被停用时，默认自动落到下一个可用的）
+    const defaultName = list.find((p) => p.enabled !== false)?.name;
+    list.forEach((p) => {
+      const off = p.enabled === false;
+      const isDefault = !off && p.name === defaultName;
       const d = document.createElement("div");
-      d.className = "prov-item" + (i === 0 ? " default" : "");
+      d.className = "prov-item" + (isDefault ? " default" : "") + (off ? " disabled" : "");
       d.innerHTML = `
         <div class="prov-head">
           <b>${escapeHtml(p.name)}</b>
-          ${i === 0 ? '<span class="chip ok">默认</span>' : ""}
+          ${isDefault ? '<span class="chip ok">默认</span>' : ""}
+          ${off ? '<span class="chip">已停用</span>' : ""}
           <span class="prov-btns">
-            ${i !== 0 ? `<button class="ghost small-btn" data-act="default" data-name="${escapeHtml(p.name)}">设为默认</button>` : ""}
+            ${!off && !isDefault ? `<button class="ghost small-btn" data-act="default" data-name="${escapeHtml(p.name)}">设为默认</button>` : ""}
+            <button class="ghost small-btn" data-act="toggle" data-name="${escapeHtml(p.name)}" data-on="${off ? "1" : "0"}">${off ? "启用" : "停用"}</button>
             <button class="ghost small-btn" data-act="edit" data-name="${escapeHtml(p.name)}">编辑</button>
             <button class="danger small-btn" data-act="del" data-name="${escapeHtml(p.name)}">删除</button>
           </span>
         </div>
-        <div class="meta">${escapeHtml(p.baseUrl)} · key ${escapeHtml(p.apiKey || "未填")}</div>
+        <div class="meta">${escapeHtml(p.baseUrl)} · key ${p.apiKey ? "••••••" : "未填"}</div>
         <div class="meta">模型（${p.models.length}）：${escapeHtml(p.models.slice(0, 6).join("、"))}${p.models.length > 6 ? "…" : ""}</div>`;
       box.appendChild(d);
     });
@@ -2039,6 +2378,11 @@ async function loadProvList() {
           await api.send("/api/providers/set-default", { method: "POST", body: JSON.stringify({ type: provState.type, name }) });
           loadProvList();
           toast("✓ 已设为默认");
+        } else if (b.dataset.act === "toggle") {
+          const turnOn = b.dataset.on === "1";
+          await api.send("/api/providers/toggle", { method: "POST", body: JSON.stringify({ type: provState.type, name, enabled: turnOn }) });
+          loadProvList();
+          toast(turnOn ? `✓ 已启用 ${name}` : `已停用 ${name}（配置保留）`);
         }
       })
     );
@@ -2216,7 +2560,7 @@ function renderTtsProviders() {
           <button class="danger small-btn" data-act="del">删除</button>
         </span>
       </div>
-      <div class="meta">${escapeHtml(p.baseUrl)} · key ${escapeHtml(p.key || "未填")} · ${escapeHtml(TTS_KIND_LABEL[p.kind] || p.kind || "openai")}</div>
+      <div class="meta">${escapeHtml(p.baseUrl)} · key ${p.key ? "••••••" : "未填"} · ${escapeHtml(TTS_KIND_LABEL[p.kind] || p.kind || "openai")}</div>
       <div class="meta">模型 ${escapeHtml(p.model || "—")} · 音色 ${escapeHtml(p.voice || "—")} · 语速 ${p.speed ?? 1}</div>`;
     box.appendChild(d);
     d.querySelectorAll("button[data-act]").forEach((b) =>
@@ -2272,6 +2616,8 @@ function showTtsProvForm(p) {
   $("#tts-pv-model").value = p?.model ?? "";
   $("#tts-pv-voice").value = p?.voice ?? "";
   $("#tts-pv-key").value = "";
+  // 已配置过密钥：点表示已添加（留空保存 = 保留原值），避免用户以为密钥丢了
+  $("#tts-pv-key").placeholder = p?.key ? "•••••• 已设置（留空保留）" : "sk-...";
   $("#tts-pv-speed").value = p?.speed ?? 1;
   $("#tts-pv-enabled").checked = p ? p.enabled : true;
   // 服务商预设回显：编辑时 kind+baseUrl 都匹配才选中，否则归「自定义」；新添加默认「— 选择 —」让用户先选
@@ -2416,6 +2762,8 @@ async function showProvForm(name) {
     const p = (provState.type === "chat" ? data.chat : data.image).find((x) => x.name === name);
     if (p) {
       $("#pv-url").value = p.baseUrl;
+      // 已配置过密钥：用点表示已添加（留空保存 = 保留原值），避免用户以为密钥丢了
+      $("#pv-key").placeholder = p.apiKey ? "•••••• 已设置（留空保留）" : "sk-...";
       provState.selected = [...p.models];
       if (p.models.length) {
         provState.allModels = [...p.models];
@@ -2509,7 +2857,8 @@ function fmtTime(iso) {
 function renderMemory() {
   return `
   <div class="view">
-    <div class="page-head"><h2>记忆</h2><p class="hint">每张卡独立的长期记忆；可手动添加、单条编辑/删除</p></div>
+    <div class="page-head"><h2>记忆</h2><p class="hint">每张卡独立的长期记忆；可手动添加、单条编辑/删除。自动总结：最近 30 轮对话保护不总结，之后每攒够 N 轮就总结最早 N 轮，每段只总结一次</p></div>
+    <div id="mem-cards-head" class="mem-cards-head">选择角色卡</div>
     <div id="mem-cards" class="card-grid"></div>
     <div id="mem-detail" class="card-box" style="display:none">
       <h3 id="mem-title"></h3>
@@ -2536,13 +2885,20 @@ function initMemory() {
     const box = $("#mem-cards");
     box.innerHTML = "";
     if (!cards.length) { box.innerHTML = '<div class="muted">还没有卡片</div>'; return; }
-    for (const c of cards) {
+    // 正在本地聊天 → 只显示当前这张卡的记忆并直接展开；退出本地聊天后恢复全部
+    const chatting = workbenchOn() ? localStorage.getItem("ocs_workbench_slug") : "";
+    const focus = chatting && cards.some((c) => c.slug === chatting) ? chatting : "";
+    const list = focus ? cards.filter((c) => c.slug === focus) : cards;
+    const head = $("#mem-cards-head");
+    if (head) head.textContent = focus ? "当前聊天的角色" : "选择角色卡";
+    for (const c of list) {
       const d = document.createElement("div");
       d.className = "mini-card";
-      d.innerHTML = `<div class="mini-name">${escapeHtml(c.name)}</div><div class="meta">${c.slug}</div>`;
+      d.innerHTML = `<div class="mini-name">${escapeHtml(c.name)}</div><div class="meta">${c.role}</div>`;
       d.addEventListener("click", () => openMemDetail(c.slug));
       box.appendChild(d);
     }
+    if (focus) openMemDetail(focus);
   })();
   $("#mem-save-rounds").addEventListener("click", saveMemRounds);
   $("#mem-clear").addEventListener("click", clearMem);
@@ -2751,10 +3107,10 @@ function addChatBubble(role, text) {
     const btn = document.createElement("button");
     btn.className = "tts-speak-btn";
     btn.innerHTML = icon("volume");
-    btn.title = "朗读这条回复";
+    btn.title = "朗读这条回复（播放中再点停止）";
     btn.addEventListener("click", (ev) => {
       ev.stopPropagation();
-      speakText(text);
+      speakText(text, btn); // 传按钮 → 支持"再点一次停止"
     });
     div.appendChild(btn);
   }
@@ -2763,14 +3119,39 @@ function addChatBubble(role, text) {
   return div;
 }
 let ttsAudio = null;
-async function speakText(text) {
+let ttsOwner = null;   // 正在朗读的那个按钮，用于高亮与"再点一次停止"
+let ttsLoading = false;
+
+/** 停掉当前朗读并清理状态 */
+function stopSpeak() {
+  if (ttsAudio) { try { ttsAudio.pause(); } catch { /* 忽略 */ } ttsAudio = null; }
+  if (ttsOwner) { ttsOwner.classList.remove("playing"); ttsOwner = null; }
+}
+
+/**
+ * 朗读一段文本。btn 传入时支持切换语义：
+ * 正在朗读同一条 → 停止；朗读别条或没在朗读 → 从头开始播这条。
+ */
+async function speakText(text, btn) {
+  // 正在放这一条（或正在为它取音频）→ 这次点击就是"停止"
+  if (btn && ttsOwner === btn) { stopSpeak(); ttsLoading = false; return; }
+  stopSpeak();
+  if (ttsLoading) return;
+  ttsLoading = true;
+  if (btn) { ttsOwner = btn; btn.classList.add("playing"); }
   try {
-    if (ttsAudio) { ttsAudio.pause(); ttsAudio = null; }
     const r = await api.send("/api/tts/synthesize", { method: "POST", body: JSON.stringify({ text: String(text).slice(0, 500) }) });
+    // 取音频期间用户可能已点了停止
+    if (btn && ttsOwner !== btn) return;
     ttsAudio = new Audio(r.url);
-    ttsAudio.play();
+    ttsAudio.addEventListener("ended", stopSpeak);
+    ttsAudio.addEventListener("error", stopSpeak);
+    await ttsAudio.play().catch(() => stopSpeak());
   } catch (e) {
+    stopSpeak();
     toast("朗读失败：" + e.message, false);
+  } finally {
+    ttsLoading = false;
   }
 }
 /**
@@ -2950,6 +3331,8 @@ function renderChannels() {
         <p class="hint">腾讯官方通道，仅单聊；需微信有 ClawBot 入口（灰度）。</p>
         <div class="row"><button id="btn-wx-login" class="primary">开始扫码绑定</button><button id="btn-wx-refresh" class="ghost">刷新</button></div>
         <pre id="wx-qr" class="qr-box" style="display:none"></pre>
+        <div id="wx-qr-img" class="qr-img" style="display:none"></div>
+        <a id="wx-qr-link" class="qr-link" target="_blank" style="display:none">扫不了？点这里在浏览器打开链接</a>
         <div id="wx-login-msg" class="status"></div>
         <h3>配对授权</h3>
         <div class="row"><input id="pairing-code" placeholder="配对码"><button id="btn-pair-approve" class="primary small-btn">批准</button></div>
@@ -2960,11 +3343,13 @@ function renderChannels() {
         <p class="hint">官方开放平台机器人（单聊/群聊@/频道）。</p>
         <div class="row"><button id="btn-qq-login" class="primary">开始扫码绑定</button><button id="btn-qq-refresh" class="ghost">刷新</button></div>
         <pre id="qq-qr" class="qr-box" style="display:none"></pre>
+        <div id="qq-qr-img" class="qr-img" style="display:none"></div>
+        <a id="qq-qr-link" class="qr-link" target="_blank" style="display:none">扫不了？点这里在浏览器打开链接</a>
         <div id="qq-login-msg" class="status"></div>
         <div class="guide"><ol>
-          <li><a href="https://q.qq.com/" target="_blank">QQ 开放平台</a> 扫码登录 → 创建机器人</li>
-          <li>点上方「开始扫码绑定」，手机 QQ 扫网页二维码</li>
-          <li>QQ 消息列表找到机器人发消息测试</li>
+          <li>先在 <a href="https://q.qq.com/" target="_blank">QQ 开放平台</a> 创建机器人</li>
+          <li>点「开始扫码绑定」，用<b>手机 QQ</b> 扫上方二维码（扫的是 QQ 开放平台的登录授权码，把这台机器和你的开发者账号绑起来）</li>
+          <li>成功后在 QQ 里找到机器人发消息测试</li>
         </ol></div>
         <pre id="qq-out" class="small-out"></pre>
       </div>
@@ -2979,23 +3364,31 @@ function renderChannels() {
 
 const loginTimers = {};
 async function startLogin(channelPath, qrSel, msgSel, refreshCb) {
+  const imgSel = qrSel + "-img", linkSel = qrSel + "-link";
   try {
     await api.send(channelPath, { method: "POST" });
-    $(qrSel).style.display = "block";
     $(msgSel).textContent = "二维码生成中…";
     if (loginTimers[channelPath]) clearInterval(loginTimers[channelPath]);
     loginTimers[channelPath] = setInterval(async () => {
       try {
         const s = await api.get(channelPath);
-        if (s.output) { $(qrSel).textContent = s.output; $(qrSel).style.display = "block"; }
+        // 优先高清图片二维码，退回终端 ASCII
+        if (s.qrDataUrl && $(imgSel)) {
+          $(imgSel).innerHTML = `<img src="${s.qrDataUrl}" alt="扫码二维码">`;
+          $(imgSel).style.display = "block";
+          $(qrSel).style.display = "none";
+          if ($(linkSel) && s.qrUrl) { $(linkSel).href = s.qrUrl; $(linkSel).style.display = "block"; }
+        } else if (s.output) {
+          $(qrSel).textContent = s.output; $(qrSel).style.display = "block";
+        }
         if (!s.running && s.done) {
           clearInterval(loginTimers[channelPath]);
           loginTimers[channelPath] = null;
-          $(msgSel).textContent = s.ok ? "✓ 扫码成功，已绑定！" : "✗ 未成功，检查平台侧后重试";
+          $(msgSel).textContent = s.ok ? "扫码成功，已绑定！" : "未成功，检查平台侧后重试";
           refreshCb && refreshCb();
         }
       } catch { /* 忽略 */ }
-    }, 2000);
+    }, 800);
   } catch (e) { $(msgSel).textContent = "启动失败：" + e.message; }
 }
 
@@ -3152,19 +3545,21 @@ function renderWorkbenchSettings() {
         <div class="form">
           <label>工具</label>
           <div class="cap-checks">
+            ${FEATURES.workspace ? `
             <label><input type="checkbox" id="cap-code"> 写代码*</label>
-            <label><input type="checkbox" id="cap-file"> 文件</label>
+            <label><input type="checkbox" id="cap-file"> 文件</label>` : ""}
             <label><input type="checkbox" id="cap-search"> 搜索</label>
             <label><input type="checkbox" id="cap-weather"> 天气</label>
             <label><input type="checkbox" id="cap-memory"> 记忆</label>
           </div>
+          ${FEATURES.skills ? `
           <label>技能</label>
           <div class="cap-checks">
             <label><input type="checkbox" id="cap-skill-code"> 代码</label>
             <label><input type="checkbox" id="cap-skill-trans"> 翻译</label>
             <label><input type="checkbox" id="cap-skill-write"> 写作</label>
             <label><input type="checkbox" id="cap-skill-companion"> 陪伴</label>
-          </div>
+          </div>` : ""}
           <label>思考深度</label>
           <select id="cap-thinking">
             <option value="off">关闭</option><option value="auto" selected>自动</option>
@@ -3175,30 +3570,12 @@ function renderWorkbenchSettings() {
           <div id="cap-msg" class="status"></div>
         </div>
       </div>
+      ${FEATURES.workspace ? `
       <div class="card-box">
         <h3>工作区</h3>
-        <p class="hint">每个角色卡一个独立沙箱目录 <code>data/sandbox/&lt;slug&gt;</code>，助手通过工具读写；文件管理在首页工作台</p>
+        <p class="hint">所有卡片共用一个工作区 <code>data/workspace-files</code>：换卡只换对话，文件不变。</p>
         <div id="ws-overview" class="small-out">读取中…</div>
-      </div>
-    </div>
-
-    <div class="card-box">
-      <h3>MCP 服务器</h3>
-      <p class="hint">连接外部工具服务器：本地程序（stdio）或远程 URL（SSE / StreamableHTTP）；工具调用默认需审批。表单化配置，按服务器启用、按工具勾选。</p>
-      <div id="mcp-list" class="mcp-list"></div>
-      <div class="row" style="margin-top:8px">
-        <button id="mcp-add" class="ghost small-btn">+ 添加服务器</button>
-      </div>
-      <div id="mcp-form-wrap" style="display:none"></div>
-      <details class="mcp-json">
-        <summary>JSON 导入 / 导出（高级）</summary>
-        <textarea id="mcp-config" rows="6" spellcheck="false"></textarea>
-        <div class="row" style="margin-top:8px">
-          <button id="btn-mcp-import" class="ghost small-btn">从 JSON 导入</button>
-          <button id="btn-mcp-export" class="ghost small-btn">导出为 JSON</button>
-        </div>
-        <div id="mcp-msg" class="status"></div>
-      </details>
+      </div>` : ""}
     </div>
   </div>`;
 }
@@ -3217,56 +3594,45 @@ function initWorkbenchSettings() {
       ? "已开启：首页将变为工作台"
       : "已关闭：首页恢复普通样式";
   });
-  $("#wb-go").addEventListener("click", () => { location.hash = "#/home"; location.reload(); });
+  $("#wb-go").addEventListener("click", () => {
+    if ((location.hash || "").replace(/^#\/?/, "") === "home") router();
+    else location.hash = "#/home";
+  });
   $("#wb-go").style.display = workbenchOn() ? "" : "none";
 
-  // ---- 默认能力（沿用原逻辑） ----
+  // ---- 默认能力（未启用的功能对应的勾选框不会渲染，取值用可选链兜底） ----
   const def = capDefaults();
   const tools = def.tools ?? [];
-  $("#cap-code").checked = tools.includes("code_exec");
-  $("#cap-file").checked = tools.includes("sandbox_list");
+  if ($("#cap-code")) $("#cap-code").checked = tools.includes("code_exec");
+  if ($("#cap-file")) $("#cap-file").checked = tools.includes("sandbox_list");
   $("#cap-search").checked = tools.includes("web_search");
   $("#cap-weather").checked = tools.includes("weather");
   $("#cap-memory").checked = tools.includes("memory_save");
   const skills = def.skills ?? [];
-  $("#cap-skill-code").checked = skills.includes("code_expert");
-  $("#cap-skill-trans").checked = skills.includes("translator");
-  $("#cap-skill-write").checked = skills.includes("writing");
-  $("#cap-skill-companion").checked = skills.includes("companion");
+  if ($("#cap-skill-code")) {
+    $("#cap-skill-code").checked = skills.includes("code_expert");
+    $("#cap-skill-trans").checked = skills.includes("translator");
+    $("#cap-skill-write").checked = skills.includes("writing");
+    $("#cap-skill-companion").checked = skills.includes("companion");
+  }
   $("#cap-thinking").value = def.thinking ?? "auto";
   $("#btn-cap-save").addEventListener("click", () => {
     const t = [];
-    if ($("#cap-code").checked) t.push("code_exec");
-    if ($("#cap-file").checked) t.push("sandbox_list", "sandbox_read", "sandbox_write", "sandbox_grep");
+    if ($("#cap-code")?.checked) t.push("code_exec");
+    if ($("#cap-file")?.checked) t.push("sandbox_list", "sandbox_read", "sandbox_write", "sandbox_grep");
     if ($("#cap-search").checked) t.push("web_search");
     if ($("#cap-weather").checked) t.push("weather");
     if ($("#cap-memory").checked) t.push("memory_save");
     const s = [];
-    if ($("#cap-skill-code").checked) s.push("code_expert");
-    if ($("#cap-skill-trans").checked) s.push("translator");
-    if ($("#cap-skill-write").checked) s.push("writing");
-    if ($("#cap-skill-companion").checked) s.push("companion");
+    if ($("#cap-skill-code")?.checked) s.push("code_expert");
+    if ($("#cap-skill-trans")?.checked) s.push("translator");
+    if ($("#cap-skill-write")?.checked) s.push("writing");
+    if ($("#cap-skill-companion")?.checked) s.push("companion");
     saveCapDefaults({ tools: t, skills: s, thinking: $("#cap-thinking").value });
     $("#cap-msg").textContent = "✓ 已保存";
   });
 
-  // ---- MCP ----
-  $("#mcp-add").addEventListener("click", () => mcpEdit(-1));
-  $("#btn-mcp-export").addEventListener("click", () => {
-    $("#mcp-config").value = JSON.stringify(mcpServers, null, 2);
-  });
-  $("#btn-mcp-import").addEventListener("click", async () => {
-    try {
-      const arr = JSON.parse($("#mcp-config").value);
-      if (!Array.isArray(arr)) throw new Error("需要 JSON 数组");
-      mcpServers = arr;
-      await mcpSave();
-      mcpRenderList();
-      $("#mcp-msg").textContent = "✓ 已导入并重连";
-    } catch (e) { $("#mcp-msg").textContent = "导入失败：" + e.message; }
-  });
-  mcpLoad();
-  wsLoadOverview();
+  if (FEATURES.workspace) wsLoadOverview();
 }
 
 function mcpHeadersText(s) {
@@ -3433,12 +3799,9 @@ async function wsLoadOverview() {
   const el = $("#ws-overview");
   try {
     const r = await api.get("/api/workspace/overview");
-    const dirs = r.dirs ?? [];
-    if (!dirs.length) { el.innerHTML = '<span class="muted">还没有工作区（选卡聊过天后会自动创建）</span>'; return; }
-    el.innerHTML = dirs.map((d) => {
-      const size = d.size < 1024 * 1024 ? (d.size / 1024).toFixed(1) + " KB" : (d.size / 1024 / 1024).toFixed(1) + " MB";
-      return `<div class="ws-row"><code>${escapeHtml(d.slug)}</code><span class="ws-meta">${d.files} 文件 · ${size}</span></div>`;
-    }).join("");
+    const size = r.size < 1024 * 1024 ? (r.size / 1024).toFixed(1) + " KB" : (r.size / 1024 / 1024).toFixed(1) + " MB";
+    el.innerHTML = `<div class="ws-row"><code>${escapeHtml(r.path ?? "data/workspace-files")}</code></div>
+      <div class="ws-row"><span>共享工作区</span><span class="ws-meta">${r.files} 个文件 · ${size}</span></div>`;
   } catch (e) { el.innerHTML = '<span class="muted">读取失败：' + escapeHtml(e.message) + "</span>"; }
 }
 
@@ -3600,25 +3963,77 @@ function bindPresets() {
   });
 }
 
-// ---- 数据 / 设置 ----
-function renderData() {
+// ---- 设置（原「数据」页的备份与记忆已并入这里） ----
+function renderSettings() {
   return `
   <div class="view">
-    <div class="page-head"><h2>数据</h2><p class="hint">备份与记忆</p></div>
+    <div class="page-head"><h2>设置</h2><p class="hint">技能、MCP 工具服务器、公告与数据备份</p></div>
+
+    ${FEATURES.skills ? `
+    <div class="card-box">
+      <h3>${icon("tool")} 技能库</h3>
+      <p class="hint">技能 = 给 AI 追加的一段能力说明（如「代码专家」）。内置四个不可改，你可以自己加；聊天时在能力开关里勾选生效。</p>
+      <div id="skill-list" class="skill-list"></div>
+      <div class="row" style="margin-top:8px"><button id="skill-add" class="ghost small-btn">+ 添加技能</button></div>
+      <div id="skill-form-wrap" style="display:none"></div>
+    </div>` : ""}
+
+    ${FEATURES.mcp ? `
+    <div class="card-box">
+      <h3>${icon("zap")} MCP 服务器</h3>
+      <p class="hint">连接外部工具服务器：本地程序（stdio）或远程 URL（SSE / StreamableHTTP）。工具调用默认需你确认后执行。</p>
+      <div id="mcp-list" class="mcp-list"></div>
+      <div class="row" style="margin-top:8px"><button id="mcp-add" class="ghost small-btn">+ 添加服务器</button></div>
+      <div id="mcp-form-wrap" style="display:none"></div>
+      <details class="mcp-json">
+        <summary>JSON 导入 / 导出（高级）</summary>
+        <textarea id="mcp-config" rows="6" spellcheck="false"></textarea>
+        <div class="row" style="margin-top:8px">
+          <button id="btn-mcp-import" class="ghost small-btn">从 JSON 导入</button>
+          <button id="btn-mcp-export" class="ghost small-btn">导出为 JSON</button>
+        </div>
+        <div id="mcp-msg" class="status"></div>
+      </details>
+    </div>` : ""}
+
+    <div class="card-box">
+      <h3>${icon("store")} 插件 <span class="plug-badge">暂未开放</span></h3>
+      <p class="hint">插件功能暂未开放（正在评估可用性）。已安装的插件会继续生效，但市场浏览、安装、卸载等操作暂不提供；开放后会回到这里。</p>
+      <div id="plug-installed-ro" class="small-out tall">加载中…</div>
+    </div>
+
     <div class="two-col">
       <div class="card-box">
-        <h3>备份</h3>
-        <p class="hint">全部卡片 + 记忆 + MCP 配置 → 一个 JSON</p>
-        <button id="btn-backup" class="primary">下载备份</button>
+        <h3>${icon("clipboard")} 首页公告</h3>
+        <div class="form">
+          <label>展示在首页公告卡（支持换行，留空则首页显示「暂无公告」）</label>
+          <textarea id="notice-text" rows="5" maxlength="2000"></textarea>
+          <div class="row"><button id="notice-save" class="primary">${icon("save")} 保存公告</button></div>
+          <div id="notice-msg" class="status"></div>
+        </div>
       </div>
       <div class="card-box">
-        <h3>全部记忆</h3>
+        <h3>${icon("package")} 数据备份</h3>
+        <p class="hint">全部卡片 + 记忆 + 各项配置 → 一个 JSON 文件</p>
+        <button id="btn-backup" class="primary">下载备份</button>
+        <h3 style="margin-top:14px">全部记忆</h3>
         <div id="memory-list" class="small-out tall"></div>
       </div>
     </div>
   </div>`;
 }
-function initData() {
+function initSettings() {
+  // ---- 公告 ----
+  api.get("/api/announcement").then((a) => { $("#notice-text").value = a.text ?? ""; }).catch(() => {});
+  $("#notice-save").addEventListener("click", async () => {
+    try {
+      await api.send("/api/announcement", { method: "POST", body: JSON.stringify({ text: $("#notice-text").value }) });
+      $("#notice-msg").textContent = "✓ 已保存";
+      toast("✓ 公告已更新");
+    } catch (e) { $("#notice-msg").textContent = "保存失败：" + e.message; }
+  });
+
+  // ---- 数据备份 + 记忆总览（原「数据」页并进来） ----
   $("#btn-backup").addEventListener("click", async () => {
     try {
       const r = await api.get("/api/backup");
@@ -3633,50 +4048,145 @@ function initData() {
           `${f}\n  ` + (entries || []).map((e) => `[${e.cat}] ${e.fact}`).join("\n  ")).join("\n\n")
       : "（还没有记忆）";
   }).catch(() => {});
-}
 
-function renderSettings() {
-  return `
-  <div class="view">
-    <div class="page-head"><h2>设置</h2><p class="hint">服务信息与说明</p></div>
-    <div class="two-col">
-      <div class="card-box">
-        <h3>${icon("clipboard")} 首页公告</h3>
-        <div class="form">
-          <label>展示在首页公告卡（支持换行，留空则首页显示「暂无公告」）</label>
-          <textarea id="notice-text" rows="5" maxlength="2000"></textarea>
-          <div class="row"><button id="notice-save" class="primary">${icon("save")} 保存公告</button></div>
-          <div id="notice-msg" class="status"></div>
-        </div>
-      </div>
-      <div class="card-box"><h3>服务信息</h3><div id="svc-info" class="small-out">读取中…</div></div>
-    </div>
-    <div class="card-box"><h3>说明</h3>
-      <ul class="guide">
-        <li>本机：<code>http://127.0.0.1:17880</code></li>
-        <li>公网：<code>https://soulbox.319274.xyz</code>（旧地址 openclaw.319274.xyz 同样可用）</li>
-        <li>开关：桌面「openclaw-shell 开关.bat」（已配开机自启）</li>
-        <li>数据全部在本机 <code>data/</code>，不上传</li>
-      </ul>
-    </div>
-  </div>`;
-}
-function initSettings() {
-  api.get("/api/announcement").then((a) => { $("#notice-text").value = a.text ?? ""; }).catch(() => {});
-  $("#notice-save").addEventListener("click", async () => {
-    try {
-      await api.send("/api/announcement", { method: "POST", body: JSON.stringify({ text: $("#notice-text").value }) });
-      $("#notice-msg").textContent = "✓ 已保存";
-      toast("✓ 公告已更新");
-    } catch (e) { $("#notice-msg").textContent = "保存失败：" + e.message; }
-  });
+  // 服务状态点仍然要亮（原来挂在服务信息块里）
   api.get("/api/health").then((h) => {
-    $("#svc-info").textContent = `服务：SoulBox（openclaw-shell）\n版本：${h.schema}\n数据目录：${h.dataDir ?? "—"}\n监听：127.0.0.1:${h.port ?? "—"}`;
     $("#drawer-meta").textContent = `SoulBox v${h.schema}`;
     $("#svc-dot").classList.add("on");
+  }).catch(() => { $("#svc-dot").classList.add("bad"); });
+
+  // ---- 插件（暂未开放）：只读展示已安装列表 ----
+  api.get("/api/plugins/installed").then((d) => {
+    const el = $("#plug-installed-ro");
+    if (!el) return;
+    const list = (d.plugins ?? []).filter((p) => p.id && p.enabled !== false);
+    el.textContent = list.length
+      ? list.map((p) => `· ${p.name || p.id} v${p.version || ""}${p.enabled === false ? "（已停用）" : ""}${p.source ? "（" + p.source + "）" : ""}`).join("\n")
+      : "（未安装任何插件）";
   }).catch(() => {
-    $("#svc-info").textContent = "无法连接服务";
-    $("#svc-dot").classList.add("bad");
+    const el = $("#plug-installed-ro");
+    if (el) el.textContent = "（读取失败）";
+  });
+
+  // ---- 技能库（FEATURES.skills 关闭时整块不渲染，跳过绑定） ----
+  if (FEATURES.skills) {
+    $("#skill-add").addEventListener("click", () => skillEdit(-1));
+    skillLoad();
+  }
+
+  // ---- MCP（同上） ----
+  if (FEATURES.mcp) {
+    $("#mcp-add").addEventListener("click", () => mcpEdit(-1));
+    $("#btn-mcp-export").addEventListener("click", () => {
+      $("#mcp-config").value = JSON.stringify(mcpServers, null, 2);
+    });
+    $("#btn-mcp-import").addEventListener("click", async () => {
+      try {
+        const arr = JSON.parse($("#mcp-config").value);
+        if (!Array.isArray(arr)) throw new Error("需要 JSON 数组");
+        mcpServers = arr;
+        await mcpSave();
+        mcpRenderList();
+        $("#mcp-msg").textContent = "✓ 已导入并重连";
+      } catch (e) { $("#mcp-msg").textContent = "导入失败：" + e.message; }
+    });
+    mcpLoad();
+  }
+}
+
+// ============================================================
+//  技能库（内置只读 + 用户自定义增删改）
+// ============================================================
+let skillsAll = [];      // 内置 + 自定义（后端合并返回）
+let skillEditing = -1;   // 自定义技能在 userSkills 里的下标；-1 = 新增
+
+function userSkills() { return skillsAll.filter((s) => !s.builtin); }
+
+async function skillLoad() {
+  try {
+    const r = await api.get("/api/skills");
+    skillsAll = r.skills ?? [];
+  } catch { skillsAll = []; }
+  skillRenderList();
+}
+
+async function skillSave() {
+  try {
+    const r = await api.send("/api/skills", { method: "POST", body: JSON.stringify({ skills: userSkills() }) });
+    const fresh = await api.get("/api/skills").catch(() => null);
+    if (fresh) skillsAll = fresh.skills ?? [];
+    toast(`✓ 技能已保存（自定义 ${r.count} 个）`);
+  } catch (e) { toast("保存失败：" + e.message, false); }
+}
+
+function skillRenderList() {
+  const el = $("#skill-list");
+  if (!el) return;
+  el.innerHTML = "";
+  for (const s of skillsAll) {
+    const div = document.createElement("div");
+    div.className = "skill-item";
+    const idx = s.builtin ? -1 : userSkills().findIndex((u) => u.id === s.id);
+    div.innerHTML = `
+      <span class="skill-name">${escapeHtml(s.name)}</span>
+      ${s.builtin
+        ? '<span class="skill-tag">内置</span>'
+        : `<label class="skill-enable"><input type="checkbox" data-skill-enable="${idx}" ${s.enabled ? "checked" : ""}>启用</label>`}
+      <span class="skill-prompt" title="${escapeHtml(s.prompt)}">${escapeHtml(s.prompt.slice(0, 60))}${s.prompt.length > 60 ? "…" : ""}</span>
+      ${s.builtin ? "" : `<button class="ghost small-btn" data-skill-edit="${idx}">编辑</button>
+      <button class="ghost small-btn" data-skill-del="${idx}">删除</button>`}`;
+    el.appendChild(div);
+  }
+  el.querySelectorAll("[data-skill-enable]").forEach((c) => c.addEventListener("change", async () => {
+    const list = userSkills();
+    list[Number(c.dataset.skillEnable)].enabled = c.checked;
+    skillsAll = [...skillsAll.filter((s) => s.builtin), ...list];
+    await skillSave();
+    skillRenderList();
+  }));
+  el.querySelectorAll("[data-skill-edit]").forEach((b) => b.addEventListener("click", () => skillEdit(Number(b.dataset.skillEdit))));
+  el.querySelectorAll("[data-skill-del]").forEach((b) => b.addEventListener("click", async () => {
+    const list = userSkills();
+    const i = Number(b.dataset.skillDel);
+    if (!confirm(`删除技能「${list[i].name}」？`)) return;
+    list.splice(i, 1);
+    skillsAll = [...skillsAll.filter((s) => s.builtin), ...list];
+    await skillSave();
+    skillRenderList();
+  }));
+}
+
+function skillEdit(idx) {
+  skillEditing = idx;
+  const s = idx >= 0 ? userSkills()[idx] : { name: "", prompt: "" };
+  const wrap = $("#skill-form-wrap");
+  wrap.style.display = "block";
+  wrap.innerHTML = `
+    <div class="mcp-form">
+      <h4>${idx >= 0 ? "编辑技能" : "添加技能"}</h4>
+      <div class="form">
+        <label>名称</label><input id="skill-f-name" value="${escapeHtml(s.name ?? "")}" placeholder="如 法律顾问">
+        <label>提示词（告诉 AI 这个技能该怎么做事）</label>
+        <textarea id="skill-f-prompt" rows="4" placeholder="【技能：法律顾问】遇到法律问题时：先说明不构成正式法律意见，再解释相关条款…">${escapeHtml(s.prompt ?? "")}</textarea>
+        <div class="row" style="margin-top:8px">
+          <button id="skill-f-save" class="primary small-btn">保存</button>
+          <button id="skill-f-cancel" class="ghost small-btn">取消</button>
+        </div>
+      </div>
+    </div>`;
+  $("#skill-f-cancel").addEventListener("click", () => { wrap.style.display = "none"; skillEditing = -1; });
+  $("#skill-f-save").addEventListener("click", async () => {
+    const name = $("#skill-f-name").value.trim();
+    const prompt = $("#skill-f-prompt").value.trim();
+    if (!prompt) return toast("提示词不能为空", false);
+    const list = userSkills();
+    if (skillEditing >= 0) list[skillEditing] = { ...list[skillEditing], name, prompt };
+    else list.push({ name, prompt, enabled: true });
+    skillsAll = [...skillsAll.filter((x) => x.builtin), ...list];
+    await skillSave();
+    skillRenderList();
+    wrap.style.display = "none";
+    skillEditing = -1;
   });
 }
 
@@ -4087,10 +4597,11 @@ const routes = {
   tts: { render: renderTtsPage, init: initTtsPage },
   memory: { render: renderMemory, init: initMemory },
   emojis: { render: renderEmojis, init: initEmojis },
-  plugins: { render: renderPlugins, init: initPlugins },
+  // 插件商店已并入设置页（暂未开放），旧地址 #/plugins 兼容跳转设置
+  plugins: { render: renderSettings, init: initSettings },
   workbench: { render: renderWorkbenchSettings, init: initWorkbenchSettings },
   capabilities: { render: renderWorkbenchSettings, init: initWorkbenchSettings }, // 旧地址 #/capabilities 兼容
-  data: { render: renderData, init: initData },
+  data: { render: renderSettings, init: initSettings }, // 旧地址 #/data 兼容（已并入设置）
   settings: { render: renderSettings, init: initSettings },
 };
 

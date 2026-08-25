@@ -4,6 +4,9 @@
 $ErrorActionPreference = 'Stop'
 $root = 'D:\ai_workspace\openclaw-shell'
 $pidFile = Join-Path $root 'data\stack-pids.json'
+# Allow the local tts-server to fall back to local SAPI/Edge for OpenClaw on this machine.
+# Selling deployments that run tts-server standalone must NOT set this (never sell local quality).
+$env:TTS_ALLOW_LOCAL = '1'
 
 function Test-Port([int]$port) {
   return $null -ne (Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue)
@@ -33,6 +36,7 @@ $serverPid = Start-Component 'server' 'node.exe' @("$root\dist\server.js") 'serv
 $gwPid     = Start-Component 'gateway' 'node.exe' @("$env:APPDATA\npm\node_modules\openclaw\openclaw.mjs", 'gateway') 'gateway' { Test-Port 18789 }
 $tunnelPid = Start-Component 'tunnel' 'D:\ai_workspace\cloudflared\cloudflared.exe' `
     @('tunnel', '--config', 'C:\Users\followsun\.cloudflared\config-openclaw.yml', 'run', '74975232-d922-4337-9644-76fac4d04c26') 'tunnel' { Test-TunnelRunning }
+$ttsPid    = Start-Component 'tts-server' 'node.exe' @("$root\dist\tts-server.js") 'tts-server' { Test-Port 17900 }
 
 # Record real PIDs (for stop-stack). If a component is already running, look up its PID by port/process.
 # NOTE: keep this file pure ASCII (Chinese comments get misread as GBK and can break parsing on PS5.1).
@@ -51,9 +55,10 @@ function Get-TunnelPid() {
 
 $entries = New-Object System.Collections.ArrayList
 foreach ($pair in @(
-    @{ key = 'server';  pid = $serverPid; port = 17880 },
-    @{ key = 'gateway'; pid = $gwPid;    port = 18789 },
-    @{ key = 'tunnel';  pid = $tunnelPid; port = 0 }
+    @{ key = 'server';     pid = $serverPid; port = 17880 },
+    @{ key = 'gateway';    pid = $gwPid;    port = 18789 },
+    @{ key = 'tunnel';     pid = $tunnelPid; port = 0 },
+    @{ key = 'tts-server'; pid = $ttsPid;   port = 17900 }
   )) {
   $pidActual = $pair.pid
   if ($pidActual -le 0) {

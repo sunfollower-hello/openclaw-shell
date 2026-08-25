@@ -218,11 +218,63 @@ export function updateEntry(
   });
 }
 
-/** 清空某卡记忆文件（含旧计数器与导出 md） */
+/** 清空某卡记忆文件（含旧计数器、导出 md 与对话日志） */
 export async function clearMemory(slug: string): Promise<void> {
   await fs.rm(memoryFile(slug), { force: true }).catch(() => {});
   await fs.rm(memoryFile(slug) + ".count", { force: true }).catch(() => {});
   await fs.rm(path.join(memoryExportDir(), `${slug}.md`), { force: true }).catch(() => {});
+  await fs.rm(chatLogFile(slug), { force: true }).catch(() => {});
+}
+
+// ---------- 每卡对话日志（自动总结用：只保留「未总结」的轮次，总结过即删除） ----------
+export interface ChatRound {
+  u: string; // 用户消息（截断）
+  a: string; // 角色回复（截断）
+  t: string; // 时间戳
+}
+
+export function chatLogFile(slug: string): string {
+  return path.join(dataDir(), "memory", `${slug}.chatlog.jsonl`);
+}
+
+/** 读取未总结的对话轮次（不加重写锁，仅供内部/调试读取） */
+export async function readChatLog(slug: string): Promise<ChatRound[]> {
+  const raw = await fs.readFile(chatLogFile(slug), "utf8").catch(() => "");
+  const out: ChatRound[] = [];
+  for (const line of raw.split(/\r?\n/)) {
+    if (!line.trim()) continue;
+    try {
+      const o = JSON.parse(line) as Partial<ChatRound>;
+      out.push({ u: String(o.u ?? ""), a: String(o.a ?? ""), t: String(o.t ?? "") });
+    } catch {
+      /* 跳过损坏行 */
+    }
+  }
+  return out;
+}
+
+/**
+ * 追加一轮对话到日志，并按「最近 30 轮保护」的滑动分批规则处理：
+ * 日志里永远保留最近 30 轮不总结；超过 30 轮后每攒够 batch 轮「超额」，
+ * 就把最早 batch 轮取出返回（已从日志删除，之后不再参与总结）。
+ * 返回需要总结的段（数组为空 = 未到阈值）。整段操作在写锁内原子完成。
+ */
+export async function pushChatRound(slug: string, round: ChatRound, batch: number): Promise<ChatRound[]> {
+  const b = Math.max(1, Math.min(50, batch || 20));
+  // 最近 30 轮保护窗口：不参与总结
+  const PROTECTED_RECENT_ROUNDS = 30;
+  return withLock(slug, async () => {
+    const file = chatLogFile(slug);
+    await fs.mkdir(path.dirname(file), { recursive: true });
+    await fs.appendFile(file, JSON.stringify(round) + "\n", "utf8");
+    const lines = await readChatLog(slug);
+    if (lines.length < PROTECTED_RECENT_ROUNDS + b) return [];
+    const segment = lines.slice(0, b);
+    const rest = lines.slice(b);
+    const text = rest.map((r) => JSON.stringify(r)).join("\n");
+    await fs.writeFile(file, text + (text ? "\n" : ""), "utf8");
+    return segment;
+  });
 }
 
 /** 相关召回：按关键词重合 + 新鲜度打分取前 limit 条；query 为空时返回最新 limit 条 */
