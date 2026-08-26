@@ -31,7 +31,7 @@
 powershell -ExecutionPolicy Bypass -File scripts\setup-new-machine.ps1
 ```
 
-脚本自动完成：环境检查 → `npm install` → `npm run build` → 全局安装 OpenClaw CLI（2026.6.34）→ 安装腾讯 QQ/微信官方插件 → `--link` 安装仓库自带的生图插件 → 生成 `.env`（含随机登录密码，打印在屏幕上）→ 输出剩余手工步骤。
+脚本自动完成：环境检查 → `npm install` → `npm run build` → 全局安装 OpenClaw CLI（2026.6.34）→ 安装腾讯 QQ/微信官方插件 → `--link` 安装仓库自带的生图插件 → 提示 `.env` 可选（纯本地无需登录，见 §9）→ 输出剩余手工步骤。
 
 国内网络自动使用 npmmirror 镜像。脚本全程纯 ASCII 输出。
 
@@ -108,7 +108,7 @@ powershell -ExecutionPolicy Bypass -File scripts\start-stack.ps1
 
 | 项 | 地址 | 验证 |
 |---|---|---|
-| 管理台（网页） | http://127.0.0.1:17880 | 浏览器打开，用 `.env` 里生成的身份登录（未生成则见 §2） |
+| 管理台（网页） | http://127.0.0.1:17880 | 浏览器直接打开即可（本地无需登录；只有配置了公网隧道才需要 .env 密码） |
 | OpenClaw 网关 | 127.0.0.1:18789 | `openclaw health` 或看 `data\gateway.log` |
 | TTS 服务 | 127.0.0.1:17900 | `curl http://127.0.0.1:17900/health` |
 
@@ -118,7 +118,7 @@ powershell -ExecutionPolicy Bypass -File scripts\start-stack.ps1
 
 ## 6. 首次使用流程（网页内完成，无需改代码）
 
-1. 登录管理台 → 「API 与模型」页 → 添加提供商并设为默认（或直接改 openclaw.json）
+1. 打开管理台 → 「API 与模型」页 → 添加提供商并设为默认（或直接改 openclaw.json）
 2. 「人设卡库」→ 做卡 / 导入 CCv2 卡
 3. 点开卡 → 右上角「⚙ 高级配置」→ 机器人接入 → 创建机器人 → 扫码绑定 QQ/微信（**唯一需要账号的步骤**，每张卡一个独立机器人，凭证存本机，之后换卡可复用免扫码）
 4. 网关重启后生效（start-stack 重跑一次即可）
@@ -152,7 +152,7 @@ powershell -ExecutionPolicy Bypass -File scripts\start-stack.ps1   # 已在跑�
 
 - 项目数据（卡库/记忆/机器人实例/生图配置）在项目的 `data/` 目录，已 gitignore，不会上传
 - 账号凭证（QQ AppID/密钥、微信 token）在本机 `%USERPROFILE%\.openclaw\`，不入仓库
-- `.env` 里的管理台密码是访问钥匙：本地部署可随意；**若配置公网隧道必须改强密码**
+- 管理台默认**无需登录**（认证只有当 `.env` 设置了用户/密码才启用）。纯本地直接访问即可；**若配置公网隧道，必须先建带强密码的 `.env`**（参考 `scripts/setup-new-machine.ps1` 末尾说明）
 
 ---
 

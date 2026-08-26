@@ -78,17 +78,14 @@ Set-Location $root
 & node $oc plugins install --link $igDir
 if ($LASTEXITCODE -ne 0) { Write-Host "WARN: imagegen --link returned non-zero; run manually after checking output." }
 
-# ---------- 6. .env template ----------
+# ---------- 6. .env (optional) ----------
+# The management UI only enables HTTP Basic auth when .env sets OPENCLAW_SHELL_UI_USER/PASS.
+# Pure-local use (no public tunnel) does NOT need it: do not create .env, browse 127.0.0.1 freely.
+# Only add one later if you expose the UI publicly (Cloudflare tunnel etc).
 $envFile = Join-Path $root '.env'
 if (-not (Test-Path $envFile)) {
-  $pass = -join ((48..57) + (65..90) + (97..122) | Get-Random -Count 12 | ForEach-Object { [char]$_ })
-  @(
-    "OPENCLAW_SHELL_UI_USER=admin",
-    "OPENCLAW_SHELL_UI_PASS=$pass"
-  ) | Set-Content -Path $envFile -Encoding UTF8
-  Write-Host "`n.env created. UI login: admin / $pass  (change it before exposing publicly!)"
-} else {
-  Write-Host "`n.env already exists (kept)."
+  Write-Host "`nNote: no .env created. Local UI needs no login (auth only activates when .env has OPENCLAW_SHELL_UI_USER/PASS)."
+  Write-Host "If you later open a public tunnel, create .env with a strong password first."
 }
 
 # ---------- 7. what remains ----------
