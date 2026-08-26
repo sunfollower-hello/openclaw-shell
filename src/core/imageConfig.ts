@@ -13,7 +13,7 @@ export interface ImageConfig {
   /** 图片自动清理：保留最近 N 天的正式生图（0 = 不自动清理） */
   retentionDays: number;
   novelai: { key: string };
-  openai: { baseUrl: string; key: string };
+  openai: { baseUrl: string; key: string; model: string };
   /** 画师串列表（用户可增删改），生成时拼到提示词末尾 */
   artists: ArtistPreset[];
   /** 当前生效的画师串名（空 = 不用画师串） */
@@ -24,7 +24,7 @@ const DEFAULTS: ImageConfig = {
   provider: "novelai",
   retentionDays: 30,
   novelai: { key: "" },
-  openai: { baseUrl: "", key: "" },
+  openai: { baseUrl: "", key: "", model: "agnes-image-2.0-flash" },
   artists: [],
   activeArtist: "",
 };
@@ -49,7 +49,7 @@ export async function getImageConfig(): Promise<ImageConfig> {
       provider: c.provider === "openai" ? "openai" : "novelai",
       retentionDays: Number(c.retentionDays) || DEFAULTS.retentionDays,
       novelai: { key: String(c.novelai?.key ?? "") },
-      openai: { baseUrl: String(c.openai?.baseUrl ?? ""), key: String(c.openai?.key ?? "") },
+      openai: { baseUrl: String(c.openai?.baseUrl ?? ""), key: String(c.openai?.key ?? ""), model: String(c.openai?.model ?? DEFAULTS.openai.model) },
       artists,
       activeArtist: artists.some((a) => a.name === c.activeArtist) ? String(c.activeArtist) : "",
     };

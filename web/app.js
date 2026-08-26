@@ -2166,6 +2166,7 @@ function renderImgGenPage() {
         <textarea id="ig-test-prompt" rows="2" placeholder="如：一个穿和服的少女，樱花树下，黄昏光线，精致细节"></textarea>
         <div class="row">
           <select id="ig-test-aspect">
+            <option value="auto">自动</option>
             <option value="square">方图 1024×1024</option>
             <option value="portrait">竖图 832×1216</option>
             <option value="landscape">横图 1216×832</option>
@@ -4548,12 +4549,16 @@ async function addEmojiToLib() {
   const btn = $("#em-add");
   btn.disabled = true;
   try {
-    const b64 = await fileToBase64(f);
+    // 二进制直传：跳过 FileReader/base64/JSON，大图导入更快
     const ext = (f.name.split(".").pop() || "png").toLowerCase();
-    await api.send("/api/emojis", {
+    const q = new URLSearchParams({ name, ext, exp: $("#em-exp").value.trim() }).toString();
+    const r = await fetchApi("/api/emojis/raw?" + q, {
       method: "POST",
-      body: JSON.stringify({ name, explanation: $("#em-exp").value.trim(), imageBase64: b64, ext }),
+      headers: { "Content-Type": "application/octet-stream" },
+      body: f,
     });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(data.error || r.statusText);
     $("#em-name").value = "";
     $("#em-exp").value = "";
     $("#em-file").value = "";

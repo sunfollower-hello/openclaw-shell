@@ -136,15 +136,21 @@ export async function migrateLegacyEmojis(
  * 生成注入 prompt 的表情清单说明。
  * level 来自卡片 voice.message_style.emoji（关闭/克制/贴近原始）；关闭时返回空串。
  */
-export async function buildEmojiPrompt(level: string): Promise<string> {
+/**
+ * mode 决定告诉模型"怎么发表情"：
+ * - "inline"（网页聊天）：写 [表情:名字] 标记，前端会替换成图片；
+ * - "tool"（QQ/微信）：调 emoji_send 工具，由插件把图片投递到通道。
+ *   通道端没有前端做标记替换，若还教它写标记，用户会看到字面的 `[表情:xxx]`。
+ */
+export async function buildEmojiPrompt(level: string, mode: "inline" | "tool" = "inline"): Promise<string> {
   if (level === "关闭") return "";
   const emojis = await listEmojis();
   if (emojis.length === 0) return "";
   const usage = level === "贴近原始" ? "尽量在合适位置使用" : level === "克制" ? "偶尔在合适位置使用" : "少量使用";
   const lines = emojis.map((e) => `- ${e.name}：${e.explanation || "（无解释）"}`).join("\n");
-  return (
-    `\n\n【表情包】你有以下表情包可用，${usage}。` +
-    `想发表情时在回复里写 [表情:名字]（会被渲染成图片），名字必须与下面完全一致，不要编造：\n` +
-    lines
-  );
+  const how =
+    mode === "tool"
+      ? "想发表情时调用 emoji_send 工具（参数 name 填表情名），不要在文字里写 [表情:名字]。"
+      : "想发表情时在回复里写 [表情:名字]（会被渲染成图片）。";
+  return `\n\n【表情包】你有以下表情包可用，${usage}。${how}名字必须与下面完全一致，不要编造：\n` + lines;
 }

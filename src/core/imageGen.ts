@@ -11,6 +11,18 @@ export const ASPECT_SIZES: Record<string, [number, number]> = {
   landscape: [1216, 832],
 };
 
+/** 尺寸解析：传 square/portrait/landscape 用指定档；auto/未传时按提示词画面内容推断（AI 决定构图，后端从 prompt 识别） */
+export function resolveAspect(prompt: string, aspect?: string): [number, number] {
+  const a = String(aspect ?? "auto").toLowerCase();
+  if (a === "square" || a === "portrait" || a === "landscape") return ASPECT_SIZES[a];
+  const p = String(prompt ?? "").toLowerCase();
+  // 竖构图：竖/全身/站/半身/塔等
+  if (/(portrait|full[ -]?body|standing|tall|upper body|全身|站|竖|半身|一身)/.test(p)) return ASPECT_SIZES.portrait;
+  // 横构图：风景/横/全景/场景/远景等
+  if (/(landscape|scenery|panorama|wide|horizon|远景|全景|风景|横|场景|背景)/.test(p)) return ASPECT_SIZES.landscape;
+  return ASPECT_SIZES.square;
+}
+
 // NovelAI 固定默认参数（不对用户开放；对齐 RP-Hub：steps 40 / scale 6 / k_dpmpp_2m_sde / karras）
 const NAI_MODEL = "nai-diffusion-4-5-full";
 const NAI_STEPS = 40;
@@ -30,8 +42,8 @@ const NAI_NEGATIVE =
   // 内容尺度：图片一律 SFW（至少不露三点）。破甲档只管聊天文字，生图全局禁露骨标签
   "nsfw, {nudity}, {nude}, {naked}, topless, bottomless, exposed breasts, bare breasts, nipples, areola, crotch, pussy, penis, genitals, pubic hair, sex, sexual, intercourse, penetration, porn, hentai, uncensored, no clothes, undressing";
 
-// OpenAI 兼容固定默认（不对用户开放）
-const OAI_MODEL = "agnes-image-2.0-flash";
+// OpenAI 兼容固定默认（配置里未选模型时的兜底）
+const OAI_DEFAULT_MODEL = "agnes-image-2.0-flash";
 const OAI_FALLBACK_SIZE = "1024x1024";
 
 export interface GenParams {
@@ -77,8 +89,7 @@ export async function generateImage(params: GenParams, saveDir?: string): Promis
   const cfg = params.cfg ?? (await getImageConfig());
   const prompt = String(params.prompt ?? "").trim();
   if (!prompt) return { ok: false, error: "提示词为空" };
-  const aspect = params.aspect && ASPECT_SIZES[params.aspect] ? params.aspect : "square";
-  const [w, h] = ASPECT_SIZES[aspect];
+  const [w, h] = resolveAspect(prompt, params.aspect);
 
   // 画师串：当前生效的画师串拼到提示词末尾
   const artist = cfg.artists.find((a) => a.name === cfg.activeArtist)?.content ?? "";
@@ -118,11 +129,13 @@ export async function generateImage(params: GenParams, saveDir?: string): Promis
       buf = Buffer.from(await r.arrayBuffer());
     } else if (provider === "openai" && cfg.openai.baseUrl && cfg.openai.key) {
       const size = `${w}x${h}`;
+      // 不带 response_format：部分兼容端点（如 agnes t2i）不支持 b64_json 参数，
+      // 标准 OpenAI 端点默认返回 data[].url，下载即可；个别端点返回 b64_json 也兼容
       const call = (sz: string): Promise<Response> =>
         fetch(`${cfg.openai.baseUrl.replace(/\/+$/, "")}/images/generations`, {
           method: "POST",
           headers: { "Content-Type": "application/json", Authorization: `Bearer ${cfg.openai.key}` },
-          body: JSON.stringify({ model: OAI_MODEL, prompt: usedPrompt, n: 1, size: sz, response_format: "b64_json" }),
+          body: JSON.stringify({ model: cfg.openai.model || OAI_DEFAULT_MODEL, prompt: usedPrompt, n: 1, size: sz }),
           signal: AbortSignal.timeout(GEN_TIMEOUT),
         });
       let r = await call(size);
@@ -131,10 +144,17 @@ export async function generateImage(params: GenParams, saveDir?: string): Promis
         r = await call(OAI_FALLBACK_SIZE);
       }
       if (!r.ok) return { ok: false, error: httpError("生图 API", r.status, await r.text().catch(() => "")) };
-      const j = (await r.json()) as { data?: { b64_json?: string }[] };
-      const b64 = j.data?.[0]?.b64_json;
-      if (!b64) return { ok: false, error: "生图 API 返回里没有图片数据" };
-      buf = Buffer.from(b64, "base64");
+      const j = (await r.json()) as { data?: { b64_json?: string; url?: string }[] };
+      const item = j.data?.[0];
+      if (item?.b64_json) {
+        buf = Buffer.from(item.b64_json, "base64");
+      } else if (item?.url) {
+        const img = await fetch(item.url, { signal: AbortSignal.timeout(GEN_TIMEOUT) });
+        if (!img.ok) return { ok: false, error: "生图成功但下载图片失败 HTTP " + img.status };
+        buf = Buffer.from(await img.arrayBuffer());
+      } else {
+        return { ok: false, error: "生图 API 返回里没有图片数据" };
+      }
     } else {
       return {
         ok: false,

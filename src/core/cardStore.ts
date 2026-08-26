@@ -81,15 +81,19 @@ export class CardStore {
     const prev = await this.get(card.slug).catch(() => null);
     await fs.mkdir(path.dirname(this.cardPath(card.slug)), { recursive: true });
     await fs.writeFile(this.cardPath(card.slug), JSON.stringify(card, null, 2), "utf8");
-    // 版本快照放到后台做：卡里可能带 base64 头像（~1MB），同步写会让保存明显变慢
+    // 版本快照放到后台做，避免拖慢保存
     if (prev) {
       void (async () => {
         try {
           await fs.mkdir(this.versionsDir(card.slug), { recursive: true });
           const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+          // 快照不存头像：base64 头像能占到卡片的 99%（实测 1.28MB），
+          // 10 份快照就是 13MB 垃圾。头像不是需要回溯的内容，回滚时沿用当前头像即可。
+          const { avatar: _omit, ...identityRest } = prev.identity ?? ({} as PersonaCard["identity"]);
+          const snapshot = { ...prev, identity: identityRest, _avatarOmitted: true };
           await fs.writeFile(
             path.join(this.versionsDir(card.slug), `v${prev.version}-${stamp}.json`),
-            JSON.stringify(prev),
+            JSON.stringify(snapshot),
             "utf8"
           );
           await this.pruneVersions(card.slug);

@@ -2287,6 +2287,23 @@ app.post("/api/emojis", async (req, res) => {
   }
 });
 
+// 表情导入（二进制直传）：前端跳过 FileReader/base64/JSON，体积省 33%、无大字符串序列化
+app.post("/api/emojis/raw", express.raw({ type: "application/octet-stream", limit: "20mb" }), async (req, res) => {
+  try {
+    const name = String(req.query?.name ?? "").trim();
+    const explanation = String(req.query?.exp ?? "").slice(0, 100);
+    const ext = String(req.query?.ext ?? "png").toLowerCase();
+    const buf = req.body as Buffer;
+    if (!name) return res.status(400).json({ error: "表情名不能为空" });
+    if (!buf || !buf.length) return res.status(400).json({ error: "缺少图片内容" });
+    const item = await addEmoji({ name, explanation, imageBase64: buf.toString("base64"), ext });
+    res.json({ ok: true, emoji: { ...item, url: emojiUrl(item.file) } });
+  } catch (e) {
+    res.status(400).json({ error: toUserError(e) });
+  }
+});
+
+
 app.post("/api/emojis/:id", async (req, res) => {
   try {
     const { name, explanation } = req.body ?? {};

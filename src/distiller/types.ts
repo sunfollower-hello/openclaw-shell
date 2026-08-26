@@ -15,6 +15,8 @@ export interface RedactReport {
 export interface DistillItem {
   text: string;
   evidence: "verbatim" | "artifact" | "impression";
+  /** 细分类别（catchphrase/tone/quote/length/multi_send/emoji/trait/value/emotion/boundary/fact/relation/timeline） */
+  kind?: string;
   topic?: string;
   scope?: string;
 }

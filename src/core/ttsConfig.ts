@@ -113,13 +113,15 @@ export async function listEdgeVoices(): Promise<{ id: string; label: string }[]>
 async function synthProvider(text: string, p: TtsProvider, voice?: string, speed?: number): Promise<Buffer> {
   const base = p.baseUrl.replace(/\/+$/, "");
   if (!base || !p.key) throw new Error(`上游「${p.name}」未配置 Base URL / Key`);
+  const v = voice || p.voice;
+  if (!v) throw new Error(`上游「${p.name}」未配置音色（OpenAI 兼容 TTS 的 voice 必填），请到「语音合成」页编辑该提供商填写「默认音色」`);
   const r = await fetch(`${base}/audio/speech`, {
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: `Bearer ${p.key}` },
     body: JSON.stringify({
       model: p.model,
       input: text,
-      voice: voice || p.voice || undefined,
+      voice: v,
       response_format: "mp3",
       speed: speed ?? p.speed ?? 1,
       stream: false,
@@ -246,6 +248,41 @@ const SAPI_SCRIPT_TEMPLATE = (text: string, outFile: string): string =>
     "$s.Dispose()",
   ].join("\n");
 
+/** SAPI 的 PCM WAV 转 MP3（纯 JS lamejs）：网页播放/售卖接口默认用 mp3 */
+export async function wavToMp3(wav: Buffer): Promise<Buffer> {
+  const lameMod: { Mp3Encoder?: unknown } = (await import("@breezystack/lamejs")) as { Mp3Encoder?: unknown };
+  const Mp3Encoder = lameMod.Mp3Encoder as
+    | (new (channels: number, sampleRate: number, kbps: number) => {
+        encodeBuffer(left: Int16Array, right?: Int16Array): Int8Array;
+        flush(): Int8Array;
+      })
+    | undefined;
+  if (!Mp3Encoder) throw new Error("MP3 编码器加载失败");
+  // SAPI 产标准 44 字节头 WAV（16kHz 16bit mono）；找不到 data 块时按 44 偏移
+  let dataOffset = 44;
+  for (let i = 12; i < wav.length - 8; i++) {
+    if (wav[i] === 0x64 && wav[i + 1] === 0x61 && wav[i + 2] === 0x74 && wav[i + 3] === 0x61) {
+      dataOffset = i + 8;
+      break;
+    }
+  }
+  const channels = wav.length > 23 ? wav.readUInt16LE(22) : 1;
+  const sampleRate = wav.length > 27 ? wav.readUInt32LE(24) : 16000;
+  const pcm = wav.subarray(dataOffset);
+  const encoder = new Mp3Encoder(channels, sampleRate, 64);
+  const blockBytes = 1152 * 2 * channels;
+  const out: Buffer[] = [];
+  for (let i = 0; i + blockBytes <= pcm.length; i += blockBytes) {
+    const samples = new Int16Array(pcm.buffer, pcm.byteOffset + i, 1152 * channels);
+    const data = channels === 1 ? encoder.encodeBuffer(samples) : encoder.encodeBuffer(samples, samples);
+    if (data && data.length) out.push(Buffer.from(data));
+  }
+  const end = encoder.flush();
+  if (end && end.length) out.push(Buffer.from(end));
+  if (!out.length) throw new Error("MP3 编码失败：无输出");
+  return Buffer.concat(out);
+}
+
 async function synthSapi(text: string): Promise<Buffer> {
   const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "ocls-sapi-"));
   const script = path.join(tmpDir, "speak.ps1");
@@ -264,7 +301,7 @@ async function synthSapi(text: string): Promise<Buffer> {
     });
     const buf = await fs.readFile(wav);
     if (!buf.length) throw new Error("SAPI 返回空音频");
-    return buf;
+    return buf; // 返回原始 WAV：silk 编码需要 wav 输入，mp3 由 convertAudio 按需转换
   } finally {
     fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
   }
@@ -295,6 +332,34 @@ export async function synthesize(text: string, opts?: SynthesizeOptions): Promis
   // 本地兜底
   if (cfg.local.engine === "sapi") return synthSapi(t);
   return synthEdge(t, cfg.local.voice, cfg.local.rate, cfg.local.pitch);
+}
+
+/** 音频格式判定：RIFF=wav，#!SILK=silk，其余按 mp3/压缩格式对待 */
+export function detectAudioKind(buf: Buffer): "wav" | "silk" | "other" {
+  if (buf.length > 4 && buf[0] === 0x52 && buf[1] === 0x49 && buf[2] === 0x46 && buf[3] === 0x46) return "wav";
+  const head = buf.subarray(0, 10).toString("latin1");
+  if (head.includes("#!SILK")) return "silk";
+  return "other";
+}
+
+/**
+ * 把合成结果转成目标格式。silk（QQ 语音消息唯一接受的上传格式）只能从 wav 编码，
+ * 上游直接返回 mp3 时无法转 silk，会抛出可读错误提示改用本地兜底或让上游输出 wav。
+ */
+export async function convertAudio(buf: Buffer, target: "mp3" | "wav" | "silk"): Promise<Buffer> {
+  const kind = detectAudioKind(buf);
+  if (target === "silk") {
+    if (kind === "silk") return buf;
+    if (kind !== "wav") throw new Error("生成 SILK 需要 WAV 音频；当前上游返回的是压缩格式（mp3 等），请让上游输出 wav 或使用本地兜底");
+    const { toSilk } = await import("./silk.js");
+    return (await toSilk(buf)).buffer;
+  }
+  if (target === "wav") {
+    if (kind === "wav") return buf;
+    throw new Error("上游返回的不是 WAV，无法转换为 WAV");
+  }
+  // mp3：wav 本地编码，其他（已是 mp3/压缩格式）原样返回
+  return kind === "wav" ? await wavToMp3(buf) : buf;
 }
 
 /** 测试某个上游（或本地兜底），返回可读结果（不落盘、不记账） */

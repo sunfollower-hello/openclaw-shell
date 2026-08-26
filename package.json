@@ -13,11 +13,13 @@
     "start:tts": "node dist/tts-server.js"
   },
   "dependencies": {
+    "@breezystack/lamejs": "^1.2.7",
     "@modelcontextprotocol/sdk": "^1.30.0",
     "adm-zip": "^0.6.0",
     "edge-tts": "^1.0.1",
     "express": "^4.21.2",
     "qrcode": "^1.5.4",
+    "silk-wasm": "^3.7.1",
     "zod": "^3.24.1"
   },
   "devDependencies": {

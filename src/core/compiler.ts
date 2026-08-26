@@ -354,7 +354,8 @@ export async function compileCard(card: PersonaCard, workspace: string): Promise
 
   const presetBlocks = (await resolveCardPresetBlocks(c)).map((b) => applyMacros(b, macros));
   // 表情包清单（全局共享库）：让通道端的机器人也能像真人一样发表情
-  const emojiBlock = await buildEmojiPrompt(c.voice?.message_style?.emoji ?? "克制").catch(() => "");
+  // 通道端走工具投递（emoji_send），不能用 [表情:名字] 标记——那边没有前端做替换
+  const emojiBlock = await buildEmojiPrompt(c.voice?.message_style?.emoji ?? "克制", "tool").catch(() => "");
 
   const rel = (name: string): string => path.join("skills", "personas", c.slug, name);
   const files: Record<string, string> = {

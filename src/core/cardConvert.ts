@@ -67,6 +67,8 @@ export function cardToCCv2(card: PersonaCard): Record<string, unknown> {
     regex_scripts: [],
     character_book: { entries: [] },
   };
+  // avatar 不放导出 JSON：封面以 PNG 图面承载（参考 RP-Hub），避免产物被 base64 撑到 10MB
+  const { avatar: _avatar, ...identityRest } = card.identity ?? ({} as PersonaCard["identity"]);
   return {
     spec: "chara_card_v2",
     spec_version: "2.0",
@@ -92,7 +94,7 @@ export function cardToCCv2(card: PersonaCard): Record<string, unknown> {
           version: card.version,
           license: card.license,
           created_at: card.created_at,
-          identity: card.identity, // 含 role/relation/bio/tags（avatar 不放这里，PNG 图像本体已承载）
+          identity: identityRest, // 含 role/relation/bio/tags（avatar 已在上面剥离）
           voice: card.voice,
           personality: card.personality,
           memory: card.memory,

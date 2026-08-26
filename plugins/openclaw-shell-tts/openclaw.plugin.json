@@ -1,0 +1,19 @@
+{
+  "id": "openclaw-shell-tts",
+  "name": "Openclaw Shell TTS",
+  "description": "openclaw-shell 语音工具：合成语音并以 QQ 可用的 SILK 格式发送语音条",
+  "version": "0.1.0",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  },
+  "activation": {
+    "onStartup": true
+  },
+  "contracts": {
+    "tools": [
+      "speak"
+    ]
+  }
+}

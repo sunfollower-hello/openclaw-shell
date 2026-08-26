@@ -7,6 +7,61 @@ export interface ValidationResult {
   warnings: string[];
 }
 
+// 字段路径 → 用户看得懂的名字。zod 原文形如
+// `sillytavern_v2.character_book.entries.3.comment: Expected string, received null`，
+// 普通用户完全无从下手，这里翻成「世界书第 4 条」这种说法。
+const FIELD_LABELS: Record<string, string> = {
+  name: "名称",
+  slug: "英文标识",
+  identity: "身份信息",
+  bio: "简介",
+  role: "关系类型",
+  tags: "标签",
+  avatar: "头像",
+  voice: "说话方式",
+  tone_rules: "语气规则",
+  catchphrases: "口头禅",
+  quotes: "语录",
+  personality: "人格",
+  traits: "性格特质",
+  values: "价值观",
+  boundaries: "禁区",
+  memory: "记忆",
+  facts: "事实",
+  knowledge: "知识边界",
+  chat: "聊天设置",
+  presets: "预设",
+  tools: "工具",
+  emojis: "表情包",
+  sillytavern_v2: "角色卡内容",
+  character_book: "世界书",
+  entries: "条目",
+  first_mes: "开场白",
+  regex_scripts: "正则替换",
+  description: "角色档案",
+  content: "内容",
+  keys: "触发关键词",
+  comment: "条目名称",
+};
+
+function describeIssue(pathParts: string[], message: string): string {
+  const labeled: string[] = [];
+  for (const p of pathParts) {
+    if (/^\d+$/.test(p)) labeled.push(`第 ${Number(p) + 1} 条`);
+    else if (FIELD_LABELS[p]) labeled.push(FIELD_LABELS[p]);
+    else if (p === "chara_card_v2" || p === "schema") continue; // 内部字段，不必告诉用户
+    else labeled.push(p);
+  }
+  const where = labeled.join("·") || "卡片内容";
+  // zod 的英文说明也翻一下最常见的几种
+  let why = message;
+  if (/Expected string, received null/i.test(message)) why = "这一项不能是空值";
+  else if (/Required/i.test(message)) why = "这一项必填";
+  else if (/Expected .*, received/i.test(message)) why = "格式不对";
+  else if (/Invalid input/i.test(message)) why = "内容不合规";
+  return `${where}：${why}`;
+}
+
 export function validateCard(input: unknown): ValidationResult {
   const errors: string[] = [];
   const warnings: string[] = [];
@@ -15,8 +70,7 @@ export function validateCard(input: unknown): ValidationResult {
   const parsed = personaCardSchema.safeParse(input);
   if (!parsed.success) {
     for (const issue of parsed.error.issues) {
-      const path = issue.path.join(".");
-      errors.push(`${path}: ${issue.message}`);
+      errors.push(describeIssue(issue.path.map(String), issue.message));
     }
     return { ok: false, errors, warnings };
   }

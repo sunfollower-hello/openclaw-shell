@@ -6,13 +6,20 @@ import express from "express";
 import path from "node:path";
 import { promises as fs } from "node:fs";
 import { dataDir } from "./core/cardStore.js";
-import { getTtsConfig, synthesize, maskKey } from "./core/ttsConfig.js";
+import { getTtsConfig, synthesize, maskKey, convertAudio } from "./core/ttsConfig.js";
 import { recordUsage } from "./core/ttsUsage.js";
 
 const PORT = Number(process.env.TTS_PORT ?? 17900);
 const HOST = process.env.TTS_HOST ?? "0.0.0.0";
 /** 允许本机自用时的本地兜底合成（售卖部署请勿设置，避免把本地音质卖给客户） */
 const ALLOW_LOCAL = String(process.env.TTS_ALLOW_LOCAL ?? "0") === "1";
+/**
+ * 强制输出 SILK：QQ 语音上传（file_type=3）只接受 silk，mp3/wav 一律被腾讯拒（"请求数据异常"）。
+ * OpenClaw 核心的 response_format 白名单不含 silk、qqbot 插件 v2.0.1 出站也没有转码能力
+ * （audioFormatPolicy 只服务入站 STT，uploadDirectFormats 是未接线的死配置），
+ * 所以由本服务无条件返回 silk：核心按 mp3 记元数据、插件原样直传，腾讯只校验内容。
+ */
+const FORCE_SILK = String(process.env.TTS_FORCE_SILK ?? "0") === "1";
 const app = express();
 app.use(express.json({ limit: "2mb" }));
 
@@ -63,28 +70,37 @@ app.post("/v1/audio/speech", async (req, res) => {
     let providerId: string | undefined;
     const matched = cfg.providers.find((p) => p.enabled && (p.model === askedModel || askedModel.includes(p.model.split("/").pop() ?? "____")));
     if (matched) providerId = matched.id;
-    if (!providerId && cfg.defaultProvider !== "local") providerId = cfg.defaultProvider;
+    // 默认上游只在「已启用」时才用；未启用则留空往下走本地兜底，而不是报「未启用」硬失败
+    if (!providerId && cfg.defaultProvider !== "local") {
+      const def = cfg.providers.find((p) => p.id === cfg.defaultProvider);
+      if (def?.enabled) providerId = def.id;
+    }
     // 本机自用允许本地兜底（OpenClaw 调本服务、无上游时用 SAPI/Edge）；售卖部署不设 TTS_ALLOW_LOCAL 则保持不卖本地音质
     if (!providerId && ALLOW_LOCAL) providerId = "local";
     if (!providerId) {
       res.status(503).json({ error: "服务端未配置可用的 TTS 上游（请先在上游供应商里填写并启用，或设置默认上游）" });
       return;
     }
-    const buf = await synthesize(text, {
+    const raw = await synthesize(text, {
       providerId,
       voice: askedVoice || undefined,
       speed: typeof speed === "number" ? speed : undefined,
     });
-    const fmt = ["mp3", "wav", "opus", "pcm", "aac", "flac"].includes(String(response_format)) ? String(response_format) : "mp3";
+    const asked = ["mp3", "wav", "silk", "opus", "pcm", "aac", "flac"].includes(String(response_format)) ? String(response_format) : "mp3";
+    // FORCE_SILK 下一律产出 silk（QQ 语音唯一可上传格式）；否则按客户要求的格式转换
+    const fmt = FORCE_SILK ? "silk" : asked;
+    const buf = fmt === "silk" || fmt === "mp3" || fmt === "wav" ? await convertAudio(raw, fmt) : raw;
     const ctype: Record<string, string> = {
       mp3: "audio/mpeg",
       wav: "audio/wav",
+      silk: "audio/silk",
       opus: "audio/opus",
       pcm: "audio/x-pcm",
       aac: "audio/aac",
       flac: "audio/flac",
     };
-    res.setHeader("Content-Type", ctype[fmt] ?? "application/octet-stream");
+    // FORCE_SILK 时对外仍声明客户请求的类型（核心据此判定 voice-compatible 并给文件名），内容是 silk
+    res.setHeader("Content-Type", ctype[FORCE_SILK ? asked : fmt] ?? "application/octet-stream");
     res.setHeader("X-TTS-Provider", providerId);
     res.setHeader("X-TTS-Chars", String(text.length));
     res.send(buf);

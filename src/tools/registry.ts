@@ -158,35 +158,109 @@ const sandboxGrep: ToolDef = {
   },
 };
 
-// ---------- 联网搜索 / 天气 / 时间（同前，非危险） ----------
+// ---------- 联网搜索 ----------
+// 用国内可直连的搜索源：DuckDuckGo 在国内网络下连不上（实测三个域名全部连接超时），
+// 换成 360 搜索为主、必应国内版兜底，都不需要 API key，也不用代理。
+const SEARCH_UA =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+
+interface SearchHit {
+  title: string;
+  snippet: string;
+  url: string;
+}
+
+function stripTags(s: string): string {
+  return String(s ?? "")
+    .replace(/<[^>]+>/g, "")
+    .replace(/&(?:nbsp|ensp|emsp|thinsp);/g, " ")
+    .replace(/&amp;/g, "&")
+    .replace(/&quot;/g, '"')
+    .replace(/&#x27;|&#39;/g, "'")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    // 数字实体（搜索页里常见 &#0183; 之类的分隔符）
+    .replace(/&#x([0-9a-f]+);/gi, (_, h) => String.fromCodePoint(parseInt(h, 16)))
+    .replace(/&#(\d+);/g, (_, d) => String.fromCodePoint(Number(d)))
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+async function fetchHtml(url: string): Promise<string> {
+  const r = await fetch(url, {
+    headers: { "User-Agent": SEARCH_UA, "Accept-Language": "zh-CN,zh;q=0.9" },
+    signal: AbortSignal.timeout(15000),
+  });
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  return r.text();
+}
+
+/** 360 搜索：结果块是 li.res-list，标题在 h3>a，摘要在 .res-desc / .res-rich */
+function parseSo(html: string, limit: number): SearchHit[] {
+  const out: SearchHit[] = [];
+  const blocks = html.split(/<li[^>]*class="res-list/).slice(1);
+  for (const b of blocks) {
+    if (out.length >= limit) break;
+    const title = stripTags((b.match(/<h3[^>]*>[\s\S]*?<a[^>]*>([\s\S]*?)<\/a>/) ?? [])[1] ?? "");
+    const url = ((b.match(/<h3[^>]*>[\s\S]*?<a[^>]*href="([^"]+)"/) ?? [])[1] ?? "").trim();
+    const snippet = stripTags(
+      (b.match(/class="res-desc"[^>]*>([\s\S]*?)<\/p>/) ??
+        b.match(/class="res-rich[^"]*"[^>]*>([\s\S]*?)<\/div>/) ??
+        [])[1] ?? ""
+    );
+    // 只要真结果：相关搜索/站内跳转是相对路径，翻译等 onebox 卡片没有摘要
+    if (!title || !/^https?:\/\//i.test(url)) continue;
+    if (!snippet) continue;
+    out.push({ title, snippet, url });
+  }
+  return out;
+}
+
+/** 必应国内版兜底：结果块 li.b_algo */
+function parseBing(html: string, limit: number): SearchHit[] {
+  const out: SearchHit[] = [];
+  const blocks = html.split(/<li[^>]*class="[^"]*b_algo/).slice(1);
+  for (const b of blocks) {
+    if (out.length >= limit) break;
+    const title = stripTags((b.match(/<h2[^>]*>[\s\S]*?<a[^>]*>([\s\S]*?)<\/a>/) ?? [])[1] ?? "");
+    const url = ((b.match(/<h2[^>]*>[\s\S]*?<a[^>]*href="([^"]+)"/) ?? [])[1] ?? "").trim();
+    const snippet = stripTags(
+      (b.match(/class="b_caption"[\s\S]*?<p[^>]*>([\s\S]*?)<\/p>/) ?? b.match(/<p[^>]*>([\s\S]*?)<\/p>/) ?? [])[1] ?? ""
+    );
+    if (!title || !/^https?:\/\//i.test(url)) continue;
+    out.push({ title, snippet: snippet || "（无摘要）", url });
+  }
+  return out;
+}
+
+/** 依次尝试各搜索源，第一个出结果的就用它 */
+async function webSearchTop(query: string, limit: number): Promise<SearchHit[]> {
+  const sources: { name: string; url: string; parse: (h: string, n: number) => SearchHit[] }[] = [
+    { name: "360", url: `https://www.so.com/s?q=${encodeURIComponent(query)}`, parse: parseSo },
+    { name: "bing", url: `https://cn.bing.com/search?q=${encodeURIComponent(query)}`, parse: parseBing },
+  ];
+  for (const s of sources) {
+    try {
+      const hits = s.parse(await fetchHtml(s.url), limit);
+      if (hits.length) return hits;
+    } catch {
+      // 这个源不通就换下一个
+    }
+  }
+  return [];
+}
+
 const webSearch: ToolDef = {
   id: "web_search",
   name: "联网搜索",
-  description: "搜索互联网并返回前 5 条结果的标题、摘要和链接（DuckDuckGo，无需 API key）。",
+  description: "搜索互联网并返回前几条结果的标题、摘要和链接（无需 API key）。",
   parameters: { type: "object", properties: { query: { type: "string" } }, required: ["query"] },
   async run(args) {
-    const query = String(args.query ?? "");
-    try {
-      const r = await fetch(`https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`, {
-        headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" },
-        signal: AbortSignal.timeout(20000),
-      });
-      const html = await r.text();
-      const results: string[] = [];
-      const re = /<a[^>]*class="result__a"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>[\s\S]*?<a[^>]*class="result__snippet"[^>]*>([\s\S]*?)<\/a>/g;
-      const clean = (s: string) =>
-        s.replace(/<[^>]+>/g, "").replace(/&amp;/g, "&").replace(/&quot;/g, '"').replace(/&#x27;/g, "'").trim();
-      let m: RegExpExecArray | null;
-      let count = 0;
-      while ((m = re.exec(html)) !== null && count < 5) {
-        const url = decodeURIComponent((m[1].match(/uddg=([^&]+)/)?.[1] ?? m[1]).replace(/\+/g, " "));
-        results.push(`${count + 1}. ${clean(m[2])}\n   ${clean(m[3])}\n   ${url}`);
-        count++;
-      }
-      return results.length ? results.join("\n\n") : "没有搜到结果";
-    } catch (e) {
-      return `搜索失败: ${String(e)}`;
-    }
+    const query = String(args.query ?? "").trim();
+    if (!query) return "没有给搜索关键词";
+    const hits = await webSearchTop(query, 5);
+    if (hits.length === 0) return "没有搜到结果（可以换个说法或换关键词再试）";
+    return hits.map((r, i) => `${i + 1}. ${r.title}\n   ${r.snippet}\n   ${r.url}`).join("\n\n");
   },
 };
 
@@ -254,13 +328,13 @@ const imageGen: ToolDef = {
   id: "image_gen",
   name: "生图（AI 绘画）",
   description:
-    "根据文字描述生成图片并发送（需先在「生图配置」页配置提供商与 Key）。参数 prompt 为绘画提示词（必须用英文 Danbooru 标签风格：逗号分隔、含角色/服饰/动作/场景/光线/画质词，不要用自然语言），negative 为负面词（可选），aspect 为比例（square 方图/portrait 竖图/landscape 横图，可选，默认方图），seed 为随机种子（可选，相同种子可复现）。内容尺度：图片必须得体（SFW），即使对话氛围开放也绝不使用裸体/性相关标签（nude、nsfw、nipples、explicit 等），用完整衣着与含蓄描述表达。",
+    "根据文字描述生成图片并发送（需先在「生图配置」页配置提供商与 Key）。prompt 的写法取决于当前生效的提供商：若配置的是 NovelAI，prompt 必须用英文 Danbooru 标签风格（逗号分隔、含角色/服饰/动作/场景/光线/画质词，不要用自然语言）；若配置的是 OpenAI 兼容，prompt 用自然语言详细描述画面即可。若不确定当前提供商，默认按 NovelAI 的标签风格写。negative 为负面词（可选），aspect 为比例（square 方图/portrait 竖图/landscape 横图/auto 自动按画面内容选，可选，默认 auto——人物肖像/竖构图选竖图，风景横场景选横图，一般选方图），seed 为随机种子（可选，相同种子可复现）。内容尺度：图片必须得体（SFW），即使对话氛围开放也绝不使用裸体/性相关标签（nude、nsfw、nipples、explicit 等），用完整衣着与含蓄描述表达。",
   parameters: {
     type: "object",
     properties: {
       prompt: { type: "string", description: "绘画提示词" },
       negative: { type: "string", description: "负面提示词（可选）" },
-      aspect: { type: "string", description: "square/portrait/landscape（方图/竖图/横图）" },
+      aspect: { type: "string", description: "square/portrait/landscape/auto（方图/竖图/横图/自动，默认 auto）" },
       seed: { type: "number", description: "随机种子（可选，固定可复现同一张图）" },
     },
     required: ["prompt"],
