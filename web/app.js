@@ -3500,6 +3500,7 @@ function renderChannels() {
         <div id="wx-qr-img" class="qr-img" style="display:none"></div>
         <a id="wx-qr-link" class="qr-link" target="_blank" style="display:none">扫不了？点这里在浏览器打开链接</a>
         <div id="wx-login-msg" class="status"></div>
+        <pre id="wx-out" class="small-out"></pre>
         <h3>配对授权</h3>
         <div class="row"><input id="pairing-code" placeholder="配对码"><button id="btn-pair-approve" class="primary small-btn">批准</button></div>
         <pre id="pairing-list" class="small-out"></pre>
@@ -3560,10 +3561,10 @@ async function startLogin(channelPath, qrSel, msgSel, refreshCb) {
 
 function initChannels() {
   $("#btn-wx-login").addEventListener("click", () => startLogin("/api/channels/wechat/login", "#wx-qr", "#wx-login-msg", () => { refreshWechat(); refreshPairing(); }));
-  $("#btn-wx-refresh").addEventListener("click", refreshWechat);
+  $("#btn-wx-refresh").addEventListener("click", () => { refreshWechat(true); refreshConnections(); });
   $("#btn-pair-approve").addEventListener("click", approvePairing);
   $("#btn-qq-login").addEventListener("click", () => startLogin("/api/channels/qq/login", "#qq-qr", "#qq-login-msg", refreshQQ));
-  $("#btn-qq-refresh").addEventListener("click", refreshQQ);
+  $("#btn-qq-refresh").addEventListener("click", () => { refreshQQ(true); refreshConnections(); });
   refreshWechat(); refreshPairing(); refreshQQ(); refreshConnections();
 }
 async function refreshConnections() {
@@ -3586,25 +3587,31 @@ async function refreshConnections() {
     if (bots.length) {
       html += `<div class="conn-sub">已绑定（QQ ${qqCnt}/${maxQq} · 微信 ${wxCnt}/${maxWx}）</div>`;
       for (const b of bots) {
+        // 下拉表面直接显示"正在连接的那张卡"，展开才是换卡列表
+        const cardName = b.cardName || b.cardSlug;
+        const opts = (cards.cards ?? [])
+          .map((c) => `<option value="${escapeHtml(c.slug)}" ${c.slug === b.cardSlug ? "selected" : ""}>${escapeHtml(c.name)}${c.slug === b.cardSlug ? "（当前）" : ""}</option>`)
+          .join("");
         html += `<div class="conn-row">
-          <span class="conn-card">${escapeHtml(b.cardSlug)}</span>
           <span class="chip">${b.channel === "qqbot" ? "QQ" : "微信"} · ${escapeHtml(b.accountId)}</span>
-          <select class="conn-target" data-bot="${b.id}" style="max-width:150px"><option value="">换卡到…</option>${cardOpts.replaceAll("<option value=\"" + b.cardSlug + "\"", "<option value=\"" + b.cardSlug + "\" disabled")}</select>
+          <span class="conn-arrow">→</span>
+          <select class="conn-target" data-bot="${b.id}" data-cur="${escapeHtml(b.cardSlug)}" title="当前连接：${escapeHtml(cardName)}（可换卡）" style="max-width:190px">${opts}</select>
           <button class="danger small-btn" data-conn-del="${b.id}">解绑</button>
         </div>`;
       }
     } else {
       html += `<div class="muted">还没有绑定任何机器人实例。在「人设卡库」点开卡 → 右上角 ⚙ 高级配置 → 机器人接入创建。</div>`;
     }
-    // 可复用账号（未绑定）
+    // 可复用账号（未绑定）：通道页扫码建的账号会落到这里，提示用户去绑卡
     const freeAccounts = accounts.filter((a) => !a.boundBotId);
     if (freeAccounts.length) {
-      html += `<div class="conn-sub">可复用账号（凭证已认证，免扫码）</div>`;
+      html += `<div class="conn-sub">未绑卡的账号（凭证已认证，选一张卡即可用，免扫码）</div>`;
       for (const a of freeAccounts) {
         html += `<div class="conn-row">
-          <span class="conn-card">${a.channel === "qqbot" ? "QQ" : "微信"} · ${escapeHtml(a.accountId)}${a.name ? "（" + escapeHtml(a.name) + "）" : ""}</span>
-          <span class="ok-badge">✓ 已认证</span>
-          <select class="conn-cardpick" data-acc="${a.channel}|${a.accountId}" style="max-width:150px"><option value="">绑到卡…</option>${cardOpts}</select>
+          <span class="chip">${a.channel === "qqbot" ? "QQ" : "微信"} · ${escapeHtml(a.accountId)}</span>
+          <span class="warn-badge">未绑卡</span>
+          <span class="conn-arrow">→</span>
+          <select class="conn-cardpick" data-acc="${a.channel}|${a.accountId}" style="max-width:190px"><option value="">选一张卡绑定…</option>${cardOpts}</select>
         </div>`;
       }
     }
@@ -3621,12 +3628,17 @@ async function refreshConnections() {
     );
     box.querySelectorAll(".conn-target").forEach((sel) =>
       sel.addEventListener("change", async () => {
-        if (!sel.value) return;
-        if (!confirm("把该账号从当前卡转移到这张卡？旧卡会被顶掉，账号凭证复用不重新扫码。")) return;
+        // 下拉默认选中当前卡，选回自己不算换卡
+        if (!sel.value || sel.value === sel.dataset.cur) return;
+        const targetName = sel.options[sel.selectedIndex]?.textContent ?? sel.value;
+        if (!confirm(`把该账号换到「${targetName}」？原来的卡会被顶掉，账号凭证复用不重新扫码。`)) {
+          sel.value = sel.dataset.cur; // 取消就还原选中项
+          return;
+        }
         try {
           const r = await api.send("/api/bots/transfer", { method: "POST", body: JSON.stringify({ botId: sel.dataset.bot, toCardSlug: sel.value }) });
-          toast(r.ok ? "✓ 已转移" : "转移失败：" + (r.error ?? ""), r.ok);
-        } catch (e) { toast("转移失败：" + e.message, false); }
+          toast(r.ok ? "✓ 已换卡" : "换卡失败：" + (r.error ?? ""), r.ok);
+        } catch (e) { toast("换卡失败：" + e.message, false); }
         refreshConnections();
       })
     );
@@ -3653,12 +3665,16 @@ async function refreshConnections() {
     box.innerHTML = `<div class="muted">读取失败：${escapeHtml(e.message)}</div>`;
   }
 }
-async function refreshWechat() {
+async function refreshWechat(force = false) {
   try {
-    const s = await api.get("/api/channels/wechat/status");
+    const s = await api.get("/api/channels/wechat/status" + (force ? "?refresh=1" : ""));
     const el = $("#wx-status");
-    el.textContent = s.connected ? "已连接 ✓" : "未连接";
+    const accs = s.accounts ?? [];
+    el.textContent = s.connected ? (accs.length ? `已连接 ✓（${accs.length} 个账号）` : "已连接 ✓") : "未连接";
     el.className = "chip " + (s.connected ? "ok" : "");
+    // 和 QQ 一样把账号列出来：让用户知道扫的码落到哪个号，以及是否还没绑卡
+    const out = $("#wx-out");
+    if (out) out.textContent = accs.length ? "已绑定账号：" + accs.join("、") + "\n（在下方「机器人连接」给账号选一张卡即可聊天）" : "还没有绑定账号，点上方按钮扫码";
   } catch { $("#wx-status").textContent = "检测失败"; }
 }
 async function refreshPairing() {
@@ -3676,9 +3692,9 @@ async function approvePairing() {
     $("#pairing-code").value = "";
   } catch (e) { $("#pairing-list").textContent = "失败：" + e.message; }
 }
-async function refreshQQ() {
+async function refreshQQ(force = false) {
   try {
-    const s = await api.get("/api/channels/qq/status");
+    const s = await api.get("/api/channels/qq/status" + (force ? "?refresh=1" : ""));
     const el = $("#qq-status");
     el.textContent = s.connected ? "已连接 ✓" : "未连接";
     el.className = "chip " + (s.connected ? "ok" : "");

@@ -421,11 +421,16 @@ async function getChannelStatuses(force = false): Promise<Record<string, Channel
       const raw = JSON.parse(text.startsWith("{") ? text : text.slice(Math.max(0, text.indexOf("{"))));
       const accounts = (raw?.channelAccounts ?? {}) as Record<string, unknown[]>;
       for (const [id, st] of Object.entries((raw?.channels ?? {}) as Record<string, Record<string, unknown>>)) {
+        // 账号字段是 accountId（不是 id）；顺带取每个账号的连通性——通道级 connected
+        // 对微信这类无长连接的通道恒为 false，得看账号级才准
+        const accList = Array.isArray(accounts[id]) ? (accounts[id] as Record<string, unknown>[]) : [];
+        const accIds = accList.map((a) => String(a?.accountId ?? a?.id ?? a)).filter((s) => s && s !== "[object Object]");
+        const anyAccountLive = accList.some((a) => a?.connected === true || a?.running === true || a?.configured === true);
         out[id] = {
           configured: st?.configured === true,
-          connected: st?.connected === true,
+          connected: st?.connected === true || anyAccountLive,
           running: st?.running === true,
-          accounts: Array.isArray(accounts[id]) ? accounts[id].map((a) => String((a as { id?: string })?.id ?? a)) : [],
+          accounts: accIds,
         };
       }
       channelStatusCache = { at: Date.now(), data: out };
@@ -658,22 +663,76 @@ async function reconcileBotAccount(bot: BotInstance): Promise<BotInstance | null
   return updated;
 }
 
+/**
+ * 修复缺失的路由绑定。
+ * bots.json 里有实例、但 OpenClaw 的 routing bindings 里没有对应条目时，消息会落到默认
+ * agent（用共享 workspace 的人设），表现就是"连上了却不是这张卡在回"。
+ * 成因：agents add 时 bind 失败/后来被 agents delete 顺带清掉/手工改过配置。
+ * 这里查一遍 bindings，缺的补上（幂等，已存在的不动）。
+ */
+async function repairBotBindings(bots: BotInstance[]): Promise<string[]> {
+  if (bots.length === 0) return [];
+  const r = await runOpenclaw(["agents", "bindings"], { timeoutMs: 60000 });
+  const text = stripAnsi(r.stdout + r.stderr);
+  if (r.code !== 0 || !/Routing bindings|No routing bindings/i.test(text)) return []; // CLI 没跑通就别乱补
+  const repaired: string[] = [];
+  for (const b of bots) {
+    // 形如 "- <agentId> <- qqbot accountId=qq-xxxx"
+    const hasBinding = new RegExp(`^-\\s+${b.agentId}\\s+<-\\s+${b.channel}\\s+accountId=${b.accountId}\\b`, "m").test(text);
+    if (hasBinding) continue;
+    const bind = await runOpenclaw(
+      ["agents", "bind", "--agent", b.agentId, "--bind", `${b.channel}:${b.accountId}`, "--json"],
+      { timeoutMs: 30000 }
+    );
+    if (bind.code === 0) {
+      repaired.push(`${b.agentId} ← ${b.channel}:${b.accountId}`);
+      logInfo("通道", `补齐缺失的路由绑定：${b.agentId} ← ${b.channel}:${b.accountId}`);
+    }
+  }
+  if (repaired.length > 0) invalidateAgentsCache();
+  return repaired;
+}
+
 /** 通道连接页数据：机器人实例 + 已知账号（含未绑定的可复用账号） */
-app.get("/api/channels/connections", async (_req, res) => {
+app.get("/api/channels/connections", async (req, res) => {
   try {
     const bots = await listBots();
     const accounts = await scanKnownAccounts();
+    // 顺手校正微信这类"真实账号 id 由服务器下发"的占位绑定（错过登录轮询也能自愈）
+    let reconciled = 0;
+    for (const b of bots) {
+      if (!accounts.some((a) => a.channel === b.channel && a.accountId === b.accountId)) {
+        const fixed = await reconcileBotAccount(b).catch(() => null);
+        if (fixed) reconciled++;
+      }
+    }
+    const freshBots = reconciled > 0 ? await listBots() : bots;
+    // 补齐缺失的路由绑定（否则消息会落到默认 agent，表现为"回的不是这张卡"）
+    const repaired = req.query.repair === "0" ? [] : await repairBotBindings(freshBots).catch(() => []);
     // 关联：账号 → 绑定它的 bot
     const boundByAccount = new Map<string, BotInstance>();
-    for (const b of bots) boundByAccount.set(`${b.channel}:${b.accountId}`, b);
+    for (const b of freshBots) boundByAccount.set(`${b.channel}:${b.accountId}`, b);
+    // 卡名映射（前端要显示"正在连接哪张卡"，不能只给 slug）
+    const cardNames = new Map<string, string>();
+    for (const b of freshBots) {
+      if (cardNames.has(b.cardSlug)) continue;
+      const c = await store.get(b.cardSlug).catch(() => null);
+      cardNames.set(b.cardSlug, c?.name ?? b.cardSlug);
+    }
     const limits = { maxQq: MAX_QQ_BOTS, maxWeixin: MAX_WEIXIN_BOTS };
     res.json({
-      bots,
+      bots: freshBots.map((b) => ({ ...b, cardName: cardNames.get(b.cardSlug) ?? b.cardSlug })),
       accounts: accounts.map((a) => {
         const bound = boundByAccount.get(`${a.channel}:${a.accountId}`);
-        return { ...a, boundBotId: bound?.id ?? null, boundCardSlug: bound?.cardSlug ?? null };
+        return {
+          ...a,
+          boundBotId: bound?.id ?? null,
+          boundCardSlug: bound?.cardSlug ?? null,
+          boundCardName: bound ? cardNames.get(bound.cardSlug) ?? bound.cardSlug : null,
+        };
       }),
       limits,
+      repaired,
     });
   } catch (e) {
     res.status(500).json({ error: toUserError(e) });

@@ -1118,3 +1118,40 @@ button:disabled { opacity: 0.4; cursor: not-allowed; transform: none; }
 
 /* 记忆页：卡片列表上方的分组标题 */
 .mem-cards-head { font-size: 12.5px; color: var(--muted); margin: 0 0 6px 2px; }
+
+/* ---------- 运行日志面板 ---------- */
+.log-toolbar { gap: 6px; flex-wrap: wrap; margin-bottom: 8px; }
+.log-row {
+  display: grid; grid-template-columns: 62px 72px 1fr; gap: 8px;
+  padding: 4px 6px; border-bottom: 1px solid var(--border);
+  font-size: 12px; line-height: 1.5; align-items: baseline;
+}
+.log-row:last-child { border-bottom: 0; }
+.log-time { color: var(--faint); font-variant-numeric: tabular-nums; }
+.log-tag { color: var(--muted); }
+.log-msg { word-break: break-word; }
+.log-err { background: var(--danger-soft); }
+.log-err .log-msg { color: var(--danger); }
+.log-warn .log-msg { color: var(--accent-dark); }
+.log-detail { grid-column: 1 / -1; margin: 2px 0 2px 70px; }
+.log-detail summary { cursor: pointer; color: var(--muted); font-size: 11.5px; }
+.log-detail pre {
+  white-space: pre-wrap; word-break: break-all; margin: 4px 0 0;
+  padding: 6px 8px; background: var(--panel); border-radius: var(--radius-sm);
+  font-size: 11.5px; color: var(--muted);
+}
+
+/* ---------- 画师串列表 ---------- */
+.artist-item {
+  display: flex; align-items: center; gap: 8px;
+  padding: 7px 0; border-bottom: 1px dashed var(--border);
+}
+.artist-item:last-child { border-bottom: 0; }
+.artist-main { flex: 1; min-width: 0; }
+.artist-name { font-weight: 600; font-size: 13px; }
+.artist-content {
+  color: var(--muted); font-size: 12px; margin-top: 2px;
+  /* 长画师串只显示一行，超出省略——不加这个会被逐字符折行糊成一列 */
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.conn-arrow { color: #9aa1b5; font-size: 13px; }
