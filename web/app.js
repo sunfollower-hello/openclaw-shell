@@ -31,6 +31,19 @@ const api = {
   },
 };
 
+// 关系类型：卡里存的是英文枚举，界面上一律显示中文（原来卡库直接把 friend/family 打给用户看）
+const ROLE_LABEL = {
+  self: "自己",
+  friend: "朋友",
+  family: "家人",
+  partner: "恋人",
+  colleague: "同事",
+  "public-figure": "偶像·角色",
+};
+function roleLabel(role) {
+  return ROLE_LABEL[role] ?? role ?? "";
+}
+
 function escapeHtml(s) {
   return String(s ?? "").replace(/[&<>"']/g, (c) => ({
     "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
@@ -256,9 +269,44 @@ function blankCard(name, slug, role) {
 function openDrawer() { $("#drawer").classList.add("open"); $("#drawer-overlay").hidden = false; }
 function closeDrawer() { $("#drawer").classList.remove("open"); $("#drawer-overlay").hidden = true; }
 
+/**
+ * 切页前收尾：清掉上一页留下的轮询定时器和浮层。
+ * 不清的话扫码轮询会一直跑（300ms 一次、每次都让后端重渲二维码），弹窗也会浮在新页面上。
+ */
+function cleanupBeforeRoute() {
+  // 整段包 try：本函数在文件靠前处定义，而它清理的那些 let/const 声明在后面，
+  // 首次 router() 时它们还在 TDZ 里，直接访问会抛 ReferenceError 把整个页面搞白屏。
+  try {
+    if (botLoginTimer) { clearInterval(botLoginTimer); botLoginTimer = null; }
+    if (botLoginBotId) {
+      void api.send(`/api/bots/${botLoginBotId}/login/cancel`, { method: "POST" }).catch(() => {});
+      botLoginBotId = "";
+    }
+  } catch { /* 还没初始化，无需清理 */ }
+  try {
+    for (const k of Object.keys(loginTimers)) {
+      if (loginTimers[k]) {
+        clearInterval(loginTimers[k]);
+        loginTimers[k] = null;
+        // k 形如 /api/channels/qq/login，顺手让后端把挂着的登录进程杀掉
+        void api.send(k + "/cancel", { method: "POST" }).catch(() => {});
+      }
+    }
+  } catch { /* 同上 */ }
+  try {
+    if (lcEnterTimer) { clearTimeout(lcEnterTimer); lcEnterTimer = null; }
+  } catch { /* 同上 */ }
+  document.getElementById("bot-overlay")?.remove();
+  document.getElementById("adv-overlay")?.remove();
+  try {
+    stopSpeak(); // 停掉正在朗读的语音并回收 Blob URL
+  } catch { /* 同上 */ }
+}
+
 function router() {
   const hash = (location.hash || "").replace(/^#\/?/, "") || "home";
   const route = routes[hash] || routes.home;
+  cleanupBeforeRoute();
   $("#view").innerHTML = route.render();
   closeDrawer();
   $("#view").scrollTop = 0;
@@ -972,7 +1020,8 @@ async function wbSend() {
 
 async function wbFinishTurn(r) {
   if (r.type === "reply") {
-    addChatBubble("bot", r.reply);
+    // 走真人化渲染：应用卡里的正则替换，开了「拆条发送」时按空行拆成多条气泡逐条冒出
+    await addBotReplyHumanLike(r.reply);
     wbChatHistory.push({ role: "assistant", content: r.reply });
     if (wbCardObj?.abilities?.tts) speakText(r.reply); // 卡的高级配置开了 TTS → 自动朗读
   } else if (r.type === "pending") {
@@ -1240,7 +1289,7 @@ function renderCardsGrid() {
       </div>
       <div class="char-card-info">
         <div class="char-card-name">${escapeHtml(c.name)}</div>
-        <div class="meta">${c.role} · v${c.version}${bot ? ` · <span class="bot-tag">已接${bot.channel === "qqbot" ? "QQ" : "微信"}</span>` : ""}</div>
+        <div class="meta">${roleLabel(c.role)} · v${c.version}${bot ? ` · <span class="bot-tag">已接${bot.channel === "qqbot" ? "QQ" : "微信"}</span>` : ""}</div>
       </div>`;
     d.addEventListener("click", () => loadCardIntoEditor(c.slug));
     d.querySelector(".char-card-bot").addEventListener("click", (e) => {
@@ -1265,8 +1314,15 @@ function renderCardsGrid() {
 let botLoginTimer = null;
 let botDialogSlug = "";
 
+let botLoginBotId = "";   // 正在扫码的机器人，关窗时通知后端把登录进程杀掉
+
 function closeBotDialog() {
   if (botLoginTimer) { clearInterval(botLoginTimer); botLoginTimer = null; }
+  // 登录进程会一直挂着等扫码（实测能占 200MB+），关窗就取消
+  if (botLoginBotId) {
+    void api.send(`/api/bots/${botLoginBotId}/login/cancel`, { method: "POST" }).catch(() => {});
+    botLoginBotId = "";
+  }
   const ov = $("#bot-overlay");
   if (ov) ov.remove();
   botDialogSlug = "";
@@ -1308,26 +1364,37 @@ function renderBotBody(bot) {
   if (!bot) {
     const limits = botsData.limits ?? {};
     const bots = botsData.bots ?? [];
-    const wxUsed = bots.some((b) => b.channel === "openclaw-weixin");
-    const full = bots.length >= (limits.maxBots ?? 2);
+    const qqCount = bots.filter((b) => b.channel === "qqbot").length;
+    const wxCount = bots.filter((b) => b.channel === "openclaw-weixin").length;
+    const maxQq = limits.maxQq ?? 5;
+    const maxWx = limits.maxWeixin ?? 1;
+    const wxUsed = wxCount >= maxWx;
+    // 按选中渠道判断是否满额（渠道切换时同步）
+    const updateFullState = () => {
+      const full = $("#bot-channel")?.value === "qqbot" ? qqCount >= maxQq : wxCount >= maxWx;
+      const btn = $("#bot-create");
+      if (btn) { btn.disabled = full; btn.title = full ? "该渠道已达上限" : ""; }
+    };
     body.innerHTML = `
       <p class="muted">给这张卡建一个专属机器人：独立人设、独立会话记忆，接到 QQ 或微信。</p>
       <div class="bot-form">
         <label>渠道：
           <select id="bot-channel">
-            <option value="qqbot">QQ 机器人${full ? "（已达上限）" : ""}</option>
+            <option value="qqbot">QQ 机器人${qqCount >= maxQq ? "（已达上限）" : ""}</option>
             <option value="openclaw-weixin" ${wxUsed ? "disabled" : ""}>微信机器人${wxUsed ? "（已有 1 个，最多 1 个）" : ""}</option>
           </select>
         </label>
-        <label>账号 ID：<input id="bot-account" placeholder="留空自动生成（如 qq-a1b2）"></label>
+        <label>账号 ID：<input id="bot-account" placeholder="留空自动生成"></label>
       </div>
-      <p class="hint">上限 ${limits.maxBots ?? 2} 个机器人（当前 ${bots.length} 个）；QQ 需先在 <a href="https://q.qq.com/" target="_blank">q.qq.com</a> 创建机器人；微信需手机有 ClawBot 入口。</p>
+      <p class="hint">上限：QQ ${maxQq} 个（当前 ${qqCount} 个）、微信 ${maxWx} 个（当前 ${wxCount} 个）；QQ 需先在 <a href="https://q.qq.com/" target="_blank">q.qq.com</a> 创建机器人；微信需手机有 ClawBot 入口。</p>
       <div class="row" style="justify-content:flex-end">
-        <button id="bot-create" class="primary" ${full ? "disabled" : ""}>创建机器人</button>
+        <button id="bot-create" class="primary">创建机器人</button>
       </div>`;
+    $("#bot-channel").addEventListener("change", updateFullState);
+    updateFullState();
     $("#bot-create").addEventListener("click", async () => {
       const btn = $("#bot-create");
-      btn.disabled = true; btn.textContent = "创建中…（编译+建 agent）";
+      btn.disabled = true; btn.textContent = "创建中…";
       try {
         const r = await api.send("/api/bots", {
           method: "POST",
@@ -1362,7 +1429,7 @@ function renderBotBody(bot) {
         } else {
           toast("创建失败：" + e.message, false);
         }
-        btn.disabled = false; btn.textContent = "创建机器人";
+        updateFullState(); btn.textContent = "创建机器人";
       }
     });
     return;
@@ -1370,10 +1437,9 @@ function renderBotBody(bot) {
   // 已有实例：详情 + 操作
   body.innerHTML = `
     <div class="bot-detail">
-      <div class="bot-detail-row"><span>渠道</span><b>${bot.channelLabel ?? bot.channel}</b></div>
-      <div class="bot-detail-row"><span>账号 ID</span><code>${escapeHtml(bot.accountId)}</code></div>
-      <div class="bot-detail-row"><span>Agent</span><code>${escapeHtml(bot.agentId)}</code> ${bot.agentExists === true ? '<span class="ok-badge">已创建 ✓</span>' : bot.agentExists === false ? '<span class="warn-badge">agent 缺失</span>' : '<span class="muted">状态未知</span>'}</div>
-      <div class="bot-detail-row"><span>Workspace</span><code>data/agent-workspaces/${escapeHtml(bot.cardSlug)}</code></div>
+      <div class="bot-detail-row"><span>接到哪</span><b>${bot.channelLabel ?? (bot.channel === "qqbot" ? "QQ 机器人" : "微信机器人")}</b></div>
+      <div class="bot-detail-row"><span>机器人编号</span><code>${escapeHtml(bot.accountId)}</code></div>
+      <div class="bot-detail-row"><span>运行状态</span>${bot.agentExists === true ? '<span class="ok-badge">正常 ✓</span>' : bot.agentExists === false ? '<span class="warn-badge">需要重新创建</span>' : '<span class="muted">检测中…</span>'}</div>
     </div>
     <div class="bot-login-area">
       <div class="row">
@@ -1390,11 +1456,11 @@ function renderBotBody(bot) {
   $("#bot-recompile").addEventListener("click", async () => {
     try {
       const r = await api.send(`/api/bots/${bot.id}/recompile`, { method: "POST" });
-      toast(`已重新应用 ${r.files?.length ?? 0} 个文件到 agent workspace`);
+      toast(`已同步 ${r.files?.length ?? 0} 项内容给机器人`);
     } catch (e) { toast("重新应用失败：" + e.message, false); }
   });
   $("#bot-delete").addEventListener("click", async () => {
-    if (!confirm("删除这个机器人和它的 agent（渠道账号在平台侧的绑定不受影响）？")) return;
+    if (!confirm("删除这个机器人？你在 QQ/微信 平台侧的账号不受影响")) return;
     try {
       await api.send(`/api/bots/${bot.id}`, { method: "DELETE" });
       toast("已删除");
@@ -1409,6 +1475,7 @@ async function startBotLogin(botId) {
   const qrImg = $("#bot-qr-img"), qrLink = $("#bot-qr-link");
   if (!qr || !msg) return;
   try { await api.send(`/api/bots/${botId}/login`, { method: "POST" }); } catch (e) { msg.textContent = "发起失败：" + e.message; return; }
+  botLoginBotId = botId; // 记下来，关窗时取消登录进程
   msg.textContent = "二维码生成中…";
   if (botLoginTimer) clearInterval(botLoginTimer);
   // 二维码出现前用 300ms 快轮询抢首帧，拿到码后降到 1.5s 省资源
@@ -1644,7 +1711,7 @@ async function saveCard() {
   try {
     const res = await api.send(`/api/cards/${editingCard.slug}`, { method: "PUT", body: JSON.stringify(editingCard) });
     toast("✓ 已保存 v" + res.card.version);
-    loadCardList();
+    loadCardsGrid();
   } catch (e) { toast("保存失败：" + e.message, false); }
 }
 
@@ -1676,7 +1743,7 @@ async function importCard() {
     $("#import-file").value = "";
     // 同名卡默认另存不覆盖，告知用户实际入库的名字
     toast(r.renamedFrom ? `✓ 已导入：${r.card.name} · ${r.hint}` : `✓ 已导入：${r.card.name}`);
-    await loadCardList();
+    await loadCardsGrid();
     loadCardIntoEditor(r.card.slug);
   } catch (e) { toast("导入失败：" + e.message, false); }
 }
@@ -1789,6 +1856,11 @@ async function aiDraft() {
       body: JSON.stringify({ idea }),
     });
     applyDraftToForm(r.draft);
+    editingCard._coverPrompt = r.coverPrompt || "";
+    try {
+      const imgCfg = await api.get("/api/image/config");
+      editingCard._coverProvider = imgCfg.provider || "";
+    } catch { editingCard._coverProvider = ""; }
     msg.textContent = "✓ 草稿已生成，下面内容都可以改";
     await autoCover(r.draft);
   } catch (e) {
@@ -1839,23 +1911,46 @@ async function autoCover(draft) {
 async function generateCover(draft) {
   const d = draft ?? editingCard;
   if (!d) return toast("先填写名称或生成草稿", false);
-  const name = d.name || "角色";
-  const bio = (d.sillytavern_v2?.description || d.identity?.bio || "").slice(0, 120);
-  const prompt = `角色封面插画：${name}。${bio}。半身像，精致画风，适合做聊天头像`;
+  // 封面提示词由做卡 API（AI 生成草稿时）按当时的生图提供商生成，前端不拼模板
+  const prompt = (d._coverPrompt || d.coverPrompt || "").trim();
   const btn = $("#btn-ai-cover");
-  if (btn) btn.disabled = true;
+  const msg = $("#ai-msg");
+  if (!prompt) {
+    if (msg) msg.textContent = "还没有封面提示词：先点「生成草稿」让 AI 生成（提示词风格会自动跟随当前生图提供商）";
+    return;
+  }
   try {
-    const r = await api.send("/api/cards/cover", { method: "POST", body: JSON.stringify({ prompt }) });
-    if (r.ok && r.dataUrl) {
-      showCover(r.dataUrl);
-      $("#ai-msg").textContent = "✓ 封面已生成（不满意可再点「AI 生成」或上传自己的图）";
+    const imgCfg = await api.get("/api/image/config");
+    const curProv = imgCfg.provider || "";
+    if (d._coverProvider && curProv && d._coverProvider !== curProv) {
+      if (msg) msg.textContent = "生图提供商已切换（" + d._coverProvider + " → " + curProv + "）：请重新点「生成草稿」以生成匹配风格的封面提示词";
+      return;
+    }
+  } catch {}
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = "生成中…（约 20 秒）";
+  }
+  try {
+    const coverSlug =
+      d.slug ||
+      (d.name && /^[a-z0-9][a-z0-9-]*$/.test(d.name.toLowerCase())
+        ? d.name.toLowerCase()
+        : "cover-" + Date.now().toString(36));
+    const r = await api.send("/api/cards/cover", { method: "POST", body: JSON.stringify({ prompt, slug: coverSlug }) });
+    if (r.ok && r.url) {
+      showCover(r.url);
+      if (msg) msg.textContent = "✓ 封面已生成（不满意可再点「AI 生成」或上传自己的图）";
     } else {
-      $("#ai-msg").textContent = r.info || r.error || "封面生成失败";
+      if (msg) msg.textContent = r.info || r.error || "封面生成失败";
     }
   } catch (e) {
-    $("#ai-msg").textContent = "封面生成失败：" + e.message;
+    if (msg) msg.textContent = "封面生成失败：" + e.message;
   }
-  if (btn) btn.disabled = false;
+  if (btn) {
+    btn.disabled = false;
+    btn.textContent = "AI 生成";
+  }
 }
 
 async function saveNewCard() {
@@ -2022,16 +2117,17 @@ function renderImgGenPage() {
     <div class="page-head"><h2>生图配置</h2><p class="hint">网页聊天与 QQ/微信机器人共用这一套生图配置。</p></div>
     <div class="card-box">
       <div class="form">
-        <label>提供商</label>
-        <div class="img-provider-row">
-          <label class="radio"><input type="radio" name="ig-provider" value="novelai"> NovelAI（角色卡最佳）</label>
-          <label class="radio"><input type="radio" name="ig-provider" value="openai"> OpenAI 兼容</label>
+        <label>提供商（互斥，开启一个另一个关闭）</label>
+        <div class="cap-toggles img-provider-row">
+          <button type="button" class="cap-toggle" data-provider="novelai">NovelAI</button>
+          <button type="button" class="cap-toggle" data-provider="openai">OpenAI</button>
         </div>
         <div id="ig-pane-novelai" class="ig-pane">
+          <p class="hint">NovelAI 官方接口在国内直连不通（会报网络错误），需要能访问它的网络环境才能用。国内建议用 OpenAI 兼容那栏。</p>
           <label>API Key（留空 = 保留原值）</label>
-          <input id="ig-nai-key" type="password" placeholder="sk-...">
+          <input id="ig-nai-key" type="password" placeholder="NovelAI 官方 key（pst-… 开头）">
           <div class="artists-box" style="margin-top:10px">
-            <label>画师串（生成时自动拼到提示词末尾；可添加多个、改名、修改、删除，点圆点设为当前生效）</label>
+            <label>画师串（生成时自动拼到提示词末尾。可以存多条，点右边「启用」切换；再点一下取消，取消后就不拼画师串）</label>
             <div id="ig-artists-list"></div>
             <button id="ig-artist-add" class="ghost small-btn" style="margin-top:6px">${icon("plus")} 添加画师串</button>
             <div id="ig-artist-edit" style="display:none;margin-top:6px;border:1px dashed var(--border);border-radius:8px;padding:8px">
@@ -2049,6 +2145,12 @@ function renderImgGenPage() {
           <input id="ig-oai-url" placeholder="https://api.example.com/v1">
           <label style="margin-top:8px">API Key（留空 = 保留原值）</label>
           <input id="ig-oai-key" type="password" placeholder="sk-...">
+          <label style="margin-top:8px">生图模型（中转站一般不单独放生图模型，从 /models 拉取后选择）</label>
+          <div class="row">
+            <select id="ig-oai-model" style="flex:1;min-width:160px"><option value="">（先拉取模型列表）</option></select>
+            <button id="ig-oai-models" class="ghost small-btn">拉取模型</button>
+          </div>
+          <div id="ig-oai-models-status" class="status"></div>
         </div>
         <div class="row" style="margin-top:12px">
           <button id="ig-save" class="primary">${icon("save")} 保存配置</button>
@@ -2114,7 +2216,7 @@ function initImagegen() { initImgGenPage(); }
 
 // ---------- 生图配置页交互 ----------
 function igRadio() {
-  return document.querySelector('input[name="ig-provider"]:checked')?.value ?? "novelai";
+  return document.querySelector(".cap-toggle[data-provider].on")?.dataset?.provider ?? "novelai";
 }
 let imgState = { artists: [], activeArtist: "" };
 let artistEditing = null; // 正在编辑的画师串下标（null = 新增）
@@ -2125,22 +2227,39 @@ function showIgPane(provider) {
     if (pane) pane.style.display = p === provider ? "block" : "none";
   }
 }
+function setIgProvider(provider) {
+  document.querySelectorAll(".cap-toggle[data-provider]").forEach((b) => {
+    b.classList.toggle("on", b.dataset.provider === provider);
+  });
+  showIgPane(provider);
+}
 function collectImgForm() {
   const v = (id) => { const el = $(id); return el ? el.value.trim() : ""; };
   return {
     provider: igRadio(),
     novelai: { key: v("#ig-nai-key") },
-    openai: { baseUrl: v("#ig-oai-url"), key: v("#ig-oai-key") },
+    openai: { baseUrl: v("#ig-oai-url"), key: v("#ig-oai-key"), model: v("#ig-oai-model") },
     artists: imgState.artists,
     activeArtist: imgState.activeArtist,
   };
 }
 function fillImgForm(cfg) {
-  document.querySelectorAll('input[name="ig-provider"]').forEach((r) => { r.checked = r.value === cfg.provider; });
-  showIgPane(cfg.provider);
+  setIgProvider(cfg.provider);
   if ($("#ig-nai-key")) $("#ig-nai-key").value = "";
   if ($("#ig-oai-url")) $("#ig-oai-url").value = cfg.openai?.baseUrl ?? "";
   if ($("#ig-oai-key")) $("#ig-oai-key").value = "";
+  if ($("#ig-oai-model")) {
+    const sel = $("#ig-oai-model");
+    sel.dataset.cur = cfg.openai?.model ?? "";
+    // 若已保存模型不在下拉里，补一个选项保证显示
+    if (cfg.openai?.model) {
+      const opts = Array.from(sel.options).map((o) => o.value);
+      if (!opts.includes(cfg.openai.model)) {
+        sel.innerHTML = `<option value="${escapeHtml(cfg.openai.model)}">${escapeHtml(cfg.openai.model)}</option>`;
+      }
+      sel.value = cfg.openai.model;
+    }
+  }
   imgState.artists = (cfg.artists ?? []).map((a) => ({ name: a.name, content: a.content }));
   imgState.activeArtist = cfg.activeArtist ?? "";
   renderArtistsList();
@@ -2155,29 +2274,36 @@ function renderArtistsList() {
     box.innerHTML = `<div class="muted">还没有画师串。添加一个后，生成图片时会自动拼到提示词末尾。</div>`;
     return;
   }
-  box.innerHTML = imgState.artists.map((a, i) => `
-    <div class="artists-item" style="display:flex;align-items:center;gap:8px;padding:5px 0;border-bottom:1px dashed var(--border)">
-      <input type="radio" name="ig-artist-active" data-i="${i}" ${a.name === imgState.activeArtist ? "checked" : ""} title="设为当前生效">
-      <div style="flex:1;min-width:0">
-        <div style="font-weight:600">${escapeHtml(a.name)}${a.name === imgState.activeArtist ? ' <span class="mem-badge">当前</span>' : ""}</div>
-        <div class="muted" style="font-size:12px;word-break:break-all">${escapeHtml(a.content.slice(0, 80))}${a.content.length > 80 ? "…" : ""}</div>
+  box.innerHTML = imgState.artists
+    .map((a, i) => {
+      const on = a.name === imgState.activeArtist;
+      return `
+    <div class="artist-item">
+      <div class="artist-main">
+        <div class="artist-name">${escapeHtml(a.name)}${on ? ' <span class="mem-badge">生效中</span>' : ""}</div>
+        <div class="artist-content">${escapeHtml(a.content.slice(0, 90))}${a.content.length > 90 ? "…" : ""}</div>
       </div>
+      <button class="${on ? "primary" : "ghost"} small-btn" data-toggle="${i}" title="${on ? "点一下停用" : "点一下启用"}">${on ? "已启用" : "启用"}</button>
       <button class="ghost small-btn" data-edit="${i}">编辑</button>
       <button class="danger small-btn" data-del="${i}">删除</button>
-    </div>`).join("");
+    </div>`;
+    })
+    .join("");
+  // 启用/停用：点已生效的那条就取消（都不启用时生成不拼画师串）；换别的等于切换
+  box.querySelectorAll("[data-toggle]").forEach((b) =>
+    b.addEventListener("click", () => {
+      const a = imgState.artists[Number(b.dataset.toggle)];
+      if (!a) return;
+      imgState.activeArtist = imgState.activeArtist === a.name ? "" : a.name;
+      renderArtistsList();
+      saveImgConfig();
+    })
+  );
   box.querySelectorAll("[data-edit]").forEach((b) =>
     b.addEventListener("click", () => openArtistEdit(Number(b.dataset.edit)))
   );
   box.querySelectorAll("[data-del]").forEach((b) =>
     b.addEventListener("click", () => deleteArtist(Number(b.dataset.del)))
-  );
-  box.querySelectorAll('input[name="ig-artist-active"]').forEach((r) =>
-    r.addEventListener("change", () => {
-      const i = Number(r.dataset.i);
-      imgState.activeArtist = imgState.artists[i]?.name ?? "";
-      renderArtistsList();
-      saveImgConfig();
-    })
   );
 }
 function openArtistEdit(i) {
@@ -2209,9 +2335,32 @@ async function saveImgConfig() {
 async function initImgGenPage() {
   imgState = { artists: [], activeArtist: "" };
   artistEditing = null;
-  document.querySelectorAll('input[name="ig-provider"]').forEach((r) =>
-    r.addEventListener("change", () => showIgPane(igRadio()))
+  document.querySelectorAll(".cap-toggle[data-provider]").forEach((b) =>
+    b.addEventListener("click", () => setIgProvider(b.dataset.provider))
   );
+  $("#ig-oai-models").addEventListener("click", async () => {
+    const baseUrl = $("#ig-oai-url")?.value?.trim();
+    const key = $("#ig-oai-key")?.value?.trim();
+    setStatus("#ig-oai-models-status", "拉取中…");
+    try {
+      const r = await api.send("/api/image/openai-models", {
+        method: "POST",
+        body: JSON.stringify({ baseUrl: baseUrl || undefined, key: key || undefined }),
+      });
+      if (r.models) {
+        const sel = $("#ig-oai-model");
+        const cur = sel.value || sel.dataset.cur || "";
+        sel.innerHTML = `<option value="">（选择生图模型）</option>` +
+          r.models.map((m) => `<option value="${escapeHtml(m)}">${escapeHtml(m)}</option>`).join("");
+        if (cur && r.models.includes(cur)) sel.value = cur;
+        setStatus("#ig-oai-models-status", `✓ 拉取到 ${r.models.length} 个模型${cur ? "，已保留原选择" : ""}`, true);
+      } else {
+        setStatus("#ig-oai-models-status", "拉取失败：" + (r.error ?? "未知错误"), false);
+      }
+    } catch (e) {
+      setStatus("#ig-oai-models-status", "拉取失败：" + e.message, false);
+    }
+  });
   $("#ig-save").addEventListener("click", async () => {
     const f = collectImgForm();
     const r = await api.send("/api/image/config", { method: "POST", body: JSON.stringify(f) });
@@ -2686,23 +2835,26 @@ async function ttsProvSaveAndFetch() {
     if (r.id) ttsState.editingId = r.id;
     const fr = await api.send("/api/tts/fetch-models", {
       method: "POST",
-      body: JSON.stringify({ kind: body.kind, baseUrl: body.baseUrl, key: body.key || undefined }),
+      body: JSON.stringify({ id: ttsState.editingId, kind: body.kind, baseUrl: body.baseUrl, key: body.key || undefined }),
     });
     ttsState.models = fr.models || [];
     ttsState.voices = fr.voices || [];
-    renderTtsChips("tts-pv-models", ttsState.models, "tts-pv-model", body.model);
-    renderTtsChips("tts-pv-voices", ttsState.voices, "tts-pv-voice", body.voice);
+    renderTtsChips("#tts-pv-models", ttsState.models, "#tts-pv-model", body.model);
+    renderTtsChips("#tts-pv-voices", ttsState.voices, "#tts-pv-voice", body.voice);
     $("#tts-pv-fetch").style.display = "block";
     $("#tts-pv-done").style.display = "inline-block";
-    $("#tts-pv-msg").textContent = `✓ 已保存；拉取到 ${ttsState.models.length} 个模型${ttsState.voices.length ? `、${ttsState.voices.length} 个音色` : ""}。点击模型/音色填入后点「完成」`;
+    $("#tts-pv-msg").textContent = ttsState.models.length
+      ? `✓ 已保存；拉取到 ${ttsState.models.length} 个模型${ttsState.voices.length ? `、${ttsState.voices.length} 个音色` : ""}。点击模型/音色填入后点「完成」`
+      : "✓ 已保存；该接口没返回模型，请在「默认模型/默认音色」手动填写后点「完成」";
     loadTtsConfig();
   } catch (e) {
-    $("#tts-pv-msg").textContent = "失败：" + e.message;
+    $("#tts-pv-msg").textContent = "拉取失败：" + e.message + "——可手动填写「默认模型/默认音色」后点「完成」保存";
+    $("#tts-pv-done").style.display = "inline-block";
   }
 }
 
 function renderTtsChips(boxId, items, inputId, chosen) {
-  const box = $(boxId);
+  const box = $(boxId[0] === "#" ? boxId : "#" + boxId);
   if (!box) return;
   if (!items || !items.length) { box.innerHTML = '<div class="hint">（无，手动填写上方输入框）</div>'; return; }
   box.innerHTML = "";
@@ -2712,7 +2864,7 @@ function renderTtsChips(boxId, items, inputId, chosen) {
     chip.className = "model-chip" + (m === chosen ? " on" : "");
     chip.textContent = m;
     chip.addEventListener("click", () => {
-      const inp = $(inputId);
+      const inp = $(inputId[0] === "#" ? inputId : "#" + inputId);
       if (inp) inp.value = m;
       box.querySelectorAll(".model-chip").forEach((c) => c.classList.remove("on"));
       chip.classList.add("on");
@@ -2894,7 +3046,7 @@ function initMemory() {
     for (const c of list) {
       const d = document.createElement("div");
       d.className = "mini-card";
-      d.innerHTML = `<div class="mini-name">${escapeHtml(c.name)}</div><div class="meta">${c.role}</div>`;
+      d.innerHTML = `<div class="mini-name">${escapeHtml(c.name)}</div><div class="meta">${roleLabel(c.role)}</div>`;
       d.addEventListener("click", () => openMemDetail(c.slug));
       box.appendChild(d);
     }
@@ -3121,10 +3273,13 @@ function addChatBubble(role, text) {
 let ttsAudio = null;
 let ttsOwner = null;   // 正在朗读的那个按钮，用于高亮与"再点一次停止"
 let ttsLoading = false;
+let ttsUrl = null;     // 当前音频的 Blob URL（不落盘，播完要回收）
 
 /** 停掉当前朗读并清理状态 */
 function stopSpeak() {
   if (ttsAudio) { try { ttsAudio.pause(); } catch { /* 忽略 */ } ttsAudio = null; }
+  // 语音不落盘，靠内存 Blob URL 播放；不回收会一直占内存
+  if (ttsUrl) { try { URL.revokeObjectURL(ttsUrl); } catch { /* 忽略 */ } ttsUrl = null; }
   if (ttsOwner) { ttsOwner.classList.remove("playing"); ttsOwner = null; }
 }
 
@@ -3140,10 +3295,21 @@ async function speakText(text, btn) {
   ttsLoading = true;
   if (btn) { ttsOwner = btn; btn.classList.add("playing"); }
   try {
-    const r = await api.send("/api/tts/synthesize", { method: "POST", body: JSON.stringify({ text: String(text).slice(0, 500) }) });
+    // 后端直接回音频流（不落盘），这里收成 Blob 再放
+    const resp = await fetchApi("/api/tts/synthesize", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: String(text).slice(0, 500) }),
+    });
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({}));
+      throw new Error(err.error || resp.statusText);
+    }
+    const blob = await resp.blob();
     // 取音频期间用户可能已点了停止
     if (btn && ttsOwner !== btn) return;
-    ttsAudio = new Audio(r.url);
+    ttsUrl = URL.createObjectURL(blob);
+    ttsAudio = new Audio(ttsUrl);
     ttsAudio.addEventListener("ended", stopSpeak);
     ttsAudio.addEventListener("error", stopSpeak);
     await ttsAudio.play().catch(() => stopSpeak());
@@ -3413,8 +3579,12 @@ async function refreshConnections() {
     const cardOpts = (cards.cards ?? []).map((c) => `<option value="${escapeHtml(c.slug)}">${escapeHtml(c.name)}</option>`).join("");
     // 已绑定实例
     let html = "";
+    const maxQq = conn.limits?.maxQq ?? 5;
+    const maxWx = conn.limits?.maxWeixin ?? 1;
+    const qqCnt = bots.filter((b) => b.channel === "qqbot").length;
+    const wxCnt = bots.filter((b) => b.channel === "openclaw-weixin").length;
     if (bots.length) {
-      html += `<div class="conn-sub">已绑定（${bots.length}/${conn.limits?.maxBots ?? 2}）</div>`;
+      html += `<div class="conn-sub">已绑定（QQ ${qqCnt}/${maxQq} · 微信 ${wxCnt}/${maxWx}）</div>`;
       for (const b of bots) {
         html += `<div class="conn-row">
           <span class="conn-card">${escapeHtml(b.cardSlug)}</span>
@@ -3438,7 +3608,7 @@ async function refreshConnections() {
         </div>`;
       }
     }
-    html += `<p class="hint" style="margin-top:8px">账号上限：QQ 每号 5 个机器人（平台），微信 1 个；本机同时最多 ${conn.limits?.maxBots ?? 2} 个实例。换卡/绑卡都复用已有凭证，无需重新扫码。</p>`;
+    html += `<p class="hint" style="margin-top:8px">上限：QQ ${maxQq} 个机器人（平台，每号 5 个 AppID）、微信 ${maxWx} 个（一个微信号一个）。换卡/绑卡都复用已有凭证，无需重新扫码。</p>`;
     box.innerHTML = html;
     // 事件
     box.querySelectorAll("[data-conn-del]").forEach((b) =>
@@ -3509,11 +3679,15 @@ async function approvePairing() {
 async function refreshQQ() {
   try {
     const s = await api.get("/api/channels/qq/status");
-    const ok = s.pluginInstalled && s.onebotSeen;
     const el = $("#qq-status");
-    el.textContent = ok ? "已连接 ✓" : "未连接";
-    el.className = "chip " + (ok ? "ok" : "");
-    $("#qq-out").textContent = s.pluginInstalled ? "" : "官方 QQ Bot 插件未安装";
+    el.textContent = s.connected ? "已连接 ✓" : "未连接";
+    el.className = "chip " + (s.connected ? "ok" : "");
+    // 已绑定的账号列出来，让用户知道扫的码到底落到哪个号上了
+    $("#qq-out").textContent = !s.pluginInstalled
+      ? "还没装 QQ 官方插件，装好后再来扫码"
+      : s.accounts?.length
+        ? "已绑定账号：" + s.accounts.join("、")
+        : "还没有绑定账号，点上方按钮扫码";
   } catch { $("#qq-status").textContent = "检测失败"; }
 }
 
@@ -3964,6 +4138,54 @@ function bindPresets() {
 }
 
 // ---- 设置（原「数据」页的备份与记忆已并入这里） ----
+/** 拉运行日志到设置页的面板里（按级别/来源/关键词筛） */
+async function loadLogs() {
+  const box = $("#log-list");
+  if (!box) return;
+  try {
+    const level = $("#log-level")?.value ?? "all";
+    const tag = $("#log-tag")?.value ?? "all";
+    const q = ($("#log-q")?.value ?? "").trim();
+    const r = await api.get(
+      `/api/logs?level=${encodeURIComponent(level)}&tag=${encodeURIComponent(tag)}&q=${encodeURIComponent(q)}`
+    );
+    // 来源下拉按实际出现过的标签填充（保留当前选择）
+    const tagSel = $("#log-tag");
+    if (tagSel) {
+      const cur = tagSel.value;
+      const opts = ['<option value="all">全部来源</option>']
+        .concat((r.tags ?? []).map((t) => `<option value="${escapeHtml(t)}">${escapeHtml(t)}</option>`))
+        .join("");
+      if (tagSel.innerHTML !== opts) {
+        tagSel.innerHTML = opts;
+        tagSel.value = (r.tags ?? []).includes(cur) ? cur : "all";
+      }
+    }
+    if (!r.entries?.length) {
+      box.innerHTML = '<div class="muted">暂无日志（有报错会自动记在这里）</div>';
+      return;
+    }
+    box.innerHTML = r.entries
+      .map((e) => {
+        const t = new Date(e.ts);
+        const time = isNaN(t) ? "" : `${String(t.getHours()).padStart(2, "0")}:${String(t.getMinutes()).padStart(2, "0")}:${String(t.getSeconds()).padStart(2, "0")}`;
+        const lv = e.level === "error" ? "err" : e.level === "warn" ? "warn" : "info";
+        const detail = e.detail && e.detail !== e.msg
+          ? `<details class="log-detail"><summary>详情</summary><pre>${escapeHtml(e.detail)}</pre></details>`
+          : "";
+        return `<div class="log-row log-${lv}">
+          <span class="log-time">${time}</span>
+          <span class="log-tag">${escapeHtml(e.tag)}</span>
+          <span class="log-msg">${escapeHtml(e.msg)}</span>
+          ${detail}
+        </div>`;
+      })
+      .join("");
+  } catch (e) {
+    box.innerHTML = `<div class="muted">读取日志失败：${escapeHtml(e.message)}</div>`;
+  }
+}
+
 function renderSettings() {
   return `
   <div class="view">
@@ -3995,6 +4217,24 @@ function renderSettings() {
         <div id="mcp-msg" class="status"></div>
       </details>
     </div>` : ""}
+
+    <div class="card-box">
+      <h3>${icon("clipboard")} 运行日志</h3>
+      <p class="hint">出问题先看这里：聊天、通道、生图、语音、记忆的报错都会记下来。只留最近 500 条。</p>
+      <div class="row log-toolbar">
+        <select id="log-level" style="width:auto">
+          <option value="all">全部级别</option>
+          <option value="error">只看报错</option>
+          <option value="warn">只看警告</option>
+          <option value="info">只看普通</option>
+        </select>
+        <select id="log-tag" style="width:auto"><option value="all">全部来源</option></select>
+        <input id="log-q" placeholder="搜关键词…" style="flex:1;min-width:120px">
+        <button id="log-refresh" class="ghost small-btn">刷新</button>
+        <button id="log-clear" class="danger small-btn">清空</button>
+      </div>
+      <div id="log-list" class="small-out tall">加载中…</div>
+    </div>
 
     <div class="card-box">
       <h3>${icon("store")} 插件 <span class="plug-badge">暂未开放</span></h3>
@@ -4051,9 +4291,28 @@ function initSettings() {
 
   // 服务状态点仍然要亮（原来挂在服务信息块里）
   api.get("/api/health").then((h) => {
-    $("#drawer-meta").textContent = `SoulBox v${h.schema}`;
+    $("#drawer-meta").textContent = `SoulBox`;
     $("#svc-dot").classList.add("on");
   }).catch(() => { $("#svc-dot").classList.add("bad"); });
+
+  // ---- 运行日志 ----
+  $("#log-refresh").addEventListener("click", loadLogs);
+  $("#log-level").addEventListener("change", loadLogs);
+  $("#log-tag").addEventListener("change", loadLogs);
+  let logQTimer = null;
+  $("#log-q").addEventListener("input", () => {
+    clearTimeout(logQTimer);
+    logQTimer = setTimeout(loadLogs, 300);
+  });
+  $("#log-clear").addEventListener("click", async () => {
+    if (!confirm("清空运行日志？")) return;
+    try {
+      await api.send("/api/logs/clear", { method: "POST" });
+      toast("✓ 日志已清空");
+      loadLogs();
+    } catch (e) { toast("清空失败：" + e.message, false); }
+  });
+  loadLogs();
 
   // ---- 插件（暂未开放）：只读展示已安装列表 ----
   api.get("/api/plugins/installed").then((d) => {
@@ -4187,273 +4446,6 @@ function skillEdit(idx) {
     skillRenderList();
     wrap.style.display = "none";
     skillEditing = -1;
-  });
-}
-
-// ============================================================
-//  视图：插件商店（ClawHub 实时 + 精选/分享/付费目录）
-// ============================================================
-let pluginMarketData = { feeRate: 0.2, categories: [], plugins: [] };
-let pluginTab = "curated"; // curated | shared | paid | installed | search
-let pluginSearchQ = "";
-let pluginSearchResults = [];
-
-function renderPlugins() {
-  return `
-  <div class="view">
-    <div class="page-head" style="display:flex;justify-content:space-between;align-items:flex-start">
-      <div>
-        <h2>🧩 插件商店</h2>
-        <p class="hint">安装更多有趣能力：ClawHub 官方市场实时搜索 + 社区精选 + 用户分享/付费插件。装完需重启网关生效（多任务在跑可先攒着）。</p>
-      </div>
-      <div class="row" style="gap:8px">
-        <button id="btn-plug-share" class="ghost">＋ 分享免费插件</button>
-        <button id="btn-plug-sell" class="ghost">💰 上架付费插件</button>
-      </div>
-    </div>
-    <div class="row" style="gap:8px;margin:10px 0">
-      <input id="plug-search" placeholder="搜索 ClawHub 全库（如 werewolf / tts / image）…" style="flex:1">
-      <button id="btn-plug-search" class="primary">搜索</button>
-    </div>
-    <div class="plug-tabs">
-      <button data-plug-tab="curated" class="plug-tab">⭐ 精选</button>
-      <button data-plug-tab="shared" class="plug-tab">🧑‍🤝‍🧑 用户分享</button>
-      <button data-plug-tab="paid" class="plug-tab">💰 付费区</button>
-      <button data-plug-tab="installed" class="plug-tab">📦 已安装</button>
-    </div>
-    <div class="plug-cats" id="plug-cats"></div>
-    <div id="plug-grid" class="plug-grid"></div>
-  </div>`;
-}
-
-const PLUG_CAT_EMOJI = { image: "🎨", tts: "🔊", memory: "🧠", game: "🎲", tool: "🛠", channel: "💬", other: "📦" };
-
-function plugCard(p, opts = {}) {
-  const cat = opts.cat || p.category || "other";
-  const priceTag = p.price ? `<span class="plug-price">¥${p.price}</span>` : "";
-  const badge = opts.badge ? `<span class="plug-badge ${opts.badgeCls || ""}">${opts.badge}</span>` : "";
-  const actions = opts.actions || "";
-  return `
-  <div class="plug-card">
-    <div class="plug-card-top">
-      <div class="plug-emoji">${PLUG_CAT_EMOJI[cat] ?? "📦"}</div>
-      <div class="plug-main">
-        <div class="plug-name">${escapeHtml(p.name)} ${badge} ${priceTag}</div>
-        <div class="plug-desc">${escapeHtml(p.desc || p.descZh || "")}</div>
-        <div class="plug-meta">${escapeHtml(p.source || "")}${p.version ? " · v" + escapeHtml(p.version) : ""}${p.type === "paid" ? " · 卖家实得 ¥" + Math.round((p.price ?? 0) * (1 - pluginMarketData.feeRate) * 100) / 100 : ""}</div>
-      </div>
-    </div>
-    <div class="plug-actions">${actions}</div>
-  </div>`;
-}
-
-function plugActions(p, installedMap) {
-  const inst = installedMap[p.id] || installedMap[(p.pkg || "").replace("clawhub:", "").toLowerCase()];
-  if (p.type === "paid" && !inst) {
-    return `<button class="primary small-btn" data-plug-buy="${p.id}">购买 ¥${p.price}</button>`;
-  }
-  if (inst) {
-    return `<span class="ok-badge">已安装 v${escapeHtml(inst.version || "")}</span>
-      <button class="ghost small-btn" data-plug-uninstall="${escapeHtml(inst.id)}">卸载</button>`;
-  }
-  return `<button class="primary small-btn" data-plug-install="${escapeHtml(p.pkg || "bundle:" + p.id)}">安装</button>`;
-}
-
-async function loadPluginMarket() {
-  const grid = $("#plug-grid");
-  if (grid) grid.innerHTML = `<div class="muted">加载中…（首次需等已装插件列表）</div>`;
-  try {
-    const d = await api.get("/api/plugins/market");
-    pluginMarketData = d;
-    renderPluginsGrid();
-  } catch (e) { grid.innerHTML = `<div class="muted">读取失败：${escapeHtml(e.message)}</div>`; }
-}
-
-function renderPluginsGrid() {
-  const cats = pluginMarketData.categories ?? [];
-  const catSel = $("#plug-cats");
-  if (catSel) {
-    catSel.innerHTML = [`<button data-cat="" class="plug-cat on">全部</button>`]
-      .concat(cats.map((c) => `<button data-cat="${c.id}" class="plug-cat">${PLUG_CAT_EMOJI[c.id] ?? "📦"} ${c.label}</button>`))
-      .join("");
-  }
-  const grid = $("#plug-grid");
-  if (!grid) return;
-  const installedMap = {};
-  let list = [];
-  if (pluginTab === "search") {
-    list = pluginSearchResults;
-    if (!list.length) { grid.innerHTML = `<div class="muted">${pluginSearchQ ? "没有搜到结果" : "输入关键词搜索 ClawHub"}</div>`; return; }
-    grid.innerHTML = list.map((p) => plugCard(p, { actions: plugActions(p, {}) })).join("");
-    return;
-  }
-  if (pluginTab === "installed") {
-    list = pluginMarketData.plugins.filter((p) => p.installed);
-    if (!list.length) { grid.innerHTML = `<div class="muted">还没装任何目录里的插件</div>`; return; }
-    grid.innerHTML = list.map((p) => plugCard(p, { actions: plugActions(p, { [p.id]: { version: p.installedVersion, id: p.id } }) })).join("");
-    return;
-  }
-  const typeMap = { curated: "curated", shared: "userShared", paid: "paid" };
-  list = pluginMarketData.plugins.filter((p) => p.type === typeMap[pluginTab]);
-  if (!list.length) {
-    grid.innerHTML = `<div class="muted">${pluginTab === "curated" ? "暂无精选" : pluginTab === "shared" ? "还没有用户分享，点右上「＋ 分享免费插件」" : "还没有付费插件，点右上「💰 上架付费插件」"}</div>`;
-    return;
-  }
-  for (const p of pluginMarketData.plugins) if (p.installed) installedMap[p.id] = { version: p.installedVersion, id: p.id };
-  grid.innerHTML = list.map((p) => plugCard(p, { actions: plugActions(p, installedMap) })).join("");
-}
-
-function initPlugins() {
-  loadPluginMarket(); // 首次进入即加载市场目录
-  document.querySelectorAll("[data-plug-tab]").forEach((b) =>
-    b.addEventListener("click", () => {
-      pluginTab = b.dataset.plugTab;
-      document.querySelectorAll("[data-plug-tab]").forEach((x) => x.classList.toggle("on", x === b));
-      $("#plug-search").style.display = pluginTab === "search" ? "none" : "";
-      if (pluginTab === "search") renderPluginsGrid();
-      else loadPluginMarket();
-    })
-  );
-  $("#plug-cats").addEventListener("click", (e) => {
-    const btn = e.target.closest("[data-cat]");
-    if (!btn) return;
-    document.querySelectorAll(".plug-cat").forEach((x) => x.classList.toggle("on", x === btn));
-    const cat = btn.dataset.cat;
-    const grid = $("#plug-grid");
-    const typeMap = { curated: "curated", shared: "userShared", paid: "paid" };
-    const list = pluginMarketData.plugins.filter((p) => p.type === typeMap[pluginTab] && (!cat || p.category === cat));
-    if (!list.length) { grid.innerHTML = `<div class="muted">该分类下暂无</div>`; return; }
-    const installedMap = {};
-    for (const p of pluginMarketData.plugins) if (p.installed) installedMap[p.id] = { version: p.installedVersion, id: p.id };
-    grid.innerHTML = list.map((p) => plugCard(p, { actions: plugActions(p, installedMap) })).join("");
-  });
-  $("#plug-search").addEventListener("keydown", (e) => { if (e.key === "Enter") $("#btn-plug-search").click(); });
-  $("#btn-plug-search").addEventListener("click", async () => {
-    pluginSearchQ = $("#plug-search").value.trim();
-    const btn = $("#btn-plug-search");
-    btn.disabled = true; btn.textContent = "搜索中…";
-    try {
-      const r = await api.get("/api/plugins/search?q=" + encodeURIComponent(pluginSearchQ));
-      if (!r.ok) { toast("搜索失败：" + r.output, false); return; }
-      pluginTab = "search";
-      document.querySelectorAll("[data-plug-tab]").forEach((x) => x.classList.toggle("on", x.dataset.plugTab === "search"));
-      pluginSearchResults = r.results;
-      renderPluginsGrid();
-    } catch (e) { toast("搜索失败：" + e.message, false); }
-    finally { btn.disabled = false; btn.textContent = "搜索"; }
-  });
-  $("#btn-plug-share").addEventListener("click", () => openPlugUpload("share"));
-  $("#btn-plug-sell").addEventListener("click", () => openPlugUpload("sell"));
-
-  // 事件委托：安装/卸载/购买
-  $("#plug-grid").addEventListener("click", async (e) => {
-    const inst = e.target.closest("[data-plug-install]");
-    const uninst = e.target.closest("[data-plug-uninstall]");
-    const buy = e.target.closest("[data-plug-buy]");
-    if (inst) {
-      if (!confirm("⚠️ 插件 = 代码，安装后可能访问你的文件/网络。只安装你信任的插件。\n\n继续安装？")) return;
-      const btn = inst; btn.disabled = true; btn.textContent = "安装中…";
-      try {
-        const r = await api.send("/api/plugins/install", { method: "POST", body: JSON.stringify({ pkg: inst.dataset.plugInstall }) });
-        toast(r.ok ? "✓ 已安装。网关重启后生效（多任务在跑可先攒着）" : "安装失败：" + (r.output || ""), r.ok);
-      } catch (err) { toast("安装失败：" + err.message, false); }
-      finally { loadPluginMarket(); }
-    } else if (uninst) {
-      if (!confirm("确定卸载这个插件？")) return;
-      const btn = uninst; btn.disabled = true;
-      try {
-        const r = await api.send("/api/plugins/uninstall", { method: "POST", body: JSON.stringify({ id: uninst.dataset.plugUninstall }) });
-        toast(r.ok ? "✓ 已卸载" : "卸载失败：" + (r.output || ""), r.ok);
-      } catch (err) { toast("卸载失败：" + err.message, false); }
-      finally { loadPluginMarket(); }
-    } else if (buy) {
-      const p = (pluginMarketData.plugins ?? []).find((x) => x.id === buy.dataset.plugBuy);
-      if (!p) return;
-      const fee = Math.round(p.price * pluginMarketData.feeRate * 100) / 100;
-      if (!confirm(`购买「${p.name}」¥${p.price}（手续费 ¥${fee}）？\n\n当前为记账模式：支付通道待开通，购买后直接安装。`)) return;
-      const btn = buy; btn.disabled = true; btn.textContent = "购买中…";
-      try {
-        const r = await api.send("/api/plugins/purchase", { method: "POST", body: JSON.stringify({ id: p.id }) });
-        toast(r.ok ? `✓ 已购买并安装「${p.name}」` : "购买失败：" + (r.error || ""), r.ok);
-      } catch (err) { toast("购买失败：" + err.message, false); }
-      finally { loadPluginMarket(); }
-    }
-  });
-}
-
-async function openPlugUpload(mode) {
-  const isSell = mode === "sell";
-  const ov = document.createElement("div");
-  ov.id = "plug-upload-overlay";
-  ov.className = "bot-overlay";
-  ov.innerHTML = `<div class="bot-dialog">
-    <div class="bot-dialog-head">
-      <h3>${isSell ? "💰 上架付费插件" : "🧑‍🤝‍🧑 分享免费插件"}</h3>
-      <button class="ghost small-btn" id="plug-upload-close">✕</button>
-    </div>
-    <div class="bot-form">
-      <label>名称：<input id="pu-name" placeholder="插件名"></label>
-      <label>简介：<input id="pu-desc" placeholder="一句话说明它做什么（中文）"></label>
-      <label>分类：
-        <select id="pu-cat">
-          <option value="image">生图</option><option value="tts">语音</option>
-          <option value="memory">记忆</option><option value="game">游戏</option>
-          <option value="tool">工具</option><option value="channel">通道</option><option value="other">其他</option>
-        </select>
-      </label>
-      ${isSell ? `<label>定价（¥）：<input id="pu-price" type="number" min="1" step="0.01" placeholder="如 9.9"></label>` : ""}
-      <label class="adv-switch" style="border:1px solid var(--border);padding:8px;border-radius:8px">
-        <input type="checkbox" id="pu-uploadzip"> <span><b>上传自己的插件包（zip）</b><small>不勾选则填下面的 ClawHub 包名</small></span>
-      </label>
-      <label id="pu-pkg-row">ClawHub 包名：<input id="pu-pkg" placeholder="如 clawhub:openclaw-memory-graph"></label>
-      <label id="pu-file-row" style="display:none">插件包（zip）：<input type="file" id="pu-file" accept=".zip"></label>
-      ${isSell ? `<p class="hint">付费区只能上传你自己的插件 zip（转售他人插件有版权问题）。手续费 ${Math.round(pluginMarketData.feeRate * 100)}%，实得自动计算。</p>` : ""}
-    </div>
-    <div class="row" style="justify-content:flex-end">
-      <button id="pu-submit" class="primary">${isSell ? "上架" : "分享"}</button>
-    </div>
-  </div>`;
-  document.body.appendChild(ov);
-  ov.addEventListener("click", (e) => { if (e.target === ov) ov.remove(); });
-  $("#plug-upload-close").addEventListener("click", () => ov.remove());
-  $("#pu-uploadzip").addEventListener("change", (e) => {
-    const on = e.target.checked;
-    $("#pu-pkg-row").style.display = on ? "none" : "";
-    $("#pu-file-row").style.display = on ? "" : "none";
-  });
-  $("#pu-submit").addEventListener("click", async () => {
-    const btn = $("#pu-submit");
-    const name = $("#pu-name").value.trim(), desc = $("#pu-desc").value.trim();
-    if (!name || !desc) return toast("名称和简介必填", false);
-    btn.disabled = true; btn.textContent = "提交中…";
-    try {
-      const zipBase64 = await readZipBase64($("#pu-file").files[0]);
-      const body = { name, descZh: desc, category: $("#pu-cat").value };
-      if (zipBase64) body.zipBase64 = zipBase64;
-      else body.pkg = $("#pu-pkg").value.trim();
-      if (isSell) {
-        if (!zipBase64) { toast("付费插件必须上传 zip 包", false); btn.disabled = false; btn.textContent = "上架"; return; }
-        body.price = Number($("#pu-price").value);
-        const r = await api.send("/api/plugins/sell", { method: "POST", body: JSON.stringify(body) });
-        toast(`✓ 已上架，定价 ¥${body.price}，手续费 ¥${r.fee}，实得 ¥${r.sellerGets}`);
-      } else {
-        if (!zipBase64 && !body.pkg) { toast("填 ClawHub 包名或上传 zip", false); btn.disabled = false; btn.textContent = "分享"; return; }
-        const r = await api.send("/api/plugins/share", { method: "POST", body: JSON.stringify(body) });
-        toast("✓ 已分享到商店");
-      }
-      ov.remove();
-      loadPluginMarket();
-    } catch (e) { toast("提交失败：" + e.message, false); btn.disabled = false; btn.textContent = isSell ? "上架" : "分享"; }
-  });
-}
-function readZipBase64(file) {
-  if (!file) return Promise.resolve(null);
-  if (!file.name.endsWith(".zip")) { toast("请上传 .zip 文件", false); return Promise.resolve(null); }
-  return new Promise((resolve, reject) => {
-    const r = new FileReader();
-    r.onload = () => resolve(String(r.result).split(",")[1]);
-    r.onerror = reject;
-    r.readAsDataURL(file);
   });
 }
 

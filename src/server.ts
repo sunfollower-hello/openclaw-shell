@@ -14,6 +14,7 @@ import {
   stripAnsi,
   startChannelLogin,
   getChannelLoginState,
+  cancelChannelLogin,
 } from "./core/openclawCli.js";
 import {
   listProviders,
@@ -36,9 +37,10 @@ import {
   type PresetKind,
 } from "./core/presets.js";
 import { TOOL_REGISTRY, toolsToOpenAI, resolveInSandbox, type ToolDef, type ToolCtx } from "./tools/registry.js";
-import { SKILL_LIBRARY } from "./core/skills.js";
 import { allSkills, saveUserSkills, skillPromptsByIds, type UserSkill } from "./core/skillStore.js";
 import { FEATURES, filterDisabledTools } from "./core/features.js";
+import { toUserError } from "./core/errors.js";
+import { queryLogs, clearLogs, logInfo, logWarn, logError } from "./core/logger.js";
 import {
   getMCPTools,
   loadMCPConfig,
@@ -50,6 +52,7 @@ import {
 import { cardToCCv2, ccv2ToCard } from "./core/cardConvert.js";
 import { solidPng, pngWithTexts, extractCardJson, pngStripCardMeta, isPng } from "./core/png.js";
 import { getImageConfig, saveImageConfig, maskKey, testNovelaiKey, testOpenAIImageKey } from "./core/imageConfig.js";
+import { coversDir, saveCover, readCover, normalizeAvatar } from "./core/covers.js";
 import {
   getTtsConfig,
   saveTtsConfig,
@@ -79,8 +82,10 @@ import {
   removeBot,
   agentWorkspaceDir,
   applyAgentHumanDelay,
+  applyAgentModel,
+  updateBotAccount,
   CHANNEL_LABELS,
-  MAX_BOTS,
+  MAX_QQ_BOTS,
   MAX_WEIXIN_BOTS,
   type BotChannel,
   type BotInstance,
@@ -136,7 +141,7 @@ if (UI_USER && UI_PASS) {
       if (user === UI_USER && pass === UI_PASS) return next();
     }
     res.setHeader("WWW-Authenticate", 'Basic realm="openclaw-shell"');
-    res.status(401).json({ error: "需要认证（OPENCLAW_SHELL_UI_USER / PASS）" });
+    res.status(401).json({ error: "需要登录" });
   });
 }
 
@@ -148,12 +153,34 @@ app.use(express.static(path.join(projectRoot, "web"), { etag: true, maxAge: 0, s
 // 表情包与生图产物（挂在认证之后，公网同样受 Basic 保护）
 app.use("/emojis", express.static(path.join(dataDir(), "emojis")));
 app.use("/img", express.static(path.join(dataDir(), "images")));
+app.use("/covers", express.static(coversDir(), { etag: true, maxAge: 0 }));
 // 语音合成产物
-app.use("/tts", express.static(path.join(dataDir(), "tts")));
+// 语音不再落盘（/api/tts/synthesize 直接回音频流），所以没有 /tts 静态目录
 
 // ---------- API ----------
 app.get("/api/health", (_req, res) => {
   res.json({ ok: true, service: "soulbox", schema: SCHEMA_VERSION, port: PORT, dataDir: dataDir() });
+});
+
+// ---------- 运行日志（设置页直接看，出问题不用翻文件） ----------
+app.get("/api/logs", (req, res) => {
+  try {
+    res.json(
+      queryLogs({
+        level: (req.query.level as "info" | "warn" | "error" | "all") ?? "all",
+        tag: typeof req.query.tag === "string" ? req.query.tag : "all",
+        keyword: typeof req.query.q === "string" ? req.query.q : "",
+        limit: Number(req.query.limit) || 200,
+      })
+    );
+  } catch (e) {
+    res.status(500).json({ error: toUserError(e) });
+  }
+});
+
+app.post("/api/logs/clear", (_req, res) => {
+  clearLogs();
+  res.json({ ok: true });
 });
 
 // ---------- 用户资料（抽屉头像/昵称，可编辑） ----------
@@ -178,7 +205,7 @@ app.post("/api/profile", async (req, res) => {
     await fs.writeFile(PROFILE_FILE(), JSON.stringify(profile), "utf8");
     res.json({ ok: true, profile });
   } catch (e) {
-    res.status(500).json({ error: String(e) });
+    res.status(500).json({ error: toUserError(e) });
   }
 });
 
@@ -207,24 +234,44 @@ app.post("/api/announcement", async (req, res) => {
     await fs.writeFile(ANNOUNCEMENT_FILE(), JSON.stringify(announcement), "utf8");
     res.json({ ok: true, announcement });
   } catch (e) {
-    res.status(500).json({ error: String(e) });
+    res.status(500).json({ error: toUserError(e) });
   }
 });
 
 app.get("/api/cards", async (_req, res) => {
   try {
-    res.json({ cards: await store.list() });
+    const metas = await store.list();
+    // 旧卡还存着 base64 头像时，一次性迁移成 /covers/ 文件 URL（list 卡库缩略图不能扛 2MB base64）
+    for (const m of metas) {
+      if (typeof m.avatar === "string" && m.avatar.startsWith("data:image/")) {
+        const migrated = await normalizeAvatar(m.avatar, m.slug);
+        if (migrated !== m.avatar) {
+          m.avatar = migrated;
+          const card = await store.get(m.slug).catch(() => null);
+          if (card) {
+            card.identity.avatar = migrated;
+            await store.save(card).catch(() => {});
+          }
+        }
+      }
+    }
+    res.json({ cards: metas });
   } catch (e) {
-    res.status(500).json({ error: String(e) });
+    res.status(500).json({ error: toUserError(e) });
   }
 });
 
 app.get("/api/cards/:slug", async (req, res) => {
   try {
     const card = await store.get(req.params.slug);
+    const migrated = await normalizeAvatar(card.identity?.avatar, card.slug);
+    if (migrated !== card.identity?.avatar) {
+      card.identity.avatar = migrated;
+      await store.save(card).catch(() => {});
+    }
     res.json(card);
   } catch {
-    res.status(404).json({ error: `卡片不存在: ${req.params.slug}` });
+    res.status(404).json({ error: "找不到这张卡，可能已被删除" });
   }
 });
 
@@ -248,7 +295,7 @@ app.post("/api/cards", async (req, res) => {
     await store.save(card);
     res.status(201).json({ card });
   } catch (e) {
-    res.status(500).json({ error: String(e) });
+    res.status(500).json({ error: toUserError(e) });
   }
 });
 
@@ -256,16 +303,27 @@ app.put("/api/cards/:slug", async (req, res) => {
   try {
     const body = req.body ?? {};
     if (body.slug && body.slug !== req.params.slug) {
-      return res.status(400).json({ error: "slug 不可通过编辑修改（先删除再新建）" });
+      return res.status(400).json({ error: "卡片的英文标识不能改（如需更名请新建一张）" });
     }
     body.slug = req.params.slug;
     body.updated_at = nowIso();
+    const tv0 = Date.now();
     const result = validateCard(body);
+    const tv1 = Date.now();
     if (!result.ok) return res.status(400).json({ error: result.errors.join("; ") });
+    if (body.identity?.avatar) {
+      body.identity.avatar = await normalizeAvatar(body.identity.avatar, body.slug);
+    }
     await store.save(body);
+    const tv2 = Date.now();
+    logInfo(
+      "卡片",
+      `更新 ${body.name ?? body.slug} 共 ${tv2 - tv0}ms`,
+      `体积 ${Math.round(JSON.stringify(body).length / 1024)}KB · 校验 ${tv1 - tv0}ms · 落盘 ${tv2 - tv1}ms`
+    );
     res.json({ card: body, warnings: result.warnings });
   } catch (e) {
-    res.status(500).json({ error: String(e) });
+    res.status(500).json({ error: toUserError(e) });
   }
 });
 
@@ -294,33 +352,114 @@ app.delete("/api/cards/:slug", async (req, res) => {
       await runOpenclaw(["agents", "delete", b.agentId, "--force"], { timeoutMs: 60000 }).catch(() => {});
     }
     if (removedBots > 0) invalidateAgentsCache();
+    invalidateChannelStatus();
     res.json({ ok: true, removedBots });
   } catch (e) {
-    res.status(500).json({ error: String(e) });
+    res.status(500).json({ error: toUserError(e) });
   }
 });
+
+/**
+ * 编译人设卡到通道端。写两个地方，缺一不可：
+ * - `data/agent-workspaces/<slug>`：该卡专属 agent 读这里，多机器人互不覆盖；
+ * - `data/workspace`（共享）：`agents.defaults.workspace` 指向它，凡是没有显式 workspace 的 agent
+ *   （包括默认的 `main`）都读这里。只写前者的话，消息落到 main 时会读到"上一次编译的别的卡"，
+ *   表现就是"绑定了 A 卡，QQ 里回话的却是 B 卡"。
+ */
+async function compileForBot(card: PersonaCard): Promise<{ workspace: string; files: string[] }> {
+  const parsed = personaCardSchema.parse(card); // 补全默认字段，避免残缺卡编译崩溃
+  const out = await compileCard(parsed, agentWorkspaceDir(parsed.slug));
+  await compileCard(parsed, path.join(dataDir(), "workspace")).catch(() => {});
+  return out;
+}
 
 app.post("/api/cards/:slug/compile", async (req, res) => {
   try {
-    const card = await store.get(req.params.slug);
+    const card = await store.get(req.params.slug).catch(() => null);
+    if (!card) return res.status(404).json({ error: "找不到这张卡，可能已被删除" });
     const result = validateCard(card);
     if (!result.ok) return res.status(400).json({ error: result.errors.join("; ") });
-    const out = await compileCard(card, path.join(dataDir(), "workspace"));
+    const out = await compileForBot(card);
     res.json({ workspace: out.workspace, files: out.files, warnings: result.warnings });
   } catch (e) {
-    res.status(500).json({ error: String(e) });
+    res.status(500).json({ error: toUserError(e) });
   }
 });
 
-// ---------- 通道：微信 ----------
-app.get("/api/channels/wechat/status", async (_req, res) => {
+// ---------- 通道状态：读 openclaw 的结构化输出，不靠文本正则猜 ----------
+// `channels status --probe` 的纯文本在"没有账号"时只打印 "Gateway reachable."，
+// 拿它做正则永远判不出已连接；--json 直接给 configured/connected/running 和账号列表。
+interface ChannelStatus {
+  configured: boolean;
+  connected: boolean;
+  running: boolean;
+  accounts: string[];
+}
+
+let channelStatusCache: { at: number; data: Record<string, ChannelStatus> } | null = null;
+let channelStatusInflight: Promise<Record<string, ChannelStatus>> | null = null;
+// 查一次要跑 CLI（冷启动 30s+），缓存短了等于没缓存；绑定成功等状态变化时会主动失效
+const CHANNEL_STATUS_CACHE_MS = 5 * 60 * 1000;
+
+function invalidateChannelStatus(): void {
+  channelStatusCache = null;
+}
+
+async function getChannelStatuses(force = false): Promise<Record<string, ChannelStatus>> {
+  if (!force && channelStatusCache && Date.now() - channelStatusCache.at < CHANNEL_STATUS_CACHE_MS) {
+    return channelStatusCache.data;
+  }
+  // 并发合并：进通道页会同时查微信和 QQ，CLI 冷启动 5-15s，并行跑只会互相拖慢
+  if (channelStatusInflight) return channelStatusInflight;
+  channelStatusInflight = (async () => {
+    const out: Record<string, ChannelStatus> = {};
+    try {
+      // 超时给足：CLI 冷启动实测能到 30s+，卡在超时上只会拿到被截断的输出，解析必然失败
+      const r = await runOpenclaw(["channels", "status", "--probe", "--json"], { timeoutMs: 90000 });
+      const text = stripAnsi(r.stdout).trim();
+      // 个别版本会在 JSON 前多打提示行，从第一个 { 开始截
+      const raw = JSON.parse(text.startsWith("{") ? text : text.slice(Math.max(0, text.indexOf("{"))));
+      const accounts = (raw?.channelAccounts ?? {}) as Record<string, unknown[]>;
+      for (const [id, st] of Object.entries((raw?.channels ?? {}) as Record<string, Record<string, unknown>>)) {
+        out[id] = {
+          configured: st?.configured === true,
+          connected: st?.connected === true,
+          running: st?.running === true,
+          accounts: Array.isArray(accounts[id]) ? accounts[id].map((a) => String((a as { id?: string })?.id ?? a)) : [],
+        };
+      }
+      channelStatusCache = { at: Date.now(), data: out };
+    } catch (e) {
+      // CLI 挂了/输出不是 JSON：返回空对象，调用方按"未知"处理，不要断言未连接
+      logWarn("通道", "查询通道状态失败（按未知处理）", e instanceof Error ? e.message : String(e));
+    }
+    return out;
+  })();
   try {
-    const probe = await runOpenclaw(["channels", "status", "--probe"], { timeoutMs: 25000 });
-    const text = stripAnsi(probe.stdout + probe.stderr);
-    const connected = /weixin|wechat/i.test(text) && !/not logged|not connected|offline|error/i.test(text);
-    res.json({ connected, raw: text.slice(-2000) });
+    return await channelStatusInflight;
+  } finally {
+    channelStatusInflight = null;
+  }
+}
+
+/** 通道是否可用：账号已配置即算接上（connected 只在长连接型通道上有意义） */
+function channelUsable(st?: ChannelStatus): boolean {
+  if (!st) return false;
+  return st.configured || st.connected || st.accounts.length > 0;
+}
+
+// ---------- 通道：微信 ----------
+app.get("/api/channels/wechat/status", async (req, res) => {
+  try {
+    const all = await getChannelStatuses(req.query.refresh === "1");
+    const st = all["openclaw-weixin"];
+    res.json({
+      connected: channelUsable(st),
+      accounts: st?.accounts ?? [],
+      detail: st ?? null,
+    });
   } catch (e) {
-    res.status(500).json({ error: String(e) });
+    res.status(500).json({ error: toUserError(e) });
   }
 });
 
@@ -367,7 +506,7 @@ app.get("/api/channels/wechat/pairing", async (_req, res) => {
     const r = await runOpenclaw(["pairing", "list", "openclaw-weixin"], { timeoutMs: 20000 });
     res.json({ raw: stripAnsi(r.stdout + r.stderr) });
   } catch (e) {
-    res.status(500).json({ error: String(e) });
+    res.status(500).json({ error: toUserError(e) });
   }
 });
 
@@ -378,24 +517,24 @@ app.post("/api/channels/wechat/pairing/approve", async (req, res) => {
     const r = await runOpenclaw(["pairing", "approve", "openclaw-weixin", String(code)], { timeoutMs: 20000 });
     res.json({ ok: r.code === 0, output: stripAnsi(r.stdout + r.stderr).slice(-1000) });
   } catch (e) {
-    res.status(500).json({ error: String(e) });
+    res.status(500).json({ error: toUserError(e) });
   }
 });
 
 // ---------- 通道：QQ (官方开放平台 qqbot) ----------
-app.get("/api/channels/qq/status", async (_req, res) => {
+app.get("/api/channels/qq/status", async (req, res) => {
   try {
-    const plugin = await runOpenclaw(["plugins", "list"], { timeoutMs: 25000 });
-    const hasPlugin = /qqbot|napcat/i.test(plugin.stdout + plugin.stderr);
-    const onebot = await runOpenclaw(["channels", "status", "--probe"], { timeoutMs: 25000 });
-    const onebotText = stripAnsi(onebot.stdout + onebot.stderr);
+    const all = await getChannelStatuses(req.query.refresh === "1");
+    const st = all["qqbot"];
     res.json({
-      pluginInstalled: hasPlugin,
-      // QQ 官方开放平台插件（openclaw-qqbot）；保留 onebot/napcat 兼容旧输出
-      onebotSeen: /qqbot|onebot|napcat/i.test(onebotText),
+      // 通道在 openclaw 的清单里出现即说明插件已装（不用再单独跑一次 plugins list）
+      pluginInstalled: st !== undefined,
+      connected: channelUsable(st),
+      accounts: st?.accounts ?? [],
+      detail: st ?? null,
     });
   } catch (e) {
-    res.status(500).json({ error: String(e) });
+    res.status(500).json({ error: toUserError(e) });
   }
 });
 
@@ -405,6 +544,24 @@ app.post("/api/channels/qq/login", (_req, res) => {
 
 app.get("/api/channels/qq/login", async (_req, res) => {
   res.json(await loginStateWithQr(getChannelLoginState("qqbot")));
+});
+
+// 取消扫码：前端关掉二维码弹窗/离开页面时调。登录进程会一直挂着等扫码（实测能占 200MB+），必须回收
+app.post("/api/channels/:kind/login/cancel", (req, res) => {
+  const kind = String(req.params.kind);
+  const channel = kind === "qq" ? "qqbot" : kind === "wechat" ? "openclaw-weixin" : "";
+  if (!channel) return res.status(400).json({ error: "未知通道" });
+  res.json({ ok: cancelChannelLogin(channel) });
+});
+
+app.post("/api/bots/:id/login/cancel", async (req, res) => {
+  try {
+    const bot = (await listBots()).find((b) => b.id === req.params.id);
+    if (!bot) return res.status(404).json({ error: "机器人不存在" });
+    res.json({ ok: cancelChannelLogin(bot.channel, bot.accountId) });
+  } catch (e) {
+    res.status(500).json({ error: toUserError(e) });
+  }
 });
 
 // ---------- 多机器人：每卡一个独立 bot（卡 × 渠道账号 × OpenClaw agent） ----------
@@ -472,6 +629,35 @@ async function scanKnownAccounts(): Promise<KnownAccount[]> {
   return out;
 }
 
+/**
+ * 校正 bot 的渠道账号 id。
+ * 微信登录成功后，真实 accountId 是服务器下发的（形如 `xxxx-im-bot`），而我们创建 bot 时
+ * 只能先填一个占位名（`wx-main`）。若不校正，`agents bind openclaw-weixin:wx-main` 指向的
+ * 是个不存在的账号，微信消息永远路由不到这个 agent。
+ * 做法：扫出该通道下真实存在、且没被别的 bot 占用的账号，改绑到它上面。
+ */
+async function reconcileBotAccount(bot: BotInstance): Promise<BotInstance | null> {
+  const known = (await scanKnownAccounts()).filter((a) => a.channel === bot.channel);
+  if (known.some((a) => a.accountId === bot.accountId)) return null; // 已经对得上
+  const bots = await listBots();
+  const taken = new Set(bots.filter((b) => b.id !== bot.id).map((b) => `${b.channel}:${b.accountId}`));
+  const target = known.find((a) => !taken.has(`${a.channel}:${a.accountId}`));
+  if (!target) return null;
+  // 先解掉占位绑定（失败不致命：占位账号本来就不存在）
+  await runOpenclaw(["agents", "unbind", "--agent", bot.agentId, "--bind", `${bot.channel}:${bot.accountId}`], {
+    timeoutMs: 30000,
+  }).catch(() => null);
+  const bind = await runOpenclaw(
+    ["agents", "bind", "--agent", bot.agentId, "--bind", `${bot.channel}:${target.accountId}`, "--json"],
+    { timeoutMs: 30000 }
+  );
+  if (bind.code !== 0) return null;
+  const updated = await updateBotAccount(bot.id, target.accountId);
+  invalidateAgentsCache();
+    invalidateChannelStatus();
+  return updated;
+}
+
 /** 通道连接页数据：机器人实例 + 已知账号（含未绑定的可复用账号） */
 app.get("/api/channels/connections", async (_req, res) => {
   try {
@@ -480,7 +666,7 @@ app.get("/api/channels/connections", async (_req, res) => {
     // 关联：账号 → 绑定它的 bot
     const boundByAccount = new Map<string, BotInstance>();
     for (const b of bots) boundByAccount.set(`${b.channel}:${b.accountId}`, b);
-    const limits = { maxBots: MAX_BOTS, maxWeixin: MAX_WEIXIN_BOTS };
+    const limits = { maxQq: MAX_QQ_BOTS, maxWeixin: MAX_WEIXIN_BOTS };
     res.json({
       bots,
       accounts: accounts.map((a) => {
@@ -490,14 +676,14 @@ app.get("/api/channels/connections", async (_req, res) => {
       limits,
     });
   } catch (e) {
-    res.status(500).json({ error: String(e) });
+    res.status(500).json({ error: toUserError(e) });
   }
 });
 
 app.get("/api/bots", async (req, res) => {
   try {
     const bots = await listBots();
-    const limits = { maxBots: MAX_BOTS, maxWeixin: MAX_WEIXIN_BOTS };
+    const limits = { maxQq: MAX_QQ_BOTS, maxWeixin: MAX_WEIXIN_BOTS };
     // 没有实例就不必查 agent 状态，省掉 CLI 冷启动
     if (bots.length === 0) return res.json({ bots: [], limits });
     // skipStatus=1：只要实例数据不查存活（前端开面板首屏用，秒回）
@@ -518,7 +704,7 @@ app.get("/api/bots", async (req, res) => {
       limits,
     });
   } catch (e) {
-    res.status(500).json({ error: String(e) });
+    res.status(500).json({ error: toUserError(e) });
   }
 });
 
@@ -526,21 +712,21 @@ app.post("/api/bots", async (req, res) => {
   try {
     const { cardSlug, channel, accountId } = req.body ?? {};
     if (channel !== "qqbot" && channel !== "openclaw-weixin") {
-      return res.status(400).json({ error: "channel 必须是 qqbot 或 openclaw-weixin" });
+      return res.status(400).json({ error: "请选择 QQ 或微信" });
     }
     const card = await store.get(String(cardSlug)).catch(() => null);
     if (!card) {
-      return res.status(400).json({ error: `人设卡 ${cardSlug} 不存在` });
+      return res.status(400).json({ error: "找不到这张卡，可能已被删除" });
     }
     if (!/^[a-z0-9-]+$/i.test(card.slug)) {
-      return res.status(400).json({ error: "卡 slug 不能用作 agent 名（仅字母数字横线）" });
+      return res.status(400).json({ error: "这张卡的英文标识含特殊字符，无法接入机器人，请重新建卡" });
     }
     const account = String(accountId ?? "").trim() || (channel === "qqbot" ? `qq-${Date.now().toString(36).slice(-4)}` : "wx-main");
     let bot: BotInstance;
     try {
       bot = await addBot({ cardSlug: card.slug, channel, accountId: account });
     } catch (e) {
-      const msg = String(e);
+      const msg = toUserError(e);
       // 账号被其他卡占用 → 409 + 占用者信息，前端引导"一键转移"
       const occupied = /已被其他机器人占用/.test(msg) || /账号.*占用/.test(msg);
       if (occupied) {
@@ -557,14 +743,14 @@ app.post("/api/bots", async (req, res) => {
       return res.status(400).json({ error: msg });
     }
 
-    // ① 编译卡到该 agent 专属 workspace（每 agent 一份 SOUL.md，互不覆盖）
-    // zod parse 补全默认字段，避免残缺卡（缺 voice 等）编译崩溃
-    const compile = await compileCard(personaCardSchema.parse(card), agentWorkspaceDir(bot.cardSlug));
+    // ① 编译卡（agent 专属 workspace + 共享 workspace 兜底，见 compileForBot 注释）
+    const compile = await compileForBot(card);
 
     // ② 解析模型：卡单独配置优先，否则默认提供商
     const llm = await resolveChatLLM(card);
     if (!llm) {
       await removeBot(bot.id);
+      await fs.rm(agentWorkspaceDir(bot.cardSlug), { recursive: true, force: true }).catch(() => {});
       return res.status(400).json({ error: "没有可用模型（先在 API 页配置模型提供商）" });
     }
 
@@ -579,7 +765,8 @@ app.post("/api/bots", async (req, res) => {
       ],
       { timeoutMs: 60000 }
     );
-    invalidateAgentsCache(); // agent 列表变了，缓存作废
+    invalidateAgentsCache();
+    invalidateChannelStatus(); // agent 列表变了，缓存作废
     // 拟真节奏：用卡里的 chat.delay 配 OpenClaw 原生 humanDelay（分段回复之间自然停顿）
     await applyAgentHumanDelay(bot.agentId, card.chat?.delay).catch(() => {});
     let addOutput = stripAnsi(add.stdout + add.stderr);
@@ -600,11 +787,11 @@ app.post("/api/bots", async (req, res) => {
       compileFiles: compile.files,
       model: `${llm.provider}/${llm.model}`,
       output: addOutput.slice(-1500),
-      hint: "agent 已创建并绑定路由。下一步点「扫码绑定」完成渠道账号登录；网关在跑的话重启后生效（桌面开关）。",
+      hint: "机器人已创建。下一步点「扫码绑定」登录账号；如果服务在跑，重启后生效。",
       agentExists: true, // 刚 add 成功，前端直接采信，不必再等 CLI 查一遍
     });
   } catch (e) {
-    res.status(400).json({ error: String(e) });
+    res.status(400).json({ error: toUserError(e) });
   }
 });
 
@@ -614,9 +801,9 @@ app.post("/api/bots/:id/bind", async (req, res) => {
     const bot = (await listBots()).find((b) => b.id === req.params.id);
     if (!bot) return res.status(404).json({ error: "机器人实例不存在" });
     const { channel, accountId } = req.body ?? {};
-    if (channel !== "qqbot" && channel !== "openclaw-weixin") return res.status(400).json({ error: "channel 不合法" });
+    if (channel !== "qqbot" && channel !== "openclaw-weixin") return res.status(400).json({ error: "通道选择不正确" });
     const acc = String(accountId ?? "").trim();
-    if (!acc) return res.status(400).json({ error: "缺少 accountId" });
+    if (!acc) return res.status(400).json({ error: "缺少机器人编号" });
     // 校验账号已认证（凭证在 → 免扫码）
     const known = (await scanKnownAccounts()).find((a) => a.channel === channel && a.accountId === acc);
     if (!known) return res.status(400).json({ error: "该账号还没扫码认证过，无法免扫码绑定（先用扫码绑定创建）" });
@@ -637,9 +824,10 @@ app.post("/api/bots/:id/bind", async (req, res) => {
     bots[idx] = { ...bots[idx], channel, accountId: acc };
     await fs.writeFile(path.join(dataDir(), "bots.json"), JSON.stringify({ bots }, null, 2), "utf8");
     invalidateAgentsCache();
+    invalidateChannelStatus();
     res.json({ ok: true, output: stripAnsi((unbind.stdout + bind.stdout + unbind.stderr + bind.stderr)).slice(-500), hint: "已换绑到已认证账号，网关重启后生效" });
   } catch (e) {
-    res.status(500).json({ error: String(e) });
+    res.status(500).json({ error: toUserError(e) });
   }
 });
 
@@ -661,7 +849,7 @@ app.post("/api/bots/transfer", async (req, res) => {
       }
     }
     // ① 编译新卡
-    const compile = await compileCard(personaCardSchema.parse(card), agentWorkspaceDir(card.slug));
+    const compile = await compileForBot(card);
     // ② 解析模型
     const llm = await resolveChatLLM(card);
     if (!llm) return res.status(400).json({ error: "没有可用模型（先在 API 页配置模型提供商）" });
@@ -676,6 +864,7 @@ app.post("/api/bots/transfer", async (req, res) => {
     // ④ 删旧 agent（旧卡被顶掉）
     const delOld = await runOpenclaw(["agents", "delete", oldBot.agentId, "--force"], { timeoutMs: 60000 });
     invalidateAgentsCache();
+    invalidateChannelStatus();
     // ⑤ 更新记录：旧 bot 记录改为新卡（同一 id，账号不变）
     const bots = await listBots();
     const idx = bots.findIndex((b) => b.id === oldBot.id);
@@ -693,7 +882,7 @@ app.post("/api/bots/transfer", async (req, res) => {
       hint: `已将 ${oldBot.channel === "qqbot" ? "QQ" : "微信"} 账号 ${oldBot.accountId} 从旧卡转移到「${card.name}」，凭证复用未重新扫码，网关重启后生效`,
     });
   } catch (e) {
-    res.status(500).json({ error: String(e) });
+    res.status(500).json({ error: toUserError(e) });
   }
 });
 
@@ -703,7 +892,7 @@ app.post("/api/bots/:id/login", async (req, res) => {
     if (!bot) return res.status(404).json({ error: "机器人实例不存在" });
     res.json(startChannelLogin(bot.channel, bot.accountId));
   } catch (e) {
-    res.status(500).json({ error: String(e) });
+    res.status(500).json({ error: toUserError(e) });
   }
 });
 
@@ -711,9 +900,18 @@ app.get("/api/bots/:id/login", async (req, res) => {
   try {
     const bot = (await listBots()).find((b) => b.id === req.params.id);
     if (!bot) return res.status(404).json({ error: "机器人实例不存在" });
-    res.json(await loginStateWithQr(getChannelLoginState(bot.channel, bot.accountId)));
+    const state = getChannelLoginState(bot.channel, bot.accountId);
+    const payload = await loginStateWithQr(state);
+    // 登录成功后校正 accountId：微信的真实账号 id 由服务器下发（形如 xxxx-im-bot），
+    // 我们建 bot 时先占了个 wx-main 之类的占位名。不校正的话绑定会指向一个不存在的账号，
+    // 消息永远路由不到这个 agent。
+    if (state.done && state.ok) {
+      const fixed = await reconcileBotAccount(bot).catch(() => null);
+      if (fixed) return res.json({ ...payload, accountFixed: fixed.accountId });
+    }
+    res.json(payload);
   } catch (e) {
-    res.status(500).json({ error: String(e) });
+    res.status(500).json({ error: toUserError(e) });
   }
 });
 
@@ -723,12 +921,21 @@ app.post("/api/bots/:id/recompile", async (req, res) => {
     const bot = (await listBots()).find((b) => b.id === req.params.id);
     if (!bot) return res.status(404).json({ error: "机器人实例不存在" });
     const card = personaCardSchema.parse(await store.get(bot.cardSlug));
-    const out = await compileCard(card, agentWorkspaceDir(bot.cardSlug));
+    const out = await compileForBot(card);
     // 卡里的节奏改了也要同步到 agent（humanDelay 在 openclaw.json 里）
     await applyAgentHumanDelay(bot.agentId, card.chat?.delay).catch(() => {});
-    res.json({ ok: true, files: out.files, workspace: out.workspace });
+    // 卡片专属模型改了也要跟着更新：模型只在 agents add 时写过一次，
+    // 不在这里同步的话用户改完模型点了"重新应用"，通道端还在用旧模型。
+    let modelNote = "";
+    const llm = await resolveChatLLM(card);
+    if (llm) {
+      const model = `${llm.provider}/${llm.model}`;
+      const changed = await applyAgentModel(bot.agentId, model).catch(() => false);
+      if (changed) modelNote = `，模型已切到 ${model}（网关重启后生效）`;
+    }
+    res.json({ ok: true, files: out.files, workspace: out.workspace, modelNote });
   } catch (e) {
-    res.status(500).json({ error: String(e) });
+    res.status(500).json({ error: toUserError(e) });
   }
 });
 
@@ -738,13 +945,14 @@ app.delete("/api/bots/:id", async (req, res) => {
     if (!bot) return res.status(404).json({ error: "机器人实例不存在" });
     const del = await runOpenclaw(["agents", "delete", bot.agentId, "--force"], { timeoutMs: 60000 });
     invalidateAgentsCache();
+    invalidateChannelStatus();
     res.json({
       ok: true,
       output: stripAnsi(del.stdout + del.stderr).slice(-800),
-      hint: "agent 已删除（workspace/state 进入回收站）。网关重启后路由完全移除。",
+      hint: "机器人已删除。重启服务后彻底移除。",
     });
   } catch (e) {
-    res.status(500).json({ error: String(e) });
+    res.status(500).json({ error: toUserError(e) });
   }
 });
 
@@ -771,6 +979,13 @@ app.post("/api/cards/ai-draft", async (req, res) => {
     const llm = await resolveChatLLM();
     if (!llm) return res.status(400).json({ error: "未配置模型 API。请先到「API 与模型」页添加提供商并设为默认" });
 
+
+    // 封面提示词风格跟随当前生图提供商：NovelAI=英文标签 / OpenAI=英文自然语言
+    const imgCfg = await getImageConfig();
+    const coverPromptRule =
+      imgCfg.provider === "novelai"
+        ? `"cover_prompt": "角色卡封面的生图提示词：用英文 Danbooru 标签风格（逗号分隔的英文标签，禁止中文和自然语言），体现角色外观（发型/瞳色/服装/气质）、角色所处场景与氛围（贴合世界观）、封面式构图（角色融入场景、适合竖版封面，不是证件照头像）；若是同人/已有作品角色，官方英文名或常用角色 Tag 放最前；只输出标签串",`
+        : `"cover_prompt": "角色卡封面的生图提示词：用英文自然语言写 2-3 句连贯的英文句子（必须全英文，内容含角色外观、服饰、所处场景、氛围光线、竖版封面构图，角色融入场景而不是证件照头像）",`;
     const sys = `你是角色卡创作助手。用户会给你一段角色想法，请把它扩展成一张完整的角色卡草稿。
 要求：
 1. 输出严格 JSON（不要 Markdown、不要多余文字）
@@ -788,11 +1003,13 @@ app.post("/api/cards/ai-draft", async (req, res) => {
     { "name": "人物关系", "content": "与{{user}}的关系设定，{{user}}即用户，可自定义关系", "constant": true },
     { "name": "（其他条目，带关键词）", "keys": ["关键词1", "关键词2"], "content": "触发内容", "constant": false }
   ],
-  "regex": []
+  "regex": [],
+  ${coverPromptRule}
 }
 3. 世界书 3-6 条；「人物形象」必须 constant=true 且内容完整（这是角色扮演的核心依据）
 4. 语言风格要具体可执行：给出日常/情绪波动时不同的说话方式示例
-5. 全程中文输出；regex 一般留空数组`;
+5. 全程中文输出（cover_prompt 必须全英文，除外）；regex 一般留空数组
+6. cover_prompt 根据角色设定生成：必须全英文，体现"根据角色内容生成的封面"（角色在其世界场景中的画面），不要写成头像/证件照`;
 
     const userMsg = `角色的想法：${ideaText}\n关系类型：${ROLE_ZH_MAP[r] ?? "朋友"}`;
     const ctrl = new AbortController();
@@ -812,7 +1029,7 @@ app.post("/api/cards/ai-draft", async (req, res) => {
       });
     } catch (e) {
       clearTimeout(timer);
-      return res.status(500).json({ error: `调用模型失败：${e instanceof Error && e.name === "AbortError" ? "超时(90s)" : String(e)}` });
+      return res.status(500).json({ error: e instanceof Error && e.name === "AbortError" ? "模型响应超时（90 秒），换个模型或稍后再试" : toUserError(e, "调用模型失败") });
     }
     clearTimeout(timer);
     if (!llmRes.ok) {
@@ -831,6 +1048,7 @@ app.post("/api/cards/ai-draft", async (req, res) => {
       return res.status(502).json({ error: "模型返回的 JSON 解析失败，请重试" });
     }
 
+    const coverPrompt = String(parsed.cover_prompt ?? "").trim().slice(0, 800);
     const name = String(parsed.name ?? "").trim().slice(0, 40) || "新角色";
     const draft = defaultCard(name, slugFromName(name));
     draft.id = newCardId();
@@ -902,7 +1120,8 @@ app.post("/api/cards/ai-draft", async (req, res) => {
 
     const vr = validateCard(draft);
     if (!vr.ok) return res.status(500).json({ error: "草稿校验失败：" + vr.errors.join("; ") });
-    res.json({ draft, warnings: vr.warnings });
+    logInfo("卡片", `AI 草稿 ${draft.name} 完成`, `封面提示词 ${coverPrompt ? coverPrompt.length + " 字符" : "无"}`);
+    res.json({ draft, warnings: vr.warnings, coverPrompt });
   } catch (err) {
     res.status(500).json({ error: String(err) });
   }
@@ -923,10 +1142,11 @@ app.post("/api/cards/cover", async (req, res) => {
     const { generateImage } = await import("./core/imageGen.js");
     const r = await generateImage({ prompt, aspect: "portrait" });
     if (!r.ok || !r.buffer) return res.json({ ok: false, error: r.error ?? "生成失败" });
-    const mime = r.mimeType === "image/jpeg" ? "image/jpeg" : "image/png";
-    res.json({ ok: true, dataUrl: `data:${mime};base64,${r.buffer.toString("base64")}` });
+    const coverSlug = String(req.body?.slug ?? "").trim().replace(/[^A-Za-z0-9_-]/g, "-").slice(0, 60) || "cover";
+    const url = await saveCover(coverSlug, r.buffer, r.mimeType);
+    res.json({ ok: true, url });
   } catch (e) {
-    res.status(500).json({ ok: false, error: String(e) });
+    res.status(500).json({ ok: false, error: toUserError(e) });
   }
 });
 
@@ -939,18 +1159,18 @@ app.get("/api/providers", async (_req, res) => {
       image: data.image.map((p, i) => ({ ...p, isDefault: i === 0 })),
     });
   } catch (e) {
-    res.status(500).json({ error: String(e) });
+    res.status(500).json({ error: toUserError(e) });
   }
 });
 
 app.post("/api/providers/save", async (req, res) => {
   try {
     const { type, name, baseUrl, apiKey, models } = req.body ?? {};
-    if (type !== "chat" && type !== "image") return res.status(400).json({ error: "type 必须是 chat 或 image" });
+    if (type !== "chat" && type !== "image") return res.status(400).json({ error: "类型不正确" });
     const entry = await saveProvider(type, { name, baseUrl, apiKey, models });
     res.json({ ok: true, entry: { ...entry, apiKey: entry.apiKey.slice(0, 6) + "…" } });
   } catch (e) {
-    res.status(400).json({ error: String(e) });
+    res.status(400).json({ error: toUserError(e) });
   }
 });
 
@@ -961,7 +1181,7 @@ app.post("/api/providers/delete", async (req, res) => {
     await deleteProvider(type, name);
     res.json({ ok: true });
   } catch (e) {
-    res.status(500).json({ error: String(e) });
+    res.status(500).json({ error: toUserError(e) });
   }
 });
 
@@ -984,7 +1204,7 @@ app.post("/api/providers/fetch-models", async (req, res) => {
     const models = await fetchModels(url, key);
     res.json({ models });
   } catch (e) {
-    res.status(502).json({ error: String(e) });
+    res.status(502).json({ error: toUserError(e) });
   }
 });
 
@@ -996,7 +1216,7 @@ app.post("/api/providers/set-default", async (req, res) => {
     await moveProviderDefault(type, name);
     res.json({ ok: true });
   } catch (e) {
-    res.status(400).json({ error: String(e) });
+    res.status(400).json({ error: toUserError(e) });
   }
 });
 
@@ -1009,7 +1229,7 @@ app.post("/api/providers/toggle", async (req, res) => {
     const p = await setProviderEnabled(type, name, enabled !== false);
     res.json({ ok: true, name: p.name, enabled: p.enabled });
   } catch (e) {
-    res.status(400).json({ error: String(e) });
+    res.status(400).json({ error: toUserError(e) });
   }
 });
 
@@ -1052,25 +1272,38 @@ app.post("/api/distill", async (req, res) => {
     });
     res.json({ card: result.card, talkers: result.talkers, stats: result.stats });
   } catch (e) {
-    res.status(500).json({ error: String(e) });
+    res.status(500).json({ error: toUserError(e) });
   }
 });
 
 app.post("/api/cards/import", async (req, res) => {
   try {
+    const t0 = Date.now();
     const card = req.body?.card;
     if (!card) return res.status(400).json({ error: "缺少 card" });
+    const bodyKB = Math.round(JSON.stringify(card).length / 1024);
     // 解析补全默认字段后保存（做卡/导入的卡可能只填了部分字段）
     const parsed = personaCardSchema.safeParse(card);
+    const tParse = Date.now();
     if (!parsed.success) {
-      return res.status(400).json({ error: parsed.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("; ") });
+      return res.status(400).json({ error: "卡片内容不合规：" + validateCard(card).errors.slice(0, 3).join("；") });
     }
     const result = validateCard(parsed.data);
+    const tValidate = Date.now();
     if (!result.ok) return res.status(400).json({ error: result.errors.join("; ") });
+    if (parsed.data.identity?.avatar) {
+      parsed.data.identity.avatar = await normalizeAvatar(parsed.data.identity.avatar, parsed.data.slug);
+    }
     await store.save(parsed.data);
+    const tSave = Date.now();
+    logInfo(
+      "卡片",
+      `保存 ${parsed.data.name} 共 ${tSave - t0}ms`,
+      `体积 ${bodyKB}KB · schema ${tParse - t0}ms · 校验 ${tValidate - tParse}ms · 落盘 ${tSave - tValidate}ms`
+    );
     res.json({ card: parsed.data });
   } catch (e) {
-    res.status(500).json({ error: String(e) });
+    res.status(500).json({ error: toUserError(e) });
   }
 });
 
@@ -1112,7 +1345,10 @@ async function buildCardExport(card: PersonaCard, format: string): Promise<{ fil
   }
   let png: Buffer | null = null;
   const avatar = card.identity.avatar;
-  if (typeof avatar === "string" && avatar.startsWith("data:image/")) {
+  if (typeof avatar === "string" && avatar.startsWith("/covers/")) {
+    // 封面文件存储：读文件做图面
+    png = await readCover(avatar);
+  } else if (typeof avatar === "string" && avatar.startsWith("data:image/")) {
     const raw = Buffer.from(avatar.split(",")[1] ?? "", "base64");
     // 头像必须是真 PNG：把 jpeg 当 PNG 写会产出打不开的坏文件（上游生图可能返回 jpeg）
     if (isPng(raw)) png = raw;
@@ -1129,12 +1365,14 @@ async function buildCardExport(card: PersonaCard, format: string): Promise<{ fil
 
 app.post("/api/cards/:slug/export", async (req, res) => {
   try {
+    const te0 = Date.now();
     const card = await store.get(req.params.slug);
     const format = ["json", "chatlog"].includes(req.body?.format) ? req.body.format : "png";
     const out = await buildCardExport(card, format);
+    logInfo("卡片", `导出 ${card.name} (${format}) 共 ${Date.now() - te0}ms`, `产物 ${Math.round(out.dataUrl.length / 1024)}KB`);
     res.json({ format, ...out });
   } catch (e) {
-    res.status(500).json({ error: String(e) });
+    res.status(500).json({ error: toUserError(e) });
   }
 });
 
@@ -1148,7 +1386,7 @@ app.post("/api/cards/export-card", async (req, res) => {
     const out = await buildCardExport(card as PersonaCard, req.body?.format === "json" ? "json" : "png");
     res.json({ format: req.body?.format === "json" ? "json" : "png", ...out });
   } catch (e) {
-    res.status(500).json({ error: String(e) });
+    res.status(500).json({ error: toUserError(e) });
   }
 });
 
@@ -1176,15 +1414,17 @@ app.post("/api/cards/import-card", async (req, res) => {
       card.slug = await store.freeSlug(card.slug);
       const result = validateCard(card);
       if (!result.ok) return res.status(400).json({ error: result.errors.join("; ") });
+      if (card.identity?.avatar) card.identity.avatar = await normalizeAvatar(card.identity.avatar, card.slug);
       await store.save(card);
       return res.json({ card, renamedFrom: original, hint: `已存在同名卡「${original}」，本次另存为「${card.slug}」` });
     }
     const result = validateCard(card);
     if (!result.ok) return res.status(400).json({ error: result.errors.join("; ") });
+    if (card.identity?.avatar) card.identity.avatar = await normalizeAvatar(card.identity.avatar, card.slug);
     await store.save(card);
     res.json({ card, overwrote: conflict === true });
   } catch (e) {
-    res.status(500).json({ error: String(e) });
+    res.status(500).json({ error: toUserError(e) });
   }
 });
 
@@ -1233,7 +1473,7 @@ app.post("/api/distill/weflow", async (req, res) => {
     });
     res.json({ card: result.card, talkers: result.talkers, stats: result.stats });
   } catch (e) {
-    res.status(500).json({ error: String(e) });
+    res.status(500).json({ error: toUserError(e) });
   }
 });
 
@@ -1294,6 +1534,7 @@ async function executeToolCalls(tools: ToolDef[], toolCalls: ToolCallMsg[], mess
       try {
         result = await def.run(JSON.parse(tc.function?.arguments || "{}"), ctx);
       } catch (e) {
+        logError("工具", `${tc.function?.name ?? "?"} 执行出错`, e);
         result = `工具执行出错: ${String(e)}`;
       }
     }
@@ -1381,9 +1622,9 @@ function chatCtx(slug: string): ToolCtx {
 app.post("/api/chat", async (req, res) => {
   try {
     const { slug, message, history, tools, skills, thinking, useMCP, model } = req.body ?? {};
-    if (!slug || !message) return res.status(400).json({ error: "slug / message 不能为空" });
+    if (!slug || !message) return res.status(400).json({ error: "请选择卡片并输入内容" });
     const card = await store.get(slug).catch(() => null);
-    if (!card) return res.status(404).json({ error: `卡片不存在: ${slug}` });
+    if (!card) return res.status(404).json({ error: "找不到这张卡，可能已被删除" });
     // 本次聊天可临时换模型（"提供商::模型" 形式），不传则用卡片自己的设置
     const llm = await resolveChatLLM(overrideCardModel(card, model));
     if (!llm || !llm.apiKey) return res.status(400).json({ error: "未配置模型 API（API 页）" });
@@ -1444,6 +1685,7 @@ app.post("/api/chat", async (req, res) => {
       ...(Array.isArray(history) ? history.slice(-20) : []),
       { role: "user", content: message },
     ];
+    logInfo("聊天", `${card.name} 用 ${llm.provider}/${llm.model}` + (toolDefs.length ? ` · 工具 ${toolDefs.length} 个` : ""));
     const result = await runToolLoop(llm, messages, toolDefs, chatCtx(slug), card.tools?.policy === "ask", reasoning);
     if (result.type === "reply") {
       // 滑动分批自动总结记忆（后台执行，不阻塞回复）
@@ -1451,7 +1693,7 @@ app.post("/api/chat", async (req, res) => {
     }
     res.json(result);
   } catch (e) {
-    res.status(500).json({ error: String(e) });
+    res.status(500).json({ error: toUserError(e) });
   }
 });
 
@@ -1536,10 +1778,10 @@ async function autoMemorize(
 app.post("/api/chat/approve", async (req, res) => {
   try {
     const { slug, messages, approve, tools, useMCP, model } = req.body ?? {};
-    if (!slug || !Array.isArray(messages)) return res.status(400).json({ error: "slug / messages 不能为空" });
+    if (!slug || !Array.isArray(messages)) return res.status(400).json({ error: "请选择卡片并输入内容" });
     // 与 /api/chat 保持一致：用卡片单独配置的模型（否则审批续聊会静默换回默认模型）
     const card = await store.get(slug).catch(() => null);
-    if (!card) return res.status(404).json({ error: `卡片不存在: ${slug}` });
+    if (!card) return res.status(404).json({ error: "找不到这张卡，可能已被删除" });
     const llm = await resolveChatLLM(overrideCardModel(card, model));
     if (!llm || !llm.apiKey) return res.status(400).json({ error: "未配置模型 API（API 页）" });
     const enabledTools = Array.isArray(tools) ? (tools as string[]) : [];
@@ -1566,7 +1808,7 @@ app.post("/api/chat/approve", async (req, res) => {
     }
     res.json(result);
   } catch (e) {
-    res.status(500).json({ error: String(e) });
+    res.status(500).json({ error: toUserError(e) });
   }
 });
 
@@ -1577,7 +1819,7 @@ app.get("/api/presets", async (_req, res) => {
   try {
     res.json(await listPresets());
   } catch (e) {
-    res.status(500).json({ error: String(e) });
+    res.status(500).json({ error: toUserError(e) });
   }
 });
 
@@ -1587,7 +1829,7 @@ app.post("/api/presets", async (req, res) => {
     if (!isPresetKind(kind)) return res.status(400).json({ error: "kind 必须是 tier 或 style" });
     res.status(201).json(await addPreset(kind, String(name ?? ""), String(content ?? "")));
   } catch (e) {
-    res.status(500).json({ error: String(e) });
+    res.status(500).json({ error: toUserError(e) });
   }
 });
 
@@ -1600,7 +1842,7 @@ app.put("/api/presets/:kind/:id", async (req, res) => {
     if (typeof req.body?.content === "string") patch.content = req.body.content;
     res.json(await updatePreset(kind, String(req.params.id), patch));
   } catch (e) {
-    res.status(500).json({ error: String(e) });
+    res.status(500).json({ error: toUserError(e) });
   }
 });
 
@@ -1610,7 +1852,7 @@ app.delete("/api/presets/:kind/:id", async (req, res) => {
     if (!isPresetKind(kind)) return res.status(400).json({ error: "kind 必须是 tier 或 style" });
     res.json(await deletePreset(kind, String(req.params.id)));
   } catch (e) {
-    res.status(500).json({ error: String(e) });
+    res.status(500).json({ error: toUserError(e) });
   }
 });
 
@@ -1618,7 +1860,7 @@ app.post("/api/presets/reset", async (_req, res) => {
   try {
     res.json(await resetBuiltinPresets());
   } catch (e) {
-    res.status(500).json({ error: String(e) });
+    res.status(500).json({ error: toUserError(e) });
   }
 });
 
@@ -1627,7 +1869,7 @@ app.get("/api/mcp/config", requireFeature("mcp"), async (_req, res) => {
   try {
     res.json(await loadMCPConfig());
   } catch (e) {
-    res.status(500).json({ error: String(e) });
+    res.status(500).json({ error: toUserError(e) });
   }
 });
 
@@ -1639,7 +1881,7 @@ app.post("/api/mcp/config", requireFeature("mcp"), async (req, res) => {
     await reloadMCP();
     res.json({ ok: true, servers: clean.servers.length });
   } catch (e) {
-    res.status(500).json({ error: String(e) });
+    res.status(500).json({ error: toUserError(e) });
   }
 });
 
@@ -1656,7 +1898,7 @@ app.get("/api/skills", requireFeature("skills"), async (_req, res) => {
   try {
     res.json({ skills: await allSkills() });
   } catch (e) {
-    res.status(500).json({ error: String(e) });
+    res.status(500).json({ error: toUserError(e) });
   }
 });
 
@@ -1668,7 +1910,7 @@ app.post("/api/skills", requireFeature("skills"), async (req, res) => {
     const saved = await saveUserSkills(skills as Array<Partial<UserSkill>>);
     res.json({ ok: true, count: saved.length, skills: saved });
   } catch (e) {
-    res.status(500).json({ error: String(e) });
+    res.status(500).json({ error: toUserError(e) });
   }
 });
 
@@ -1679,7 +1921,7 @@ app.post("/api/mcp/test", requireFeature("mcp"), async (req, res) => {
     if (!server || typeof server !== "object") return res.status(400).json({ error: "server 不能为空" });
     res.json(await testMCPServer(server as MCPServerConfig));
   } catch (e) {
-    res.status(500).json({ error: String(e) });
+    res.status(500).json({ error: toUserError(e) });
   }
 });
 
@@ -1724,7 +1966,7 @@ app.get("/api/workspace/list", requireFeature("workspace"), async (req, res) => 
   try {
     const base = await wsBase();
     const dir = resolveInSandbox(base, String(req.query.dir ?? ""));
-    if (!dir) return res.status(400).json({ error: "路径越界" });
+    if (!dir) return res.status(400).json({ error: "这个位置不允许访问" });
     const items = await fs.readdir(dir, { withFileTypes: true }).catch(() => null);
     if (items === null) return res.status(404).json({ error: "目录不存在" });
     const out = [];
@@ -1742,7 +1984,7 @@ app.get("/api/workspace/list", requireFeature("workspace"), async (req, res) => 
     out.sort((a, b) => (a.dir === b.dir ? a.name.localeCompare(b.name) : a.dir ? -1 : 1));
     res.json({ dir: String(req.query.dir ?? ""), items: out });
   } catch (e) {
-    res.status(500).json({ error: String(e) });
+    res.status(500).json({ error: toUserError(e) });
   }
 });
 
@@ -1750,12 +1992,12 @@ app.post("/api/workspace/write", requireFeature("workspace"), async (req, res) =
   try {
     const base = await wsBase();
     const abs = resolveInSandbox(base, String(req.body?.file ?? ""));
-    if (!abs) return res.status(400).json({ error: "路径越界" });
+    if (!abs) return res.status(400).json({ error: "这个位置不允许访问" });
     await fs.mkdir(path.dirname(abs), { recursive: true });
     await fs.writeFile(abs, String(req.body?.content ?? ""), "utf8");
     res.json({ ok: true });
   } catch (e) {
-    res.status(500).json({ error: String(e) });
+    res.status(500).json({ error: toUserError(e) });
   }
 });
 
@@ -1763,11 +2005,11 @@ app.post("/api/workspace/mkdir", requireFeature("workspace"), async (req, res) =
   try {
     const base = await wsBase();
     const abs = resolveInSandbox(base, String(req.body?.dir ?? ""));
-    if (!abs) return res.status(400).json({ error: "路径越界" });
+    if (!abs) return res.status(400).json({ error: "这个位置不允许访问" });
     await fs.mkdir(abs, { recursive: true });
     res.json({ ok: true });
   } catch (e) {
-    res.status(500).json({ error: String(e) });
+    res.status(500).json({ error: toUserError(e) });
   }
 });
 
@@ -1775,12 +2017,12 @@ app.post("/api/workspace/delete", requireFeature("workspace"), async (req, res) 
   try {
     const base = await wsBase();
     const abs = resolveInSandbox(base, String(req.body?.path ?? ""));
-    if (!abs) return res.status(400).json({ error: "路径越界" });
+    if (!abs) return res.status(400).json({ error: "这个位置不允许访问" });
     if (abs === base) return res.status(400).json({ error: "不能删除工作区根目录" });
     await fs.rm(abs, { recursive: true, force: true });
     res.json({ ok: true });
   } catch (e) {
-    res.status(500).json({ error: String(e) });
+    res.status(500).json({ error: toUserError(e) });
   }
 });
 
@@ -1788,12 +2030,12 @@ app.get("/api/workspace/download", requireFeature("workspace"), async (req, res)
   try {
     const base = await wsBase();
     const abs = resolveInSandbox(base, String(req.query.file ?? ""));
-    if (!abs) return res.status(400).json({ error: "路径越界" });
+    if (!abs) return res.status(400).json({ error: "这个位置不允许访问" });
     const st = await fs.stat(abs).catch(() => null);
     if (!st || st.isDirectory()) return res.status(404).json({ error: "文件不存在" });
     res.download(abs);
   } catch (e) {
-    res.status(500).json({ error: String(e) });
+    res.status(500).json({ error: toUserError(e) });
   }
 });
 
@@ -1801,14 +2043,14 @@ app.post("/api/workspace/upload", requireFeature("workspace"), async (req, res) 
   try {
     const base = await wsBase();
     const abs = resolveInSandbox(base, String(req.body?.file ?? ""));
-    if (!abs) return res.status(400).json({ error: "路径越界" });
+    if (!abs) return res.status(400).json({ error: "这个位置不允许访问" });
     let b64 = String(req.body?.data ?? "");
     if (b64.includes(",")) b64 = b64.slice(b64.indexOf(",") + 1);
     await fs.mkdir(path.dirname(abs), { recursive: true });
     await fs.writeFile(abs, Buffer.from(b64, "base64"));
     res.json({ ok: true });
   } catch (e) {
-    res.status(500).json({ error: String(e) });
+    res.status(500).json({ error: toUserError(e) });
   }
 });
 
@@ -1833,7 +2075,7 @@ app.get("/api/workspace/overview", requireFeature("workspace"), async (_req, res
     await walk(base);
     res.json({ path: base, files, size });
   } catch (e) {
-    res.status(500).json({ error: String(e) });
+    res.status(500).json({ error: toUserError(e) });
   }
 });
 
@@ -1844,7 +2086,7 @@ app.get("/api/active-persona", async (_req, res) => {
     const m = soul.match(/^# SOUL\.md\s*[—-]\s*(.+)$/m);
     res.json({ active: m ? m[1].trim() : null });
   } catch (e) {
-    res.status(500).json({ error: String(e) });
+    res.status(500).json({ error: toUserError(e) });
   }
 });
 
@@ -1877,7 +2119,7 @@ app.get("/api/backup", async (_req, res) => {
       dataUrl: "data:application/json;charset=utf-8," + encodeURIComponent(JSON.stringify(bundle, null, 2)),
     });
   } catch (e) {
-    res.status(500).json({ error: String(e) });
+    res.status(500).json({ error: toUserError(e) });
   }
 });
 
@@ -1886,7 +2128,7 @@ app.get("/api/memory", async (_req, res) => {
   try {
     res.json({ memory: await readAllMemories() });
   } catch (e) {
-    res.status(500).json({ error: String(e) });
+    res.status(500).json({ error: toUserError(e) });
   }
 });
 
@@ -1904,7 +2146,7 @@ app.post("/api/memory/clear", async (req, res) => {
     void exportAllMemoriesToMarkdown().catch(() => {});
     res.json({ ok: true });
   } catch (e) {
-    res.status(500).json({ error: String(e) });
+    res.status(500).json({ error: toUserError(e) });
   }
 });
 
@@ -1921,7 +2163,7 @@ app.post("/api/memory/:slug", async (req, res) => {
     void exportMemoryToMarkdown(req.params.slug).catch(() => {});
     res.json({ ok: true, entry: result.entry });
   } catch (e) {
-    res.status(500).json({ error: String(e) });
+    res.status(500).json({ error: toUserError(e) });
   }
 });
 
@@ -1934,7 +2176,7 @@ app.post("/api/memory/:slug/delete", async (req, res) => {
     void exportMemoryToMarkdown(req.params.slug).catch(() => {});
     res.json({ ok: removed });
   } catch (e) {
-    res.status(500).json({ error: String(e) });
+    res.status(500).json({ error: toUserError(e) });
   }
 });
 
@@ -1951,7 +2193,7 @@ app.post("/api/memory/:slug/update", async (req, res) => {
     void exportMemoryToMarkdown(req.params.slug).catch(() => {});
     res.json({ ok: true, entry });
   } catch (e) {
-    res.status(500).json({ error: String(e) });
+    res.status(500).json({ error: toUserError(e) });
   }
 });
 
@@ -1972,7 +2214,7 @@ app.get("/api/emojis", async (_req, res) => {
     const emojis = await listEmojis();
     res.json({ emojis: emojis.map((e) => ({ ...e, url: emojiUrl(e.file) })), max: MAX_EMOJIS });
   } catch (e) {
-    res.status(500).json({ error: String(e) });
+    res.status(500).json({ error: toUserError(e) });
   }
 });
 
@@ -1982,7 +2224,7 @@ app.post("/api/emojis", async (req, res) => {
     const item = await addEmoji({ name, explanation, imageBase64, ext });
     res.json({ ok: true, emoji: { ...item, url: emojiUrl(item.file) } });
   } catch (e) {
-    res.status(400).json({ error: e instanceof Error ? e.message : String(e) });
+    res.status(400).json({ error: toUserError(e) });
   }
 });
 
@@ -1993,7 +2235,7 @@ app.post("/api/emojis/:id", async (req, res) => {
     if (!item) return res.status(404).json({ error: "表情不存在" });
     res.json({ ok: true, emoji: { ...item, url: emojiUrl(item.file) } });
   } catch (e) {
-    res.status(400).json({ error: e instanceof Error ? e.message : String(e) });
+    res.status(400).json({ error: toUserError(e) });
   }
 });
 
@@ -2003,7 +2245,7 @@ app.delete("/api/emojis/:id", async (req, res) => {
     if (!ok) return res.status(404).json({ error: "表情不存在" });
     res.json({ ok: true });
   } catch (e) {
-    res.status(500).json({ error: String(e) });
+    res.status(500).json({ error: toUserError(e) });
   }
 });
 
@@ -2015,12 +2257,12 @@ app.get("/api/image/config", async (_req, res) => {
       provider: cfg.provider,
       retentionDays: cfg.retentionDays,
       novelai: { key: maskKey(cfg.novelai.key) },
-      openai: { baseUrl: cfg.openai.baseUrl, key: maskKey(cfg.openai.key) },
+      openai: { baseUrl: cfg.openai.baseUrl, key: maskKey(cfg.openai.key), model: cfg.openai.model },
       artists: cfg.artists,
       activeArtist: cfg.activeArtist,
     });
   } catch (e) {
-    res.status(500).json({ error: String(e) });
+    res.status(500).json({ error: toUserError(e) });
   }
 });
 
@@ -2041,6 +2283,7 @@ app.post("/api/image/config", async (req, res) => {
       openai: {
         baseUrl: openai?.baseUrl !== undefined ? String(openai.baseUrl) : cur.openai.baseUrl,
         key: openai?.key ? String(openai.key) : cur.openai.key,
+        model: openai?.model !== undefined ? String(openai.model) : cur.openai.model,
       },
       artists: nextArtists,
       activeArtist:
@@ -2049,7 +2292,7 @@ app.post("/api/image/config", async (req, res) => {
     await saveImageConfig(next);
     res.json({ ok: true, hint: "已保存。工作模式勾选「生图」工具即可让 AI 生成图片" });
   } catch (e) {
-    res.status(500).json({ error: String(e) });
+    res.status(500).json({ error: toUserError(e) });
   }
 });
 
@@ -2071,7 +2314,21 @@ app.post("/api/image/test", async (req, res) => {
     }
     res.json({ ok: false, info: "未知提供商" });
   } catch (e) {
-    res.status(500).json({ error: String(e) });
+    res.status(500).json({ error: toUserError(e) });
+  }
+});
+
+// 拉取 OpenAI 兼容生图可用模型（中转站一般不会单独放出生图模型，需从 /models 里选）
+app.post("/api/image/openai-models", async (req, res) => {
+  try {
+    const { baseUrl, key } = req.body ?? {};
+    const b = baseUrl ?? (await getImageConfig()).openai.baseUrl;
+    const k = key ?? (await getImageConfig()).openai.key;
+    if (!b || !k) return res.json({ error: "未填 Base URL / Key" });
+    const models = await fetchModels(String(b), String(k));
+    res.json({ models });
+  } catch (e) {
+    res.status(400).json({ error: toUserError(e) });
   }
 });
 
@@ -2094,6 +2351,7 @@ app.post("/api/image/generate", async (req, res) => {
         ...cfg.openai,
         baseUrl: openai?.baseUrl !== undefined ? String(openai.baseUrl) : cfg.openai.baseUrl,
         key: openai?.key ? String(openai.key) : cfg.openai.key,
+        model: openai?.model !== undefined ? String(openai.model) : cfg.openai.model,
       },
     };
     const saveDir = path.join(dataDir(), "images", "_test");
@@ -2110,7 +2368,7 @@ app.post("/api/image/generate", async (req, res) => {
     const file = r.file ? path.basename(r.file) : "gen.png";
     res.json({ ok: true, url: `/img/_test/${file}`, width: r.width, height: r.height });
   } catch (e) {
-    res.status(500).json({ ok: false, error: String(e) });
+    res.status(500).json({ ok: false, error: toUserError(e) });
   }
 });
 
@@ -2134,7 +2392,7 @@ app.get("/api/image/list", async (_req, res) => {
     out.sort((a, b) => b.mtime - a.mtime);
     res.json({ images: out });
   } catch (e) {
-    res.status(500).json({ error: String(e) });
+    res.status(500).json({ error: toUserError(e) });
   }
 });
 
@@ -2150,7 +2408,7 @@ app.post("/api/image/delete", async (req, res) => {
     await fs.unlink(target);
     res.json({ ok: true });
   } catch (e) {
-    res.status(500).json({ error: String(e) });
+    res.status(500).json({ error: toUserError(e) });
   }
 });
 
@@ -2195,7 +2453,7 @@ app.get("/api/tts/config", async (_req, res) => {
       commonVoices: COMMON_EDGE_VOICES,
     });
   } catch (e) {
-    res.status(500).json({ error: String(e) });
+    res.status(500).json({ error: toUserError(e) });
   }
 });
 
@@ -2218,7 +2476,7 @@ app.post("/api/tts/config", async (req, res) => {
     await saveTtsConfig(next);
     res.json({ ok: true, hint: "已保存。聊天里点「🔊」即可朗读 AI 回复" });
   } catch (e) {
-    res.status(500).json({ error: String(e) });
+    res.status(500).json({ error: toUserError(e) });
   }
 });
 
@@ -2247,7 +2505,7 @@ app.post("/api/tts/providers", async (req, res) => {
       if (body.key) merged.key = String(body.key);
       providers[providers.indexOf(existing)] = merged;
     } else {
-      if (!body.name || !body.baseUrl) return res.status(400).json({ error: "name / baseUrl 必填" });
+      if (!body.name || !body.baseUrl) return res.status(400).json({ error: "名称和地址都要填" });
       id = `p_${Date.now().toString(36)}`;
       providers.push({
         id,
@@ -2266,7 +2524,7 @@ app.post("/api/tts/providers", async (req, res) => {
     await saveTtsConfig({ ...cur, providers });
     res.json({ ok: true, id, hint: existing ? "已更新上游" : "已新增上游" });
   } catch (e) {
-    res.status(500).json({ error: String(e) });
+    res.status(500).json({ error: toUserError(e) });
   }
 });
 
@@ -2282,11 +2540,42 @@ app.delete("/api/tts/providers/:id", async (req, res) => {
     });
     res.json({ ok: true });
   } catch (e) {
-    res.status(500).json({ error: String(e) });
+    res.status(500).json({ error: toUserError(e) });
   }
 });
 
 // 拉取 TTS 上游的模型/音色列表：openai 兼容走 GET {base}/models（+尽力 /audio/voice/list）；minimax/volc 给内置可选列表
+/** 宽容提取模型 id：兼容 {data:[...]} / {models:[...]} / 根数组 / 嵌套容器 / 条目字段 id|model|name */
+function extractModelIds(j: unknown): string[] {
+  const out: string[] = [];
+  const walk = (v: unknown): void => {
+    if (Array.isArray(v)) {
+      v.forEach(walk);
+      return;
+    }
+    if (v && typeof v === "object") {
+      const o = v as Record<string, unknown>;
+      for (const key of ["data", "models", "items", "list", "model_list"]) {
+        const c = o[key];
+        if (Array.isArray(c)) {
+          walk(c);
+          return;
+        }
+      }
+      if (typeof o.id === "string" && o.id.trim() || typeof o.model === "string" && o.model.trim() || typeof o.name === "string" && o.name.trim()) {
+        const idv = typeof o.id === "string" ? o.id : typeof o.model === "string" ? o.model : o.name;
+        if (typeof idv === "string" && idv.trim()) out.push(idv.trim());
+        return;
+      }
+      for (const child of Object.values(o)) {
+        if (Array.isArray(child)) walk(child);
+      }
+    }
+  };
+  walk(j);
+  return [...new Set(out.filter((s) => s.length > 0 && s.length < 200))];
+}
+
 function extractVoiceIds(j: unknown): string[] {
   const out: string[] = [];
   const walk = (v: unknown): void => {
@@ -2316,21 +2605,34 @@ function extractVoiceIds(j: unknown): string[] {
 
 app.post("/api/tts/fetch-models", async (req, res) => {
   try {
-    const { kind, baseUrl, key } = req.body ?? {};
+    const { kind, baseUrl, key, id } = req.body ?? {};
     const k: string = TTS_KINDS.includes(kind) ? kind : "openai";
-    const base = String(baseUrl ?? "").replace(/\/+$/, "");
-    if (!base || !key) return res.status(400).json({ error: "Base URL 与 API Key 必填" });
+    let base = String(baseUrl ?? "").replace(/\/+$/, "");
+    let apiKey = String(key ?? "");
+    // 编辑重拉：key/baseUrl 留空时回退已保存的提供商配置（同 API 页按名称回退）
+    if ((!base || !apiKey) && id) {
+      const cur = await getTtsConfig();
+      const p = cur.providers.find((x) => x.id === id);
+      if (p) {
+        if (!base) base = p.baseUrl;
+        if (!apiKey) apiKey = p.key;
+      }
+    }
+    if (!base) return res.status(400).json({ error: "Base URL 必填" });
     let models: string[] = [];
     let voices: string[] = [];
     if (k === "openai") {
-      const r = await fetch(`${base}/models`, { headers: { Authorization: `Bearer ${key}` }, signal: AbortSignal.timeout(20000) });
+      if (!apiKey) return res.status(400).json({ error: "API Key 必填（编辑留空时应先保存过 Key，或重新填写）" });
+      const r = await fetch(`${base}/models`, { headers: { Authorization: `Bearer ${apiKey}` }, signal: AbortSignal.timeout(20000) });
       if (!r.ok) return res.status(502).json({ error: `拉取模型失败 HTTP ${r.status}: ${(await r.text()).slice(0, 200)}` });
-      const j = (await r.json().catch(() => null)) as { data?: { id?: string }[] } | null;
-      const ids = Array.isArray(j?.data) ? j.data.map((m) => String(m?.id ?? "")).filter(Boolean) : [];
+      const j: unknown = await r.json().catch(() => null);
+      if (j === null) return res.status(400).json({ error: "接口返回的不是 JSON，无法解析模型列表；请确认 baseUrl 正确（OpenAI 兼容以 /v1 结尾）" });
+      const ids = extractModelIds(j);
       models = ids.filter((id) => /tts|speech|voice|audio|cosy|moss/i.test(id));
-      if (!models.length) models = ids; // 过滤不到就全给
+      if (!models.length) models = ids.slice(0, 200); // 过滤不到就全给（限 200 防巨列表卡界面）
+      if (!models.length) return res.status(400).json({ error: "该接口未返回任何模型（/models 空或结构无法识别），请手动填写「默认模型/默认音色」后点完成" });
       // 尽力拉音色列表（硅基流动等支持 GET /audio/voice/list），失败不影响模型
-      const vr = await fetch(`${base}/audio/voice/list`, { headers: { Authorization: `Bearer ${key}` }, signal: AbortSignal.timeout(20000) }).catch(() => null);
+      const vr = await fetch(`${base}/audio/voice/list`, { headers: { Authorization: `Bearer ${apiKey}` }, signal: AbortSignal.timeout(20000) }).catch(() => null);
       if (vr?.ok) {
         const vj = await vr.json().catch(() => null);
         voices = extractVoiceIds(vj);
@@ -2342,7 +2644,7 @@ app.post("/api/tts/fetch-models", async (req, res) => {
     }
     res.json({ models, voices });
   } catch (e) {
-    res.status(500).json({ error: String(e) });
+    res.status(500).json({ error: toUserError(e) });
   }
 });
 
@@ -2350,7 +2652,7 @@ app.get("/api/tts/voices", async (_req, res) => {
   try {
     res.json({ voices: await listEdgeVoices() });
   } catch (e) {
-    res.status(500).json({ error: String(e) });
+    res.status(500).json({ error: toUserError(e) });
   }
 });
 
@@ -2360,7 +2662,7 @@ app.post("/api/tts/test", async (req, res) => {
     const { target } = req.body ?? {};
     res.json(await testTts(String(target ?? "")));
   } catch (e) {
-    res.status(500).json({ error: String(e) });
+    res.status(500).json({ error: toUserError(e) });
   }
 });
 
@@ -2369,12 +2671,13 @@ app.post("/api/tts/synthesize", async (req, res) => {
   try {
     const { text, providerId, voice, speed } = req.body ?? {};
     const buf = await synthesizeTts(String(text ?? ""), { providerId, voice, speed });
-    const ext = buf[0] === 0x52 && buf[1] === 0x49 ? "wav" : "mp3"; // RIFF → wav
-    const file = `tts-${Date.now()}.${ext}`;
-    const dir = path.join(dataDir(), "tts");
-    await fs.mkdir(dir, { recursive: true });
-    await fs.writeFile(path.join(dir, file), buf);
-    res.json({ url: `/tts/${file}`, bytes: buf.length });
+    // 直接把音频回给浏览器，不落盘：本地 SAPI 输出未压缩 WAV，单次朗读可达数 MB，
+    // 存下来只为播一次不值得（想再听就重新合成）。
+    // QQ/微信 的语音走 tts-server:17900，那边本来就是 res.send 不落盘，不受这里影响。
+    const isWav = buf[0] === 0x52 && buf[1] === 0x49; // RIFF
+    res.setHeader("Content-Type", isWav ? "audio/wav" : "audio/mpeg");
+    res.setHeader("Cache-Control", "no-store");
+    res.send(buf);
     void recordUsage({
       ts: new Date().toISOString(),
       provider: providerId ?? (await getTtsConfig()).defaultProvider,
@@ -2387,7 +2690,7 @@ app.post("/api/tts/synthesize", async (req, res) => {
       via: "admin",
     }).catch(() => {});
   } catch (e) {
-    res.status(500).json({ error: String(e) });
+    res.status(500).json({ error: toUserError(e) });
   }
 });
 
@@ -2395,7 +2698,7 @@ app.get("/api/tts/usage", async (_req, res) => {
   try {
     res.json(await getUsageSummary());
   } catch (e) {
-    res.status(500).json({ error: String(e) });
+    res.status(500).json({ error: toUserError(e) });
   }
 });
 
@@ -2403,13 +2706,7 @@ app.get("/api/tts/usage", async (_req, res) => {
 import AdmZip from "adm-zip";
 import {
   readCatalog,
-  addMarketPlugin,
-  removeMarketPlugin,
   getMarketPlugin,
-  saveUploadedZip,
-  recordSale,
-  listSales,
-  splitPrice,
   CATEGORY_LABELS,
   type MarketPlugin,
 } from "./core/pluginMarket.js";
@@ -2536,7 +2833,7 @@ app.get("/api/plugins/market", async (_req, res) => {
       }),
     });
   } catch (e) {
-    res.status(500).json({ error: String(e) });
+    res.status(500).json({ error: toUserError(e) });
   }
 });
 
@@ -2554,7 +2851,7 @@ app.get("/api/plugins/search", async (req, res) => {
       })),
     });
   } catch (e) {
-    res.status(500).json({ error: String(e) });
+    res.status(500).json({ error: toUserError(e) });
   }
 });
 
@@ -2570,7 +2867,7 @@ app.get("/api/plugins/installed", async (_req, res) => {
     } catch { /* 解析失败 */ }
     res.json({ ok: r.code === 0, plugins });
   } catch (e) {
-    res.status(500).json({ error: String(e) });
+    res.status(500).json({ error: toUserError(e) });
   }
 });
 
@@ -2588,9 +2885,9 @@ app.post("/api/plugins/install", async (req, res) => {
       result = { code: r.code ?? -1, output: stripAnsi(r.stdout + r.stderr) };
     }
     if (result.code === 0) invalidatePluginsCache();
-    res.json({ ok: result.code === 0, output: result.output.slice(-1200), hint: "网关重启后插件才会被加载（多任务在跑可先攒着）" });
+    res.json({ ok: result.code === 0, output: result.output.slice(-1200), hint: "网关重启后插件才会被加载" });
   } catch (e) {
-    res.status(500).json({ error: String(e) });
+    res.status(500).json({ error: toUserError(e) });
   }
 });
 
@@ -2636,7 +2933,7 @@ app.post("/api/plugins/uninstall", async (req, res) => {
     if (ok) invalidatePluginsCache();
     res.json({ ok, output: ok && dirRemoved ? output + "\n已清理本地插件目录" : output });
   } catch (e) {
-    res.status(500).json({ error: String(e) });
+    res.status(500).json({ error: toUserError(e) });
   }
 });
 
@@ -2647,7 +2944,7 @@ app.post("/api/plugins/update", async (req, res) => {
     const r = await runOpenclaw(["plugins", "update", String(id)], { timeoutMs: 120000 });
     res.json({ ok: r.code === 0, output: stripAnsi(r.stdout + r.stderr).slice(-800) });
   } catch (e) {
-    res.status(500).json({ error: String(e) });
+    res.status(500).json({ error: toUserError(e) });
   }
 });
 
@@ -2658,109 +2955,31 @@ app.post("/api/plugins/toggle", async (req, res) => {
     const r = await runOpenclaw(["plugins", enabled ? "enable" : "disable", String(id)], { timeoutMs: 60000 });
     res.json({ ok: r.code === 0, output: stripAnsi(r.stdout + r.stderr).slice(-800) });
   } catch (e) {
-    res.status(500).json({ error: String(e) });
+    res.status(500).json({ error: toUserError(e) });
   }
 });
 
-// 免费分享：填 ClawHub 包名推荐，或上传自己的 zip 插件包
-app.post("/api/plugins/share", async (req, res) => {
-  try {
-    const { name, descZh, category, pkg, zipBase64 } = req.body ?? {};
-    if (!name || !descZh) return res.status(400).json({ error: "名称和简介必填" });
-    const cat = CATEGORY_LABELS[category] ? category : "other";
-    const id = "sp_" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
-    let storePkg = String(pkg ?? "").trim();
-    if (zipBase64) {
-      const zipPath = await saveUploadedZip(id, String(zipBase64));
-      storePkg = "bundle";
-      await addMarketPlugin({ id, type: "userShared", pkg: "bundle", name, descZh, category: cat, source: "用户分享", zip: zipPath.replace(/\\/g, "/").replace(dataDir().replace(/\\/g, "/") + "/plugin-market/", ""), uploadedAt: new Date().toISOString() });
-    } else {
-      if (!storePkg) return res.status(400).json({ error: "请填 ClawHub 包名（如 clawhub:xxx）或上传 zip" });
-      await addMarketPlugin({ id, type: "userShared", pkg: storePkg, name, descZh, category: cat, source: "用户分享", uploadedAt: new Date().toISOString() });
-    }
-    res.json({ ok: true, id });
-  } catch (e) {
-    res.status(500).json({ error: String(e) });
-  }
-});
 
-// 付费上架：用户上传自己的插件 zip + 自主定价（我们按 feeRate 收手续费）
-app.post("/api/plugins/sell", async (req, res) => {
-  try {
-    const { name, descZh, category, price, zipBase64 } = req.body ?? {};
-    if (!name || !descZh || !zipBase64) return res.status(400).json({ error: "名称/简介/插件包(zip)必填" });
-    const p = Number(price);
-    if (!Number.isFinite(p) || p <= 0) return res.status(400).json({ error: "价格必须大于 0" });
-    if (p > 99999) return res.status(400).json({ error: "价格过大" });
-    const cat = CATEGORY_LABELS[category] ? category : "other";
-    const id = "pd_" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
-    const zipPath = await saveUploadedZip(id, String(zipBase64));
-    const catalog = await readCatalog();
-    const { fee, sellerGets } = splitPrice(p, catalog.feeRate);
-    await addMarketPlugin({
-      id, type: "paid", pkg: "bundle", name, descZh, category: cat, source: "用户上架",
-      price: p, sales: 0, zip: zipPath.replace(/\\/g, "/").replace(dataDir().replace(/\\/g, "/") + "/plugin-market/", ""),
-      uploadedAt: new Date().toISOString(),
-    });
-    res.json({ ok: true, id, fee, sellerGets, feeRate: catalog.feeRate });
-  } catch (e) {
-    res.status(500).json({ error: String(e) });
-  }
-});
 
-// 购买付费插件：先记账（支付通道待开通），返回安装结果
-app.post("/api/plugins/purchase", async (req, res) => {
-  try {
-    const { id } = req.body ?? {};
-    const plugin = await getMarketPlugin(String(id ?? ""));
-    if (!plugin) return res.status(404).json({ error: "插件不存在" });
-    if (plugin.type !== "paid") return res.status(400).json({ error: "只有付费区插件可以购买" });
-    const catalog = await readCatalog();
-    const { fee } = splitPrice(plugin.price ?? 0, catalog.feeRate);
-    await recordSale({ pluginId: plugin.id, name: plugin.name, seller: plugin.source, price: plugin.price ?? 0, fee, buyer: "local" });
-    let install: { code: number; output: string } | null = null;
-    if (plugin.pkg === "bundle") {
-      install = await installBundlePlugin(plugin);
-      if (install.code !== 0) {
-        return res.status(500).json({ ok: false, error: "安装失败（款已记账）：" + install.output.slice(-500) });
-      }
-    }
-    res.json({ ok: true, name: plugin.name, price: plugin.price, fee, install: install ? { ok: install.code === 0, output: install.output.slice(-500) } : null });
-  } catch (e) {
-    res.status(500).json({ error: String(e) });
-  }
-});
 
-app.get("/api/plugins/sales", async (_req, res) => {
-  try {
-    res.json(await listSales());
-  } catch (e) {
-    res.status(500).json({ error: String(e) });
-  }
-});
 
-// 从商店目录下架（自己的分享/付费条目；不卸载已安装的插件）
-app.post("/api/plugins/remove", async (req, res) => {
-  try {
-    const { id } = req.body ?? {};
-    if (!id) return res.status(400).json({ error: "缺少 id" });
-    await removeMarketPlugin(String(id));
-    res.json({ ok: true });
-  } catch (e) {
-    res.status(500).json({ error: String(e) });
-  }
-});
 
 app.listen(PORT, HOST, () => {
-  console.log(`openclaw-shell 已启动: http://${HOST}:${PORT}`);
+  logInfo("启动", `服务已启动 http://${HOST}:${PORT}`);
   console.log(`卡片目录: ${store["dir"]}`);
   // 生图图片自动清理：启动清一次 + 每天清一次（_test 试生图超 15 天删；正式图超 retentionDays 删）
   void cleanupImages().then((r) => {
-    if (r.removed > 0) console.log(`图片自动清理：已删除 ${r.removed} 张过期图片`);
+    if (r.removed > 0) logInfo("生图", `自动清理了 ${r.removed} 张过期图片`);
   });
   setInterval(() => void cleanupImages(), 24 * 3600 * 1000);
   // 记忆导出：启动时同步全部卡的记忆到 md（供 OpenClaw memorySearch.extraPaths 索引）
   void exportAllMemoriesToMarkdown().then((slugs) => {
-    if (slugs.length) console.log(`记忆已导出 md：${slugs.join(", ")}`);
+    if (slugs.length) logInfo("记忆", `已导出 ${slugs.length} 张卡的记忆`);
+  });
+  // 预热通道状态：这条查询要跑 openclaw CLI（冷启动 30s+），
+  // 先在后台跑一次填进缓存，用户进通道页就不用干等
+  void getChannelStatuses(true).then((all) => {
+    const ids = Object.keys(all);
+    if (ids.length) logInfo("通道", `状态已预热：${ids.join(", ")}`);
   });
 });
