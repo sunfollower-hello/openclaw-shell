@@ -128,6 +128,8 @@ openclaw-shell/
 18. **多机器人实测事实（2026-08-24）**：`agents add <slug> --workspace <dir> --model <p/m> --bind qqbot:<acc> --non-interactive --json` 全参数可用；`agents delete --force` 会把 workspace 目录移入回收站（重建时 compileCard 自动重生成，无碍）；qqbot 扫码输出含终端二维码 + `https://q.qq.com/qqbot/openclaw/connect.html?task_id=...` 链接，一次扫码只绑一个机器人；QQ 个体开发者一号最多 5 个机器人
 19. **插件商店踩坑（2026-08-24）**：① ClawHub 部分社区插件有包装问题（如 png-to-pdf 缺编译产物：`package install requires compiled runtime output`）——是上游问题不是我们 bug，安装失败提示即可；② `openclaw plugins uninstall` 不认 `--link` 本地装的插件（registry 无条目）也不删目录——卸载端点按 manifest id 扫描项目 plugins/ 目录删 + 清 openclaw.json 的 plugins.load.paths/entries；③ --link 安装 bundle 的目录名是 shareId（sp_xxx）不是插件 id，清理必须读 manifest 匹配；④ 本地插件包必须有 package.json 的 `openclaw.extensions` + manifest 的 `configSchema`（缺失报错 `plugin manifest requires configSchema`），上传校验已内置这两条；⑤ plugins list/agents list 都慢（5-15s），market/bots 端点都要缓存+并发合并，前端给"加载中"提示；⑥ 安装失败自动回滚（删目录+清 config）
 
+20. **通道绑定联通踩坑（2026-08-26，三个真 bug）**：① `channels status --probe --json` 的 `channelAccounts[channel][]` 账号字段是 **`accountId` 不是 `id`**（读错会得到 `[object Object]`）；且**通道级 `connected` 对微信恒为 false**（无长连接），必须看账号级 connected/running/configured——这是"微信明明绑好了却显示未连接"的原因；② **bots.json 有实例 ≠ OpenClaw 有路由绑定**：绑定可能因 agents add 时 bind 失败/被 agents delete 顺带清掉而丢失，此时消息落到默认 agent，表现为"连上了但回的是别的卡（共享 workspace 最后编译的那张）"——已加 `repairBotBindings()` 在进连接页时查 `agents bindings` 缺就补（幂等）；③ 微信真实 accountId 由服务器下发（`xxxx-im-bot`），创建 bot 时只能填占位名 `wx-main`，原来只在前端轮询到"登录成功那一刻"才校正，**关弹窗/刷新页面就永久错位** → 改为进连接页时对账不上就自动 `reconcileBotAccount`。经验：这类"配置在两处（我们的 bots.json + OpenClaw 的 bindings）"的设计必须有自愈对账，不能只在事件那一刻同步
+
 ## 9. 参考内容索引
 
 - **rikkahub**（github.com/rikkahub/rikkahub）：思考档位对齐（OFF/AUTO/LOW/MEDIUM/HIGH/XHIGH → effort 字符串）、APK 更新机制（GitHub Releases 当更新源，免服务器）
