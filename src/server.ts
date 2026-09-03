@@ -400,7 +400,7 @@ app.delete("/api/cards/:slug", async (req, res) => {
     const root = dataDir();
     await fs.rm(path.join(root, "memory", `${slug}.mem`), { force: true }).catch(() => {});
     await fs.rm(path.join(root, "memory", `${slug}.mem.count`), { force: true }).catch(() => {});
-    // 对话日志（老格式 + 按用户拆分的 <slug>.<ns>.chatlog.jsonl）
+    // 对话日志（每卡统一 <slug>.chatlog.jsonl，含历史按用户拆分的旧文件一并清）
     for (const f of await fs.readdir(path.join(root, "memory")).catch(() => [])) {
       if (f.startsWith(`${slug}.`) && f.endsWith(".chatlog.jsonl")) {
         await fs.rm(path.join(root, "memory", f), { force: true }).catch(() => {});
@@ -1772,7 +1772,7 @@ app.post("/api/chat", async (req, res) => {
     if (!slug || !message) return res.status(400).json({ error: "请选择卡片并输入内容" });
     const card = await store.get(slug).catch(() => null);
     if (!card) return res.status(404).json({ error: "找不到这张卡，可能已被删除" });
-    // 当前对话作用域（记忆隔离维度）：网页聊天固定 local，未来多用户/通道按会话传入
+    // 对话身份标识（保留兼容）：记忆已整卡通用，ns 不再做隔离，仅作调用链兼容
     const ns = typeof userKey === "string" && userKey.trim() ? userKey.trim() : "local";
     // 本次聊天可临时换模型（"提供商::模型" 形式），不传则用卡片自己的设置
     const llm = await resolveChatLLM(overrideCardModel(card, model));
@@ -1890,7 +1890,7 @@ async function autoMemorize(
   const rounds = card.memoryConfig?.auto_rounds ?? 10;
   if (!rounds || rounds < 1) return;
   // 追加本轮并取回「最早的一段」（若未到 保护20+N 则返回空，最近 20 轮原样保留不总结）。
-  // 对话日志按用户（ns）分开存，总结时不会把不同用户的对话混在一起
+  // 网页与通道（QQ/微信）对话进同一份日志、同一份记忆（整卡通用）
   const segment = await pushChatRound(
     slug,
     { u: String(userMsg ?? "").slice(0, 500), a: String(reply ?? "").slice(0, 500), t: new Date().toISOString() },
@@ -2342,7 +2342,7 @@ app.post("/api/memory/clear", async (req, res) => {
 app.post("/api/cards/:slug/reset", async (req, res) => {
   try {
     const slug = req.params.slug;
-    await clearMemory(slug); // 记忆 + 按用户拆分的对话日志 + 导出 md
+    await clearMemory(slug); // 记忆 + 统一对话日志 + 导出 md
     await clearGreeted(slug); // 全部开场状态（local 与通道用户都清），允许重新开场
     await clearConv(slug); // 统一会话日志
     await clearObserveCursor(slug); // 通道观察游标

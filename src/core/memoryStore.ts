@@ -3,6 +3,9 @@
 // 记忆形态（2026-09-01 改版）：不再分「信息/偏好/关系/事件」分类，每条 = 一段总结性记忆（fact）；
 //   - keywords[]  关键词：聊天里出现这些词时该条记忆优先/必注入（关键词识别注入）
 //   - important   关键记忆：识别到「总是/以后都/永远/记住/无论如何」等绝对化词时标记，始终优先注入
+// 记忆归属（2026-09-04 简化）：整卡记忆对所有入口（网页/QQ/微信）通用，ns 一律为 shared——
+//   本产品定位「一张卡 = 一个用户自己的 AI」，网页与通道都是同一个人，无需按用户隔离。
+//   保留 ns 字段仅为兼容旧数据（历史 qq:/wx:/local 标签统一视为 shared）。
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
@@ -17,7 +20,7 @@ export interface MemEntry {
   important: boolean; // 关键记忆标记（"总是/以后都/永远"等绝对化词）
   ts: string; // ISO 时间戳
   src: MemorySource;
-  /** 记忆作用域：shared=所有用户可见；其他值=仅该用户可见（local / qq:<openid> / wx:<openid>） */
+  /** 记忆作用域：统一为 shared（整卡通用）。保留字段仅为兼容旧数据，读入时强制 shared。 */
   ns: string;
 }
 
@@ -104,7 +107,7 @@ function parseLine(line: string): MemEntry | null {
       src: (["manual", "auto", "tool", "legacy"] as const).includes(o.src as MemorySource)
         ? (o.src as MemorySource)
         : "auto",
-      ns: typeof o.ns === "string" && o.ns ? o.ns : "shared",
+      ns: "shared", // 旧数据里的 qq:/wx:/local 标签一律并入 shared（整卡通用）
     };
   } catch {
     return null;
@@ -163,8 +166,8 @@ export interface AppendResult {
 }
 
 /** 追加一条记忆：自动去重（精确 + 相似）、容量上限（淘汰最旧）。重复时返回 duplicate。
- *  keywords：关键词（聊天出现这些词时优先注入）；important：关键记忆（始终优先注入）；
- *  ns：记忆作用域（shared=所有用户可见；local / qq:<openid> / wx:<openid>=仅该用户可见），默认 shared */
+ *  keywords：关键词（聊天出现这些词时优先注入）；important：关键记忆（始终优先注入）。
+ *  记忆对整张卡所有入口通用，ns 恒为 shared（保留入参仅为兼容旧调用，不再产生隔离）。 */
 export function appendEntry(
   slug: string,
   input: { fact: string; keywords?: string[]; important?: boolean; src?: MemorySource; ns?: string }
@@ -175,7 +178,6 @@ export function appendEntry(
     const src: MemorySource = ["manual", "auto", "tool"].includes(String(input.src ?? ""))
       ? (input.src as MemorySource)
       : "auto";
-    const ns = typeof input.ns === "string" && input.ns.trim() ? input.ns.trim() : "shared";
     const keywords = Array.isArray(input.keywords) ? input.keywords.map((k) => String(k).trim()).filter(Boolean) : [];
     const important = input.important === true;
     const entries = await readEntries(slug);
@@ -184,31 +186,18 @@ export function appendEntry(
         return { ok: false, duplicate: true };
       }
     }
-    const entry: MemEntry = { id: newId(), fact, keywords, important, ts: new Date().toISOString(), src, ns };
+    const entry: MemEntry = { id: newId(), fact, keywords, important, ts: new Date().toISOString(), src, ns: "shared" };
     const next = [...entries, entry];
-    // 超上限：按 ns 配额淘汰（防止某个用户/共享池独占全部容量，挤掉他人的记忆）。
-    // 共享记忆池分配一半容量，其余按用户(作用域)均分；每条作用域内优先保留 important，
-    // 再按时间保留最新的；最后仍超上限才按全局最旧淘汰。
+    // 超上限：优先淘汰普通记忆中最旧的（关键记忆 important 保留），仍超则淘汰最旧
     if (next.length > MAX_FACTS) {
-      const byNs = new Map<string, MemEntry[]>();
-      for (const e of next) {
-        const k = e.ns || "shared";
-        if (!byNs.has(k)) byNs.set(k, []);
-        byNs.get(k)!.push(e);
+      const excess = next.length - MAX_FACTS;
+      const evictable = next.filter((e) => !e.important);
+      const victims = new Set<MemEntry>();
+      if (evictable.length >= excess) {
+        evictable.sort((a, b) => a.ts.localeCompare(b.ts));
+        for (const v of evictable.slice(0, excess)) victims.add(v);
       }
-      const nsKeys = [...byNs.keys()];
-      const sharedQuota = Math.ceil(MAX_FACTS / 2);
-      const userQuota = Math.max(1, Math.floor((MAX_FACTS - sharedQuota) / Math.max(1, nsKeys.length - (byNs.has("shared") ? 1 : 0))));
-      const kept = new Map<string, MemEntry[]>();
-      for (const [k, group] of byNs) {
-        const quota = k === "shared" ? sharedQuota : userQuota;
-        const important = group.filter((e) => e.important);
-        const normal = group.filter((e) => !e.important).sort((a, b) => a.ts.localeCompare(b.ts));
-        const room = Math.max(0, quota - important.length);
-        const keep = [...important, ...normal.slice(Math.max(0, normal.length - room))];
-        kept.set(k, keep);
-      }
-      let trimmed = [...kept.values()].flat();
+      let trimmed = next.filter((e) => !victims.has(e));
       if (trimmed.length > MAX_FACTS) {
         trimmed.sort((a, b) => a.ts.localeCompare(b.ts));
         trimmed = trimmed.slice(trimmed.length - MAX_FACTS);
@@ -275,20 +264,14 @@ export interface ChatRound {
   t: string; // 时间戳
 }
 
-/** ns → 文件名安全片段（Windows 文件名不允许冒号等字符：qq:123 → qq_123） */
-function nsFileKey(ns: string): string {
-  return ns.replace(/[^A-Za-z0-9_.-]/g, "_");
-}
-
-/** 对话日志文件：带 ns 时按用户拆分（<slug>.<ns>.chatlog.jsonl），不带则读旧格式 <slug>.chatlog.jsonl */
-export function chatLogFile(slug: string, ns?: string): string {
-  const key = ns && ns.trim() ? nsFileKey(ns) : "";
-  return path.join(dataDir(), "memory", `${slug}${key ? "." + key : ""}.chatlog.jsonl`);
+/** 对话日志文件：统一为每卡单文件 <slug>.chatlog.jsonl（ns 参数保留仅为兼容旧调用，不再按用户拆分） */
+export function chatLogFile(slug: string, _ns?: string): string {
+  return path.join(dataDir(), "memory", `${slug}.chatlog.jsonl`);
 }
 
 /** 读取未总结的对话轮次（不加重写锁，仅供内部/调试读取） */
-export async function readChatLog(slug: string, ns?: string): Promise<ChatRound[]> {
-  const raw = await fs.readFile(chatLogFile(slug, ns), "utf8").catch(() => "");
+export async function readChatLog(slug: string, _ns?: string): Promise<ChatRound[]> {
+  const raw = await fs.readFile(chatLogFile(slug), "utf8").catch(() => "");
   const out: ChatRound[] = [];
   for (const line of raw.split(/\r?\n/)) {
     if (!line.trim()) continue;
@@ -303,22 +286,21 @@ export async function readChatLog(slug: string, ns?: string): Promise<ChatRound[
 }
 
 /**
- * 追加一轮对话到日志，并按「最近 30 轮保护」的滑动分批规则处理：
- * 日志里永远保留最近 30 轮不总结；超过 30 轮后每攒够 batch 轮「超额」，
+ * 追加一轮对话到日志，并按「最近 20 轮保护」的滑动分批规则处理：
+ * 日志里永远保留最近 20 轮不总结；超过后每攒够 batch 轮「超额」，
  * 就把最早 batch 轮取出返回（已从日志删除，之后不再参与总结）。
  * 返回需要总结的段（数组为空 = 未到阈值）。整段操作在写锁内原子完成。
- * ns 为对话作用域（local / qq:<openid> / wx:<openid>）：每个用户的对话日志分开存，
- * 避免不同用户的对话混在一起被总结成互相污染的"用户事实"。
+ * 网页与通道（QQ/微信）的对话进同一份日志、同一份记忆（整卡通用）。
  */
-export async function pushChatRound(slug: string, round: ChatRound, batch: number, ns?: string): Promise<ChatRound[]> {
+export async function pushChatRound(slug: string, round: ChatRound, batch: number, _ns?: string): Promise<ChatRound[]> {
   const b = Math.max(1, Math.min(50, batch || 20));
   // 最近 20 轮保护窗口：不参与总结（20 条原对话一定原样保留）
   const PROTECTED_RECENT_ROUNDS = 20;
   return withLock(slug, async () => {
-    const file = chatLogFile(slug, ns);
+    const file = chatLogFile(slug);
     await fs.mkdir(path.dirname(file), { recursive: true });
     await fs.appendFile(file, JSON.stringify(round) + "\n", "utf8");
-    const lines = await readChatLog(slug, ns);
+    const lines = await readChatLog(slug);
     if (lines.length < PROTECTED_RECENT_ROUNDS + b) return [];
     const segment = lines.slice(0, b);
     const rest = lines.slice(b);
@@ -330,13 +312,11 @@ export async function pushChatRound(slug: string, round: ChatRound, batch: numbe
 
 /**
  * 相关召回：按关键词重合 + 新鲜度打分取前 limit 条；query 为空时返回最新 limit 条。
- * ns 提供时只召回「该用户的私密记忆 + 所有用户共享的 shared 记忆」；
- * 不提供时返回全部（兼容旧调用 / 管理页展示）。
+ * 整卡记忆通用（ns 参数保留仅为兼容旧调用，不过滤）。
  */
-export async function recall(slug: string, query: string, limit = 30, ns?: string): Promise<MemEntry[]> {
+export async function recall(slug: string, query: string, limit = 30, _ns?: string): Promise<MemEntry[]> {
   const entries = await readEntries(slug);
-  const scoped = ns ? entries.filter((e) => e.ns === ns || e.ns === "shared") : entries;
-  const scored = scoped
+  const scored = entries
     .map((e) => ({ e, s: scoreEntry(e, query ?? "") }))
     .sort((a, b) => b.s - a.s);
   return scored.slice(0, Math.max(1, limit)).map((x) => x.e);
@@ -359,9 +339,8 @@ export function memoryExportDir(): string {
   return path.join(dataDir(), "memory-export");
 }
 
-/** 导出某卡记忆为 <slug>.md：先按作用域（shared / local / qq:xxx / wx:xxx）分组，
- *  组内关键记忆（important）置顶、再普通记忆；带记录时间；供 OpenClaw memorySearch.extraPaths 索引。
- *  按作用域分组后，通道端 agent 能分辨哪些记忆对所有用户有效、哪些只属于某个用户。 */
+/** 导出某卡记忆为 <slug>.md：关键记忆（important）置顶、再普通记忆；带记录时间；
+ *  供 OpenClaw memorySearch.extraPaths 索引，QQ/微信可搜到这些事实（整卡通用）。 */
 export async function exportMemoryToMarkdown(slug: string): Promise<void> {
   const entries = await readEntries(slug).catch(() => []);
   const dir = memoryExportDir();
@@ -370,44 +349,31 @@ export async function exportMemoryToMarkdown(slug: string): Promise<void> {
     await fs.rm(path.join(dir, `${slug}.md`), { force: true }).catch(() => {});
     return;
   }
-  const nsLabel = (ns: string): string =>
-    ns === "shared" ? "共享（对所有用户有效）" : ns === "local" ? "本地网页用户" : `用户 ${ns}`;
-  const byNs = new Map<string, MemEntry[]>();
-  for (const e of entries) {
-    const key = e.ns || "shared";
-    if (!byNs.has(key)) byNs.set(key, []);
-    byNs.get(key)!.push(e);
-  }
-  const nsOrder = [...byNs.keys()].sort((a, b) => (a === "shared" ? -1 : b === "shared" ? 1 : a.localeCompare(b)));
   const lines: string[] = [
     `# 用户长期记忆（${slug}）`,
     "",
-    "> 由 openclaw-shell 自动同步自聊天记忆。**关键记忆**（用户明确表达「总是/以后都/永远/记住」等长期约定）必须严格遵守，优先于普通记忆；仅在话题相关时引用普通记忆。注意所属作用域。",
+    "> 由 openclaw-shell 自动同步自聊天记忆。**关键记忆**（用户明确表达「总是/以后都/永远/记住」等长期约定）必须严格遵守，优先于普通记忆；仅在话题相关时引用普通记忆。",
     "",
   ];
-  for (const ns of nsOrder) {
-    lines.push(`## ${nsLabel(ns)}`, "");
-    const group = byNs.get(ns) ?? [];
-    const important = group.filter((e) => e.important).sort((a, b) => a.ts.localeCompare(b.ts));
-    const normal = group.filter((e) => !e.important).sort((a, b) => a.ts.localeCompare(b.ts));
-    if (important.length) {
-      lines.push("### 关键记忆（必须遵守）", "");
-      for (const e of important) {
-        const when = e.ts ? `（${e.ts.slice(0, 10)}）` : "";
-        const kw = e.keywords?.length ? ` ［关键词：${e.keywords.join("、")}］` : "";
-        lines.push(`- ${e.fact}${kw}${when}`);
-      }
-      lines.push("");
+  const important = entries.filter((e) => e.important).sort((a, b) => a.ts.localeCompare(b.ts));
+  const normal = entries.filter((e) => !e.important).sort((a, b) => a.ts.localeCompare(b.ts));
+  if (important.length) {
+    lines.push("### 关键记忆（必须遵守）", "");
+    for (const e of important) {
+      const when = e.ts ? `（${e.ts.slice(0, 10)}）` : "";
+      const kw = e.keywords?.length ? ` ［关键词：${e.keywords.join("、")}］` : "";
+      lines.push(`- ${e.fact}${kw}${when}`);
     }
-    if (normal.length) {
-      lines.push("### 普通记忆", "");
-      for (const e of normal) {
-        const when = e.ts ? `（${e.ts.slice(0, 10)}）` : "";
-        const kw = e.keywords?.length ? ` ［关键词：${e.keywords.join("、")}］` : "";
-        lines.push(`- ${e.fact}${kw}${when}`);
-      }
-      lines.push("");
+    lines.push("");
+  }
+  if (normal.length) {
+    lines.push("### 普通记忆", "");
+    for (const e of normal) {
+      const when = e.ts ? `（${e.ts.slice(0, 10)}）` : "";
+      const kw = e.keywords?.length ? ` ［关键词：${e.keywords.join("、")}］` : "";
+      lines.push(`- ${e.fact}${kw}${when}`);
     }
+    lines.push("");
   }
   await fs.writeFile(path.join(dir, `${slug}.md`), lines.join("\n"), "utf8");
 }

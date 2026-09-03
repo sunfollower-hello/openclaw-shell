@@ -1,7 +1,7 @@
 # openclaw-shell 项目交接文档（HANDOFF）
 
-> 更新：2026-08-21 · 目的：让接手 AI 读取本文后能快速上手、持续开发
-> 配套文档：`D:\ai_workspace\未来规划书.md`（未来规划）、项目内 `DESIGN.md`（设计稿）、`README.md`（使用说明）、`docs/tts-guide.md`（**TTS 专项完整指引：架构/API/部署/开卖三步/踩坑**）
+> 更新：2026-09-04（**合入异地备份版**：预设 v3 / 表情分组 / 开场白 / AI 主动消息 / 跨端会话镜像 / 记忆整卡通用化，详见 git 提交 a5907e1 + 库内 REPLICATE.md）
+> 配套文档：`D:\ai_workspace\未来规划书.md`（未来规划）、项目内 `DESIGN.md`（设计稿）、`README.md`（使用说明）、`REPLICATE.md`（异地复刻/本次大改说明）、`docs/tts-guide.md`（TTS 专项完整指引）
 
 ---
 
@@ -16,11 +16,11 @@ cd /d/ai_workspace/openclaw-shell
 npm run build            # 编译 dist/（改了 src 后必做）
 npx tsc --noEmit         # 类型检查
 powershell -ExecutionPolicy Bypass -File scripts/start-stack.ps1
-# 浏览器开 http://127.0.0.1:17880（登录凭据见项目 .env，当前：跟在太阳后面 / 13233334@@Qq）
+# 浏览器开 http://127.0.0.1:17880（登录凭据见项目 .env，当前：跟在太阳后面 / 112233123）
 # 桌面也有开关：桌面/openclaw-shell 开关.bat（在跑就停，没跑就启）
 ```
 
-启动的三件套由 `scripts/start-stack.ps1` 统一管理：**管理台(17880) + OpenClaw 网关(18789) + Cloudflare 隧道**。日志在 `data/*.log`。
+启动的四件套由 `scripts/start-stack.ps1` 统一管理：**管理台(17880，127.0.0.1) + OpenClaw 网关(18789) + TTS 售卖服务(17900) + Cloudflare 隧道（可选，自动探测 cloudflared）**。日志在 `data/*.log`。
 
 ## 2. 技术栈与环境
 
@@ -38,7 +38,14 @@ openclaw-shell/
 │   ├── cli.ts            # CLI：create/list/view/validate/compile/distill
 │   ├── server.ts         # Express 后端：全部 /api/*（卡片/蒸馏/通道/API/聊天/工具/表情/生图/MCP/备份）
 │   ├── core/
-│   │   ├── schema.ts     # persona-card v1 schema（zod）：身份/声音/人格/记忆/知识/变体/工具/表情/CCv2 段
+│   │   ├── schema.ts     # persona-card v1 schema（zod）：身份/声音/人格/记忆/知识/变体/工具/表情/CCv2 段 + presets(tier/style)/emojiGroups/life/abilities
+│   │   ├── presets.ts    # 角色扮演预设 v3：档位(不破甲/破甲最高)×风格(纯对话/重描写)+全局输出护栏+示例对话跟随风格（data/presets.json，缺则自动重建内置）
+│   │   ├── sanitize.ts   # 出站文本清理：stripCoT 剥离纯文本思维链前缀（「分析：」「思路：」等，不误伤角色动作描写）
+│   │   ├── greetedStore.ts# 开场白状态 data/memory/<slug>.greeted.json（按 userKey 原子领取，避免重复开场）
+│   │   ├── conversationStore.ts # 统一会话日志 data/conversations/<slug>.jsonl（网页+通道互传）
+│   │   ├── sessionMirror.ts # 通道会话观察器：读 OpenClaw sessions jsonl 增量同步到网页（游标防重）
+│   │   ├── lifeScheduler.ts # AI 主动发消息调度 data/life/<slug>.json（间隔/静默时段/时间情绪/防骚扰）
+│   │   ├── emojiStore.ts # 共享表情库 v3：分组体系（data/emojis/_shared + library.json + groups.json），卡片多选分组，旧按卡表情自动迁移
 │   │   ├── validator.ts  # 校验（蒸馏卡必须脱敏、语录 PII 抽查等）
 │   │   ├── cardStore.ts  # 卡库（data/cards/<slug>/persona.json）+ dataDir() 数据根
 │   │   ├── compiler.ts   # persona.json → OpenClaw workspace（SOUL.md + skills/personas/<slug>/ 含世界书/开场白/工具）
@@ -72,18 +79,19 @@ openclaw-shell/
 
 | 面 | 功能 |
 |---|---|
-| 人设卡 | 建/编/校验/编译、聊天测试（人设+工具+技能+记忆+语音+思考深度）、做卡向导（简介/开场白/世界书/正则/头像）、导出 PNG/JSON、导入 PNG/JSON（CCv2）、生效人设指示、**表情包（每卡≤120，带解释，AI 用 [表情:名字] 标记）**、**高级配置（编辑卡右上角 ⚙：每卡模型下拉 + 能力开关[联网搜索/生图/写代码/记忆/天气/时间/技能库/TTS 自动朗读，存 card.tools.enabled+card.abilities，普通聊天按此走] + 机器人接入）** |
+| 人设卡 | 建/编/校验/编译、聊天测试（人设+工具+技能+记忆+语音+思考深度）、做卡向导（简介/开场白/世界书/正则/头像）、导出 PNG/JSON、导入 PNG/JSON（CCv2）、生效人设指示、**表情包（共享库分组体系 v3：全局 300 个上限、分组 CRUD、卡片高级配置多选分组 emojiGroups、聊天 [表情:名字] 渲染为图片）**、**高级配置（编辑卡右上角 ⚙：每卡模型下拉 + 能力开关[联网搜索/生图/写代码/记忆/天气/时间/技能库/TTS 自动朗读] + 机器人接入 + 预设档位/风格 + 主动发消息）**、**开场白自动发送（greetedStore 按用户原子领取，本地首次显示、通道 SKILL.md 规则防重复）** |
+| 预设 | **预设系统 v3（2026-08-30 异地开发，09-04 合入）**：档位（不破甲 / 破甲最高）× 风格（纯对话 / 重描写）+ 全局输出护栏（禁思维链泄漏/末句无句号）+ 示例对话跟随风格注入（few-shot 锚定）+ 网页试聊与 OpenClaw 编译共用同一套解析（compiler 编译 SKILL.md 时同步注入） |
 | 蒸馏 | WeFlow JSON 上传 / 粘贴「昵称: 内容」文本 / 直连本机 WeFlow(5031) → PII 脱敏 → 四维蒸馏（互动/人格/记忆，证据分级）→ 保存或直接导出 PNG |
 | 通道 | 微信官方插件扫码绑定（单聊，ClawBot 灰度）、QQ 官方开放平台扫码绑定（q.qq.com 机器人，单聊/群@/频道）、配对授权；**多机器人（2026-08-24）：卡库每卡右上角 🤖 → 建独立 bot（OpenClaw agents 多 agent + 渠道账号路由），上限 QQ 5 个/微信 1 个/每卡 1 个（2026-08-26 起放开 2 实例限制），每 agent 独立 workspace/模型/会话；创建=编译卡→agents add→扫码绑定该账号，卡片更新可一键重编译，入口保留旧通道页**；**快速接卡（2026-08-24）：通道页下方「🤖 机器人连接」区——已认证账号仓库（扫描 openclaw.json `channels.qqbot.accounts`+默认账号+微信 accounts.json）+ 可复用账号免扫码绑定（凭证落盘）+ 一键转移（账号被占用从旧卡顶到新卡，`POST /api/bots/transfer`）+ 创建冲突返 409 conflict+占用者，卡上弹窗引导转移** |
 | API | 模型提供商配置+测试、默认模型、**生图配置（NovelAI/OpenAI 兼容；三档比例方 1024x1024/竖 832x1216/横 1216x832（NAI 标准普通档）+ **auto 自动档**（按提示词画面内容推断：人物竖构图→竖图、风景横场景→横图、其余→方图）；画师串可增删改/设当前；参数固定默认不开放；试生一张；图片库与清理入口不在前端展示，后端保留自动清理 retentionDays 默认 30）**、MCP 服务器、数据备份；**TTS 语音合成为独立页 #/tts（上游聚合 OpenAI 兼容/MiniMax/火山豆包，添加向导+自动拉取模型；用量记账；对外售卖接口）** |
 | 聊天能力 | 工具：沙箱写代码+文件（危险先问后做审批）/搜索/天气/时间/记忆/生图；**聊天气泡内直接渲染生成的图片（点击放大）**；技能库；思考深度 关闭/自动/低/中/高/极高（对齐 rikkahub，极高=xhigh 不支持自动降级）；**TTS 朗读（bot 气泡 hover 出 🔊，点击合成播放，走默认通道）**；普通聊天/工作模式分离 |
-| 记忆 | 每卡独立长期记忆（JSONL 结构化）；**相关召回注入**（关键词+新鲜度，不再一刀切取最后 N 条）、memory_save 工具去重+分类、**自动总结（最近 30 轮保护）**（日志永远保留最近 30 轮不总结，超过后每攒够 N 轮就总结最早 N 轮，每段只总结一次、改档位不重算；对话日志 `data/memory/<slug>.chatlog.jsonl` 只存未总结轮）、**前端单条管理**（手动添加/编辑/删除/搜索/分类徽标/相对时间）、旧纯文本自动迁移、每卡 300 条上限自动淘汰、备份兼容；**OpenClaw 端已打通（2026-08-24）**：记忆变更自动导出 `data/memory-export/<slug>.md` → `agents.defaults.memorySearch.extraPaths` 索引 → QQ/微信 可用 memory_search 召回；嵌入用本机 Ollama+nomic-embed-text（零 key，向量+关键词混合），配置脚本 `scripts/setup-openclaw-memory.mjs`（改配置后重启网关 + `openclaw memory index --force`） |
+| 记忆 | 每卡独立长期记忆（JSONL 结构化，**整卡通用：网页/QQ/微信共用同一份记忆，ns 恒为 shared，2026-09-04 起不再按用户隔离**）；**相关召回注入**（关键词+新鲜度+关键词命中强相关+关键记忆 important 恒优先）、memory_save 工具（去重+关键词+关键标记）、**自动总结（最近 20 轮保护）**（日志永远保留最近 20 轮不总结，超过后每攒够 N 轮就总结最早 N 轮，每段只总结一次；对话日志统一 `data/memory/<slug>.chatlog.jsonl`）、**前端单条管理**（编辑/删除/搜索/关键记忆红色分区+switch 开关/相对时间；已去掉手动添加，记忆由自动总结与 memory_save 产生）、旧纯文本自动迁移、每卡 300 条上限自动淘汰（关键记忆保留优先）、备份兼容；**OpenClaw 端已打通**：记忆变更自动导出 `data/memory-export/<slug>.md` → `agents.defaults.memorySearch.extraPaths` 索引 → QQ/微信可搜到；**跨端会话（2026-09-01）**：绑定卡片后网页与 QQ/微信互传同一份记录（conversationStore + sessionMirror 观察器每 5 秒同步），未绑定各自独立；一键重置清空记忆+对话+开场状态 |
 | 插件商店 | **侧边栏「🧩 插件商店」（2026-08-24）**：ClawHub 官方市场实时搜索（跟着上游更新）+ 精选区（5 个中文简介内置精选）+ 用户免费分享（填 ClawHub 包名或上传 zip）+ 付费区（用户上传自研 zip 自主定价，feeRate 20% 手续费，购买记账 sales.jsonl，当前记账模式支付通道待开通）+ 已装管理（卸载/启停/更新，装完提示重启网关生效）；安装 zip 包校验 manifest（configSchema 必填）→ 解压到项目 plugins/<id>/ → `plugins install --link`；卸载自动清理目录+openclaw.json 条目；安装失败自动回滚 |
 | 基建 | 开机自启 + 桌面开关、Cloudflare 独立隧道公网、Basic 认证、数据全本地 |
 
 ## 5. 服务与依赖（关键路径/配置）
 
-- **OpenClaw 配置** `~/.openclaw/openclaw.json`：`gateway.mode=local` + `gateway.auth.token`；`agents.defaults.workspace = D:\ai_workspace\openclaw-shell\data\workspace`；`models.providers.agnes`（测试上游：`https://apihub.agnes-ai.cn/v1`，模型 ID **必须写 `agnes-2.0-flash`**，写 2.0Flash 会 503）；`agents.defaults.memorySearch` = `{ extraPaths: [data/memory-export], provider: "ollama", model: "nomic-embed-text" }`（记忆打通，见「记忆」行；Ollama 需已跑且已 `ollama pull nomic-embed-text`）
+- **OpenClaw 配置** `~/.openclaw/openclaw.json`：`gateway.mode=local` + `gateway.auth.token`；`agents.defaults.workspace = D:\ai_workspace\openclaw-shell\data\workspace`；`models.providers.agnes`（测试上游：`https://apihub.agnes-ai.cn/v1`，模型 ID **必须写 `agnes-2.0-flash`**，写 2.0Flash 会 503）；`agents.defaults.memorySearch` = `{ extraPaths: [data/memory-export], provider: "ollama", model: "nomic-embed-text" }`（记忆打通，见「记忆」行；Ollama 需已跑且已 `ollama pull nomic-embed-text`）；**QQ 分泡（2026-09-04 配置）**：`agents.defaults.blockStreamingDefault="on"` + `blockStreamingChunk{minChars:20,maxChars:600,breakPreference:"paragraph"}` + `blockStreamingCoalesce{idleMs:300}` + `channels.qqbot.deliverDebounce.enabled=false` → 长回复按段落拆多个 QQ 气泡、无 `---` 横线（中文断句必须用 paragraph，sentence 只认英文句号对中文无效）
 - **插件**（~/.openclaw/npm/projects/）：`openclaw-weixin` v2.4.6（腾讯官方微信）、`openclaw-qqbot` v2.0.1（腾讯官方 QQ）；**自研插件 `openclaw-shell-imagegen`**（源码在项目 `plugins/openclaw-shell-imagegen/`，`openclaw plugins install --link` 已装，gateway 启动时自动加载）→ 给 OpenClaw agent（QQ/微信）注册 `image_gen` 生图工具，复用项目 `dist/core/imageGen.js`（同一份 data/imageConfig.json），图片存 `~/.openclaw/media`（QQ 插件白名单目录），返回文本带 `MEDIA:<路径>` 行 + 结构化 attachments（双保险投递）
 - **Cloudflare**：
   - 新隧道 `openclaw`（ID 74975232-d922-4337-9644-76fac4d04c26），配置 `C:\Users\followsun\.cloudflared\config-openclaw.yml`，用户账户运行（由 start-stack 托管）→ 子域名 `openclaw.319274.xyz` → 17880
@@ -103,7 +111,7 @@ openclaw-shell/
 ## 7. 未来展望（详见 D:\ai_workspace\未来规划书.md）
 
 - **等条件**：QQ/微信绑定验证（等用户扫码，验收清单已在规划书）、M5 中转商业化（等中转站，用 one-api/new-api）、**TTS 开卖（等用户注册任一上游拿 key 填入 API 页并启用；售卖接口/记账/多协议适配器已就绪）**、App 更新推送机制（参考 rikkahub 的 GitHub Releases 方案）
-- **功能增强**：MetaPact 多模态能力包（vision/hearing/voice skills）、cc-connect 自己的号渠道（封号风险待拍板）、本地生图（ComfyUI/Forge 分析已写）、GPT-SoVITS 声音克隆（付费增值：TTS 已留 provider 结构，加 kind 即可扩）、语音 STT 输入、OpenClaw 端工具策略接入（**生图 ✅ 已接入**：openclaw-shell-imagegen 插件，QQ/微信机器人已可调用 image_gen 发图；沙箱/记忆/技能/表情/审批 待接入，目前只在网页聊天测试生效）、记忆增强、群运营、MCP 真实联调、心跳主动消息、模型能力路由、README 宣传
+- **功能增强**：MetaPact 多模态能力包（vision/hearing/voice skills）、cc-connect 自己的号渠道（封号风险待拍板）、本地生图（ComfyUI/Forge 分析已写）、GPT-SoVITS 声音克隆（付费增值：TTS 已留 provider 结构，加 kind 即可扩）、语音 STT 输入、OpenClaw 端工具策略接入（**生图 ✅ 已接入**：openclaw-shell-imagegen 插件，QQ/微信机器人已可调用 image_gen 发图；沙箱/记忆/技能/表情/审批 待接入，目前只在网页聊天测试生效）、群运营、MCP 真实联调、模型能力路由、README 宣传（**主动消息 ✅ 2026-09-01 已实现：lifeScheduler；跨端会话 ✅ 已实现：sessionMirror**）
 - **打包分发**：Windows 便携版/安装包（内嵌 Node+OpenClaw+首次引导）优先；与 M5 中转配套
 
 ## 8. 踩坑记录（接手必读，避免重复踩）
