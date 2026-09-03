@@ -18,7 +18,26 @@ $env:TTS_FORCE_SILK = '1'
 # so the QQ channel TTS_ALLOWED_ROOTS check fails and blocks the audio. Long TMP unifies both.
 $env:TMP = Join-Path $env:SystemDrive "\Users\$env:USERNAME\AppData\Local\Temp"
 $env:TEMP = $env:TMP
+# Bind the web UI to localhost (public access goes through the optional Cloudflare tunnel,
+# which also sets Basic-auth via .env). Set HOST=0.0.0.0 to expose on the LAN explicitly.
+$env:HOST = if ($env:HOST) { $env:HOST } else { '127.0.0.1' }
 
+# Default TTS engine to offline Windows SAPI if no ttsConfig.json yet (CN networks often
+# get 403 from the online Edge endpoint; localfallback still works with zero config).
+# The web UI can switch back to Edge / cloud providers on the TTS page at any time.
+$ttsCfg = Join-Path $root 'data\ttsConfig.json'
+if (-not (Test-Path $ttsCfg)) {
+  New-Item -ItemType Directory -Force -Path (Split-Path $ttsCfg) | Out-Null
+  $defaultTts = @{
+    defaultProvider = 'local'
+    local           = @{ engine = 'sapi'; voice = ''; rate = '+0%'; pitch = '+0Hz' }
+    providers       = @()
+  } | ConvertTo-Json -Depth 5
+  [IO.File]::WriteAllText($ttsCfg, $defaultTts)
+  Write-Host "[tts] created data\ttsConfig.json with offline SAPI default"
+}
+
+# No LAN exposure by default (HOST=127.0.0.1); no inbound firewall rule needed.
 function Test-Port([int]$port) {
   return $null -ne (Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue)
 }
@@ -120,4 +139,4 @@ if ($entries.Count -gt 0) {
   [IO.File]::WriteAllText($pidFile, ($entries | ConvertTo-Json))
   Write-Host "PIDs saved: $pidFile"
 }
-Write-Host "Done. Local http://127.0.0.1:17880 / Public https://openclaw.319274.xyz"
+Write-Host "Done. Local http://127.0.0.1:17880"

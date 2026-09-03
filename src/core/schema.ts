@@ -248,12 +248,16 @@ const cardAbilitiesSchema = z
   })
   .default({});
 
-// ---------- 表情包（最多 120 个，每个带解释供 AI 理解） ----------
+// ---------- 表情包分组（高级配置里多选；选了 = 开启表情包，AI 从所选分组挑表情；空数组 = 不启用） ----------
+const emojiGroupsSchema = z.array(z.string()).default([]);
+
+// ---------- 表情包（最多 300 个，每个带解释供 AI 理解；group 引用共享库分组） ----------
 const emojiSchema = z.object({
   id: z.string(),
   name: z.string().min(1, "表情名不能为空"),
   file: z.string(),
   explanation: z.string().default(""),
+  group: z.string().default("default"),
 });
 
 // ---------- 卡片独立模型配置（每张卡可用不同 API/模型） ----------
@@ -264,10 +268,19 @@ const cardModelSchema = z
   })
   .default({});
 
-// ---------- 记忆配置（每 N 轮自动总结一次，默认 20，1-50；总结固定用此卡的聊天模型） ----------
+// ---------- 记忆配置（每 N 轮自动总结一次，默认 10，1-20；总结固定用此卡的聊天模型） ----------
 const memoryConfigSchema = z
   .object({
-    auto_rounds: z.number().int().min(1).max(50).default(20),
+    auto_rounds: z.number().int().min(1).max(20).default(10),
+  })
+  .default({});
+
+// ---------- AI 生命（主动发消息）：intervalHours 0=关闭，1-24 小时间隔；0-6 点静默 ----------
+const lifeConfigSchema = z
+  .object({
+    intervalHours: z.number().int().min(0).max(24).default(0), // 0 = 关闭主动消息
+    quietFrom: z.number().int().min(0).max(23).default(0), // 静默时段起点（小时）
+    quietTo: z.number().int().min(0).max(24).default(6), // 静默时段终点（小时，开区间）
   })
   .default({});
 
@@ -296,7 +309,9 @@ export const personaCardSchema = z.object({
   tools: toolsSchema,
   model: cardModelSchema,
   abilities: cardAbilitiesSchema,
+  emojiGroups: emojiGroupsSchema,
   memoryConfig: memoryConfigSchema,
+  life: lifeConfigSchema,
   emojis: z.array(emojiSchema).max(120).default([]),
   sillytavern_v2: sillytavernSchema.optional(),
   ethics: ethicsSchema.default({}),

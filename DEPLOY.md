@@ -108,13 +108,19 @@ powershell -ExecutionPolicy Bypass -File scripts\start-stack.ps1
 
 | 项 | 地址 | 验证 |
 |---|---|---|
-| 管理台（网页） | http://127.0.0.1:17880 | 浏览器直接打开即可（本地无需登录；只有配置了公网隧道才需要 .env 密码） |
+| 管理台（网页） | http://127.0.0.1:17880（局域网 http://<内网IP>:17880） | 浏览器直接打开即可（本地默认免登录；建了 .env 则需账号密码） |
 | OpenClaw 网关 | 127.0.0.1:18789 | `openclaw health` 或看 `data\gateway.log` |
 | TTS 服务 | 127.0.0.1:17900 | `curl http://127.0.0.1:17900/health` |
 
 停止：`powershell -ExecutionPolicy Bypass -File scripts\stop-stack.ps1`。
 
 日常使用顺序：**先起网关再起网页**（start-stack 已按此设计；若先开了网页会提示网关未连接，重启脚本即可）。
+
+> **局域网模式（本仓库默认）**：`start-stack.ps1` 会把网页绑定 `0.0.0.0`，同网络机器用
+> `http://<本机内网IP>:17880` 访问（脚本末尾自动打印内网 IP，如 `http://192.168.1.61:17880`）。
+> 首次需**以管理员身份**运行一次 `scripts\add-firewall-rule.bat` 放行 17880 入站，否则局域网浏览器连不上
+> （本机 127.0.0.1 不受影响）。管理台默认**免登录**；若日后想加登录，建 `.env` 并填
+> `OPENCLAW_SHELL_UI_USER/PASS` 即可（见 §9）。
 
 ## 6. 首次使用流程（网页内完成，无需改代码）
 

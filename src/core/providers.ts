@@ -81,8 +81,9 @@ export async function saveProvider(
   const data = await listProviders(false);
   const arr = data[type];
   const name = String(input.name ?? "").trim();
-  if (!name || !/^[a-zA-Z0-9_-]{1,32}$/.test(name)) {
-    throw new Error("名称只能包含字母/数字/下划线/连字符（1-32 位）");
+  // 名称不限制字符集（允许中文/空格等）；仅限制长度防滥用，并禁止纯空白
+  if (!name || name.length > 32) {
+    throw new Error("名称不能为空且长度不超过 32 字符");
   }
   const i = arr.findIndex((x) => x.name === name);
   const prev = i >= 0 ? arr[i] : undefined;

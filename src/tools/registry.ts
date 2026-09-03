@@ -6,6 +6,8 @@ import path from "node:path";
 
 export interface ToolCtx {
   slug: string;
+  /** 当前对话的作用域（local / qq:<openid> / wx:<openid>），记忆按此隔离 */
+  ns: string;
   sandboxDir: string;
   memoryPath: string;
   imagesDir: string;
@@ -299,17 +301,18 @@ const datetime: ToolDef = {
   },
 };
 
-// ---------- 长期记忆（保存关于用户的事实，去重 + 分类） ----------
+// ---------- 长期记忆（保存关于用户的事实，去重 + 关键词 + 关键记忆；按当前对话用户隔离） ----------
 const memorySave: ToolDef = {
   id: "memory_save",
   name: "记住事实（长期记忆）",
   description:
-    "把关于用户的重要事实保存到长期记忆（例如：用户住在上海、用户养了一只叫旺财的狗、用户下周三过生日）。只保存值得长期记住的事实，不要保存一次性对话内容。已记住的相同/相似事实不会重复写入。category 可选，取值为：信息/偏好/关系/事件/待定，默认信息。",
+    "把关于用户的重要事实保存到长期记忆（例如：用户住在上海、用户养了一只叫旺财的狗、用户下周三过生日）。只保存值得长期记住的事实，不要保存一次性对话内容。已记住的相同/相似事实不会重复写入。保存到当前对话用户的记忆空间，其他用户看不到。important 可选（true=关键记忆，用户明确说「总是/以后都/永远/记住/我绝对」等长期约定时必须设为 true）；keywords 可选（该事实的触发词，用户之后提到这些词时这条记忆优先被想起，如「咖啡」）。",
   parameters: {
     type: "object",
     properties: {
       fact: { type: "string", description: "要记住的事实" },
-      category: { type: "string", description: "分类：信息/偏好/关系/事件/待定（可选）" },
+      important: { type: "boolean", description: "是否为关键记忆（长期约定/必须遵守，默认 false）" },
+      keywords: { type: "array", items: { type: "string" }, description: "触发关键词（可选）" },
     },
     required: ["fact"],
   },
@@ -317,9 +320,15 @@ const memorySave: ToolDef = {
     const fact = String(args.fact ?? "").trim();
     if (!fact) return "错误：事实为空";
     const { appendEntry } = await import("../core/memoryStore.js");
-    const res = await appendEntry(ctx.slug ?? "", { fact, cat: String(args.category ?? "") as never, src: "tool" });
+    const res = await appendEntry(ctx.slug ?? "", {
+      fact,
+      important: args.important === true,
+      keywords: Array.isArray(args.keywords) ? args.keywords.map((k) => String(k)).filter(Boolean) : [],
+      src: "tool",
+      ns: ctx.ns || "shared",
+    });
     if (!res.ok) return res.duplicate ? `这条已经记住了：${fact}` : "错误：事实为空";
-    return `已记住（${res.entry!.cat}）：${fact}`;
+    return `已记住${res.entry!.important ? "（关键记忆）" : ""}：${fact}`;
   },
 };
 

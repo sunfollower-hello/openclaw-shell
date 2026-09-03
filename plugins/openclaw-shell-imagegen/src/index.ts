@@ -5,16 +5,45 @@ import { Type } from "typebox";
 import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
 import os from "node:os";
 import path from "node:path";
+import { existsSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 
 const MEDIA_DIR = path.join(os.homedir(), ".openclaw", "media");
-// openclaw-shell 编译产物位置（本机固定；可用环境变量覆盖）
+
+/**
+ * 自动探测 openclaw-shell 项目根目录（含 dist/core/ 编译产物）。
+ * 顺序：环境变量优先（OPENCLAW_SHELL_IMAGE_GEN_ENTRY / OPENCLAW_SHELL_EMOJI_STORE_ENTRY
+ * 或 OPENCLAW_SHELL_ROOT）→ 从插件自身位置向上找（插件在 <项目根>/plugins/...）→ 兜底空。
+ * 之前硬编码 "D:/ai_workspace/..." 是旧机器路径，换机器/换目录直接 import 失败（生图、表情全挂）。
+ */
+function detectShellRoot(): string | null {
+  const envRoot = process.env.OPENCLAW_SHELL_ROOT?.trim();
+  if (envRoot && existsSync(path.join(envRoot, "dist", "core", "emojiStore.js"))) return envRoot;
+  // 从本文件向上找：<root>/plugins/openclaw-shell-imagegen/src/index.ts → 找含 package.json 且含 dist/core 的目录
+  let dir = path.dirname(fileURLToPath(import.meta.url));
+  for (let i = 0; i < 6; i++) {
+    if (
+      existsSync(path.join(dir, "package.json")) &&
+      existsSync(path.join(dir, "dist", "core", "emojiStore.js"))
+    ) {
+      return dir;
+    }
+    const parent = path.dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return null;
+}
+
+const SHELL_ROOT = detectShellRoot();
+// 编译产物入口（环境变量可覆盖；默认用探测到的项目根，找不到时仍保留环境变量兜底）
 const SHELL_IMAGE_GEN_ENTRY =
   process.env.OPENCLAW_SHELL_IMAGE_GEN_ENTRY ??
-  "file:///D:/ai_workspace/openclaw-shell/dist/core/imageGen.js";
+  (SHELL_ROOT ? `file:///${path.join(SHELL_ROOT, "dist", "core", "imageGen.js").replace(/\\/g, "/")}` : "");
 // 表情库（与网页端同一份 data/emojis/library.json）
 const SHELL_EMOJI_STORE_ENTRY =
   process.env.OPENCLAW_SHELL_EMOJI_STORE_ENTRY ??
-  "file:///D:/ai_workspace/openclaw-shell/dist/core/emojiStore.js";
+  (SHELL_ROOT ? `file:///${path.join(SHELL_ROOT, "dist", "core", "emojiStore.js").replace(/\\/g, "/")}` : "");
 
 export default definePluginEntry({
   id: "openclaw-shell-imagegen",
@@ -87,10 +116,27 @@ export default definePluginEntry({
         if (!wanted) return { content: [{ type: "text", text: "没有指定表情名" }] } as never;
         const { listEmojis, emojiDir } = await import(/* @vite-ignore */ SHELL_EMOJI_STORE_ENTRY);
         const all = (await listEmojis()) as { name: string; file: string }[];
-        const hit = all.find((e) => e.name === wanted);
+        // 归一化：去空格/标点/全角→半角/小写，用于容错匹配（模型可能多写或少写符号）
+        const norm = (s: string) =>
+          s
+            .replace(/[\s\u3000]+/g, "")
+            .replace(/[，。！？；：、,.!?;:"'“”‘’（）()【】\[\]《》<>]/g, "")
+            .toLowerCase();
+        const wantedNorm = norm(wanted);
+        const hit =
+          all.find((e) => e.name === wanted) ??
+          all.find((e) => norm(e.name) === wantedNorm) ??
+          all.find((e) => norm(e.name).includes(wantedNorm) || wantedNorm.includes(norm(e.name)));
         if (!hit) {
           const names = all.map((e) => e.name).join("、") || "（表情库是空的）";
-          return { content: [{ type: "text", text: `没有叫「${wanted}」的表情。可用：${names}` }] } as never;
+          return {
+            content: [
+              {
+                type: "text",
+                text: `没有叫「${wanted}」的表情。可用：${names}。请从这些名字里选一个重新调用 emoji_send，不要编造。`,
+              },
+            ],
+          } as never;
         }
         const filePath = path.join((emojiDir as () => string)(), hit.file);
         const mimeByExt: Record<string, string> = {

@@ -1,5 +1,5 @@
 # openclaw-shell stack stop: only reclaims PIDs in data\stack-pids.json; never touches system services.
-$root = 'D:\ai_workspace\openclaw-shell'
+$root = Split-Path $PSScriptRoot -Parent
 $pidFile = Join-Path $root 'data\stack-pids.json'
 if (-not (Test-Path $pidFile)) {
   Write-Host 'No PID record (stack not started via start-stack?)'

@@ -254,7 +254,7 @@ function blankCard(name, slug, role) {
     knowledge: { known: [], unknown: [], no_evidence_policy: "降低确定性或追问，不编造" },
     chat: { quote_style: "reuse", thinking: "auto", trigger: { dm: "any", group: "@" } },
     model: { provider: "", model: "" },
-    memoryConfig: { auto_rounds: 20 },
+    memoryConfig: { auto_rounds: 10 },
     sillytavern_v2: {
       chara_card_v2: "0.0.1",
       description: "", personality: "", scenario: "",
@@ -767,6 +767,9 @@ let wbChatHistory = [];
 let wbPending = null;
 let wbLastOpts = null;
 let wbDir = "";
+let wbMirror = null;        // 跨端会话状态（绑定=联通；null=本地聊天）
+let wbMirrorTimer = null;   // 通道消息轮询定时器
+let wbRenderedIds = new Set(); // 已渲染的会话条目 id（增量渲染防重复）
 
 function renderWorkbench() {
   return `
@@ -783,6 +786,7 @@ function renderWorkbench() {
       <div class="lc-top-actions">
         <select id="wb-card" class="lc-card-sel"><option value="">— 选择卡片 —</option></select>
         <button id="wb-chat-clear" class="ghost small-btn" title="清空对话">${icon("trash")}</button>
+        <button id="wb-chat-reset" class="ghost small-btn reset" title="重置角色：清空全部记忆和聊天记录">${icon("x")}重置</button>
         <button id="wb-exit" class="ghost small-btn">退出本地聊天</button>
       </div>
     </div>
@@ -831,10 +835,23 @@ async function initWorkbench() {
   const input = $("#wb-input");
   input.addEventListener("keydown", wbInputEnter);
   input.addEventListener("input", () => wbAutoGrow(input));
-  $("#wb-chat-clear").addEventListener("click", () => {
-    if (wbChatHistory.length && !confirm("清空当前对话？")) return;
-    wbChatHistory = []; wbPending = null; $("#chat-log").innerHTML = "";
+$("#wb-chat-clear").addEventListener("click", () => {
+  if (wbChatHistory.length && !confirm("清空当前对话？")) return;
+  wbChatHistory = []; wbPending = null; $("#chat-log").innerHTML = "";
+  // 清空对话 = 允许重新开场：清掉本卡「本地」的开场状态，下次打开卡会再次显示开场白
+  if (wbSlug) void api.send(`/api/cards/${encodeURIComponent(wbSlug)}/greeting/clear`, { method: "POST", body: JSON.stringify({ userKey: "local" }) }).catch(() => {});
   });
+// 一键重置：清空该卡全部记忆 + 聊天记录 + 开场状态（重塑角色形象，不可恢复）
+$("#wb-chat-reset").addEventListener("click", async () => {
+  if (!wbSlug) return;
+  const name = wbCardObj?.name ?? wbSlug;
+  if (!confirm(`重置「${name}」？\n将删除这张卡的全部记忆和聊天记录（包括通道里记住的事），AI 会忘掉之前的一切，此操作不可恢复。`)) return;
+  try {
+    await api.send(`/api/cards/${encodeURIComponent(wbSlug)}/reset`, { method: "POST", body: "{}" });
+    wbChatHistory = []; wbPending = null; $("#chat-log").innerHTML = "";
+    toast(`✓ 「${name}」已重置，可以重新开始`);
+  } catch (e) { toast("重置失败：" + e.message, false); }
+});
   // 退出走 SPA 内部切换，不整页重载（重载会重新拉 200KB 脚本，明显卡顿）
   $("#wb-exit").addEventListener("click", () => { setWorkbenchOn(false); router(); });
   // 聊天选项记住上次的选择
@@ -892,15 +909,64 @@ async function wbPickCard(slug) {
     }
     const m = c?.model;
     if (subEl) subEl.textContent = m?.provider || m?.model ? `${m.provider ?? ""}${m.model ? " / " + m.model : ""}` : "跟随默认提供商";
-    // 有开场白且还没聊过 → 先把开场白显示出来（不入历史，避免影响上下文）
-    const first = c?.sillytavern_v2?.first_mes?.trim();
-    if (first && !wbChatHistory.length) addChatBubble("bot", first);
+    // 跨端会话：绑定（联通）→ 网页聊天 = 通道会话（互传，记录相同）；未绑定 → 本地聊天
+    wbMirror = null;
+    if (wbMirrorTimer) { clearInterval(wbMirrorTimer); wbMirrorTimer = null; }
+    wbRenderedIds = new Set();
+    const mir = await api.get(`/api/cards/${encodeURIComponent(slug)}/mirror/status`).catch(() => ({ bound: false }));
+    if (mir?.bound) {
+      wbMirror = { ...mir, slug };
+      if (subEl) subEl.textContent = `已联通${mir.channel === "qqbot" ? "QQ" : "微信"} · 互传中`;
+      $("#wb-chat-clear").disabled = true; // 绑定模式下清空对话交给「重置」（一键清记忆+记录）
+      const conv = await api.get(`/api/cards/${encodeURIComponent(slug)}/conversation`).catch(() => ({ entries: [] }));
+      for (const e of conv.entries ?? []) {
+        wbRenderedIds.add(e.id);
+        addChatBubble(e.role === "assistant" ? "bot" : "user", e.content);
+      }
+      wbMirrorTimer = setInterval(() => wbMirrorSync(slug), 3000);
+      void wbMirrorSync(slug); // 立即同步一次
+    } else {
+      $("#wb-chat-clear").disabled = false;
+      // 开场白（本地）：有 first_mes 且「本地」还没开场过 → 领取并显示（原子去重）
+      const first = c?.sillytavern_v2?.first_mes?.trim();
+      if (first) {
+        try {
+          const g = await api.send(`/api/cards/${encodeURIComponent(slug)}/greeting/claim`, {
+            method: "POST",
+            body: JSON.stringify({ userKey: "local" }),
+          });
+          if (g.greeted && g.text) addChatBubble("bot", g.text);
+        } catch { /* 领取失败不阻塞选卡 */ }
+      }
+    }
   } else {
     if (nameEl) nameEl.textContent = "选择角色卡";
     if (subEl) subEl.textContent = "本地聊天";
     if (avEl) avEl.innerHTML = "";
   }
   if (FEATURES.workspace) wbLoadFiles();
+}
+
+// 绑定（联通）模式：定期把通道新消息同步进网页（互传）；解绑时自动切回本地聊天
+async function wbMirrorSync(slug) {
+  if (!wbMirror || wbMirror.slug !== slug) return;
+  try {
+    await api.send(`/api/cards/${encodeURIComponent(slug)}/mirror/sync`, { method: "POST", body: "{}" });
+    const st = await api.get(`/api/cards/${encodeURIComponent(slug)}/mirror/status`).catch(() => ({ bound: false }));
+    if (!st.bound) {
+      if (wbMirrorTimer) { clearInterval(wbMirrorTimer); wbMirrorTimer = null; }
+      wbMirror = null;
+      $("#wb-chat-clear").disabled = false;
+      toast("已解除绑定，聊天切回本地模式");
+      return;
+    }
+    const conv = await api.get(`/api/cards/${encodeURIComponent(slug)}/conversation`).catch(() => ({ entries: [] }));
+    for (const e of conv.entries ?? []) {
+      if (wbRenderedIds.has(e.id)) continue;
+      wbRenderedIds.add(e.id);
+      addChatBubble(e.role === "assistant" ? "bot" : "user", e.content);
+    }
+  } catch { /* 单次同步失败忽略，下轮重试 */ }
 }
 
 // 本地聊天可用的模型商（已过滤停用项）
@@ -994,6 +1060,23 @@ async function wbSend() {
   const btn = $("#wb-send");
   btn.disabled = true;
   wbAutoGrow(input); // 清空后收回高度
+  // 绑定（联通）模式：走通道 agent 会话（回复同时投递到微信/QQ 并回显网页，聊天记录相同）
+  if (wbMirror?.bound) {
+    try {
+      const r = await api.send(`/api/cards/${encodeURIComponent(wbSlug)}/mirror/send`, {
+        method: "POST",
+        body: JSON.stringify({ message }),
+      });
+      for (const id of r.entryIds ?? []) wbRenderedIds.add(id); // 这两条已显示，防同步重复渲染
+      await addBotReplyHumanLike(r.reply);
+      wbChatHistory.push({ role: "assistant", content: r.reply });
+    } catch (e) {
+      wbChatHistory.pop();
+      addChatBubble("bot", "⚠ " + e.message);
+    }
+    btn.disabled = false;
+    return;
+  }
   // 能力跟随这张卡的「高级配置」；联网搜索由输入框旁的按钮临时叠加
   const cardTools = Array.isArray(wbCardObj?.tools?.enabled) ? [...wbCardObj.tools.enabled] : [];
   const tools = FEATURES.workspace ? cardTools : cardTools.filter((t) => !WORKSPACE_TOOL_IDS.includes(t));
@@ -1008,7 +1091,7 @@ async function wbSend() {
   try {
     const r = await api.send("/api/chat", {
       method: "POST",
-      body: JSON.stringify({ slug: wbSlug, message, history: wbChatHistory.slice(0, -1), ...wbLastOpts }),
+      body: JSON.stringify({ slug: wbSlug, message, history: wbChatHistory.slice(0, -1), userKey: "local", ...wbLastOpts }),
     });
     await wbFinishTurn(r);
   } catch (e) {
@@ -1032,7 +1115,7 @@ async function wbFinishTurn(r) {
     ok.className = "small-btn primary"; ok.textContent = "执行";
     const no = document.createElement("button");
     no.className = "small-btn danger"; no.textContent = "拒绝";
-    wbPending = { slug: wbSlug, messages: r.messages, tools: wbLastOpts?.tools ?? [], useMCP: false, model: wbLastOpts?.model ?? "", approve: false };
+    wbPending = { slug: wbSlug, messages: r.messages, tools: wbLastOpts?.tools ?? [], useMCP: false, model: wbLastOpts?.model ?? "", userKey: "local", approve: false };
     ok.addEventListener("click", async () => { row.remove(); wbPending.approve = true; await wbApprove(); });
     no.addEventListener("click", async () => { row.remove(); wbPending.approve = false; await wbApprove(); });
     row.append(ok, no);
@@ -1313,6 +1396,7 @@ function renderCardsGrid() {
 // ============================================================
 let botLoginTimer = null;
 let botDialogSlug = "";
+let botConnections = null;   // /api/channels/connections 快照（已认证账号 + 绑定状态）
 
 let botLoginBotId = "";   // 正在扫码的机器人，关窗时通知后端把登录进程杀掉
 
@@ -1353,6 +1437,8 @@ async function openBotDialog(slug) {
     if (bot !== undefined) renderBotBody(bot);
   };
   render(undefined);
+  // 已认证渠道账号 + 绑定状态（供「直接连接已绑定账号」流程用）
+  botConnections = await api.get("/api/channels/connections").catch(() => null);
   botsData = await api.get("/api/bots").catch(() => ({ bots: [] }));
   const bot = (botsData.bots ?? []).find((b) => b.cardSlug === slug);
   render(bot ?? null);
@@ -1369,14 +1455,39 @@ function renderBotBody(bot) {
     const maxQq = limits.maxQq ?? 5;
     const maxWx = limits.maxWeixin ?? 1;
     const wxUsed = wxCount >= maxWx;
+    // 已认证账号（本渠道）：可直接连接，免扫码
+    const accounts = (botConnections?.accounts ?? []).filter((a) => a.authed);
+    const qqAccounts = accounts.filter((a) => a.channel === "qqbot");
+    const wxAccounts = accounts.filter((a) => a.channel === "openclaw-weixin");
     // 按选中渠道判断是否满额（渠道切换时同步）
     const updateFullState = () => {
       const full = $("#bot-channel")?.value === "qqbot" ? qqCount >= maxQq : wxCount >= maxWx;
       const btn = $("#bot-create");
       if (btn) { btn.disabled = full; btn.title = full ? "该渠道已达上限" : ""; }
     };
+    // 已认证账号下拉的选项 + 选中态
+    const renderAccountSelect = (preserve) => {
+      const chan = $("#bot-channel").value;
+      const list = chan === "qqbot" ? qqAccounts : wxAccounts;
+      const sel = $("#bot-account");
+      if (!sel) return;
+      const hasAccounts = list.length > 0;
+      sel.innerHTML = hasAccounts
+        ? [`<option value="">（新建机器人，扫码绑定）</option>`]
+            .concat(list.map((a) => {
+              const label = a.boundCardName ? `${a.name ?? a.accountId} — 已被「${a.boundCardName}」占用` : `${a.name ?? a.accountId}`;
+              return `<option value="${escapeHtml(a.accountId)}" ${preserve && a.accountId === $("#bot-account").value ? "selected" : ""}>${escapeHtml(label)}</option>`;
+            }))
+            .join("")
+        : `<option value="">（该渠道还没有已认证账号，选此项新建扫码）</option>`;
+      sel.disabled = false;
+      const tip = $("#bot-account-tip");
+      if (tip) tip.textContent = hasAccounts
+        ? "选一个已认证账号可直接连接（免扫码）；选「新建机器人」则走扫码绑定。"
+        : "当前渠道还没有已认证账号：先在「通道连接」页扫码登录，或直接用下方新建流程扫码。";
+    };
     body.innerHTML = `
-      <p class="muted">给这张卡建一个专属机器人：独立人设、独立会话记忆，接到 QQ 或微信。</p>
+      <p class="muted">给这张卡接机器人：可直连已认证账号（免扫码），或新建后扫码绑定。已认证账号若被别的卡占用，连接时会二次确认换卡。</p>
       <div class="bot-form">
         <label>渠道：
           <select id="bot-channel">
@@ -1384,43 +1495,75 @@ function renderBotBody(bot) {
             <option value="openclaw-weixin" ${wxUsed ? "disabled" : ""}>微信机器人${wxUsed ? "（已有 1 个，最多 1 个）" : ""}</option>
           </select>
         </label>
-        <label>账号 ID：<input id="bot-account" placeholder="留空自动生成"></label>
+        <label>账号：
+          <select id="bot-account"></select>
+        </label>
+        <p class="hint" id="bot-account-tip"></p>
       </div>
-      <p class="hint">上限：QQ ${maxQq} 个（当前 ${qqCount} 个）、微信 ${maxWx} 个（当前 ${wxCount} 个）；QQ 需先在 <a href="https://q.qq.com/" target="_blank">q.qq.com</a> 创建机器人；微信需手机有 ClawBot 入口。</p>
       <div class="row" style="justify-content:flex-end">
-        <button id="bot-create" class="primary">创建机器人</button>
+        <button id="bot-create" class="primary">连接 / 创建</button>
       </div>`;
-    $("#bot-channel").addEventListener("change", updateFullState);
+    $("#bot-channel").addEventListener("change", () => { updateFullState(); renderAccountSelect(true); });
+    renderAccountSelect(false);
     updateFullState();
     $("#bot-create").addEventListener("click", async () => {
       const btn = $("#bot-create");
-      btn.disabled = true; btn.textContent = "创建中…";
+      btn.disabled = true; btn.textContent = "处理中…";
+      const chan = $("#bot-channel").value;
+      const acc = $("#bot-account").value; // 空 = 新建扫码；非空 = 直连已认证账号
       try {
+        if (acc) {
+          // ── 直连已认证账号 ──
+          const conn = botConnections ?? await api.get("/api/channels/connections").catch(() => null);
+          const acct = (conn?.accounts ?? []).find((a) => a.channel === chan && a.accountId === acc);
+          if (acct?.boundCardSlug && acct.boundCardSlug !== botDialogSlug) {
+            // 该账号已绑定别的卡 → 二次确认换卡
+            if (!confirm(`账号「${acct.name ?? acc}」当前已绑定「${acct.boundCardName ?? acct.boundCardSlug}」这张卡。\n\n确认把它换到当前卡「${card.name}」吗？换卡后旧卡不再接收该账号消息（凭证复用，不重新扫码）。`)) {
+              btn.disabled = false; btn.textContent = "连接 / 创建";
+              return;
+            }
+            try {
+              const r = await api.send("/api/bots/transfer", { method: "POST", body: JSON.stringify({ botId: acct.boundBotId, toCardSlug: botDialogSlug }) });
+              if (!r.ok) throw new Error(r.error ?? "换卡失败");
+              toast("✓ 已换到当前卡并连接");
+              if (r.bot) renderBotBody({ ...r.bot, agentExists: true });
+              refreshBots(); refreshConnections();
+              return;
+            } catch (err) {
+              toast("换卡失败：" + err.message, false);
+              btn.disabled = false; btn.textContent = "连接 / 创建";
+              return;
+            }
+          }
+          // 未占用 → 直接创建 bot 并绑定该已认证账号（免扫码）
+          const r = await api.send("/api/bots", {
+            method: "POST",
+            body: JSON.stringify({ cardSlug: botDialogSlug, channel: chan, accountId: acc }),
+          });
+          toast("✓ 已连接「" + (acct?.name ?? acc) + "」");
+          renderBotBody({ ...r.bot, channelLabel: chan === "qqbot" ? "QQ 机器人" : "微信机器人", agentExists: true });
+          refreshBots(); refreshConnections();
+          return;
+        }
+        // ── 新建机器人（扫码绑定） ──
         const r = await api.send("/api/bots", {
           method: "POST",
-          body: JSON.stringify({
-            cardSlug: botDialogSlug,
-            channel: $("#bot-channel").value,
-            accountId: $("#bot-account").value.trim(),
-          }),
+          body: JSON.stringify({ cardSlug: botDialogSlug, channel: chan, accountId: "" }),
         });
         toast("机器人已创建，接下来扫码绑定");
-        // 后端刚 add 成功，直接采信 agentExists，省掉一次 CLI 查询
         renderBotBody({ ...r.bot, channelLabel: r.bot.channel === "qqbot" ? "QQ 机器人" : "微信机器人", agentExists: r.agentExists ?? null });
         refreshBots();
       } catch (e) {
         // 账号被其他卡占用 → 一键转移（凭证复用不重新扫码）
         if (/占用/.test(e.message)) {
-          const chan = $("#bot-channel").value;
-          const acc = $("#bot-account").value.trim();
-          const conn = await api.get("/api/channels/connections").catch(() => null);
+          const conn = botConnections ?? await api.get("/api/channels/connections").catch(() => null);
           const occupier = conn?.bots?.find((b) => b.channel === chan && b.accountId === acc);
           if (occupier && confirm(`该账号已被「${occupier.cardSlug}」占用。一键转移：把账号从旧卡顶到当前卡？（凭证复用，不重新扫码）`)) {
             try {
               const r = await api.send("/api/bots/transfer", { method: "POST", body: JSON.stringify({ botId: occupier.id, toCardSlug: botDialogSlug }) });
               toast(r.ok ? "✓ 已转移" : "转移失败：" + (r.error ?? ""), r.ok);
               if (r.bot) renderBotBody({ ...r.bot, agentExists: true });
-              refreshBots();
+              refreshBots(); refreshConnections();
               return;
             } catch (err) { toast("转移失败：" + err.message, false); }
           } else {
@@ -1429,7 +1572,7 @@ function renderBotBody(bot) {
         } else {
           toast("创建失败：" + e.message, false);
         }
-        updateFullState(); btn.textContent = "创建机器人";
+        updateFullState(); btn.textContent = "连接 / 创建";
       }
     });
     return;
@@ -1521,6 +1664,114 @@ function closeAdvConfig() {
   botDialogSlug = "";
 }
 
+/** 表情包分组选择弹窗：选一个分组并确认 = 开启表情包（editingCard.emojiGroup） */
+async function openEmojiGroupPicker() {
+  if (!$("#adv-overlay")) return;
+  let data;
+  try { data = await api.get("/api/emojis"); } catch { return toast("读取表情库失败", false); }
+  const groups = data.groups ?? [];
+  const countBy = {};
+  for (const e of data.emojis ?? []) countBy[e.group] = (countBy[e.group] ?? 0) + 1;
+  const cur = new Set(editingCard.emojiGroups ?? []);
+  const wrap = document.createElement("div");
+  wrap.className = "bot-overlay";
+  wrap.id = "emoji-picker-overlay";
+  wrap.innerHTML = `<div class="bot-dialog" style="max-width:440px">
+    <div class="bot-dialog-head">
+      <h3>${icon("image")} 表情包 · ${escapeHtml(editingCard.name)}</h3>
+      <button class="ghost small-btn" id="emoji-picker-close">${icon("x")}</button>
+    </div>
+    <div class="adv-sec">
+      <p class="hint">点选一个或多个分组（可多选，高亮 = 已选），AI 就从这些分组里挑表情发送。全部取消高亮 = 关闭表情包。想管理分组去「表情包库」页。</p>
+      <div class="emoji-groups" style="margin-top:8px">
+        ${groups.map((g) => {
+          const checked = cur.has(g.id);
+          return `<span class="emoji-group-tab${checked ? " on" : ""}" data-g="${escapeHtml(g.id)}">${escapeHtml(g.name)}<span class="g-count">${countBy[g.id] ?? 0}</span></span>`;
+        }).join("")}
+      </div>
+    </div>
+    <div class="row" style="justify-content:flex-end;gap:8px">
+      <button class="ghost" id="emoji-picker-cancel">取消</button>
+      <button class="primary" id="emoji-picker-ok">确认选择</button>
+    </div>
+  </div>`;
+  document.body.appendChild(wrap);
+  const tabs = [...wrap.querySelectorAll(".emoji-group-tab")];
+  tabs.forEach((t) => t.addEventListener("click", () => t.classList.toggle("on")));
+  const close = () => wrap.remove();
+  $("#emoji-picker-close").addEventListener("click", close);
+  $("#emoji-picker-cancel").addEventListener("click", close);
+  wrap.addEventListener("click", (e) => { if (e.target === wrap) close(); });
+  $("#emoji-picker-ok").addEventListener("click", () => {
+    const picked = tabs.filter((t) => t.classList.contains("on")).map((t) => t.dataset.g);
+    editingCard.emojiGroups = picked;
+    close();
+    // 同步高级配置里的高亮与提示
+    const cap = document.querySelector('.cap-toggle[data-cap="emoji"]');
+    if (cap) cap.classList.toggle("on", picked.length > 0);
+    const hint = $("#adv-emoji-hint"), nameEl = $("#adv-emoji-group-name");
+    if (hint) hint.style.display = picked.length ? "" : "none";
+    if (nameEl) nameEl.textContent = picked.length
+      ? picked.map((id) => groups.find((g) => g.id === id)?.name ?? id).join("、")
+      : "";
+    toast(picked.length ? "✓ 已开启表情包" : "已关闭表情包");
+  });
+}
+
+/** 主动发消息配置弹窗：滑动杆选间隔（0-24h，步进 1h，0=关闭），0-6 点固定静默 */
+function openLifePicker() {
+  if (!$("#adv-overlay")) return;
+  const cur = editingCard.life?.intervalHours ?? 0;
+  const wrap = document.createElement("div");
+  wrap.className = "bot-overlay";
+  wrap.id = "life-picker-overlay";
+  wrap.innerHTML = `<div class="bot-dialog" style="max-width:440px">
+    <div class="bot-dialog-head">
+      <h3>${icon("zap")} 主动发消息 · ${escapeHtml(editingCard.name)}</h3>
+      <button class="ghost small-btn" id="life-picker-close">${icon("x")}</button>
+    </div>
+    <div class="adv-sec">
+      <p class="hint">开启后，AI 会每隔你选的时间主动给用户发一条消息（以角色身份自然发起，不同时段不同情绪）。</p>
+      <div style="margin:14px 0 6px">
+        <input type="range" id="life-interval" min="0" max="24" step="1" value="${cur}" style="width:100%">
+        <div class="row" style="justify-content:space-between;margin-top:6px">
+          <span class="muted">0 = 关闭</span>
+          <b id="life-interval-label">${cur === 0 ? "关闭" : cur + " 小时一次"}</b>
+          <span class="muted">最多 24 小时</span>
+        </div>
+      </div>
+      <p class="hint">深夜 0 点 - 6 点自动静默，不会打扰休息。用户连续不回会降低频率，久不互动自动停发。</p>
+    </div>
+    <div class="row" style="justify-content:flex-end;gap:8px">
+      <button class="ghost" id="life-picker-cancel">取消</button>
+      <button class="primary" id="life-picker-ok">确认</button>
+    </div>
+  </div>`;
+  document.body.appendChild(wrap);
+  const range = $("#life-interval"), label = $("#life-interval-label");
+  const syncLabel = () => {
+    const v = Number(range.value);
+    label.textContent = v === 0 ? "关闭" : v + " 小时一次";
+  };
+  range.addEventListener("input", syncLabel);
+  const close = () => wrap.remove();
+  $("#life-picker-close").addEventListener("click", close);
+  $("#life-picker-cancel").addEventListener("click", close);
+  wrap.addEventListener("click", (e) => { if (e.target === wrap) close(); });
+  $("#life-picker-ok").addEventListener("click", () => {
+    const h = Number(range.value);
+    editingCard.life = { ...(editingCard.life ?? {}), intervalHours: h, quietFrom: 0, quietTo: 6 };
+    close();
+    // 同步高级配置里的高亮与提示
+    const cap = document.querySelector('.cap-toggle[data-cap="life"]');
+    if (cap) cap.classList.toggle("on", h > 0);
+    const hint = $("#adv-life-hint"), intervalEl = $("#adv-life-interval");
+    if (hint) hint.style.display = h > 0 ? "" : "none";
+    if (intervalEl) intervalEl.textContent = String(h);
+    toast(h > 0 ? `✓ 已开启：每 ${h} 小时主动发消息` : "已关闭主动发消息");
+  });
+}
+
 async function openAdvConfig() {
   if (!editingCard) return;
   closeAdvConfig();
@@ -1588,13 +1839,17 @@ async function openAdvConfig() {
         ${capBtn("image_gen", "生图", enabledTools.has("image_gen"))}
         ${capBtn("memory_save", "记忆", enabledTools.has("memory_save"))}
         ${capBtn("tts", "TTS 朗读", ab.tts === true)}
+        ${capBtn("emoji", "表情包", (editingCard.emojiGroups ?? []).length > 0)}
+        ${capBtn("life", "主动发消息", (editingCard.life?.intervalHours ?? 0) > 0)}
       </div>
+      <p class="hint" id="adv-emoji-hint" style="${(editingCard.emojiGroups ?? []).length ? "" : "display:none"}">表情包分组：<b id="adv-emoji-group-name"></b>（AI 从这些分组挑表情发）</p>
+      <p class="hint" id="adv-life-hint" style="${(editingCard.life?.intervalHours ?? 0) > 0 ? "" : "display:none"}">主动发消息：每 <b id="adv-life-interval"></b> 小时一次（0-6 点静默）</p>
     </div>
 
     <div class="adv-sec">
       <h4>${icon("database")} 记忆</h4>
       <div class="adv-grid2">
-        <label>每几轮总结一次<input id="adv-mem-rounds" type="number" min="1" max="50" value="${memCfg.auto_rounds ?? 20}">（最近 30 轮保护，超额攒够 N 轮总结最早 N 轮）</label>
+        <label>每几轮总结一次<input id="adv-mem-rounds" type="number" min="1" max="20" value="${memCfg.auto_rounds ?? 10}">（最近 20 轮保护，超额攒够 N 轮总结最早 N 轮；N=1-20）</label>
       </div>
     </div>
 
@@ -1635,10 +1890,29 @@ async function openAdvConfig() {
       .map((m) => `<option value="${escapeHtml(m)}">${escapeHtml(m)}</option>`)
       .join("") || `<option value=""></option>`;
   });
-  // 能力：点一下切换高亮
+  // 能力：点一下切换高亮（表情包/主动发消息除外——它们弹配置框）
   ov.querySelectorAll(".cap-toggle").forEach((b) =>
-    b.addEventListener("click", () => b.classList.toggle("on"))
+    b.addEventListener("click", () => {
+      if (b.dataset.cap === "emoji") return openEmojiGroupPicker();
+      if (b.dataset.cap === "life") return openLifePicker();
+      b.classList.toggle("on");
+    })
   );
+  // 已开启主动消息的卡：回显间隔
+  if ((editingCard.life?.intervalHours ?? 0) > 0) {
+    const el = $("#adv-life-interval");
+    if (el) el.textContent = editingCard.life.intervalHours;
+  }
+  // 已选分组的卡：回显分组名
+  if ((editingCard.emojiGroups ?? []).length) {
+    api.get("/api/emojis").then((r) => {
+      if (!$("#adv-overlay")) return;
+      const names = (editingCard.emojiGroups ?? [])
+        .map((id) => (r.groups ?? []).find((x) => x.id === id)?.name ?? id)
+        .join("、");
+      if (names && $("#adv-emoji-group-name")) $("#adv-emoji-group-name").textContent = names;
+    }).catch(() => {});
+  }
 
   $("#adv-save").addEventListener("click", async () => {
     const btn = $("#adv-save");
@@ -1647,13 +1921,13 @@ async function openAdvConfig() {
       const provider = $("#adv-model-provider").value;
       const model = $("#adv-model-id").value;
       editingCard.model = provider ? { provider, ...(model ? { model } : {}) } : {};
-      // 能力：高亮的即启用（tts 归 abilities，其余归 tools.enabled）
+      // 能力：高亮的即启用（tts 归 abilities，其余归 tools.enabled；emoji 是独立字段不进 tools）
       const onCaps = [...ov.querySelectorAll(".cap-toggle.on")].map((b) => b.dataset.cap);
       editingCard.tools = editingCard.tools ?? { enabled: [], policy: "auto", deny: [] };
-      editingCard.tools.enabled = onCaps.filter((c) => c !== "tts");
+      editingCard.tools.enabled = onCaps.filter((c) => c !== "tts" && c !== "emoji");
       editingCard.abilities = { ...(editingCard.abilities ?? {}), tts: onCaps.includes("tts") };
       editingCard.memoryConfig = {
-        auto_rounds: Math.min(50, Math.max(1, Number($("#adv-mem-rounds").value) || 20)),
+        auto_rounds: Math.min(20, Math.max(1, Number($("#adv-mem-rounds").value) || 10)),
       };
       editingCard.presets = {
         ...(editingCard.presets ?? {}),
@@ -1774,6 +2048,10 @@ function renderCreate() {
     </div>
     <div class="ai-draft-box">
       <div class="ai-draft-head">AI 生成草稿</div>
+      <div class="ai-draft-model">
+        <label>模型商<select id="ai-provider"><option value="">跟随默认</option></select></label>
+        <label>模型<select id="ai-model"><option value="">—</option></select></label>
+      </div>
       <textarea id="ai-idea" rows="3" placeholder="描述你的角色想法，如：一个傲娇的猫娘咖啡店店员……"></textarea>
       <div class="ai-draft-actions">
         <button id="btn-ai-draft" class="primary">生成草稿</button>
@@ -1796,6 +2074,9 @@ function initCreate() {
   $("#btn-ai-draft").addEventListener("click", aiDraft);
   $("#btn-ai-cover").addEventListener("click", () => generateCover());
   $("#btn-cover-remove").addEventListener("click", () => removeCover());
+  // AI 草稿的模型选择：加载启用中的模型商，联动模型下拉（复用本地聊天的数据源）
+  loadAiDraftProviders();
+  $("#ai-provider").addEventListener("change", () => fillAiDraftModels(true));
   $("#cf-cover-file").addEventListener("change", async (e) => {
     const f = e.target.files[0];
     if (!f) return;
@@ -1842,6 +2123,34 @@ function removeCover(silent) {
 }
 
 // ---------- AI 辅助做卡 ----------
+/** 做卡页：加载启用中的模型商到 AI 草稿下拉（跟随默认 = 空） */
+async function loadAiDraftProviders() {
+  const sel = $("#ai-provider");
+  if (!sel) return;
+  try {
+    const prov = await api.get("/api/providers");
+    lcProviders = (prov.chat ?? []).filter((p) => p.enabled !== false);
+  } catch { lcProviders = []; }
+  sel.innerHTML = [`<option value="">跟随默认</option>`]
+    .concat(lcProviders.map((p) => `<option value="${escapeHtml(p.name)}">${escapeHtml(p.name)}</option>`))
+    .join("");
+  fillAiDraftModels(false);
+}
+
+/** 按选中的模型商填充模型下拉 */
+function fillAiDraftModels(keepModel) {
+  const sel = $("#ai-model");
+  if (!sel) return;
+  const p = lcProviders.find((x) => x.name === $("#ai-provider")?.value);
+  if (!p) { sel.innerHTML = `<option value="">—</option>`; sel.disabled = true; return; }
+  sel.disabled = false;
+  const cur = keepModel ? sel.value : "";
+  const models = p.models ?? [];
+  sel.innerHTML = models.length
+    ? models.map((m) => `<option value="${escapeHtml(m)}" ${m === cur ? "selected" : ""}>${escapeHtml(m)}</option>`).join("")
+    : `<option value="">—</option>`;
+}
+
 async function aiDraft() {
   const idea = $("#ai-idea").value.trim();
   if (!idea) return toast("先写下你的想法", false);
@@ -1851,9 +2160,13 @@ async function aiDraft() {
   btn.textContent = "生成中…（约 1 分钟）";
   msg.textContent = "";
   try {
+    // 选了具体模型才传（"提供商::模型"），跟随默认则交给后端
+    const prov = $("#ai-provider")?.value || "";
+    const model = $("#ai-model")?.value || "";
+    const chosen = prov && model ? `${prov}::${model}` : "";
     const r = await api.send("/api/cards/ai-draft", {
       method: "POST",
-      body: JSON.stringify({ idea }),
+      body: JSON.stringify({ idea, model: chosen }),
     });
     applyDraftToForm(r.draft);
     editingCard._coverPrompt = r.coverPrompt || "";
@@ -2190,7 +2503,7 @@ function renderProvidersPage(type, title, desc) {
       <h3 id="pv-title">添加提供商</h3>
       <div class="form">
         <div class="cf-grid2">
-          <div><label>名称（字母/数字）</label><input id="pv-name" placeholder="如 agnes / myrelay"></div>
+          <div><label>名称（任意字符，≤32 字）</label><input id="pv-name" placeholder="如 agnes / myrelay / 硅基流动"></div>
           <div><label>Base URL（以 /v1 结尾）</label><input id="pv-url" placeholder="https://api.example.com/v1"></div>
         </div>
         <label>API Key（编辑时留空 = 保留原值）</label>
@@ -2990,7 +3303,6 @@ async function provDone() {
 // ============================================================
 //  视图：记忆（每卡配置 + 查看 + 单条管理）
 // ============================================================
-const MEM_CATS = ["信息", "偏好", "关系", "事件", "待定"];
 const MEM_SRC_LABEL = { manual: "手动", auto: "自动总结", tool: "工具", legacy: "旧数据" };
 
 function fmtTime(iso) {
@@ -3010,22 +3322,21 @@ function fmtTime(iso) {
 function renderMemory() {
   return `
   <div class="view">
-    <div class="page-head"><h2>记忆</h2><p class="hint">每张卡独立的长期记忆；可手动添加、单条编辑/删除。自动总结：最近 30 轮对话保护不总结，之后每攒够 N 轮就总结最早 N 轮，每段只总结一次</p></div>
+    <div class="page-head"><h2>记忆</h2><p class="hint">每张卡独立的长期记忆（由聊天自动总结生成，可单条编辑/删除）。自动总结：最近 20 轮对话保护不总结，之后每攒够 N 轮（1-20）总结最早 N 轮，每段只总结一次。顶部「关键记忆」为必须长期遵守的约定</p></div>
     <div id="mem-cards-head" class="mem-cards-head">选择角色卡</div>
     <div id="mem-cards" class="card-grid"></div>
     <div id="mem-detail" class="card-box" style="display:none">
       <h3 id="mem-title"></h3>
       <div class="row" style="align-items:center">
-        <label>每 <input id="mem-rounds" type="number" min="1" max="50" style="width:64px;text-align:center"> 轮自动总结</label>
+        <label>每 <input id="mem-rounds" type="number" min="1" max="20" style="width:64px;text-align:center"> 轮自动总结</label>
         <button id="mem-save-rounds" class="primary small-btn">保存</button>
         <button id="mem-clear" class="danger small-btn">清空此卡记忆</button>
       </div>
-      <div class="row" style="align-items:center">
-        <select id="mem-add-cat" style="width:auto"></select>
-        <input id="mem-add-input" type="text" placeholder="添加一条记忆，例如：用户养了一只叫旺财的狗">
-        <button id="mem-add-btn" class="primary small-btn">添加</button>
-      </div>
       <input id="mem-search" type="text" placeholder="搜索记忆…" style="width:100%">
+      <div id="mem-key-section" class="mem-key-section" style="display:none">
+        <div class="mem-sec-head"><span class="mem-sec-icon">${icon("shield")}</span> 关键记忆（必须遵守）</div>
+        <div id="mem-key-entries" class="small-out" style="padding:4px 10px"></div>
+      </div>
       <div id="mem-entries" class="small-out tall" style="max-height:520px;padding:4px 10px"></div>
     </div>
   </div>`;
@@ -3055,8 +3366,6 @@ function initMemory() {
   })();
   $("#mem-save-rounds").addEventListener("click", saveMemRounds);
   $("#mem-clear").addEventListener("click", clearMem);
-  $("#mem-add-btn").addEventListener("click", addMemEntry);
-  $("#mem-add-input").addEventListener("keydown", (e) => { if (e.key === "Enter") addMemEntry(); });
   $("#mem-search").addEventListener("input", loadMemEntries);
   $("#mem-entries").addEventListener("click", onMemRowClick);
 }
@@ -3065,10 +3374,7 @@ async function openMemDetail(slug) {
   memCard = await api.get(`/api/cards/${slug}`);
   $("#mem-detail").style.display = "block";
   $("#mem-title").textContent = `${memCard.name} 的记忆`;
-  $("#mem-rounds").value = memCard.memoryConfig?.auto_rounds ?? 20;
-  const catSel = $("#mem-add-cat");
-  catSel.innerHTML = MEM_CATS.map((c) => `<option>${c}</option>`).join("");
-  catSel.value = "信息";
+  $("#mem-rounds").value = memCard.memoryConfig?.auto_rounds ?? 10;
   await loadMemEntries();
   $("#mem-detail").scrollIntoView({ behavior: "smooth" });
 }
@@ -3078,17 +3384,50 @@ async function loadMemEntries() {
   const mem = await api.get("/api/memory").catch(() => ({ memory: {} }));
   const entries = mem.memory?.[memCard.slug] ?? [];
   const q = ($("#mem-search")?.value ?? "").trim();
-  const list = q ? entries.filter((e) => (e.fact + " " + e.cat).includes(q)) : entries;
+  const filtered = q ? entries.filter((e) => (e.fact + " " + (e.keywords ?? []).join(" ")).includes(q)) : entries;
+  const keySec = $("#mem-key-section");
+  const keyEl = $("#mem-key-entries");
   const el = $("#mem-entries");
-  if (!list.length) { el.textContent = q ? "（没有匹配）" : "（还没有记忆）"; return; }
-  el.innerHTML = list.slice().reverse().map(renderMemRow).join("");
+  if (!filtered.length) {
+    if (keySec) keySec.style.display = "none";
+    if (keyEl) keyEl.innerHTML = "";
+    el.textContent = q ? "（没有匹配）" : "（还没有记忆）";
+    return;
+  }
+  const byTime = (a, b) => (b.ts || "").localeCompare(a.ts || "");
+  const keyList = filtered.filter((e) => e.important).sort(byTime);
+  const normalList = filtered.filter((e) => !e.important).sort(byTime);
+  // 关键记忆：独立分区（红色卡片，醒目、方便查看）
+  if (keySec) keySec.style.display = keyList.length ? "" : "none";
+  if (keyEl) keyEl.innerHTML = keyList.length ? keyList.map((e) => renderMemRow(e, true)).join("") : "";
+  // 普通记忆：主列表
+  if (!normalList.length) {
+    el.textContent = q ? "（没有匹配）" : "（暂无普通记忆）";
+    return;
+  }
+  el.innerHTML = normalList.map((e) => renderMemRow(e)).join("");
 }
 
-function renderMemRow(e) {
+function memNsLabel(ns) {
+  if (!ns || ns === "shared") return "";
+  if (ns === "local") return "本地";
+  if (ns.startsWith("qq:")) return "QQ";
+  if (ns.startsWith("wx:")) return "微信";
+  return ns;
+}
+
+function renderMemRow(e, inKeySection) {
   const src = MEM_SRC_LABEL[e.src] ?? e.src ?? "";
-  return `<div class="mem-row" data-id="${escapeHtml(e.id)}">
-    <span class="mem-badge cat-${escapeHtml(e.cat)}">${escapeHtml(e.cat)}</span>
-    <span class="mem-fact">${escapeHtml(e.fact)}</span>
+  const nsBadge = memNsLabel(e.ns) ? `<span class="mem-badge mem-ns">${escapeHtml(memNsLabel(e.ns))}</span>` : "";
+  const kw = Array.isArray(e.keywords) && e.keywords.length
+    ? `<span class="mem-kw">${e.keywords.map((k) => `#${escapeHtml(k)}`).join(" ")}</span>`
+    : "";
+  // 关键记忆单独分区里不再叠整行红色（分区已有红框）；主列表里的关键记忆（搜索命中时）保留高亮
+  const rowCls = `mem-row${!inKeySection && e.important ? " mem-key-row" : ""}`;
+  return `<div class="${rowCls}" data-id="${escapeHtml(e.id)}">
+    ${e.important ? `<span class="mem-badge mem-key">关键</span>` : ""}
+    ${nsBadge}
+    <span class="mem-fact">${escapeHtml(e.fact)}${kw ? " " + kw : ""}</span>
     <span class="mem-meta">${fmtTime(e.ts)}${src ? " · " + src : ""}</span>
     <span class="mem-ops">
       <button class="small-btn" data-act="edit" data-id="${escapeHtml(e.id)}">编辑</button>
@@ -3099,8 +3438,12 @@ function renderMemRow(e) {
 
 function renderMemEditRow(e) {
   return `<div class="mem-row mem-edit" data-id="${escapeHtml(e.id)}">
-    <select class="mem-edit-cat">${MEM_CATS.map((c) => `<option ${c === e.cat ? "selected" : ""}>${c}</option>`).join("")}</select>
+    <label class="mem-key-label${e.important ? " on" : ""}">
+      <span class="switch"><input class="mem-edit-key" type="checkbox" ${e.important ? "checked" : ""}><span class="slider"></span></span>
+      关键
+    </label>
     <input class="mem-edit-fact" type="text" value="${escapeHtml(e.fact)}">
+    <input class="mem-edit-kw" type="text" placeholder="触发词，逗号分隔" value="${escapeHtml((e.keywords ?? []).join("，"))}" style="max-width:130px">
     <span class="mem-ops">
       <button class="small-btn primary" data-act="save" data-id="${escapeHtml(e.id)}">保存</button>
       <button class="small-btn" data-act="cancel" data-id="${escapeHtml(e.id)}">取消</button>
@@ -3125,34 +3468,23 @@ async function onMemRowClick(ev) {
   } else if (btn.dataset.act === "cancel") {
     const mem = await api.get("/api/memory");
     const entry = (mem.memory?.[memCard.slug] ?? []).find((e) => e.id === id);
-    if (entry) row.outerHTML = renderMemRow(entry);
+    if (entry) row.outerHTML = renderMemRow(entry, !!row.closest("#mem-key-entries"));
   } else if (btn.dataset.act === "save") {
     const editRow = btn.closest(".mem-edit");
     const fact = editRow.querySelector(".mem-edit-fact").value.trim();
-    const cat = editRow.querySelector(".mem-edit-cat").value;
-    if (!fact) { toast("事实不能为空", false); return; }
-    const r = await api.send(`/api/memory/${memCard.slug}/update`, { method: "POST", body: JSON.stringify({ id, fact, cat }) });
+    const important = editRow.querySelector(".mem-edit-key")?.checked === true;
+    const keywords = (editRow.querySelector(".mem-edit-kw")?.value ?? "")
+      .split(/[,，、]/).map((k) => k.trim()).filter(Boolean);
+    if (!fact) { toast("记忆不能为空", false); return; }
+    const r = await api.send(`/api/memory/${memCard.slug}/update`, { method: "POST", body: JSON.stringify({ id, fact, important, keywords }) });
     toast("✓ 已保存");
     loadMemEntries();
   }
 }
 
-async function addMemEntry() {
-  if (!memCard) return;
-  const fact = $("#mem-add-input").value.trim();
-  if (!fact) { toast("请输入要记住的事实", false); return; }
-  const cat = $("#mem-add-cat").value;
-  const r = await api.send(`/api/memory/${memCard.slug}`, { method: "POST", body: JSON.stringify({ fact, cat }) });
-  if (r.ok === false && r.duplicate) { toast("这条已经记住了", false); return; }
-  if (!r.ok) { toast("添加失败", false); return; }
-  $("#mem-add-input").value = "";
-  await loadMemEntries();
-  toast("✓ 已记住");
-}
-
 async function saveMemRounds() {
   if (!memCard) return;
-  const rounds = Math.min(50, Math.max(1, Number($("#mem-rounds").value) || 20));
+  const rounds = Math.min(20, Math.max(1, Number($("#mem-rounds").value) || 10));
   memCard.memoryConfig = { auto_rounds: rounds };
   try {
     await api.send(`/api/cards/${memCard.slug}`, { method: "PUT", body: JSON.stringify(memCard) });
@@ -4010,8 +4342,8 @@ function renderPresetEditor(kind, list) {
   const title = kind === "tier" ? "档位（扮演模式与内容尺度）" : "风格（叙述风格）";
   const hint =
     kind === "tier"
-      ? "档位决定扮演模式：不破甲=标准沉浸（剧情内克制处理敏感内容）；破甲=深度沉浸（允许成人向虚构剧情）。由卡片选择是否启用。"
-      : "风格决定输出形式：纯对话（QQ聊天式）/ 轻描写 / 重描写（心理＋动作＋环境）。";
+      ? "档位决定扮演模式与内容尺度：不破甲=标准沉浸（剧情内克制处理敏感内容）；破甲（最高）=最高破限（露骨尺度，对齐 RP-Hub）。由卡片选择是否启用。"
+      : "风格决定输出形式：纯对话（只有对白）/ 重描写（对白＋动作心理，（）包裹）。两种风格均带对话示例，跟随风格联动。";
   return `
   <div class="card-box">
     <h3>${icon("sliders")} ${title}</h3>
@@ -4056,7 +4388,9 @@ function renderPresets() {
       <h3>${icon("info")} 说明</h3>
       <ul class="guide">
         <li>卡片高级配置（编辑卡 → 右上角 ⚙ 高级配置）里可选「档位」与「风格」，选了才生效，默认不启用。</li>
-        <li>档位不破甲/破甲可分别与三种风格自由组合（如 破甲×纯对话、不破甲×重描写）。</li>
+        <li>档位不破甲/破甲（最高）可分别与两种风格自由组合（如 破甲×纯对话、不破甲×重描写）。</li>
+        <li>示例对话跟随风格（对话开头注入，弱模型靠模仿更稳）：纯对话示例只有对白，重描写示例动作心理用（）包裹。</li>
+        <li>全局「输出铁律」护栏所有档位/风格生效：剥离思维链、禁止跳出角色、末句不加句号。</li>
         <li>能力触发：卡开了「生图」能力后，AI 会在场景需要时主动生图发图（配置见 生图配置 页）。</li>
         <li>改完预设文本后，网页试聊立即生效；QQ/微信 机器人需在卡片 🤖 机器人里点「重编译」。</li>
       </ul>
@@ -4204,23 +4538,66 @@ async function loadLogs() {
 }
 
 function renderSettings() {
+  // 设置菜单：长条按键，点击进入各自独立页面
+  const row = (route, iconName, title, desc, badge) => `
+    <a class="setting-row" href="#/${route}" data-route="${route}">
+      <span class="sr-icon">${icon(iconName)}</span>
+      <div class="sr-body">
+        <div class="sr-title">${title}${badge ? ` <span class="plug-badge">${badge}</span>` : ""}</div>
+        <div class="sr-desc">${desc}</div>
+      </div>
+      <span class="sr-chevron">${icon("chevron")}</span>
+    </a>`;
   return `
   <div class="view">
-    <div class="page-head"><h2>设置</h2><p class="hint">技能、MCP 工具服务器、公告与数据备份</p></div>
+    <div class="page-head"><h2>设置</h2><p class="hint">技能、MCP、日志、插件、公告与数据备份——点开对应项进入页面</p></div>
+    <div class="setting-rows">
+      ${FEATURES.skills ? row("skills", "tool", "技能库", "给 AI 追加能力说明（如「代码专家」）；内置四个不可改，可自己添加，聊天时勾选生效") : ""}
+      ${FEATURES.mcp ? row("mcp", "zap", "MCP 服务器", "连接外部工具服务器：本地程序（stdio）或远程 URL（SSE / StreamableHTTP）") : ""}
+      ${row("logs", "clipboard", "运行日志", "聊天 / 通道 / 生图 / 语音 / 记忆的报错记录，出问题先看这里（留最近 500 条）")}
+      ${row("plugins", "store", "插件", "已安装插件只读列表", "暂未开放")}
+      ${row("data", "package", "数据备份与记忆", "全部卡片 + 记忆 + 配置导出为 JSON；查看全部记忆")}
+      ${row("notice", "message", "首页公告", "编辑展示在首页的公告内容")}
+    </div>
+  </div>`;
+}
+function initSettings() {
+  // 服务状态点仍然要亮（原来挂在服务信息块里）
+  api.get("/api/health").then(() => {
+    $("#drawer-meta").textContent = `SoulBox`;
+    $("#svc-dot").classList.add("on");
+  }).catch(() => { $("#svc-dot").classList.add("bad"); });
+}
 
-    ${FEATURES.skills ? `
+// 设置子页统一返回按钮（放在 page-head，点击回设置菜单）
+function settingsBack() {
+  return `<a class="btn-back" href="#/settings">${icon("chevron")} 返回设置</a>`;
+}
+
+// ---- 设置子页：技能库 ----
+function renderSkillsPage() {
+  return `
+  <div class="view">
+    <div class="page-head"><h2>${icon("tool")} 技能库</h2><p class="hint">技能 = 给 AI 追加的一段能力说明（如「代码专家」）。内置四个不可改，你可以自己加；聊天时在能力开关里勾选生效。</p>${settingsBack()}</div>
     <div class="card-box">
-      <h3>${icon("tool")} 技能库</h3>
-      <p class="hint">技能 = 给 AI 追加的一段能力说明（如「代码专家」）。内置四个不可改，你可以自己加；聊天时在能力开关里勾选生效。</p>
       <div id="skill-list" class="skill-list"></div>
       <div class="row" style="margin-top:8px"><button id="skill-add" class="ghost small-btn">+ 添加技能</button></div>
       <div id="skill-form-wrap" style="display:none"></div>
-    </div>` : ""}
+    </div>
+  </div>`;
+}
+function initSkillsPage() {
+  if (!FEATURES.skills) return;
+  $("#skill-add").addEventListener("click", () => skillEdit(-1));
+  skillLoad();
+}
 
-    ${FEATURES.mcp ? `
+// ---- 设置子页：MCP 服务器 ----
+function renderMcpPage() {
+  return `
+  <div class="view">
+    <div class="page-head"><h2>${icon("zap")} MCP 服务器</h2><p class="hint">连接外部工具服务器：本地程序（stdio）或远程 URL（SSE / StreamableHTTP）。工具调用默认需你确认后执行。</p>${settingsBack()}</div>
     <div class="card-box">
-      <h3>${icon("zap")} MCP 服务器</h3>
-      <p class="hint">连接外部工具服务器：本地程序（stdio）或远程 URL（SSE / StreamableHTTP）。工具调用默认需你确认后执行。</p>
       <div id="mcp-list" class="mcp-list"></div>
       <div class="row" style="margin-top:8px"><button id="mcp-add" class="ghost small-btn">+ 添加服务器</button></div>
       <div id="mcp-form-wrap" style="display:none"></div>
@@ -4233,11 +4610,34 @@ function renderSettings() {
         </div>
         <div id="mcp-msg" class="status"></div>
       </details>
-    </div>` : ""}
+    </div>
+  </div>`;
+}
+function initMcpPage() {
+  if (!FEATURES.mcp) return;
+  $("#mcp-add").addEventListener("click", () => mcpEdit(-1));
+  $("#btn-mcp-export").addEventListener("click", () => {
+    $("#mcp-config").value = JSON.stringify(mcpServers, null, 2);
+  });
+  $("#btn-mcp-import").addEventListener("click", async () => {
+    try {
+      const arr = JSON.parse($("#mcp-config").value);
+      if (!Array.isArray(arr)) throw new Error("需要 JSON 数组");
+      mcpServers = arr;
+      await mcpSave();
+      mcpRenderList();
+      $("#mcp-msg").textContent = "✓ 已导入并重连";
+    } catch (e) { $("#mcp-msg").textContent = "导入失败：" + e.message; }
+  });
+  mcpLoad();
+}
 
+// ---- 设置子页：运行日志 ----
+function renderLogsPage() {
+  return `
+  <div class="view">
+    <div class="page-head"><h2>${icon("clipboard")} 运行日志</h2><p class="hint">出问题先看这里：聊天、通道、生图、语音、记忆的报错都会记下来。只留最近 500 条。</p>${settingsBack()}</div>
     <div class="card-box">
-      <h3>${icon("clipboard")} 运行日志</h3>
-      <p class="hint">出问题先看这里：聊天、通道、生图、语音、记忆的报错都会记下来。只留最近 500 条。</p>
       <div class="row log-toolbar">
         <select id="log-level" style="width:auto">
           <option value="all">全部级别</option>
@@ -4252,67 +4652,9 @@ function renderSettings() {
       </div>
       <div id="log-list" class="small-out tall">加载中…</div>
     </div>
-
-    <div class="card-box">
-      <h3>${icon("store")} 插件 <span class="plug-badge">暂未开放</span></h3>
-      <p class="hint">插件功能暂未开放（正在评估可用性）。已安装的插件会继续生效，但市场浏览、安装、卸载等操作暂不提供；开放后会回到这里。</p>
-      <div id="plug-installed-ro" class="small-out tall">加载中…</div>
-    </div>
-
-    <div class="two-col">
-      <div class="card-box">
-        <h3>${icon("clipboard")} 首页公告</h3>
-        <div class="form">
-          <label>展示在首页公告卡（支持换行，留空则首页显示「暂无公告」）</label>
-          <textarea id="notice-text" rows="5" maxlength="2000"></textarea>
-          <div class="row"><button id="notice-save" class="primary">${icon("save")} 保存公告</button></div>
-          <div id="notice-msg" class="status"></div>
-        </div>
-      </div>
-      <div class="card-box">
-        <h3>${icon("package")} 数据备份</h3>
-        <p class="hint">全部卡片 + 记忆 + 各项配置 → 一个 JSON 文件</p>
-        <button id="btn-backup" class="primary">下载备份</button>
-        <h3 style="margin-top:14px">全部记忆</h3>
-        <div id="memory-list" class="small-out tall"></div>
-      </div>
-    </div>
   </div>`;
 }
-function initSettings() {
-  // ---- 公告 ----
-  api.get("/api/announcement").then((a) => { $("#notice-text").value = a.text ?? ""; }).catch(() => {});
-  $("#notice-save").addEventListener("click", async () => {
-    try {
-      await api.send("/api/announcement", { method: "POST", body: JSON.stringify({ text: $("#notice-text").value }) });
-      $("#notice-msg").textContent = "✓ 已保存";
-      toast("✓ 公告已更新");
-    } catch (e) { $("#notice-msg").textContent = "保存失败：" + e.message; }
-  });
-
-  // ---- 数据备份 + 记忆总览（原「数据」页并进来） ----
-  $("#btn-backup").addEventListener("click", async () => {
-    try {
-      const r = await api.get("/api/backup");
-      downloadDataUrl(r.dataUrl, r.filename);
-      toast("✓ 备份已下载");
-    } catch (e) { toast("备份失败：" + e.message, false); }
-  });
-  api.get("/api/memory").then((r) => {
-    const el = $("#memory-list");
-    el.textContent = Object.keys(r.memory ?? {}).length
-      ? Object.entries(r.memory).map(([f, entries]) =>
-          `${f}\n  ` + (entries || []).map((e) => `[${e.cat}] ${e.fact}`).join("\n  ")).join("\n\n")
-      : "（还没有记忆）";
-  }).catch(() => {});
-
-  // 服务状态点仍然要亮（原来挂在服务信息块里）
-  api.get("/api/health").then((h) => {
-    $("#drawer-meta").textContent = `SoulBox`;
-    $("#svc-dot").classList.add("on");
-  }).catch(() => { $("#svc-dot").classList.add("bad"); });
-
-  // ---- 运行日志 ----
+function initLogsPage() {
   $("#log-refresh").addEventListener("click", loadLogs);
   $("#log-level").addEventListener("change", loadLogs);
   $("#log-tag").addEventListener("change", loadLogs);
@@ -4330,8 +4672,19 @@ function initSettings() {
     } catch (e) { toast("清空失败：" + e.message, false); }
   });
   loadLogs();
+}
 
-  // ---- 插件（暂未开放）：只读展示已安装列表 ----
+// ---- 设置子页：插件（只读） ----
+function renderPluginsPage() {
+  return `
+  <div class="view">
+    <div class="page-head"><h2>${icon("store")} 插件 <span class="plug-badge">暂未开放</span></h2><p class="hint">插件功能暂未开放（正在评估可用性）。已安装的插件会继续生效，但市场浏览、安装、卸载等操作暂不提供；开放后会回到这里。</p>${settingsBack()}</div>
+    <div class="card-box">
+      <div id="plug-installed-ro" class="small-out tall">加载中…</div>
+    </div>
+  </div>`;
+}
+function initPluginsPage() {
   api.get("/api/plugins/installed").then((d) => {
     const el = $("#plug-installed-ro");
     if (!el) return;
@@ -4343,31 +4696,67 @@ function initSettings() {
     const el = $("#plug-installed-ro");
     if (el) el.textContent = "（读取失败）";
   });
+}
 
-  // ---- 技能库（FEATURES.skills 关闭时整块不渲染，跳过绑定） ----
-  if (FEATURES.skills) {
-    $("#skill-add").addEventListener("click", () => skillEdit(-1));
-    skillLoad();
-  }
+// ---- 设置子页：数据备份与记忆 ----
+function renderDataPage() {
+  return `
+  <div class="view">
+    <div class="page-head"><h2>${icon("package")} 数据备份与记忆</h2><p class="hint">全部卡片 + 记忆 + 各项配置 → 一个 JSON 文件；下面是每张卡的长期记忆</p>${settingsBack()}</div>
+    <div class="two-col">
+      <div class="card-box">
+        <h3>${icon("package")} 数据备份</h3>
+        <p class="hint">全部卡片 + 记忆 + 各项配置 → 一个 JSON 文件</p>
+        <button id="btn-backup" class="primary">下载备份</button>
+      </div>
+      <div class="card-box">
+        <h3>全部记忆</h3>
+        <div id="memory-list" class="small-out tall"></div>
+      </div>
+    </div>
+  </div>`;
+}
+function initDataPage() {
+  $("#btn-backup").addEventListener("click", async () => {
+    try {
+      const r = await api.get("/api/backup");
+      downloadDataUrl(r.dataUrl, r.filename);
+      toast("✓ 备份已下载");
+    } catch (e) { toast("备份失败：" + e.message, false); }
+  });
+  api.get("/api/memory").then((r) => {
+    const el = $("#memory-list");
+    el.textContent = Object.keys(r.memory ?? {}).length
+      ? Object.entries(r.memory).map(([f, entries]) =>
+          `${f}\n  ` + (entries || []).map((e) => `${e.important ? "【关键】" : ""}${e.fact}${(e.keywords ?? []).length ? "  #" + e.keywords.join(" #") : ""}`).join("\n  ")).join("\n\n")
+      : "（还没有记忆）";
+  }).catch(() => {});
+}
 
-  // ---- MCP（同上） ----
-  if (FEATURES.mcp) {
-    $("#mcp-add").addEventListener("click", () => mcpEdit(-1));
-    $("#btn-mcp-export").addEventListener("click", () => {
-      $("#mcp-config").value = JSON.stringify(mcpServers, null, 2);
-    });
-    $("#btn-mcp-import").addEventListener("click", async () => {
-      try {
-        const arr = JSON.parse($("#mcp-config").value);
-        if (!Array.isArray(arr)) throw new Error("需要 JSON 数组");
-        mcpServers = arr;
-        await mcpSave();
-        mcpRenderList();
-        $("#mcp-msg").textContent = "✓ 已导入并重连";
-      } catch (e) { $("#mcp-msg").textContent = "导入失败：" + e.message; }
-    });
-    mcpLoad();
-  }
+// ---- 设置子页：首页公告 ----
+function renderNoticePage() {
+  return `
+  <div class="view">
+    <div class="page-head"><h2>${icon("message")} 首页公告</h2><p class="hint">编辑展示在首页的公告内容</p>${settingsBack()}</div>
+    <div class="card-box">
+      <div class="form">
+        <label>展示在首页公告卡（支持换行，留空则首页显示「暂无公告」）</label>
+        <textarea id="notice-text" rows="5" maxlength="2000"></textarea>
+        <div class="row"><button id="notice-save" class="primary">${icon("save")} 保存公告</button></div>
+        <div id="notice-msg" class="status"></div>
+      </div>
+    </div>
+  </div>`;
+}
+function initNoticePage() {
+  api.get("/api/announcement").then((a) => { $("#notice-text").value = a.text ?? ""; }).catch(() => {});
+  $("#notice-save").addEventListener("click", async () => {
+    try {
+      await api.send("/api/announcement", { method: "POST", body: JSON.stringify({ text: $("#notice-text").value }) });
+      $("#notice-msg").textContent = "✓ 已保存";
+      toast("✓ 公告已更新");
+    } catch (e) { $("#notice-msg").textContent = "保存失败：" + e.message; }
+  });
 }
 
 // ============================================================
@@ -4474,10 +4863,14 @@ function renderEmojis() {
   <div class="view">
     <div class="page-head">
       <h2>表情包库</h2>
-      <p class="hint">全部角色卡共用这一套表情。AI 想发表情时会写 [表情:名字]，聊天里渲染成图片；名字和解释会告诉 AI，所以解释要写清楚什么场合用</p>
+      <p class="hint">全部角色卡共用。按分组组织：在卡片「高级配置」里选一个分组，AI 就只从这个分组里挑表情发。名字和解释会告诉 AI，解释要写清楚什么场合用</p>
     </div>
     <div class="card-box">
-      <h3>添加表情</h3>
+      <h3>分组</h3>
+      <div class="emoji-groups" id="em-groups"></div>
+    </div>
+    <div class="card-box">
+      <h3>添加表情 <span class="hint" id="em-cur-group-hint"></span></h3>
       <div class="form">
         <div class="cf-grid2">
           <div><label>表情名（AI 用它引用，唯一）</label><input id="em-name" placeholder="如：得意、无语、抱抱"></div>
@@ -4486,59 +4879,177 @@ function renderEmojis() {
         <label>图片（png / jpg / gif / webp）</label>
         <input type="file" id="em-file" accept=".png,.jpg,.jpeg,.gif,.webp">
         <div class="row">
-          <button id="em-add" class="primary">${icon("plus")} 添加到库</button>
+          <button id="em-add" class="primary">${icon("plus")} 添加到当前分组</button>
           <span id="em-msg" class="status"></span>
         </div>
       </div>
     </div>
     <div class="card-box">
-      <h3>库里的表情 <span id="em-count" class="hint"></span></h3>
+      <h3>「<span id="em-group-title">默认</span>」里的表情 <span id="em-count" class="hint"></span></h3>
       <div id="em-list" class="emoji-grid"></div>
     </div>
   </div>`;
 }
+
+let emojiGroups = [];        // 分组列表
+let emojiCurGroup = "default"; // 当前选中分组
 
 function initEmojis() {
   $("#em-add").addEventListener("click", addEmojiToLib);
   loadEmojiList();
 }
 
+/** 渲染分组标签栏 */
+function renderEmojiGroups() {
+  const box = $("#em-groups");
+  if (!box) return;
+  const countByGroup = {};
+  for (const e of emojiLib) countByGroup[e.group] = (countByGroup[e.group] ?? 0) + 1;
+  const tabs = emojiGroups
+    .map((g) => {
+      const cnt = countByGroup[g.id] ?? 0;
+      const extra = g.builtin
+        ? ""
+        : `<span class="g-rename" title="重命名分组" data-gr="${escapeHtml(g.id)}">${icon("pen")}</span>
+           <span class="g-del" title="删除分组（组内表情移回默认）" data-gd="${escapeHtml(g.id)}">${icon("trash")}</span>`;
+      return `<span class="emoji-group-tab${g.id === emojiCurGroup ? " on" : ""}" data-g="${escapeHtml(g.id)}">
+        ${escapeHtml(g.name)}<span class="g-count">${cnt}</span>${extra}
+      </span>`;
+    })
+    .join("");
+  box.innerHTML = tabs + `<button class="emoji-group-add" id="em-group-add">＋ 新建分组</button>`;
+  box.querySelectorAll("[data-g]").forEach((t) =>
+    t.addEventListener("click", (e) => {
+      if (e.target.closest("[data-gr]") || e.target.closest("[data-gd]")) return; // 管理按钮不切分组
+      emojiCurGroup = t.dataset.g;
+      renderEmojiGroups();
+      renderEmojiList();
+    })
+  );
+  box.querySelectorAll("[data-gr]").forEach((b) =>
+    b.addEventListener("click", async () => {
+      const g = emojiGroups.find((x) => x.id === b.dataset.gr);
+      if (!g) return;
+      const name = prompt("分组名", g.name);
+      if (!name || name === g.name) return;
+      try {
+        await api.send(`/api/emojis/groups/${g.id}`, { method: "PUT", body: JSON.stringify({ name }) });
+        toast("✓ 已重命名");
+        await loadEmojiList();
+      } catch (e) { toast(e.message, false); }
+    })
+  );
+  box.querySelectorAll("[data-gd]").forEach((b) =>
+    b.addEventListener("click", async () => {
+      const g = emojiGroups.find((x) => x.id === b.dataset.gd);
+      if (!g) return;
+      if (!confirm(`删除分组「${g.name}」？组内表情会移回「默认」分组。`)) return;
+      try {
+        await api.send(`/api/emojis/groups/${g.id}`, { method: "DELETE" });
+        if (emojiCurGroup === g.id) emojiCurGroup = "default";
+        toast("✓ 已删除");
+        await loadEmojiList();
+      } catch (e) { toast(e.message, false); }
+    })
+  );
+  $("#em-group-add").addEventListener("click", async () => {
+    const name = prompt("新分组名");
+    if (!name) return;
+    try {
+      await api.send("/api/emojis/groups", { method: "POST", body: JSON.stringify({ name }) });
+      toast("✓ 已创建");
+      await loadEmojiList();
+    } catch (e) { toast(e.message, false); }
+  });
+}
+
 async function loadEmojiList() {
   const box = $("#em-list");
-  if (!box) return;
   try {
     const r = await api.get("/api/emojis");
     emojiLib = r.emojis ?? [];
-    if ($("#em-count")) $("#em-count").textContent = `${emojiLib.length} / ${r.max ?? 200}`;
-    if (!emojiLib.length) {
-      box.innerHTML = '<div class="muted">库里还没有表情，上面添加第一个</div>';
-      return;
+    emojiGroups = r.groups ?? [];
+    if ($("#em-count")) {
+      const cnt = emojiLib.filter((e) => e.group === emojiCurGroup).length;
+      $("#em-count").textContent = `${cnt} / ${r.max ?? 300}`;
     }
-    box.innerHTML = emojiLib
-      .map(
-        (e) => `<div class="emoji-item" data-id="${escapeHtml(e.id)}">
-          <img src="${escapeHtml(e.url)}" alt="${escapeHtml(e.name)}" loading="lazy">
-          <div class="emoji-name">${escapeHtml(e.name)}</div>
-          <div class="emoji-exp">${escapeHtml(e.explanation || "（未写用法）")}</div>
-          <div class="row">
-            <button class="ghost small-btn" data-act="edit">编辑</button>
-            <button class="danger small-btn" data-act="del">删除</button>
-          </div>
-        </div>`
-      )
-      .join("");
-    box.querySelectorAll("button[data-act]").forEach((b) =>
-      b.addEventListener("click", () => {
-        const id = b.closest(".emoji-item").dataset.id;
-        const item = emojiLib.find((x) => x.id === id);
-        if (!item) return;
-        if (b.dataset.act === "del") return delEmoji(item);
-        editEmoji(item);
-      })
-    );
+    if ($("#em-group-title")) $("#em-group-title").textContent = emojiGroups.find((g) => g.id === emojiCurGroup)?.name ?? "默认";
+    renderEmojiGroups();
+    renderEmojiList();
   } catch (e) {
-    box.innerHTML = `<div class="muted">读取失败：${escapeHtml(e.message)}</div>`;
+    if (box) box.innerHTML = `<div class="muted">读取失败：${escapeHtml(e.message)}</div>`;
   }
+}
+
+function renderEmojiList() {
+  const box = $("#em-list");
+  if (!box) return;
+  const items = emojiLib.filter((e) => e.group === emojiCurGroup);
+  if (!items.length) {
+    box.innerHTML = '<div class="muted">这个分组还没有表情，上面添加第一个</div>';
+    return;
+  }
+  const groupOpts = emojiGroups.filter((g) => g.id !== emojiCurGroup).map((g) => `<option value="${escapeHtml(g.id)}">${escapeHtml(g.name)}</option>`).join("");
+  box.innerHTML = items
+    .map(
+      (e) => `<div class="emoji-item" data-id="${escapeHtml(e.id)}">
+        <img src="${escapeHtml(e.url)}" alt="${escapeHtml(e.name)}" loading="lazy">
+        <div class="emoji-name">${escapeHtml(e.name)}</div>
+        <div class="emoji-exp">${escapeHtml(e.explanation || "（未写用法）")}</div>
+        <div class="row">
+          <button class="ghost small-btn" data-act="edit">编辑</button>
+          <button class="danger small-btn" data-act="del">删除</button>
+        </div>
+        <div class="row" style="gap:4px">
+          <select class="em-move" data-mid="${escapeHtml(e.id)}" title="复制/移动到其他分组">
+            <option value="">移动到…</option>
+            ${groupOpts}
+          </select>
+          <button class="ghost small-btn" data-act="copy" title="复制一份到其他分组">复制</button>
+        </div>
+      </div>`
+    )
+    .join("");
+  box.querySelectorAll("button[data-act]").forEach((b) =>
+    b.addEventListener("click", () => {
+      const id = b.closest(".emoji-item").dataset.id;
+      const item = emojiLib.find((x) => x.id === id);
+      if (!item) return;
+      if (b.dataset.act === "del") return delEmoji(item);
+      if (b.dataset.act === "copy") return copyEmojiToGroup(item);
+      editEmoji(item);
+    })
+  );
+  box.querySelectorAll("select.em-move").forEach((sel) =>
+    sel.addEventListener("change", async () => {
+      const target = sel.value;
+      if (!target) return;
+      const id = sel.dataset.mid;
+      const item = emojiLib.find((x) => x.id === id);
+      if (!item) return;
+      const destName = emojiGroups.find((g) => g.id === target)?.name;
+      try {
+        await api.send(`/api/emojis/${id}/move`, { method: "POST", body: JSON.stringify({ group: target, copy: false }) });
+        toast("✓ 已移动到「" + destName + "」");
+        await loadEmojiList();
+      } catch (e) { toast(e.message, false); }
+    })
+  );
+}
+
+/** 复制表情到其他分组（选目标分组） */
+async function copyEmojiToGroup(item) {
+  const others = emojiGroups.filter((g) => g.id !== emojiCurGroup);
+  if (!others.length) return toast("没有其他分组可复制", false);
+  const name = prompt("复制「" + item.name + "」到哪个分组？（填分组名）\n可选：" + others.map((g) => g.name).join("、"));
+  if (!name) return;
+  const dest = others.find((x) => x.name === name.trim());
+  if (!dest) return toast("没找到分组「" + name + "」", false);
+  try {
+    await api.send(`/api/emojis/${item.id}/move`, { method: "POST", body: JSON.stringify({ group: dest.id, copy: true }) });
+    toast("✓ 已复制到「" + dest.name + "」");
+    await loadEmojiList();
+  } catch (e) { toast(e.message, false); }
 }
 
 async function addEmojiToLib() {
@@ -4551,7 +5062,7 @@ async function addEmojiToLib() {
   try {
     // 二进制直传：跳过 FileReader/base64/JSON，大图导入更快
     const ext = (f.name.split(".").pop() || "png").toLowerCase();
-    const q = new URLSearchParams({ name, ext, exp: $("#em-exp").value.trim() }).toString();
+    const q = new URLSearchParams({ name, ext, exp: $("#em-exp").value.trim(), group: emojiCurGroup }).toString();
     const r = await fetchApi("/api/emojis/raw?" + q, {
       method: "POST",
       headers: { "Content-Type": "application/octet-stream" },
@@ -4610,11 +5121,15 @@ const routes = {
   tts: { render: renderTtsPage, init: initTtsPage },
   memory: { render: renderMemory, init: initMemory },
   emojis: { render: renderEmojis, init: initEmojis },
-  // 插件商店已并入设置页（暂未开放），旧地址 #/plugins 兼容跳转设置
-  plugins: { render: renderSettings, init: initSettings },
+  // 设置子页（设置菜单里长条按键跳转过来）
+  skills: { render: renderSkillsPage, init: initSkillsPage },
+  mcp: { render: renderMcpPage, init: initMcpPage },
+  logs: { render: renderLogsPage, init: initLogsPage },
+  plugins: { render: renderPluginsPage, init: initPluginsPage },
+  data: { render: renderDataPage, init: initDataPage },
+  notice: { render: renderNoticePage, init: initNoticePage },
   workbench: { render: renderWorkbenchSettings, init: initWorkbenchSettings },
   capabilities: { render: renderWorkbenchSettings, init: initWorkbenchSettings }, // 旧地址 #/capabilities 兼容
-  data: { render: renderSettings, init: initSettings }, // 旧地址 #/data 兼容（已并入设置）
   settings: { render: renderSettings, init: initSettings },
 };
 

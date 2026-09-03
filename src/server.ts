@@ -34,8 +34,20 @@ import {
   deletePreset,
   resetBuiltinPresets,
   resolveCardPresetBlocks,
+  resolveCardPresetExamples,
   type PresetKind,
 } from "./core/presets.js";
+import { sanitizeChatReply } from "./core/sanitize.js";
+import { claimGreeting, isGreeted, clearGreeted } from "./core/greetedStore.js";
+import {
+  runLifeTick,
+  applyLifeConfig,
+  recordUserContact,
+  readQQKnownUsers,
+  readWXKnownUsers,
+  buildMoodPrompt,
+  type LifeState,
+} from "./core/lifeScheduler.js";
 import { TOOL_REGISTRY, toolsToOpenAI, resolveInSandbox, type ToolDef, type ToolCtx } from "./tools/registry.js";
 import { allSkills, saveUserSkills, skillPromptsByIds, type UserSkill } from "./core/skillStore.js";
 import { FEATURES, filterDisabledTools } from "./core/features.js";
@@ -74,12 +86,18 @@ import {
   emojiUrl,
   buildEmojiPrompt,
   migrateLegacyEmojis,
+  listGroups,
+  addGroup,
+  renameGroup,
+  deleteGroup,
+  moveEmojiToGroup,
   MAX_EMOJIS,
 } from "./core/emojiStore.js";
 import {
   listBots,
   addBot,
   removeBot,
+  getBotByCard,
   agentWorkspaceDir,
   applyAgentHumanDelay,
   applyAgentModel,
@@ -100,9 +118,15 @@ import {
   exportMemoryToMarkdown,
   exportAllMemoriesToMarkdown,
   pushChatRound,
-  MEMORY_CATEGORIES,
-  type MemoryCategory,
 } from "./core/memoryStore.js";
+import { appendConv, readConv, clearConv, type ConvSurface } from "./core/conversationStore.js";
+import {
+  pollSessionTurns,
+  findSession,
+  sessionKeyOf,
+  clearObserveCursor,
+  type MirrorTurn,
+} from "./core/sessionMirror.js";
 
 // 加载项目 .env（仅补环境变量空缺，如 OPENCLAW_SHELL_UI_USER/PASS）
 async function loadEnv(): Promise<void> {
@@ -275,6 +299,43 @@ app.get("/api/cards/:slug", async (req, res) => {
   }
 });
 
+// ---------- 开场白：领取 / 查询 / 清除（避免冷场 + 不重复触发） ----------
+// userKey 由调用方传：本地聊天用 "local"，通道侧用 "qq:<openid>" / "wx:<openid>"。
+// claim = 原子领取：首次返回 first_mes 并标记已开场；已开场过返回 null（前端不再显示）。
+app.post("/api/cards/:slug/greeting/claim", async (req, res) => {
+  try {
+    const { userKey } = req.body ?? {};
+    const card = await store.get(req.params.slug);
+    const firstMes = card.sillytavern_v2?.first_mes?.trim() ?? "";
+    const text = await claimGreeting(card.slug, String(userKey ?? ""), firstMes);
+    res.json({ greeted: text !== null, text });
+  } catch (e) {
+    res.status(500).json({ error: toUserError(e) });
+  }
+});
+
+app.get("/api/cards/:slug/greeting", async (req, res) => {
+  try {
+    const card = await store.get(req.params.slug);
+    const userKey = String(req.query.userKey ?? "");
+    const greeted = await isGreeted(card.slug, userKey);
+    res.json({ greeted, firstMes: card.sillytavern_v2?.first_mes?.trim() ?? "" });
+  } catch {
+    res.status(404).json({ error: "找不到这张卡，可能已被删除" });
+  }
+});
+
+app.post("/api/cards/:slug/greeting/clear", async (req, res) => {
+  try {
+    const { userKey } = req.body ?? {};
+    const card = await store.get(req.params.slug);
+    await clearGreeted(card.slug, userKey ? String(userKey) : undefined);
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: toUserError(e) });
+  }
+});
+
 app.post("/api/cards", async (req, res) => {
   try {
     const { name, slug, role } = req.body ?? {};
@@ -316,6 +377,10 @@ app.put("/api/cards/:slug", async (req, res) => {
     }
     await store.save(body);
     const tv2 = Date.now();
+    // AI 生命配置变更 → 同步到调度状态（intervalHours=0 时清空冷却）
+    if (body.life) {
+      await applyLifeConfig(body.slug, body.life).catch(() => {});
+    }
     logInfo(
       "卡片",
       `更新 ${body.name ?? body.slug} 共 ${tv2 - tv0}ms`,
@@ -335,6 +400,12 @@ app.delete("/api/cards/:slug", async (req, res) => {
     const root = dataDir();
     await fs.rm(path.join(root, "memory", `${slug}.mem`), { force: true }).catch(() => {});
     await fs.rm(path.join(root, "memory", `${slug}.mem.count`), { force: true }).catch(() => {});
+    // 对话日志（老格式 + 按用户拆分的 <slug>.<ns>.chatlog.jsonl）
+    for (const f of await fs.readdir(path.join(root, "memory")).catch(() => [])) {
+      if (f.startsWith(`${slug}.`) && f.endsWith(".chatlog.jsonl")) {
+        await fs.rm(path.join(root, "memory", f), { force: true }).catch(() => {});
+      }
+    }
     // 工作区文件是所有卡共享的，删卡不动它；只清这张卡专属的目录
     await Promise.all(
       ["sandbox", "emojis", "images", "agent-workspaces"].map((sub) =>
@@ -1031,11 +1102,15 @@ const ROLE_ZH_MAP: Record<string, string> = {
 
 app.post("/api/cards/ai-draft", async (req, res) => {
   try {
-    const { idea, role } = req.body ?? {};
+    const { idea, role, model } = req.body ?? {};
     const ideaText = String(idea ?? "").trim();
     if (!ideaText) return res.status(400).json({ error: "先描述你的想法，AI 才能帮你生成草稿" });
     const r = role && RELATION_ROLES.includes(role) ? role : "friend";
-    const llm = await resolveChatLLM();
+    // 允许指定模型（"提供商::模型"）；不传用默认提供商
+    const draftModel = typeof model === "string" && model.trim() ? model.trim() : "";
+    const llm = draftModel
+      ? await resolveChatLLM({ model: { provider: draftModel.split("::")[0], model: draftModel.split("::")[1] ?? undefined } })
+      : await resolveChatLLM();
     if (!llm) return res.status(400).json({ error: "未配置模型 API。请先到「API 与模型」页添加提供商并设为默认" });
 
 
@@ -1068,7 +1143,19 @@ app.post("/api/cards/ai-draft", async (req, res) => {
 3. 世界书 3-6 条；「人物形象」必须 constant=true 且内容完整（这是角色扮演的核心依据）
 4. 语言风格要具体可执行：给出日常/情绪波动时不同的说话方式示例
 5. 全程中文输出（cover_prompt 必须全英文，除外）；regex 一般留空数组
-6. cover_prompt 根据角色设定生成：必须全英文，体现"根据角色内容生成的封面"（角色在其世界场景中的画面），不要写成头像/证件照`;
+6. cover_prompt 根据角色设定生成：必须全英文，体现"根据角色内容生成的封面"（角色在其世界场景中的画面），不要写成头像/证件照
+
+## 写卡铁律（必须遵守，违反即不合格）
+1. 所有设定用「陈述性条目」写，禁止小说式描写、禁止环境铺陈、禁止形容词堆砌。
+   ❌ 错误示例："她站在月光下的窗前，微风拂过她的发梢，眼神中带着一丝落寞……"
+   ✅ 正确示例："外貌：银白色长发，蓝瞳；性格：外冷内热，嘴硬心软；习惯：紧张时咬嘴唇。"
+2. 「人物形象」只写角色的静态事实（身份/外貌/性格/语言习惯/喜好/雷区），
+   不要写动态剧情、不要写场景、不要写任何叙事性文字。
+3. 「世界观」只写角色需要知道的规则与背景，≤3 条核心事实；不写风土人情的长篇介绍。
+4. 字数上限：人物形象 ≤400 字，世界观 ≤200 字，其余条目 ≤150 字。
+5. 语言风格给「可执行规则 + 1-2 个对话示例」，不要抽象形容词（如"温柔""可爱"要落到具体句式）。
+6. 整张卡的目的是「让模型能扮演这个角色」，不是「写一篇小说」——所有内容都要是
+   扮演时可直接依据的设定，禁止任何与扮演无关的叙事、抒情或氛围描写。`;
 
     const userMsg = `角色的想法：${ideaText}\n关系类型：${ROLE_ZH_MAP[r] ?? "朋友"}`;
     const ctrl = new AbortController();
@@ -1669,9 +1756,10 @@ function workspaceFilesDir(): string {
   return path.join(dataDir(), "workspace-files");
 }
 
-function chatCtx(slug: string): ToolCtx {
+function chatCtx(slug: string, ns = "local"): ToolCtx {
   return {
     slug,
+    ns,
     sandboxDir: workspaceFilesDir(),
     memoryPath: path.join(dataDir(), "memory", `${slug}.mem`),
     imagesDir: path.join(dataDir(), "images", slug),
@@ -1680,10 +1768,12 @@ function chatCtx(slug: string): ToolCtx {
 
 app.post("/api/chat", async (req, res) => {
   try {
-    const { slug, message, history, tools, skills, thinking, useMCP, model } = req.body ?? {};
+    const { slug, message, history, tools, skills, thinking, useMCP, model, userKey } = req.body ?? {};
     if (!slug || !message) return res.status(400).json({ error: "请选择卡片并输入内容" });
     const card = await store.get(slug).catch(() => null);
     if (!card) return res.status(404).json({ error: "找不到这张卡，可能已被删除" });
+    // 当前对话作用域（记忆隔离维度）：网页聊天固定 local，未来多用户/通道按会话传入
+    const ns = typeof userKey === "string" && userKey.trim() ? userKey.trim() : "local";
     // 本次聊天可临时换模型（"提供商::模型" 形式），不传则用卡片自己的设置
     const llm = await resolveChatLLM(overrideCardModel(card, model));
     if (!llm || !llm.apiKey) return res.status(400).json({ error: "未配置模型 API（API 页）" });
@@ -1695,12 +1785,17 @@ app.post("/api/chat", async (req, res) => {
       ? await skillPromptsByIds(Array.isArray(skills) ? (skills as string[]) : [])
       : [];
 
-    // 相关召回：按关键词重合 + 新鲜度取与当前话题最相关的记忆（最多 30 条）
-    const memories = await recall(slug, message, 30).catch(() => []);
+    // 相关召回：按关键词重合 + 新鲜度取与当前话题最相关的记忆（最多 20 条）。
+    // 只召回「当前用户私密 + 所有用户共享」的记忆，避免不同用户的事实互相污染
+    const memories = await recall(slug, message, 30, ns).catch(() => []);
     const memoryBlock = memories.length
-      ? `\n\n【长期记忆（关于用户的事实，仅在相关时使用；要新增事实时调用 memory_save 工具）】\n- ${memories
-          .map((m) => `[${m.cat}] ${m.fact}`)
+      ? `\n\n【长期记忆（关于你的事实，仅在相关时使用；【关键】为必须遵守的长期约定；要新增事实时调用 memory_save 工具）】\n- ${memories
+          .map((m) => `${m.important ? "【关键】" : ""}${m.fact}`)
           .join("\n- ")}`
+      : "";
+    // 显式「记住」触发规则：只有启用了 memory_save 工具才注入，避免模型嘴上说记住却没工具可调
+    const rememberRule = enabledTools.includes("memory_save")
+      ? `\n\n【记忆规则】用户明确说「记住/以后都/总是/不要/我喜欢/我讨厌/偏好」或分享重要个人信息、决定、计划时，主动调用 memory_save 工具保存为长期记忆；保存后简单确认即可（如「记住了」），不要反复强调；一次性闲聊内容不要保存。`
       : "";
 
     // 思考档位：关闭/自动 → 不传（由模型默认）；低/中/高/极高 → reasoning_effort（对齐 rikkahub：极高=xhigh）
@@ -1734,21 +1829,49 @@ app.post("/api/chat", async (req, res) => {
         : "") +
       skillPrompts.map((p) => "\n" + p).join("") +
       memoryBlock +
+      rememberRule +
       (mcpErrors.length ? `\n\n（MCP 连接提示：${mcpErrors.join("；")}）` : "");
 
     // 表情包注入：全局共享库（关闭档不注入）
-    system += await buildEmojiPrompt(card.voice?.message_style?.emoji ?? "克制");
+    system += await buildEmojiPrompt(card.voice?.message_style?.emoji ?? "克制", "inline", card.emojiGroups);
+
+    // 破甲示范对话（few-shot 锚定）：从所选档位预设的 <example> 块解析，注入在真实对话开头。
+    // 对齐 RP-Hub 的「system 破限 + user/AI 消息注入」三重结构，弱模型靠模仿比靠指令更稳。
+    const presetExamples = await resolveCardPresetExamples(card);
+
+    // 开场白上下文：这是全新对话（前端无历史）且卡有 first_mes 时，把它作为已发出的
+    // assistant 消息注入，模型才知道"已经开过场"，接得上话（配合前端 greeting API 显示气泡）。
+    const isFreshChat = !Array.isArray(history) || history.length === 0;
+    const firstMes = card.sillytavern_v2?.first_mes?.trim() ?? "";
+    const openedWithGreeting = isFreshChat && firstMes ? firstMes : "";
 
     const messages: unknown[] = [
       { role: "system", content: system },
+      ...(presetExamples.length
+        ? presetExamples.map((e) => ({ role: e.role, content: `（示范对话，仅作语气/尺度参考，不要复述）${e.content}` }))
+        : []),
+      ...(openedWithGreeting ? [{ role: "assistant", content: openedWithGreeting }] : []),
       ...(Array.isArray(history) ? history.slice(-20) : []),
       { role: "user", content: message },
     ];
-    logInfo("聊天", `${card.name} 用 ${llm.provider}/${llm.model}` + (toolDefs.length ? ` · 工具 ${toolDefs.length} 个` : ""));
-    const result = await runToolLoop(llm, messages, toolDefs, chatCtx(slug), card.tools?.policy === "ask", reasoning);
+    logInfo("聊天", `${card.name} 用 ${llm.provider}/${llm.model}` + (toolDefs.length ? ` · 工具 ${toolDefs.length} 个` : "") + (presetExamples.length ? " · 破甲示范注入" : ""));
+    // 记录用户活跃（AI 生命调度用：重置该用户 missedBeats）
+    void recordUserContact(card.slug, "local").catch(() => {});
+    // 统一会话日志：网页聊天的轮次也落盘（绑定后网页与通道互传、记录相同）
+    void appendConv(slug, { role: "user", content: String(message ?? ""), surface: "web", ns }).catch(() => {});
+    const result = await runToolLoop(llm, messages, toolDefs, chatCtx(slug, ns), card.tools?.policy === "ask", reasoning);
+    // 出站清理：剥离低级模型泄漏的纯文本思维链（「分析：」「（思考）」等前缀行）
+    if (result.type === "reply" && typeof result.reply === "string") {
+      const cleaned = sanitizeChatReply(card, result.reply);
+      if (cleaned !== result.reply) {
+        logWarn("清洗", `${card.name} 回复剥离了思维链残留`);
+        result.reply = cleaned;
+      }
+    }
     if (result.type === "reply") {
+      void appendConv(slug, { role: "assistant", content: String(result.reply ?? ""), surface: "web", ns }).catch(() => {});
       // 滑动分批自动总结记忆（后台执行，不阻塞回复）
-      void autoMemorize(slug, card, message, (result as { reply?: string }).reply ?? "").catch(() => {});
+      void autoMemorize(slug, card, message, (result as { reply?: string }).reply ?? "", ns).catch(() => {});
     }
     res.json(result);
   } catch (e) {
@@ -1761,24 +1884,29 @@ async function autoMemorize(
   slug: string,
   card: { model?: { provider?: string; model?: string }; memoryConfig?: { auto_rounds?: number } },
   userMsg: string,
-  reply: string
+  reply: string,
+  ns = "local"
 ): Promise<void> {
-  const rounds = card.memoryConfig?.auto_rounds ?? 20;
+  const rounds = card.memoryConfig?.auto_rounds ?? 10;
   if (!rounds || rounds < 1) return;
-  // 追加本轮并取回「最早的一段」（若未到 2N 轮则返回空，最近 N 轮不受影响）
+  // 追加本轮并取回「最早的一段」（若未到 保护20+N 则返回空，最近 20 轮原样保留不总结）。
+  // 对话日志按用户（ns）分开存，总结时不会把不同用户的对话混在一起
   const segment = await pushChatRound(
     slug,
     { u: String(userMsg ?? "").slice(0, 500), a: String(reply ?? "").slice(0, 500), t: new Date().toISOString() },
-    rounds
+    rounds,
+    ns
   ).catch(() => []);
   if (!segment.length) return;
   // 记忆总结固定用这张卡的聊天模型
   const llm = await resolveChatLLM(card as never);
   if (!llm?.apiKey) return;
+  // 总结字数上限随 N：1-10 轮 ≤100 字；11-20 轮 ≤200 字（批次越大允许越详实）
+  const maxLen = rounds <= 10 ? 100 : 200;
   // 已记住的只带最近 100 条给 LLM，避免 token 随文件膨胀
   const existing = (await readAllMemories().then((m) => m[slug] ?? []).catch(() => []))
     .slice(-100)
-    .map((e) => `- [${e.cat}] ${e.fact}`)
+    .map((e) => `- ${e.important ? "【关键】" : ""}${e.fact}`)
     .join("\n");
   const recent = segment
     .map((r) => `用户: ${r.u}\n角色: ${r.a}`)
@@ -1794,41 +1922,41 @@ async function autoMemorize(
           {
             role: "system",
             content:
-              "你是记忆提取器。从下面的对话中提取【值得长期记住的用户事实】（名字/住址/喜好/重要事件/关系等），给每条打分类标签：" +
-              `分类只能是：${MEMORY_CATEGORIES.join("/")}。已经记住的不要重复；没有新事实就返回空数组。` +
-              "输出严格 JSON 数组，每项是 {fact: 事实文本, cat: 分类}，不要任何其他文字。",
+              "你是记忆提炼器。把下面的对话提炼成【一条】简洁的长期记忆，抓住重点（用户的名字/住址/喜好/习惯/关系/重要决定/共同经历等）。要求：\n" +
+              "1. 只输出一条总结性记忆（不是列表），口语化、简练，不超过 " +
+              maxLen +
+              " 字；\n" +
+              "2. 若对话里用户表达了【长期、绝对的约定或强烈偏好】（出现「总是、以后都、永远、一直、记住、我绝对、我特别喜欢/讨厌、无论如何」等词），把 important 设为 true（关键记忆，必须长期遵守）；否则 false；\n" +
+              "3. 提炼 2-5 个关键词放进 keywords（用于之后聊天出现这些词时召回这条记忆）。\n" +
+              "4. 已记住的不要重复。没有值得记的内容就返回 {\"skip\": true}。\n" +
+              "输出严格 JSON：{\"summary\":\"...\",\"important\":true/false,\"keywords\":[\"...\"]}，不要任何其他文字。",
           },
-          { role: "user", content: `已记住的事实：\n${existing || "（无）"}\n\n最近对话：\n${recent}` },
+          { role: "user", content: `已记住的记忆：\n${existing || "（无）"}\n\n最近对话：\n${recent}` },
         ],
         temperature: 0.2,
-        max_tokens: 600,
+        max_tokens: 500,
       }),
       signal: AbortSignal.timeout(45000),
     });
     if (!r.ok) return;
     const data = await r.json();
     const text = String(data.choices?.[0]?.message?.content ?? "").replace(/```json|```/g, "").trim();
-    const start = text.indexOf("[");
-    const end = text.lastIndexOf("]");
+    const start = text.indexOf("{");
+    const end = text.lastIndexOf("}");
     if (start === -1 || end === -1) return;
-    const facts = JSON.parse(text.slice(start, end + 1));
-    if (!Array.isArray(facts) || facts.length === 0) return;
-    const items = facts
-      .map((f) => {
-        const o = f as { fact?: unknown; cat?: unknown };
-        const fact = typeof o.fact === "string" ? o.fact.trim() : "";
-        const cat = (MEMORY_CATEGORIES as readonly string[]).includes(String(o.cat ?? ""))
-          ? (o.cat as MemoryCategory)
-          : "信息";
-        return fact ? { fact, cat } : null;
-      })
-      .filter((x): x is { fact: string; cat: MemoryCategory } => x !== null)
-      .slice(0, 10);
-    if (!items.length) return;
-    for (const it of items) {
-      await appendEntry(slug, { fact: it.fact, cat: it.cat, src: "auto" }).catch(() => {});
-    }
-    void exportMemoryToMarkdown(slug).catch(() => {});
+    const o = JSON.parse(text.slice(start, end + 1)) as { summary?: unknown; important?: unknown; keywords?: unknown; skip?: unknown };
+    if (o.skip === true) return;
+    const fact = typeof o.summary === "string" ? o.summary.trim().slice(0, maxLen) : "";
+    if (!fact) return;
+    const keywords = Array.isArray(o.keywords)
+      ? o.keywords.map((k) => String(k).trim()).filter(Boolean).slice(0, 5)
+      : [];
+    const important = o.important === true;
+    await appendEntry(slug, { fact, keywords, important, src: "auto", ns }).catch(() => {});
+    void (async () => {
+      await exportMemoryToMarkdown(slug).catch(() => {});
+      await syncAgentUserMemory(slug).catch(() => {});
+    })().catch(() => {});
   } catch {
     /* 自动记忆失败不影响聊天 */
   }
@@ -1836,11 +1964,12 @@ async function autoMemorize(
 
 app.post("/api/chat/approve", async (req, res) => {
   try {
-    const { slug, messages, approve, tools, useMCP, model } = req.body ?? {};
+    const { slug, messages, approve, tools, useMCP, model, userKey } = req.body ?? {};
     if (!slug || !Array.isArray(messages)) return res.status(400).json({ error: "请选择卡片并输入内容" });
     // 与 /api/chat 保持一致：用卡片单独配置的模型（否则审批续聊会静默换回默认模型）
     const card = await store.get(slug).catch(() => null);
     if (!card) return res.status(404).json({ error: "找不到这张卡，可能已被删除" });
+    const ns = typeof userKey === "string" && userKey.trim() ? userKey.trim() : "local";
     const llm = await resolveChatLLM(overrideCardModel(card, model));
     if (!llm || !llm.apiKey) return res.status(400).json({ error: "未配置模型 API（API 页）" });
     const enabledTools = Array.isArray(tools) ? (tools as string[]) : [];
@@ -1848,22 +1977,21 @@ app.post("/api/chat/approve", async (req, res) => {
     const last = messages[messages.length - 1] as { tool_calls?: ToolCallMsg[] };
     const toolCalls = (last?.tool_calls ?? []).filter((tc) => tc.function?.name);
     if (approve) {
-      await executeToolCalls(toolDefs, toolCalls, messages, chatCtx(slug));
+      await executeToolCalls(toolDefs, toolCalls, messages, chatCtx(slug, ns));
     } else {
       for (const tc of toolCalls) {
         messages.push({ role: "tool", tool_call_id: tc.id ?? "", content: "用户拒绝执行此工具调用" });
       }
     }
-    const result = await runToolLoop(llm, messages, toolDefs, chatCtx(slug), card.tools?.policy === "ask");
+    const result = await runToolLoop(llm, messages, toolDefs, chatCtx(slug, ns), card.tools?.policy === "ask");
     if (result.type === "reply") {
       // 与 /api/chat 一致：审批续聊后的回复同样计入自动记忆（用户消息取 messages 里最后一条 user）
       const lastUser = [...messages].reverse().find((m) => (m as { role?: string }).role === "user");
-      void autoMemorize(
-        slug,
-        card,
-        String((lastUser as { content?: string } | undefined)?.content ?? ""),
-        (result as { reply?: string }).reply ?? ""
-      ).catch(() => {});
+      const userText = String((lastUser as { content?: string } | undefined)?.content ?? "");
+      const replyText = (result as { reply?: string }).reply ?? "";
+      void appendConv(slug, { role: "user", content: userText, surface: "web", ns }).catch(() => {});
+      void appendConv(slug, { role: "assistant", content: String(replyText), surface: "web", ns }).catch(() => {});
+      void autoMemorize(slug, card, userText, replyText, ns).catch(() => {});
     }
     res.json(result);
   } catch (e) {
@@ -2209,17 +2337,258 @@ app.post("/api/memory/clear", async (req, res) => {
   }
 });
 
-// 手动添加一条记忆
+// 一键重置（网页聊天页「重置」按钮）：清空该卡全部记忆 + 对话日志 + 开场状态，
+// 让 AI 忘掉之前的所有事（含通道用户记住的事实），可重新开场、重塑角色形象。不可恢复。
+app.post("/api/cards/:slug/reset", async (req, res) => {
+  try {
+    const slug = req.params.slug;
+    await clearMemory(slug); // 记忆 + 按用户拆分的对话日志 + 导出 md
+    await clearGreeted(slug); // 全部开场状态（local 与通道用户都清），允许重新开场
+    await clearConv(slug); // 统一会话日志
+    await clearObserveCursor(slug); // 通道观察游标
+    await fs.rm(mirrorStateFile(slug), { force: true }).catch(() => {}); // 镜像目标状态
+    // 剥离 agent 工作区 USER.md 里的记忆段（记忆没了，这个也该清，否则通道 agent 读到幽灵记忆）
+    const userMd = path.join(agentWorkspaceDir(slug), "USER.md");
+    const existing = await fs.readFile(userMd, "utf8").catch(() => "");
+    if (existing.includes(USER_MEMORY_START)) {
+      const base = existing.replace(new RegExp(`${USER_MEMORY_START}[\\s\\S]*?${USER_MEMORY_END}\\s*`, "g"), "").trimEnd();
+      await fs.writeFile(userMd, base + "\n", "utf8");
+    }
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: toUserError(e) });
+  }
+});
+
+// ---------- 跨端会话（本地网页 ↔ QQ/微信）：统一日志 + 通道观察 + 网页驱动通道 ----------
+// 设计（用户拍板）：机器人只跟一个人聊（=你），本地网页与微信/QQ 是同一段对话的两个窗口。
+//   绑定（联通）：网页发消息经通道 agent 会话驱动（回复同时投递到微信/QQ 并回显网页）；
+//               通道里用户发来的消息由观察器轮询同步进网页 —— 两边记录相同。
+//   未绑定（断开）：网页聊天照常走 /api/chat（local），轮次也落日志；记忆与对话不丢不串。
+//   解绑：记忆保留；重新绑定同一账号 → 同一会话键 → 对话续上。
+
+function nsOfChannel(channel: BotChannel): string {
+  return channel === "qqbot" ? "qq" : "wx";
+}
+
+function surfaceOfChannel(channel: BotChannel): ConvSurface {
+  return channel === "qqbot" ? "qq" : "wx";
+}
+
+// 镜像状态：data/memory/<slug>.mirror.json = { openid, sessionId, lastSyncAt }
+function mirrorStateFile(slug: string): string {
+  return path.join(dataDir(), "memory", `${slug}.mirror.json`);
+}
+
+async function readMirrorState(slug: string): Promise<{ openid?: string; sessionId?: string; lastSyncAt?: string }> {
+  try {
+    return JSON.parse(await fs.readFile(mirrorStateFile(slug), "utf8"));
+  } catch {
+    return {};
+  }
+}
+
+async function writeMirrorState(slug: string, s: { openid?: string; sessionId?: string; lastSyncAt?: string }): Promise<void> {
+  const file = mirrorStateFile(slug);
+  await fs.mkdir(path.dirname(file), { recursive: true });
+  await fs.writeFile(file, JSON.stringify(s, null, 2), "utf8");
+}
+
+/** 绑定的目标用户：优先上次用过的 openid（用户说了机器人只跟一个人聊，不弹选择），
+ *  否则取该通道最近互动的已知用户；通道还没人聊过时返回 null。 */
+async function mirrorTargetOf(bot: BotInstance): Promise<{ openid: string } | null> {
+  const state = await readMirrorState(bot.cardSlug);
+  if (state.openid) return { openid: state.openid };
+  const users = bot.channel === "qqbot" ? await readQQKnownUsers() : await readWXKnownUsers();
+  if (!users.length) return null;
+  const lastAt = (u: { openid: string; lastInteractionAt?: number }): number => u.lastInteractionAt ?? 0;
+  const sorted = [...users].sort((a, b) => lastAt(b) - lastAt(a));
+  return { openid: sorted[0].openid };
+}
+
+/** 观察一张卡的通道会话：增量同步进统一日志 + 喂自动记忆。返回新增轮次数。 */
+async function observeCard(slug: string): Promise<number> {
+  const bot = await getBotByCard(slug);
+  if (!bot) return 0;
+  const target = await mirrorTargetOf(bot);
+  if (!target) return 0;
+  const ns = `${nsOfChannel(bot.channel)}:${target.openid}`;
+  const { sessionId, turns } = await pollSessionTurns(slug, bot, target.openid);
+  if (!turns.length) return 0;
+  for (const t of turns) {
+    void appendConv(slug, { role: t.role, content: t.content, surface: surfaceOfChannel(bot.channel), ns }).catch(() => {});
+  }
+  // 配对 user/assistant 喂自动记忆（assistant 与前一条 user 组成一轮；单条不配对等下一批）
+  const card = await store.get(slug).catch(() => null);
+  let pendingUser = "";
+  for (const t of turns) {
+    if (t.role === "user") pendingUser = t.content;
+    else if (t.role === "assistant" && pendingUser) {
+      if (card) void autoMemorize(slug, card, pendingUser, t.content, ns).catch(() => {});
+      void recordUserContact(slug, target.openid).catch(() => {});
+      pendingUser = "";
+    }
+  }
+  if (sessionId) {
+    await writeMirrorState(slug, { openid: target.openid, sessionId, lastSyncAt: new Date().toISOString() });
+  }
+  return turns.length;
+}
+
+/** 解析 `openclaw agent --json` 输出里的回复文本（实测结构：result.payloads[].text /
+ *  result.meta.finalAssistantVisibleText；另兼容顶层 reply/text/content 形态） */
+function parseAgentReply(stdout: string): string {
+  const clean = stripAnsi(stdout).trim();
+  const tryParse = (s: string): unknown => {
+    try {
+      return JSON.parse(s);
+    } catch {
+      return null;
+    }
+  };
+  let obj = tryParse(clean) as Record<string, unknown> | null;
+  if (!obj) {
+    const start = clean.indexOf("{");
+    const end = clean.lastIndexOf("}");
+    if (start >= 0 && end > start) obj = tryParse(clean.slice(start, end + 1)) as Record<string, unknown> | null;
+  }
+  if (!obj) return "";
+  // 形态 1（openclaw agent --json 实测）：result.payloads[].text 拼接
+  const result = obj.result as { payloads?: { text?: unknown }[]; meta?: { finalAssistantVisibleText?: unknown } } | undefined;
+  if (result && typeof result === "object") {
+    if (Array.isArray(result.payloads) && result.payloads.length) {
+      const texts = result.payloads.map((p) => (typeof p?.text === "string" ? p.text : "")).filter(Boolean);
+      if (texts.length) return texts.join("\n").trim();
+    }
+    if (typeof result.meta?.finalAssistantVisibleText === "string") {
+      return result.meta.finalAssistantVisibleText.trim();
+    }
+  }
+  // 形态 2：顶层 reply/text/content/message/output
+  const cand = (["reply", "text", "content", "message", "output"] as const).find((k) => obj?.[k] !== undefined);
+  if (cand) {
+    const v = obj[cand];
+    if (typeof v === "string" && v.trim()) return v.trim();
+    if (v && typeof v === "object") {
+      const t = (v as { text?: unknown }).text ?? (v as { content?: unknown }).content;
+      if (typeof t === "string" && t.trim()) return t.trim();
+    }
+  }
+  return "";
+}
+
+// 会话日志：绑定（联通）返回完整记录；未绑定只返回网页本地会话
+app.get("/api/cards/:slug/conversation", async (req, res) => {
+  try {
+    const slug = req.params.slug;
+    const bot = await getBotByCard(slug);
+    const entries = await readConv(slug);
+    const list = bot ? entries : entries.filter((e) => e.surface === "web");
+    res.json({ bound: !!bot, entries: list });
+  } catch (e) {
+    res.status(500).json({ error: toUserError(e) });
+  }
+});
+
+// 镜像状态（前端判断「已联通」与显示提示用）
+app.get("/api/cards/:slug/mirror/status", async (req, res) => {
+  try {
+    const slug = req.params.slug;
+    const bot = await getBotByCard(slug);
+    if (!bot) return res.json({ bound: false });
+    const target = await mirrorTargetOf(bot);
+    const state = await readMirrorState(slug);
+    res.json({
+      bound: true,
+      channel: bot.channel,
+      accountId: bot.accountId,
+      agentId: bot.agentId,
+      openid: target?.openid ?? "",
+      ns: target ? `${nsOfChannel(bot.channel)}:${target.openid}` : "",
+      sessionId: state.sessionId ?? "",
+      lastSyncAt: state.lastSyncAt ?? "",
+    });
+  } catch (e) {
+    res.status(500).json({ error: toUserError(e) });
+  }
+});
+
+// 手动触发一次观察同步（前端轮询/打开页面时用）
+app.post("/api/cards/:slug/mirror/sync", async (req, res) => {
+  try {
+    const added = await observeCard(req.params.slug);
+    res.json({ ok: true, added });
+  } catch (e) {
+    res.status(500).json({ error: toUserError(e) });
+  }
+});
+
+// 网页驱动通道：把网页消息发给绑定账号的用户（agent 会话生成回复 → 投递微信/QQ → 回显网页）
+app.post("/api/cards/:slug/mirror/send", async (req, res) => {
+  try {
+    const slug = req.params.slug;
+    const text = String(req.body?.message ?? "").trim();
+    if (!text) return res.status(400).json({ error: "消息不能为空" });
+    const card = await store.get(slug).catch(() => null);
+    if (!card) return res.status(404).json({ error: "找不到这张卡" });
+    const bot = await getBotByCard(slug);
+    if (!bot) return res.status(400).json({ error: "这张卡没有绑定机器人，无法投递到微信/QQ" });
+    const target = await mirrorTargetOf(bot);
+    if (!target) {
+      return res.status(400).json({ error: "通道还没有聊过的人：先在微信/QQ 里和机器人说句话，再来这里接续会话。" });
+    }
+    const ns = `${nsOfChannel(bot.channel)}:${target.openid}`;
+    const uEntry = await appendConv(slug, { role: "user", content: text, surface: surfaceOfChannel(bot.channel), ns }).catch(() => null);
+    void recordUserContact(slug, target.openid).catch(() => {});
+    const r = await runOpenclaw(
+      [
+        "agent",
+        "--agent",
+        bot.agentId,
+        "--session-key",
+        sessionKeyOf(bot.agentId, bot.accountId, target.openid),
+        "--message",
+        text,
+        "--deliver",
+        "--json",
+      ],
+      { timeoutMs: 180000 }
+    );
+    if (r.code !== 0) {
+      return res.status(502).json({ error: `通道代理执行失败（${r.code}）：${stripAnsi(r.stdout + r.stderr).slice(-300)}` });
+    }
+    const reply = parseAgentReply(r.stdout);
+    if (!reply) {
+      return res.status(502).json({ error: `无法解析通道回复：${stripAnsi(r.stdout).slice(-300)}` });
+    }
+    const aEntry = await appendConv(slug, { role: "assistant", content: reply, surface: surfaceOfChannel(bot.channel), ns }).catch(() => null);
+    void autoMemorize(slug, card, text, reply, ns).catch(() => {});
+    res.json({
+      ok: true,
+      reply,
+      entryIds: [uEntry?.id, aEntry?.id].filter(Boolean),
+    });
+  } catch (e) {
+    res.status(500).json({ error: toUserError(e) });
+  }
+});
+
+// 手动添加一条记忆（管理页添加 = 所有用户可见；ns 可传 local / qq:xxx 指定归属；important=关键记忆；keywords=触发词）
 app.post("/api/memory/:slug", async (req, res) => {
   try {
-    const { fact, cat } = req.body ?? {};
+    const { fact, ns, important, keywords } = req.body ?? {};
     const result = await appendEntry(req.params.slug, {
       fact: String(fact ?? ""),
-      cat: cat as MemoryCategory,
+      important: important === true,
+      keywords: Array.isArray(keywords) ? keywords : [],
       src: "manual",
+      ns: typeof ns === "string" && ns.trim() ? ns.trim() : "shared",
     });
     if (!result.ok) return res.json({ ok: false, duplicate: result.duplicate === true });
-    void exportMemoryToMarkdown(req.params.slug).catch(() => {});
+    void (async () => {
+      await exportMemoryToMarkdown(req.params.slug).catch(() => {});
+      await syncAgentUserMemory(req.params.slug).catch(() => {});
+    })().catch(() => {});
     res.json({ ok: true, entry: result.entry });
   } catch (e) {
     res.status(500).json({ error: toUserError(e) });
@@ -2232,24 +2601,31 @@ app.post("/api/memory/:slug/delete", async (req, res) => {
     const id = String(req.body?.id ?? "");
     if (!id) return res.status(400).json({ error: "id 不能为空" });
     const removed = await deleteEntry(req.params.slug, id);
-    void exportMemoryToMarkdown(req.params.slug).catch(() => {});
+    void (async () => {
+      await exportMemoryToMarkdown(req.params.slug).catch(() => {});
+      await syncAgentUserMemory(req.params.slug).catch(() => {});
+    })().catch(() => {});
     res.json({ ok: removed });
   } catch (e) {
     res.status(500).json({ error: toUserError(e) });
   }
 });
 
-// 编辑单条记忆（fact / cat）
+// 编辑单条记忆（fact / important / keywords）
 app.post("/api/memory/:slug/update", async (req, res) => {
   try {
-    const { id, fact, cat } = req.body ?? {};
+    const { id, fact, important, keywords } = req.body ?? {};
     if (!id) return res.status(400).json({ error: "id 不能为空" });
     const entry = await updateEntry(req.params.slug, String(id), {
       fact: typeof fact === "string" ? fact : undefined,
-      cat: cat as MemoryCategory,
+      important: typeof important === "boolean" ? important : undefined,
+      keywords: Array.isArray(keywords) ? keywords : undefined,
     });
     if (!entry) return res.status(404).json({ error: "记忆不存在" });
-    void exportMemoryToMarkdown(req.params.slug).catch(() => {});
+    void (async () => {
+      await exportMemoryToMarkdown(req.params.slug).catch(() => {});
+      await syncAgentUserMemory(req.params.slug).catch(() => {});
+    })().catch(() => {});
     res.json({ ok: true, entry });
   } catch (e) {
     res.status(500).json({ error: toUserError(e) });
@@ -2271,16 +2647,64 @@ app.get("/api/emojis", async (_req, res) => {
       if (cards.length) await migrateLegacyEmojis(cards).catch(() => 0);
     }
     const emojis = await listEmojis();
-    res.json({ emojis: emojis.map((e) => ({ ...e, url: emojiUrl(e.file) })), max: MAX_EMOJIS });
+    const groups = await listGroups();
+    res.json({
+      emojis: emojis.map((e) => ({ ...e, url: emojiUrl(e.file) })),
+      groups,
+      max: MAX_EMOJIS,
+    });
   } catch (e) {
     res.status(500).json({ error: toUserError(e) });
   }
 });
 
+// ---------- 分组管理 ----------
+app.post("/api/emojis/groups", async (req, res) => {
+  try {
+    const { name } = req.body ?? {};
+    const g = await addGroup(String(name ?? ""));
+    res.status(201).json({ ok: true, group: g, groups: await listGroups() });
+  } catch (e) {
+    res.status(400).json({ error: toUserError(e) });
+  }
+});
+
+app.put("/api/emojis/groups/:id", async (req, res) => {
+  try {
+    const { name } = req.body ?? {};
+    const g = await renameGroup(req.params.id, String(name ?? ""));
+    if (!g) return res.status(404).json({ error: "分组不存在" });
+    res.json({ ok: true, group: g, groups: await listGroups() });
+  } catch (e) {
+    res.status(400).json({ error: toUserError(e) });
+  }
+});
+
+app.delete("/api/emojis/groups/:id", async (req, res) => {
+  try {
+    await deleteGroup(req.params.id);
+    res.json({ ok: true, groups: await listGroups() });
+  } catch (e) {
+    res.status(400).json({ error: toUserError(e) });
+  }
+});
+
+// 移动 / 复制表情到其他分组（copy=true 复制，false 移动）
+app.post("/api/emojis/:id/move", async (req, res) => {
+  try {
+    const { group, copy } = req.body ?? {};
+    const item = await moveEmojiToGroup(req.params.id, String(group ?? ""), copy === true);
+    if (!item) return res.status(404).json({ error: "表情不存在" });
+    res.json({ ok: true, emoji: { ...item, url: emojiUrl(item.file) } });
+  } catch (e) {
+    res.status(400).json({ error: toUserError(e) });
+  }
+});
+
 app.post("/api/emojis", async (req, res) => {
   try {
-    const { name, explanation, imageBase64, ext } = req.body ?? {};
-    const item = await addEmoji({ name, explanation, imageBase64, ext });
+    const { name, explanation, imageBase64, ext, group } = req.body ?? {};
+    const item = await addEmoji({ name, explanation, imageBase64, ext, group });
     res.json({ ok: true, emoji: { ...item, url: emojiUrl(item.file) } });
   } catch (e) {
     res.status(400).json({ error: toUserError(e) });
@@ -2293,10 +2717,11 @@ app.post("/api/emojis/raw", express.raw({ type: "application/octet-stream", limi
     const name = String(req.query?.name ?? "").trim();
     const explanation = String(req.query?.exp ?? "").slice(0, 100);
     const ext = String(req.query?.ext ?? "png").toLowerCase();
+    const group = String(req.query?.group ?? "") || undefined;
     const buf = req.body as Buffer;
     if (!name) return res.status(400).json({ error: "表情名不能为空" });
     if (!buf || !buf.length) return res.status(400).json({ error: "缺少图片内容" });
-    const item = await addEmoji({ name, explanation, imageBase64: buf.toString("base64"), ext });
+    const item = await addEmoji({ name, explanation, imageBase64: buf.toString("base64"), ext, group });
     res.json({ ok: true, emoji: { ...item, url: emojiUrl(item.file) } });
   } catch (e) {
     res.status(400).json({ error: toUserError(e) });
@@ -2306,8 +2731,8 @@ app.post("/api/emojis/raw", express.raw({ type: "application/octet-stream", limi
 
 app.post("/api/emojis/:id", async (req, res) => {
   try {
-    const { name, explanation } = req.body ?? {};
-    const item = await updateEmoji(req.params.id, { name, explanation });
+    const { name, explanation, group } = req.body ?? {};
+    const item = await updateEmoji(req.params.id, { name, explanation, group });
     if (!item) return res.status(404).json({ error: "表情不存在" });
     res.json({ ok: true, emoji: { ...item, url: emojiUrl(item.file) } });
   } catch (e) {
@@ -3040,6 +3465,84 @@ app.post("/api/plugins/toggle", async (req, res) => {
 
 
 
+// ---------- 记忆检索路径：确保 OpenClaw 能索引 memory-export（通道 agent 可搜到本地记忆） ----------
+// shell 把记忆导出到 data/memory-export/*.md；OpenClaw 靠 agents.defaults.memorySearch.extraPaths
+// 把这些 md 纳入 memory_search 索引，通道端（QQ/微信）agent 才能检索到网页聊出来的记忆。
+// 之前只做了导出、没配索引路径——"通道读不到本地记忆"的根因之一。路径用 dataDir() 动态算，不硬编码。
+async function ensureMemorySearchExtraPaths(): Promise<boolean> {
+  const cfgPath = path.join(os.homedir(), ".openclaw", "openclaw.json");
+  let cfg: Record<string, any>;
+  try {
+    cfg = JSON.parse(await fs.readFile(cfgPath, "utf8"));
+  } catch {
+    return false; // 没有配置文件不动（网关首启会生成）
+  }
+  const exportDir = path.join(dataDir(), "memory-export");
+  cfg.agents ??= {};
+  cfg.agents.defaults ??= {};
+  cfg.agents.defaults.memorySearch ??= {};
+  const arr = Array.isArray(cfg.agents.defaults.memorySearch.extraPaths)
+    ? (cfg.agents.defaults.memorySearch.extraPaths as string[])
+    : [];
+  if (arr.includes(exportDir)) return false; // 已配置
+  arr.push(exportDir);
+  cfg.agents.defaults.memorySearch.extraPaths = arr;
+  await fs.writeFile(cfgPath, JSON.stringify(cfg, null, 2), "utf8");
+  return true;
+}
+
+/**
+ * USER.md 里记忆段的起止标记（便于重置时精确剥离，不破坏 OpenClaw 自己的用户档案）
+ */
+const USER_MEMORY_START = "<!-- openclaw-shell:user-memory-start -->";
+const USER_MEMORY_END = "<!-- openclaw-shell:user-memory-end -->";
+
+/**
+ * 通道读本地记忆（免向量、免搜索）：把该卡的记忆合并进绑定 agent 工作区根目录的 USER.md。
+ * USER.md 是 OpenClaw 每轮必注入的"用户档案"文件（embedded 与网关都注入，已实测），
+ * 所以记忆每次对话都自动带上——等价于"记忆代替聊天记录插入"，不依赖 memory_search/向量。
+ * 保留 USER.md 原有内容（OpenClaw 自己的用户档案），只追加一段带标记的记忆区。
+ */
+async function syncAgentUserMemory(slug: string): Promise<void> {
+  const bot = await getBotByCard(slug);
+  if (!bot) return;
+  const mdPath = path.join(dataDir(), "memory-export", `${slug}.md`);
+  const content = await fs.readFile(mdPath, "utf8").catch(() => "");
+  const userMd = path.join(agentWorkspaceDir(slug), "USER.md");
+  // 剥离旧的记忆段（若存在），保留原档案
+  const existing = await fs.readFile(userMd, "utf8").catch(() => "");
+  const base = existing.replace(new RegExp(`${USER_MEMORY_START}[\\s\\S]*?${USER_MEMORY_END}\\s*`, "g"), "").trimEnd();
+  const memSection = content.trim()
+    ? `\n\n${USER_MEMORY_START}\n${content.trim()}\n${USER_MEMORY_END}`
+    : "";
+  await fs.mkdir(agentWorkspaceDir(slug), { recursive: true });
+  await fs.writeFile(userMd, base + memSection + "\n", "utf8");
+}
+
+/** 通道会话观察器：每 5 秒把绑定卡的通道新对话同步进统一日志与记忆（网页可见） */
+let mirrorTimer: ReturnType<typeof setInterval> | null = null;
+function startMirrorObserver(): void {
+  if (mirrorTimer) return;
+  mirrorTimer = setInterval(() => {
+    void (async () => {
+      for (const bot of await listBots().catch(() => [])) {
+        try {
+          await observeCard(bot.cardSlug);
+        } catch {
+          /* 单卡观察失败不影响其他 */
+        }
+      }
+    })();
+  }, 5000);
+  if (mirrorTimer.unref) mirrorTimer.unref();
+}
+
+// 确保 OpenClaw 索引 memory-export（通道 agent 可搜索本地记忆）。必须在 listen 前完成：
+// start-stack 先起 server 再起 gateway，这里 await 落盘后网关读到的一定是新配置。
+await ensureMemorySearchExtraPaths().then((changed) => {
+  if (changed) logInfo("记忆", "已写入 OpenClaw memorySearch.extraPaths 索引路径");
+});
+
 app.listen(PORT, HOST, () => {
   logInfo("启动", `服务已启动 http://${HOST}:${PORT}`);
   console.log(`卡片目录: ${store["dir"]}`);
@@ -3051,11 +3554,84 @@ app.listen(PORT, HOST, () => {
   // 记忆导出：启动时同步全部卡的记忆到 md（供 OpenClaw memorySearch.extraPaths 索引）
   void exportAllMemoriesToMarkdown().then((slugs) => {
     if (slugs.length) logInfo("记忆", `已导出 ${slugs.length} 张卡的记忆`);
+    // 免向量方案：绑定卡的记忆同步进 agent 工作区 user-memory.md（通道 agent 直接读取）
+    void (async () => {
+      for (const b of await listBots().catch(() => [])) {
+        await syncAgentUserMemory(b.cardSlug).catch(() => {});
+      }
+    })();
   });
+  // 通道会话观察器：网页 ↔ 微信/QQ 互传、通道对话进记忆（每 5 秒）
+  startMirrorObserver();
   // 预热通道状态：这条查询要跑 openclaw CLI（冷启动 30s+），
   // 先在后台跑一次填进缓存，用户进通道页就不用干等
   void getChannelStatuses(true).then((all) => {
     const ids = Object.keys(all);
     if (ids.length) logInfo("通道", `状态已预热：${ids.join(", ")}`);
   });
+  // AI 生命调度：每分钟检查一次有哪些卡的主动消息到期
+  startLifeScheduler();
 });
+
+// ---------- AI 生命调度器（主动发消息） ----------
+// 触发链路：openclaw system event --mode now --session-key <agentId>:<accountId>:<openid>
+//   → 唤醒该卡的 agent → 模型生成角色化消息 → 经通道发给用户（已验证可行）。
+let lifeTimer: ReturnType<typeof setInterval> | null = null;
+
+/** 查某卡绑定的机器人（agentId + accountId） */
+async function lifeAgentOf(slug: string): Promise<{ agentId: string; accountId: string } | null> {
+  const bot = (await listBots()).find((b) => b.cardSlug === slug);
+  if (!bot) return null;
+  return { agentId: bot.agentId, accountId: bot.accountId };
+}
+
+/** 查某卡的所有已知用户（QQ known-users + 微信账号） */
+async function lifeKnownUsersOf(slug: string): Promise<{ openid: string }[]> {
+  const bot = (await listBots()).find((b) => b.cardSlug === slug);
+  if (!bot) return [];
+  if (bot.channel === "qqbot") return readQQKnownUsers();
+  return readWXKnownUsers();
+}
+
+/** 触发一次主动消息：system event 唤醒 agent 会话 */
+async function lifeTrigger(
+  slug: string,
+  agentId: string,
+  accountId: string,
+  openid: string,
+  moodPrompt: string
+): Promise<boolean> {
+  const sessionKey = `${agentId}:${accountId}:${openid}`;
+  const r = await runOpenclaw(
+    ["system", "event", "--mode", "now", "--session-key", sessionKey, "--text", moodPrompt, "--timeout", "60000"],
+    { timeoutMs: 90000 }
+  );
+  if (r.code === 0) {
+    logInfo("AI生命", `${slug} → ${openid} 主动消息已触发`);
+    return true;
+  }
+  logWarn("AI生命", `${slug} → ${openid} 触发失败：${stripAnsi(r.stdout + r.stderr).slice(-300)}`);
+  return false;
+}
+
+/** 启动心跳循环（每分钟检查；只在有配置的卡时才真正调 CLI） */
+function startLifeScheduler(): void {
+  if (lifeTimer) return;
+  lifeTimer = setInterval(async () => {
+    try {
+      const bots = await listBots();
+      if (bots.length === 0) return;
+      const cards = [];
+      for (const b of bots) {
+        const c = await store.get(b.cardSlug).catch(() => null);
+        if (c?.life?.intervalHours && c.life.intervalHours > 0) cards.push({ slug: c.slug, life: c.life });
+      }
+      if (cards.length === 0) return;
+      const fired = await runLifeTick(cards, lifeTrigger, lifeKnownUsersOf, lifeAgentOf);
+      if (fired.length) logInfo("AI生命", `本轮主动消息 ${fired.length} 条`);
+    } catch (e) {
+      logWarn("AI生命", `调度异常：${String(e).slice(0, 300)}`);
+    }
+  }, 60 * 1000);
+  logInfo("AI生命", "调度器已启动（每分钟检查一次主动消息）");
+}
