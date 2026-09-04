@@ -381,12 +381,23 @@ app.put("/api/cards/:slug", async (req, res) => {
     if (body.life) {
       await applyLifeConfig(body.slug, body.life).catch(() => {});
     }
+    // 卡的变化 → 通道端（QQ/微信）：有绑定机器人时自动重编译 workspace + 同步模型/节奏。
+    // 之前只靠手动点「重新应用」，改模型/人设后通道端一直用旧配置。
+    let channelSyncNote = "";
+    if (await getBotByCard(body.slug).catch(() => null)) {
+      try {
+        channelSyncNote = await syncCardToChannel(body as PersonaCard);
+        logInfo("通道同步", `${body.name ?? body.slug} ${channelSyncNote}`);
+      } catch (e) {
+        logWarn("通道同步", `卡片保存后同步通道失败：${toUserError(e)}`);
+      }
+    }
     logInfo(
       "卡片",
       `更新 ${body.name ?? body.slug} 共 ${tv2 - tv0}ms`,
       `体积 ${Math.round(JSON.stringify(body).length / 1024)}KB · 校验 ${tv1 - tv0}ms · 落盘 ${tv2 - tv1}ms`
     );
-    res.json({ card: body, warnings: result.warnings });
+    res.json({ card: body, warnings: result.warnings, channelSync: channelSyncNote || undefined });
   } catch (e) {
     res.status(500).json({ error: toUserError(e) });
   }
@@ -442,6 +453,27 @@ async function compileForBot(card: PersonaCard): Promise<{ workspace: string; fi
   const out = await compileCard(parsed, agentWorkspaceDir(parsed.slug));
   await compileCard(parsed, path.join(dataDir(), "workspace")).catch(() => {});
   return out;
+}
+
+/** 卡片保存后把变化同步到通道端：重编译 agent workspace + 同步模型/节奏。
+ *  仅当该卡有绑定机器人时调用（卡片改动不再需要手动点「重新应用」）。 */
+async function syncCardToChannel(card: PersonaCard): Promise<string> {
+  const bot = await getBotByCard(card.slug);
+  if (!bot) return "";
+  const notes: string[] = [];
+  // ① 重编译：人设/世界书/预设/开场白/表情分组 → agent workspace（SKILL.md 等）
+  const out = await compileForBot(card);
+  notes.push(`已重编译 ${out.files.length} 个文件`);
+  // ② 模型：卡的高级配置改了模型 → agent 模型（agents add 只写了一次，必须这里同步）
+  const llm = await resolveChatLLM(card);
+  if (llm) {
+    const model = `${llm.provider}/${llm.model}`;
+    const changed = await applyAgentModel(bot.agentId, model).catch(() => false);
+    if (changed) notes.push(`模型已切到 ${model}（重启网关后生效）`);
+  }
+  // ③ 节奏：humanDelay 同步（与创建/重编译接口一致）
+  await applyAgentHumanDelay(bot.agentId, card.chat?.delay).catch(() => {});
+  return notes.join("；");
 }
 
 app.post("/api/cards/:slug/compile", async (req, res) => {
@@ -2395,14 +2427,19 @@ async function writeMirrorState(slug: string, s: { openid?: string; sessionId?: 
 }
 
 /** 绑定的目标用户：优先上次用过的 openid（用户说了机器人只跟一个人聊，不弹选择），
- *  否则取该通道最近互动的已知用户；通道还没人聊过时返回 null。 */
+ *  否则取该通道最近互动的已知用户；通道还没人聊过时返回 null。
+ *  已知用户里带 accountId 的（QQ known-users.json）先按当前 bot 的账号过滤，
+ *  避免 bot 绑 A 账号却把消息投给 B 账号的用户（串台）。 */
 async function mirrorTargetOf(bot: BotInstance): Promise<{ openid: string } | null> {
   const state = await readMirrorState(bot.cardSlug);
   if (state.openid) return { openid: state.openid };
   const users = bot.channel === "qqbot" ? await readQQKnownUsers() : await readWXKnownUsers();
   if (!users.length) return null;
   const lastAt = (u: { openid: string; lastInteractionAt?: number }): number => u.lastInteractionAt ?? 0;
-  const sorted = [...users].sort((a, b) => lastAt(b) - lastAt(a));
+  // 优先取当前账号下的用户；账号无记录时才回退到全局最近互动（老数据/微信无账号维度）
+  const mine = users.filter((u) => !("accountId" in u) || u.accountId === bot.accountId);
+  const pool = mine.length ? mine : users;
+  const sorted = [...pool].sort((a, b) => lastAt(b) - lastAt(a));
   return { openid: sorted[0].openid };
 }
 

@@ -119,6 +119,8 @@ export async function applyAgentHumanDelay(
  * 更新 agent 用的模型（`provider/model` 形式）。
  * 模型只在 `agents add --model` 时写过一次，卡片后来改了专属模型必须靠这里同步，
  * 否则通道端会一直用旧模型。返回 true 表示确实改动了配置。
+ * openclaw.json 里 agent 的 model 字段可能是字符串（"p/m"，agents add 写入）
+ * 也可能是对象（{ primary: "p/m" }，老代码写入）——两种都识别，写回时保持原形态。
  */
 export async function applyAgentModel(agentId: string, model: string): Promise<boolean> {
   if (!model || !model.includes("/")) return false;
@@ -133,11 +135,11 @@ export async function applyAgentModel(agentId: string, model: string): Promise<b
   cfg.agents.list ??= [];
   const list = cfg.agents.list as { id?: string; model?: unknown }[];
   const entry = list.find((a) => a.id === agentId);
-  const next = { primary: model };
-  const cur = entry?.model as { primary?: string } | undefined;
-  if (cur?.primary === model) return false; // 没变就别写盘（避免触发网关无谓的重载）
-  if (entry) entry.model = next;
-  else list.push({ id: agentId, model: next });
+  const cur = entry?.model as string | { primary?: string } | undefined;
+  const curPrimary = typeof cur === "string" ? cur : cur?.primary;
+  if (curPrimary === model) return false; // 没变就别写盘（避免触发网关无谓的重载）
+  if (entry) entry.model = typeof cur === "string" ? model : { primary: model };
+  else list.push({ id: agentId, model: { primary: model } });
   await fs.writeFile(cfgPath, JSON.stringify(cfg, null, 2), "utf8");
   return true;
 }

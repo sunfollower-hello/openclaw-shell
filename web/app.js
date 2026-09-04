@@ -3506,7 +3506,7 @@ const CHAT_IMG_RE = /(\/img\/[A-Za-z0-9_./-]+\.(?:png|jpe?g|webp|gif))/gi;
 const CHAT_EMOJI_RE = /\[表情:([^\]]+)\]/g;
 
 /** 当前聊天用的卡片：卡片编辑器里是 editingCard，工作台里是 wbCardObj */
-function curCard() { return editingCard || wbCardObj; }
+function curCard() { return wbCardObj || editingCard; }
 
 /**
  * 应用卡片里的正则替换（酒馆 regex_scripts）到 AI 回复上。

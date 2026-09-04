@@ -200,7 +200,7 @@ export async function runLifeTick(
 
 // ---------- 已知用户来源：qqbot 插件 known-users.json / 微信账号索引 ----------
 /** 读 qqbot 插件记录的已知用户（openid 列表） */
-export async function readQQKnownUsers(): Promise<{ openid: string; lastInteractionAt?: number }[]> {
+export async function readQQKnownUsers(): Promise<{ openid: string; accountId?: string; lastInteractionAt?: number }[]> {
   try {
     const f = path.join(os.homedir(), ".openclaw", "qqbot", "data", "known-users.json");
     const j = JSON.parse(await fs.readFile(f, "utf8"));
@@ -210,6 +210,8 @@ export async function readQQKnownUsers(): Promise<{ openid: string; lastInteract
       .filter((x: unknown) => x && typeof x === "object")
       .map((x: Record<string, unknown>) => ({
         openid: String(x.openid ?? x.id ?? x.userId ?? ""),
+        // accountId 用于镜像/主动消息按账号过滤目标用户（避免跨账号串台）
+        accountId: typeof x.accountId === "string" && x.accountId ? x.accountId : undefined,
         lastInteractionAt: typeof x.lastInteractionAt === "number" ? x.lastInteractionAt : undefined,
       }))
       .filter((x: { openid: string }) => x.openid);
