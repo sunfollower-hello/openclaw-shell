@@ -1285,7 +1285,7 @@ async function wbPreview(p) {
 
 
 // ============================================================
-//  视图：人设卡库（RP-Hub 式头像卡片网格 + 编辑表单）
+//  视图：人设卡库（分条式头像卡片网格 + 编辑表单）
 // ============================================================
 let cardsGridData = [];
 let cardSearch = "";
@@ -2009,7 +2009,7 @@ async function saveCard() {
   } catch (e) { toast("保存失败：" + e.message, false); }
 }
 
-/** 卡库卡片上的删除（RP-Hub 式，直接在卡上操作） */
+/** 卡库卡片上的删除（分条式，直接在卡上操作） */
 async function deleteCardBySlug(slug, name) {
   if (!confirm(`确定删除「${name}」？不可恢复。`)) return;
   try {
@@ -4168,24 +4168,24 @@ async function wsLoadOverview() {
 // ============================================================
 //  视图：预设库（侧边栏「预设」）—— 档位/风格管理，卡片高级配置里引用
 // ============================================================
-let presetStoreData = { tiers: [], styles: [] };
+let presetStoreData = { tiers: [], styles: [], rules: [] };
 
 async function loadPresetStore() {
-  presetStoreData = await api.get("/api/presets").catch(() => ({ tiers: [], styles: [] }));
+  presetStoreData = await api.get("/api/presets").catch(() => ({ tiers: [], styles: [], rules: [] }));
   return presetStoreData;
 }
 
 function renderPresetEditor(kind, list) {
-  const title = kind === "tier" ? "档位（扮演模式与内容尺度）" : "风格（叙述风格）";
-  const hint =
-    kind === "tier"
-      ? "档位决定扮演模式与内容尺度：目前只保留「破甲（最高）」（不破甲已整合进破甲，不再区分）。"
-      : "风格决定输出形式：纯对话（只有对白，一条消息最多 2 个逗号）/ 重描写（心理用（）包裹、动作用 {} 包裹）。";
+  const meta = {
+    tier: { title: "档位（扮演模式与内容尺度）", hint: "档位决定扮演模式与内容尺度：目前只保留「破甲（最高）」（不破甲的内容已整合进来）。" },
+    style: { title: "风格（叙述风格）", hint: "风格决定输出形式：纯对话（只有对白，一条消息最多 2 个逗号）/ 重描写（心理（）动作 {}）。" },
+    rule: { title: "全局规则（独立条目，不跟卡片绑定）", hint: "每条规则是一个独立条目，可单独改插入位置或编辑内容；聊天时全部按各自位置注入。" },
+  }[kind];
   const roleLabel = (r) => (r === "user" ? "用户消息" : r === "assistant" ? "AI 消息" : "系统提示词");
   return `
   <div class="card-box">
-    <h3>${icon("sliders")} ${title}</h3>
-    <p class="hint">${hint}</p>
+    <h3>${icon("sliders")} ${meta.title}</h3>
+    <p class="hint">${meta.hint}</p>
     <div class="preset-list" id="preset-${kind}-list">
       ${list
         .map(
@@ -4206,30 +4206,33 @@ function renderPresetEditor(kind, list) {
         .join("")}
     </div>
     <div class="row" style="margin-top:10px">
-      <button class="ghost small-btn preset-add" data-kind="${kind}">${icon("plus")} 新增自定义${kind === "tier" ? "档位" : "风格"}</button>
+      <button class="ghost small-btn preset-add" data-kind="${kind}">${icon("plus")} 新增自定义${kind === "tier" ? "档位" : kind === "style" ? "风格" : "规则"}</button>
       <button class="ghost small-btn preset-reset-all" data-kind="${kind}" style="margin-left:8px">恢复内置</button>
     </div>
   </div>`;
 }
 
 function renderPresets() {
-  const { tiers, styles } = presetStoreData;
+  const { tiers, styles, rules } = presetStoreData;
   return `
   <div class="view">
     <div class="page-head">
       <h2>${icon("sliders")} 角色扮演预设</h2>
-      <p class="hint">预设 = 档位 × 风格。在每张卡的「高级配置」里选择启用（破甲用不用由你自己定）。网页试聊与 QQ/微信 机器人共用这套预设。</p>
+      <p class="hint">预设是一条一条的独立条目：档位和风格在卡片的「高级配置」里选用，全局规则默认全部生效。每条可选插入位置（系统提示词 / AI 消息 / 用户消息）。</p>
     </div>
     ${renderPresetEditor("tier", tiers)}
     <div style="height:12px"></div>
     ${renderPresetEditor("style", styles)}
+    <div style="height:12px"></div>
+    ${renderPresetEditor("rule", rules)}
     <div class="card-box" style="margin-top:12px">
       <h3>${icon("info")} 说明</h3>
       <ul class="guide">
-        <li>卡片高级配置（编辑卡 → 右上角 ⚙ 高级配置）里可选「档位」与「风格」，选了才生效，默认不启用。</li>
-        <li>档位只保留「破甲（最高）」（不破甲的内容已整合进破甲）；风格两种：纯对话 / 重描写，可自由组合。</li>
+        <li>档位只保留「破甲（最高）」（不破甲的内容已整合进破甲）；风格两种：纯对话 / 重描写。</li>
         <li>纯对话：一条消息最多 3 次断句（QQ 气泡里最多 2 个逗号），只有对白；重描写：心理用（）包裹、动作用 {} 包裹。</li>
-        <li>每条预设可设「插入位置」：系统提示词 / 用户消息 / AI 消息；内容里也可用 <code>[系统提示词]</code> <code>[AI消息]</code> <code>[用户消息]</code> 分段标记，把一条拆成多段注入不同位置（RP-Hub 式）。</li>
+        <li>每条预设可设「插入位置」：系统提示词 / 用户消息 / AI 消息；内容里也可用 <code>[系统提示词]</code> <code>[AI消息]</code> <code>[用户消息]</code> 分段标记，把一条拆成多段注入不同位置。</li>
+        <li>风格条目里的示范对话段（[AI消息]/[用户消息]）会注入真实对话开头，让 AI 模仿语气（few-shot）。</li>
+        <li>全局规则（防神化 / 防抢话 / 防跑偏）不跟卡片绑定，默认全部生效；不想用某条就把它改成自定义内容或删掉。</li>
         <li>全局「输出铁律」护栏所有档位/风格生效：剥离思维链、禁止跳出角色、末句不加句号。</li>
         <li>能力触发：卡开了「生图」能力后，AI 会在场景需要时主动生图发图（配置见 生图配置 页）。</li>
         <li>改完预设文本后，网页试聊立即生效；QQ/微信 机器人需在卡片 🤖 机器人里点「重编译」。</li>
@@ -4261,7 +4264,7 @@ function bindPresets() {
     overlay.id = "preset-editor-overlay";
     overlay.innerHTML = `<div class="bot-dialog adv-dialog" style="max-width:640px">
       <div class="bot-dialog-head">
-        <h3>${isNew ? "新增" : "编辑"}${kind === "tier" ? "档位" : "风格"}${isNew ? "" : " · " + escapeHtml(item.name)}</h3>
+        <h3>${isNew ? "新增" : "编辑"}${kind === "tier" ? "档位" : kind === "style" ? "风格" : "规则"}${isNew ? "" : " · " + escapeHtml(item.name)}</h3>
         <button class="ghost small-btn" id="pe-close">${icon("x")}</button>
       </div>
       <div class="bot-form">
@@ -4321,6 +4324,7 @@ function bindPresets() {
   };
   bindList("tier");
   bindList("style");
+  bindList("rule");
   document.querySelectorAll(".preset-add").forEach((btn) => {
     btn.addEventListener("click", () => openEditor(btn.dataset.kind, null, true));
   });

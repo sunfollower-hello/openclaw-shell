@@ -2023,7 +2023,7 @@ app.post("/api/chat/approve", async (req, res) => {
 });
 
 // ---------- 角色扮演预设库（档位/风格，卡片高级配置引用） ----------
-const isPresetKind = (k: string): k is PresetKind => k === "tier" || k === "style";
+const isPresetKind = (k: string): k is PresetKind => k === "tier" || k === "style" || k === "rule";
 
 app.get("/api/presets", async (_req, res) => {
   try {
@@ -2036,7 +2036,7 @@ app.get("/api/presets", async (_req, res) => {
 app.post("/api/presets", async (req, res) => {
   try {
     const { kind, name, content, role } = req.body ?? {};
-    if (!isPresetKind(kind)) return res.status(400).json({ error: "kind 必须是 tier 或 style" });
+    if (!isPresetKind(kind)) return res.status(400).json({ error: "kind 必须是 tier / style / rule" });
     res.status(201).json(await addPreset(kind, String(name ?? ""), String(content ?? ""), role));
   } catch (e) {
     res.status(500).json({ error: toUserError(e) });
@@ -2046,7 +2046,7 @@ app.post("/api/presets", async (req, res) => {
 app.put("/api/presets/:kind/:id", async (req, res) => {
   try {
     const kind = String(req.params.kind);
-    if (!isPresetKind(kind)) return res.status(400).json({ error: "kind 必须是 tier 或 style" });
+    if (!isPresetKind(kind)) return res.status(400).json({ error: "kind 必须是 tier / style / rule" });
     const patch: { name?: string; content?: string; role?: PresetRole } = {};
     if (typeof req.body?.name === "string") patch.name = req.body.name;
     if (typeof req.body?.content === "string") patch.content = req.body.content;
@@ -2060,7 +2060,7 @@ app.put("/api/presets/:kind/:id", async (req, res) => {
 app.delete("/api/presets/:kind/:id", async (req, res) => {
   try {
     const kind = String(req.params.kind);
-    if (!isPresetKind(kind)) return res.status(400).json({ error: "kind 必须是 tier 或 style" });
+    if (!isPresetKind(kind)) return res.status(400).json({ error: "kind 必须是 tier / style / rule" });
     res.json(await deletePreset(kind, String(req.params.id)));
   } catch (e) {
     res.status(500).json({ error: toUserError(e) });
