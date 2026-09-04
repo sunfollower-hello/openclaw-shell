@@ -79,8 +79,6 @@ function toast(msg, ok = true) {
 // 有争议或暂时难做好的能力先整体关掉：界面不显示、逻辑不启用（代码保留，将来想开只改这里）。
 // 后端也有一份同名开关（src/core/features.ts），两边都关才算真的没启用。
 const FEATURES = {
-  skills: false,     // 技能库（内置 + 自定义）
-  mcp: false,        // MCP 工具服务器
   workspace: false,  // 工作区文件面板 / 沙箱读写 / 代码执行
 };
 
@@ -916,12 +914,15 @@ async function wbPickCard(slug) {
     const mir = await api.get(`/api/cards/${encodeURIComponent(slug)}/mirror/status`).catch(() => ({ bound: false }));
     if (mir?.bound) {
       wbMirror = { ...mir, slug };
-      if (subEl) subEl.textContent = `已联通${mir.channel === "qqbot" ? "QQ" : "微信"} · 互传中`;
-      $("#wb-chat-clear").disabled = true; // 绑定模式下清空对话交给「重置」（一键清记忆+记录）
+      if (subEl) subEl.textContent = `已联通${mir.channel === "qqbot" ? "QQ" : "微信"} · 通道消息同步显示`;
+      // 单向同步：通道消息实时显示到本地，本地聊天不发送到通道（清空只清本地记录）
+      $("#wb-chat-clear").disabled = false;
       const conv = await api.get(`/api/cards/${encodeURIComponent(slug)}/conversation`).catch(() => ({ entries: [] }));
       for (const e of conv.entries ?? []) {
-        wbRenderedIds.add(e.id);
-        addChatBubble(e.role === "assistant" ? "bot" : "user", e.content);
+        if (e.surface !== "web") { // 通道消息直接渲染；本地消息由 wbChatHistory 管理
+          wbRenderedIds.add(e.id);
+          addChatBubble(e.role === "assistant" ? "bot" : "user", e.content);
+        }
       }
       wbMirrorTimer = setInterval(() => wbMirrorSync(slug), 3000);
       void wbMirrorSync(slug); // 立即同步一次
@@ -962,6 +963,7 @@ async function wbMirrorSync(slug) {
     }
     const conv = await api.get(`/api/cards/${encodeURIComponent(slug)}/conversation`).catch(() => ({ entries: [] }));
     for (const e of conv.entries ?? []) {
+      if (e.surface === "web") continue; // 本地消息走 wbChatHistory，不重复渲染
       if (wbRenderedIds.has(e.id)) continue;
       wbRenderedIds.add(e.id);
       addChatBubble(e.role === "assistant" ? "bot" : "user", e.content);
@@ -1049,6 +1051,13 @@ function lcModelOverride() {
   return p && m ? `${p}::${m}` : "";
 }
 
+// 发送防抖与截断状态：2 秒内用户连续发消息合并成一次请求（减少 API 浪费、避免强行截断）；
+// 输出未完成时用户发新消息 → 截断当前生成，结合新消息重新输出。
+let wbSendTimer = null;
+let wbSendQueue = [];
+let wbAbort = null;          // 当前 /api/chat 请求的 AbortController（截断用）
+let wbThinkingBubble = null; // "正在输出"占位气泡
+
 async function wbSend() {
   const input = $("#wb-input");
   const message = input.value.trim();
@@ -1056,49 +1065,60 @@ async function wbSend() {
   if (!wbSlug) { addChatBubble("bot", "请先在顶部选一张卡片当助手。"); return; }
   addChatBubble("user", message);
   input.value = "";
+  wbAutoGrow(input); // 清空后收回高度
   wbChatHistory.push({ role: "user", content: message });
+
+  // 上一段输出还没完就发了新消息 → 截断：中止请求、移除占位、丢弃未完成回复
+  if (wbAbort) {
+    wbAbort.abort();
+    wbAbort = null;
+    if (wbThinkingBubble) { wbThinkingBubble.remove(); wbThinkingBubble = null; }
+    addChatBubble("bot", "（已截断上一条输出，将结合你的新消息重新生成）");
+  }
+
+  // 防抖合并：入队后停顿 2 秒无新消息才真正请求
+  wbSendQueue.push(message);
+  if (wbSendTimer) clearTimeout(wbSendTimer);
+  wbSendTimer = setTimeout(() => {
+    wbSendTimer = null;
+    const merged = wbSendQueue.splice(0);
+    if (merged.length) void wbDoSend(merged);
+  }, 2000);
+}
+
+async function wbDoSend(msgs) {
   const btn = $("#wb-send");
   btn.disabled = true;
-  wbAutoGrow(input); // 清空后收回高度
-  // 绑定（联通）模式：走通道 agent 会话（回复同时投递到微信/QQ 并回显网页，聊天记录相同）
-  if (wbMirror?.bound) {
-    try {
-      const r = await api.send(`/api/cards/${encodeURIComponent(wbSlug)}/mirror/send`, {
-        method: "POST",
-        body: JSON.stringify({ message }),
-      });
-      for (const id of r.entryIds ?? []) wbRenderedIds.add(id); // 这两条已显示，防同步重复渲染
-      await addBotReplyHumanLike(r.reply);
-      wbChatHistory.push({ role: "assistant", content: r.reply });
-    } catch (e) {
-      wbChatHistory.pop();
-      addChatBubble("bot", "⚠ " + e.message);
-    }
-    btn.disabled = false;
-    return;
-  }
   // 能力跟随这张卡的「高级配置」；联网搜索由输入框旁的按钮临时叠加
   const cardTools = Array.isArray(wbCardObj?.tools?.enabled) ? [...wbCardObj.tools.enabled] : [];
   const tools = FEATURES.workspace ? cardTools : cardTools.filter((t) => !WORKSPACE_TOOL_IDS.includes(t));
   if ($("#wb-websearch")?.classList.contains("on") && !tools.includes("web_search")) tools.push("web_search");
   wbLastOpts = {
     tools,
-    useMCP: false,
-    skills: [],
     thinking: $("#wb-thinking")?.value ?? wbCardObj?.chat?.thinking ?? "auto",
     model: lcModelOverride(),
   };
+  const ctrl = new AbortController();
+  wbAbort = ctrl;
+  wbThinkingBubble = addChatBubble("bot", "（正在输出… 发新消息可截断重来）");
   try {
     const r = await api.send("/api/chat", {
       method: "POST",
-      body: JSON.stringify({ slug: wbSlug, message, history: wbChatHistory.slice(0, -1), userKey: "local", ...wbLastOpts }),
+      signal: ctrl.signal,
+      body: JSON.stringify({ slug: wbSlug, message: msgs.join("\n"), history: wbChatHistory.slice(0, -msgs.length), userKey: "local", ...wbLastOpts }),
     });
+    if (ctrl.signal.aborted) return;
+    if (wbThinkingBubble) { wbThinkingBubble.remove(); wbThinkingBubble = null; }
     await wbFinishTurn(r);
   } catch (e) {
+    if (ctrl.signal.aborted) return; // 截断不算错误
     wbChatHistory.pop();
+    if (wbThinkingBubble) { wbThinkingBubble.remove(); wbThinkingBubble = null; }
     addChatBubble("bot", "⚠ " + e.message);
+  } finally {
+    if (wbAbort === ctrl) wbAbort = null;
+    btn.disabled = false;
   }
-  btn.disabled = false;
 }
 
 async function wbFinishTurn(r) {
@@ -1115,7 +1135,7 @@ async function wbFinishTurn(r) {
     ok.className = "small-btn primary"; ok.textContent = "执行";
     const no = document.createElement("button");
     no.className = "small-btn danger"; no.textContent = "拒绝";
-    wbPending = { slug: wbSlug, messages: r.messages, tools: wbLastOpts?.tools ?? [], useMCP: false, model: wbLastOpts?.model ?? "", userKey: "local", approve: false };
+    wbPending = { slug: wbSlug, messages: r.messages, tools: wbLastOpts?.tools ?? [], model: wbLastOpts?.model ?? "", userKey: "local", approve: false };
     ok.addEventListener("click", async () => { row.remove(); wbPending.approve = true; await wbApprove(); });
     no.addEventListener("click", async () => { row.remove(); wbPending.approve = false; await wbApprove(); });
     row.append(ok, no);
@@ -1954,7 +1974,7 @@ function cardChatOptions() {
   let tools = Array.isArray(c.tools?.enabled) ? [...c.tools.enabled] : [];
   if (!FEATURES.workspace) tools = tools.filter((t) => !WORKSPACE_TOOL_IDS.includes(t));
   const thinking = c.chat?.thinking ?? "auto";
-  return { tools, useMCP: false, skills: [], thinking };
+  return { tools, thinking };
 }
 
 function showCardsGrid() {
@@ -4044,7 +4064,7 @@ async function refreshQQ(force = false) {
 // ============================================================
 //  视图：工作台设置（原「能力中心」）
 //  工作模式为半独立式：默认纯聊天；开启后首页变为工作台
-//  四块：开关 / 默认能力 / MCP 表单化配置 / 工作区概览
+//  四块：开关 / 默认能力 / 工作区概览
 // ============================================================
 function renderWorkbenchSettings() {
   return `
@@ -4075,14 +4095,6 @@ function renderWorkbenchSettings() {
             <label><input type="checkbox" id="cap-weather"> 天气</label>
             <label><input type="checkbox" id="cap-memory"> 记忆</label>
           </div>
-          ${FEATURES.skills ? `
-          <label>技能</label>
-          <div class="cap-checks">
-            <label><input type="checkbox" id="cap-skill-code"> 代码</label>
-            <label><input type="checkbox" id="cap-skill-trans"> 翻译</label>
-            <label><input type="checkbox" id="cap-skill-write"> 写作</label>
-            <label><input type="checkbox" id="cap-skill-companion"> 陪伴</label>
-          </div>` : ""}
           <label>思考深度</label>
           <select id="cap-thinking">
             <option value="off">关闭</option><option value="auto" selected>自动</option>
@@ -4103,9 +4115,6 @@ function renderWorkbenchSettings() {
   </div>`;
 }
 
-let mcpServers = [];
-let mcpEditing = -1; // >=0 编辑中；-1 新增
-let mcpTestTools = [];
 
 function initWorkbenchSettings() {
   // ---- 工作模式开关 ----
@@ -4131,13 +4140,6 @@ function initWorkbenchSettings() {
   $("#cap-search").checked = tools.includes("web_search");
   $("#cap-weather").checked = tools.includes("weather");
   $("#cap-memory").checked = tools.includes("memory_save");
-  const skills = def.skills ?? [];
-  if ($("#cap-skill-code")) {
-    $("#cap-skill-code").checked = skills.includes("code_expert");
-    $("#cap-skill-trans").checked = skills.includes("translator");
-    $("#cap-skill-write").checked = skills.includes("writing");
-    $("#cap-skill-companion").checked = skills.includes("companion");
-  }
   $("#cap-thinking").value = def.thinking ?? "auto";
   $("#btn-cap-save").addEventListener("click", () => {
     const t = [];
@@ -4146,176 +4148,11 @@ function initWorkbenchSettings() {
     if ($("#cap-search").checked) t.push("web_search");
     if ($("#cap-weather").checked) t.push("weather");
     if ($("#cap-memory").checked) t.push("memory_save");
-    const s = [];
-    if ($("#cap-skill-code")?.checked) s.push("code_expert");
-    if ($("#cap-skill-trans")?.checked) s.push("translator");
-    if ($("#cap-skill-write")?.checked) s.push("writing");
-    if ($("#cap-skill-companion")?.checked) s.push("companion");
-    saveCapDefaults({ tools: t, skills: s, thinking: $("#cap-thinking").value });
+    saveCapDefaults({ tools: t, thinking: $("#cap-thinking").value });
     $("#cap-msg").textContent = "✓ 已保存";
   });
 
   if (FEATURES.workspace) wsLoadOverview();
-}
-
-function mcpHeadersText(s) {
-  return s?.headers ? Object.entries(s.headers).map(([k, v]) => `${k}: ${v}`).join("\n") : "";
-}
-function mcpParseHeaders(text) {
-  const out = {};
-  for (const line of String(text ?? "").split(/\r?\n/)) {
-    const m = line.match(/^([^:]+):\s*(.*)$/);
-    if (m && m[1].trim()) out[m[1].trim()] = m[2].trim();
-  }
-  return Object.keys(out).length ? out : undefined;
-}
-
-async function mcpLoad() {
-  try {
-    const cfg = await api.get("/api/mcp/config");
-    mcpServers = cfg.servers ?? [];
-  } catch { mcpServers = []; }
-  mcpRenderList();
-}
-
-async function mcpSave() {
-  try {
-    const r = await api.send("/api/mcp/config", { method: "POST", body: JSON.stringify({ servers: mcpServers }) });
-    const cfg = await api.get("/api/mcp/config").catch(() => null);
-    if (cfg) mcpServers = cfg.servers ?? [];
-    toast(`✓ MCP 已保存（${r.servers} 个服务器）`);
-  } catch (e) { toast("MCP 保存失败：" + e.message, false); }
-}
-
-function mcpRenderList() {
-  const el = $("#mcp-list");
-  if (!el) return;
-  el.innerHTML = "";
-  if (!mcpServers.length) { el.innerHTML = '<div class="muted">还没有配置 MCP 服务器</div>'; return; }
-  mcpServers.forEach((s, i) => {
-    const total = (s.tools ?? []).length;
-    const nTools = (s.tools ?? []).filter((t) => t.enabled).length;
-    const sum = s.type === "stdio" ? (s.command ?? "") + " " + (s.args ?? []).join(" ") : (s.url ?? "");
-    const div = document.createElement("div");
-    div.className = "mcp-item";
-    div.innerHTML = `
-      <label class="mcp-enable"><input type="checkbox" data-mcp-enable="${i}" ${s.enabled ? "checked" : ""}>${escapeHtml(s.name)}</label>
-      <span class="mcp-type">${s.type === "stdio" ? "stdio" : s.type === "sse" ? "SSE" : "StreamableHTTP"}</span>
-      <span class="mcp-sum" title="${escapeHtml(sum)}">${escapeHtml(sum || "—")}</span>
-      <span class="mcp-tools">${total ? nTools + "/" + total + " 工具" : "—"}</span>
-      <button class="ghost small-btn" data-mcp-edit="${i}">编辑</button>
-      <button class="ghost small-btn" data-mcp-del="${i}">删除</button>`;
-    el.appendChild(div);
-  });
-  el.querySelectorAll("[data-mcp-enable]").forEach((c) => c.addEventListener("change", async () => {
-    const i = Number(c.dataset.mcpEnable);
-    mcpServers[i].enabled = c.checked;
-    await mcpSave();
-    mcpRenderList();
-  }));
-  el.querySelectorAll("[data-mcp-edit]").forEach((b) => b.addEventListener("click", () => mcpEdit(Number(b.dataset.mcpEdit))));
-  el.querySelectorAll("[data-mcp-del]").forEach((b) => b.addEventListener("click", async () => {
-    const i = Number(b.dataset.mcpDel);
-    if (!confirm(`删除 MCP 服务器「${mcpServers[i].name}」？`)) return;
-    mcpServers.splice(i, 1);
-    await mcpSave();
-    mcpRenderList();
-  }));
-}
-
-function mcpEdit(idx) {
-  mcpEditing = idx;
-  const s = idx >= 0 ? mcpServers[idx] : { name: "", enabled: true, type: "stdio" };
-  mcpTestTools = [];
-  const wrap = $("#mcp-form-wrap");
-  wrap.style.display = "block";
-  wrap.innerHTML = `
-    <div class="mcp-form">
-      <h4>${idx >= 0 ? "编辑服务器" : "添加服务器"}</h4>
-      <div class="form">
-        <label>名称</label><input id="mcp-f-name" value="${escapeHtml(s.name ?? "")}" placeholder="如 文件系统">
-        <label>类型</label>
-        <select id="mcp-f-type">
-          <option value="stdio" ${(s.type ?? "stdio") === "stdio" ? "selected" : ""}>本地程序（stdio）</option>
-          <option value="sse" ${s.type === "sse" ? "selected" : ""}>远程 SSE</option>
-          <option value="streamable-http" ${s.type === "streamable-http" ? "selected" : ""}>远程 StreamableHTTP</option>
-        </select>
-        <div id="mcp-f-stdio">
-          <label>启动命令</label><input id="mcp-f-command" value="${escapeHtml(s.command ?? "")}" placeholder="如 npx">
-          <label>参数（空格分隔）</label><input id="mcp-f-args" value="${escapeHtml((s.args ?? []).join(" "))}" placeholder="如 -y @modelcontextprotocol/server-filesystem ./workspace">
-        </div>
-        <div id="mcp-f-http" style="display:none">
-          <label>连接 URL</label><input id="mcp-f-url" value="${escapeHtml(s.url ?? "")}" placeholder="如 https://mcp.example.com/sse">
-        </div>
-        <label>请求头（每行 Key: Value，可选）</label>
-        <textarea id="mcp-f-headers" rows="2" placeholder="Authorization: Bearer xxx">${escapeHtml(mcpHeadersText(s))}</textarea>
-        <div class="row" style="margin-top:8px">
-          <button id="mcp-f-test" class="ghost small-btn">测试连接</button>
-          <button id="mcp-f-save" class="primary small-btn">保存</button>
-          <button id="mcp-f-cancel" class="ghost small-btn">取消</button>
-        </div>
-        <div id="mcp-f-result" class="status"></div>
-        <div id="mcp-f-tools"></div>
-      </div>
-    </div>`;
-  const syncType = () => {
-    const t = $("#mcp-f-type").value;
-    $("#mcp-f-stdio").style.display = t === "stdio" ? "" : "none";
-    $("#mcp-f-http").style.display = t === "stdio" ? "none" : "";
-  };
-  $("#mcp-f-type").addEventListener("change", syncType);
-  syncType();
-  $("#mcp-f-cancel").addEventListener("click", () => { wrap.style.display = "none"; mcpEditing = -1; });
-  $("#mcp-f-test").addEventListener("click", mcpTestForm);
-  $("#mcp-f-save").addEventListener("click", mcpSaveForm);
-}
-
-function mcpCollectForm() {
-  const type = $("#mcp-f-type").value;
-  return {
-    name: $("#mcp-f-name").value.trim() || "未命名服务器",
-    enabled: mcpEditing >= 0 ? mcpServers[mcpEditing].enabled : true,
-    type,
-    command: type === "stdio" ? ($("#mcp-f-command").value.trim() || undefined) : undefined,
-    args: type === "stdio" && $("#mcp-f-args").value.trim()
-      ? $("#mcp-f-args").value.trim().split(/\s+/).map((x) => x.trim()).filter(Boolean)
-      : undefined,
-    url: type !== "stdio" ? ($("#mcp-f-url").value.trim() || undefined) : undefined,
-    headers: mcpParseHeaders($("#mcp-f-headers").value),
-  };
-}
-
-async function mcpTestForm() {
-  const res = $("#mcp-f-result");
-  const btn = $("#mcp-f-test");
-  btn.disabled = true;
-  res.textContent = "连接中…";
-  try {
-    const r = await api.send("/api/mcp/test", { method: "POST", body: JSON.stringify({ server: mcpCollectForm() }) });
-    if (!r.ok) { res.textContent = "✗ " + (r.error ?? "连接失败"); return; }
-    mcpTestTools = r.tools;
-    res.textContent = `✓ 连接成功，共 ${r.tools.length} 个工具，勾选要启用的（保存时生效）：`;
-    const box = $("#mcp-f-tools");
-    box.innerHTML = r.tools.length
-      ? r.tools.map((t) => `<label class="mcp-tool"><input type="checkbox" data-mcp-tool="${escapeHtml(t.name)}" checked> ${escapeHtml(t.name)}${t.description ? `<small>${escapeHtml(String(t.description).slice(0, 80))}</small>` : ""}</label>`).join("")
-      : '<span class="muted">（该服务器没有暴露工具）</span>';
-  } catch (e) { res.textContent = "✗ " + e.message; }
-  btn.disabled = false;
-}
-
-async function mcpSaveForm() {
-  const s = mcpCollectForm();
-  if (s.type === "stdio" && !s.command) return toast("启动命令不能为空", false);
-  if (s.type !== "stdio" && !s.url) return toast("连接 URL 不能为空", false);
-  const toolChecks = [...document.querySelectorAll("[data-mcp-tool]")];
-  if (toolChecks.length) s.tools = toolChecks.map((c) => ({ name: c.dataset.mcpTool, enabled: c.checked }));
-  if (mcpEditing >= 0) mcpServers[mcpEditing] = { ...mcpServers[mcpEditing], ...s };
-  else mcpServers.push(s);
-  await mcpSave();
-  mcpRenderList();
-  $("#mcp-form-wrap").style.display = "none";
-  mcpEditing = -1;
-  mcpTestTools = [];
 }
 
 async function wsLoadOverview() {
@@ -4550,10 +4387,8 @@ function renderSettings() {
     </a>`;
   return `
   <div class="view">
-    <div class="page-head"><h2>设置</h2><p class="hint">技能、MCP、日志、插件、公告与数据备份——点开对应项进入页面</p></div>
+    <div class="page-head"><h2>设置</h2><p class="hint">日志、插件、公告与数据备份——点开对应项进入页面</p></div>
     <div class="setting-rows">
-      ${FEATURES.skills ? row("skills", "tool", "技能库", "给 AI 追加能力说明（如「代码专家」）；内置四个不可改，可自己添加，聊天时勾选生效") : ""}
-      ${FEATURES.mcp ? row("mcp", "zap", "MCP 服务器", "连接外部工具服务器：本地程序（stdio）或远程 URL（SSE / StreamableHTTP）") : ""}
       ${row("logs", "clipboard", "运行日志", "聊天 / 通道 / 生图 / 语音 / 记忆的报错记录，出问题先看这里（留最近 500 条）")}
       ${row("plugins", "store", "插件", "已安装插件只读列表", "暂未开放")}
       ${row("data", "package", "数据备份与记忆", "全部卡片 + 记忆 + 配置导出为 JSON；查看全部记忆")}
@@ -4572,64 +4407,6 @@ function initSettings() {
 // 设置子页统一返回按钮（放在 page-head，点击回设置菜单）
 function settingsBack() {
   return `<a class="btn-back" href="#/settings">${icon("chevron")} 返回设置</a>`;
-}
-
-// ---- 设置子页：技能库 ----
-function renderSkillsPage() {
-  return `
-  <div class="view">
-    <div class="page-head"><h2>${icon("tool")} 技能库</h2><p class="hint">技能 = 给 AI 追加的一段能力说明（如「代码专家」）。内置四个不可改，你可以自己加；聊天时在能力开关里勾选生效。</p>${settingsBack()}</div>
-    <div class="card-box">
-      <div id="skill-list" class="skill-list"></div>
-      <div class="row" style="margin-top:8px"><button id="skill-add" class="ghost small-btn">+ 添加技能</button></div>
-      <div id="skill-form-wrap" style="display:none"></div>
-    </div>
-  </div>`;
-}
-function initSkillsPage() {
-  if (!FEATURES.skills) return;
-  $("#skill-add").addEventListener("click", () => skillEdit(-1));
-  skillLoad();
-}
-
-// ---- 设置子页：MCP 服务器 ----
-function renderMcpPage() {
-  return `
-  <div class="view">
-    <div class="page-head"><h2>${icon("zap")} MCP 服务器</h2><p class="hint">连接外部工具服务器：本地程序（stdio）或远程 URL（SSE / StreamableHTTP）。工具调用默认需你确认后执行。</p>${settingsBack()}</div>
-    <div class="card-box">
-      <div id="mcp-list" class="mcp-list"></div>
-      <div class="row" style="margin-top:8px"><button id="mcp-add" class="ghost small-btn">+ 添加服务器</button></div>
-      <div id="mcp-form-wrap" style="display:none"></div>
-      <details class="mcp-json">
-        <summary>JSON 导入 / 导出（高级）</summary>
-        <textarea id="mcp-config" rows="6" spellcheck="false"></textarea>
-        <div class="row" style="margin-top:8px">
-          <button id="btn-mcp-import" class="ghost small-btn">从 JSON 导入</button>
-          <button id="btn-mcp-export" class="ghost small-btn">导出为 JSON</button>
-        </div>
-        <div id="mcp-msg" class="status"></div>
-      </details>
-    </div>
-  </div>`;
-}
-function initMcpPage() {
-  if (!FEATURES.mcp) return;
-  $("#mcp-add").addEventListener("click", () => mcpEdit(-1));
-  $("#btn-mcp-export").addEventListener("click", () => {
-    $("#mcp-config").value = JSON.stringify(mcpServers, null, 2);
-  });
-  $("#btn-mcp-import").addEventListener("click", async () => {
-    try {
-      const arr = JSON.parse($("#mcp-config").value);
-      if (!Array.isArray(arr)) throw new Error("需要 JSON 数组");
-      mcpServers = arr;
-      await mcpSave();
-      mcpRenderList();
-      $("#mcp-msg").textContent = "✓ 已导入并重连";
-    } catch (e) { $("#mcp-msg").textContent = "导入失败：" + e.message; }
-  });
-  mcpLoad();
 }
 
 // ---- 设置子页：运行日志 ----
@@ -4762,99 +4539,6 @@ function initNoticePage() {
 // ============================================================
 //  技能库（内置只读 + 用户自定义增删改）
 // ============================================================
-let skillsAll = [];      // 内置 + 自定义（后端合并返回）
-let skillEditing = -1;   // 自定义技能在 userSkills 里的下标；-1 = 新增
-
-function userSkills() { return skillsAll.filter((s) => !s.builtin); }
-
-async function skillLoad() {
-  try {
-    const r = await api.get("/api/skills");
-    skillsAll = r.skills ?? [];
-  } catch { skillsAll = []; }
-  skillRenderList();
-}
-
-async function skillSave() {
-  try {
-    const r = await api.send("/api/skills", { method: "POST", body: JSON.stringify({ skills: userSkills() }) });
-    const fresh = await api.get("/api/skills").catch(() => null);
-    if (fresh) skillsAll = fresh.skills ?? [];
-    toast(`✓ 技能已保存（自定义 ${r.count} 个）`);
-  } catch (e) { toast("保存失败：" + e.message, false); }
-}
-
-function skillRenderList() {
-  const el = $("#skill-list");
-  if (!el) return;
-  el.innerHTML = "";
-  for (const s of skillsAll) {
-    const div = document.createElement("div");
-    div.className = "skill-item";
-    const idx = s.builtin ? -1 : userSkills().findIndex((u) => u.id === s.id);
-    div.innerHTML = `
-      <span class="skill-name">${escapeHtml(s.name)}</span>
-      ${s.builtin
-        ? '<span class="skill-tag">内置</span>'
-        : `<label class="skill-enable"><input type="checkbox" data-skill-enable="${idx}" ${s.enabled ? "checked" : ""}>启用</label>`}
-      <span class="skill-prompt" title="${escapeHtml(s.prompt)}">${escapeHtml(s.prompt.slice(0, 60))}${s.prompt.length > 60 ? "…" : ""}</span>
-      ${s.builtin ? "" : `<button class="ghost small-btn" data-skill-edit="${idx}">编辑</button>
-      <button class="ghost small-btn" data-skill-del="${idx}">删除</button>`}`;
-    el.appendChild(div);
-  }
-  el.querySelectorAll("[data-skill-enable]").forEach((c) => c.addEventListener("change", async () => {
-    const list = userSkills();
-    list[Number(c.dataset.skillEnable)].enabled = c.checked;
-    skillsAll = [...skillsAll.filter((s) => s.builtin), ...list];
-    await skillSave();
-    skillRenderList();
-  }));
-  el.querySelectorAll("[data-skill-edit]").forEach((b) => b.addEventListener("click", () => skillEdit(Number(b.dataset.skillEdit))));
-  el.querySelectorAll("[data-skill-del]").forEach((b) => b.addEventListener("click", async () => {
-    const list = userSkills();
-    const i = Number(b.dataset.skillDel);
-    if (!confirm(`删除技能「${list[i].name}」？`)) return;
-    list.splice(i, 1);
-    skillsAll = [...skillsAll.filter((s) => s.builtin), ...list];
-    await skillSave();
-    skillRenderList();
-  }));
-}
-
-function skillEdit(idx) {
-  skillEditing = idx;
-  const s = idx >= 0 ? userSkills()[idx] : { name: "", prompt: "" };
-  const wrap = $("#skill-form-wrap");
-  wrap.style.display = "block";
-  wrap.innerHTML = `
-    <div class="mcp-form">
-      <h4>${idx >= 0 ? "编辑技能" : "添加技能"}</h4>
-      <div class="form">
-        <label>名称</label><input id="skill-f-name" value="${escapeHtml(s.name ?? "")}" placeholder="如 法律顾问">
-        <label>提示词（告诉 AI 这个技能该怎么做事）</label>
-        <textarea id="skill-f-prompt" rows="4" placeholder="【技能：法律顾问】遇到法律问题时：先说明不构成正式法律意见，再解释相关条款…">${escapeHtml(s.prompt ?? "")}</textarea>
-        <div class="row" style="margin-top:8px">
-          <button id="skill-f-save" class="primary small-btn">保存</button>
-          <button id="skill-f-cancel" class="ghost small-btn">取消</button>
-        </div>
-      </div>
-    </div>`;
-  $("#skill-f-cancel").addEventListener("click", () => { wrap.style.display = "none"; skillEditing = -1; });
-  $("#skill-f-save").addEventListener("click", async () => {
-    const name = $("#skill-f-name").value.trim();
-    const prompt = $("#skill-f-prompt").value.trim();
-    if (!prompt) return toast("提示词不能为空", false);
-    const list = userSkills();
-    if (skillEditing >= 0) list[skillEditing] = { ...list[skillEditing], name, prompt };
-    else list.push({ name, prompt, enabled: true });
-    skillsAll = [...skillsAll.filter((x) => x.builtin), ...list];
-    await skillSave();
-    skillRenderList();
-    wrap.style.display = "none";
-    skillEditing = -1;
-  });
-}
-
 // ============================================================
 //  视图：表情包库（全局共享，所有角色卡共用）
 // ============================================================
@@ -5122,8 +4806,6 @@ const routes = {
   memory: { render: renderMemory, init: initMemory },
   emojis: { render: renderEmojis, init: initEmojis },
   // 设置子页（设置菜单里长条按键跳转过来）
-  skills: { render: renderSkillsPage, init: initSkillsPage },
-  mcp: { render: renderMcpPage, init: initMcpPage },
   logs: { render: renderLogsPage, init: initLogsPage },
   plugins: { render: renderPluginsPage, init: initPluginsPage },
   data: { render: renderDataPage, init: initDataPage },

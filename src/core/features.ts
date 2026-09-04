@@ -2,10 +2,6 @@
 // 前端有一份同名开关（web/app.js 里的 FEATURES），两边都关才算没启用。
 // 将来要开：把对应项改 true（并同步前端），代码都还在。
 export const FEATURES = {
-  /** 技能库（内置 + 用户自定义）：关闭时聊天不注入任何技能提示词 */
-  skills: false,
-  /** MCP 工具服务器：关闭时不连接、不提供 MCP 工具 */
-  mcp: false,
   /** 工作区：关闭时沙箱读写与代码执行工具不可用、文件管理 API 拒绝 */
   workspace: false,
 } as const;

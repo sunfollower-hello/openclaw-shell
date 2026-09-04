@@ -49,18 +49,9 @@ import {
   type LifeState,
 } from "./core/lifeScheduler.js";
 import { TOOL_REGISTRY, toolsToOpenAI, resolveInSandbox, type ToolDef, type ToolCtx } from "./tools/registry.js";
-import { allSkills, saveUserSkills, skillPromptsByIds, type UserSkill } from "./core/skillStore.js";
 import { FEATURES, filterDisabledTools } from "./core/features.js";
 import { toUserError } from "./core/errors.js";
 import { queryLogs, clearLogs, logInfo, logWarn, logError } from "./core/logger.js";
-import {
-  getMCPTools,
-  loadMCPConfig,
-  saveMCPConfig,
-  reloadMCP,
-  testMCPServer,
-  type MCPServerConfig,
-} from "./tools/mcp.js";
 import { cardToCCv2, ccv2ToCard } from "./core/cardConvert.js";
 import { solidPng, pngWithTexts, extractCardJson, pngStripCardMeta, isPng } from "./core/png.js";
 import { getImageConfig, saveImageConfig, maskKey, testNovelaiKey, testOpenAIImageKey } from "./core/imageConfig.js";
@@ -1655,16 +1646,19 @@ app.post("/api/distill/weflow", async (req, res) => {
   }
 });
 
-// ---------- 聊天测试（人设 + 工具 + 技能 + 记忆 + 思考深度 + ask 审批） ----------
+// ---------- 聊天测试（人设 + 工具 + 记忆 + 思考深度 + ask 审批） ----------
 async function chatCompletions(
   llm: { baseUrl: string; apiKey: string; model: string },
   messages: unknown[],
   tools?: unknown[],
-  reasoning?: string
+  reasoning?: string,
+  externalSignal?: AbortSignal // 客户端断开/截断时中止模型请求（省 API）
 ): Promise<{ choices?: { message?: { content?: string; tool_calls?: unknown[] } }[] }> {
   const doCall = async (effort?: string) => {
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), 90000);
+    const onExternal = () => ctrl.abort();
+    externalSignal?.addEventListener("abort", onExternal, { once: true });
     try {
       const r = await fetch(`${llm.baseUrl.replace(/\/+$/, "")}/chat/completions`, {
         method: "POST",
@@ -1686,6 +1680,7 @@ async function chatCompletions(
       return await r.json();
     } finally {
       clearTimeout(timer);
+      externalSignal?.removeEventListener("abort", onExternal);
     }
   };
   try {
@@ -1730,10 +1725,12 @@ async function runToolLoop(
   tools: ToolDef[],
   ctx: ToolCtx,
   askAll: boolean,
-  reasoning?: string
+  reasoning?: string,
+  externalSignal?: AbortSignal // 客户端断开/截断时中止模型请求
 ): Promise<LoopResult> {
   for (let i = 0; i < 4; i++) {
-    const data = await chatCompletions(llm, messages, tools.length ? toolsToOpenAI(tools) : undefined, reasoning);
+    if (externalSignal?.aborted) return { type: "reply", reply: "（已截断）" };
+    const data = await chatCompletions(llm, messages, tools.length ? toolsToOpenAI(tools) : undefined, reasoning, externalSignal);
     const msg = data.choices?.[0]?.message;
     const toolCalls = ((msg?.tool_calls ?? []) as ToolCallMsg[]).filter((tc) => tc.function?.name);
     if (toolCalls.length === 0) return { type: "reply", reply: msg?.content ?? "（空回复）" };
@@ -1755,17 +1752,11 @@ async function runToolLoop(
   return { type: "reply", reply: "（达到工具轮次上限）" };
 }
 
-async function resolveChatTools(enabledTools: string[], useMCP: boolean): Promise<{ defs: ToolDef[]; mcpErrors: string[] }> {
-  // 未启用的功能在这里统一拦掉：即使请求里带了这些工具/开关也不会生效
+async function resolveChatTools(enabledTools: string[]): Promise<{ defs: ToolDef[] }> {
+  // 未启用的功能在这里统一拦掉：即使请求里带了这些工具也不会生效
   const allowed = filterDisabledTools(enabledTools);
   const defs = TOOL_REGISTRY.filter((t) => allowed.includes(t.id));
-  let mcpErrors: string[] = [];
-  if (useMCP && FEATURES.mcp) {
-    const m = await getMCPTools();
-    defs.push(...m.tools);
-    mcpErrors = m.errors;
-  }
-  return { defs, mcpErrors };
+  return { defs };
 }
 
 /**
@@ -1800,7 +1791,7 @@ function chatCtx(slug: string, ns = "local"): ToolCtx {
 
 app.post("/api/chat", async (req, res) => {
   try {
-    const { slug, message, history, tools, skills, thinking, useMCP, model, userKey } = req.body ?? {};
+    const { slug, message, history, tools, thinking, model, userKey } = req.body ?? {};
     if (!slug || !message) return res.status(400).json({ error: "请选择卡片并输入内容" });
     const card = await store.get(slug).catch(() => null);
     if (!card) return res.status(404).json({ error: "找不到这张卡，可能已被删除" });
@@ -1810,12 +1801,7 @@ app.post("/api/chat", async (req, res) => {
     const llm = await resolveChatLLM(overrideCardModel(card, model));
     if (!llm || !llm.apiKey) return res.status(400).json({ error: "未配置模型 API（API 页）" });
     const enabledTools = Array.isArray(tools) ? (tools as string[]) : [];
-    const { defs: toolDefs, mcpErrors } = await resolveChatTools(enabledTools, useMCP === true);
-
-    // 内置技能 + 用户在设置页自定义的技能都能按 id 命中（技能功能关闭时不注入任何提示词）
-    const skillPrompts = FEATURES.skills
-      ? await skillPromptsByIds(Array.isArray(skills) ? (skills as string[]) : [])
-      : [];
+    const { defs: toolDefs } = await resolveChatTools(enabledTools);
 
     // 相关召回：按关键词重合 + 新鲜度取与当前话题最相关的记忆（最多 20 条）。
     // 只召回「当前用户私密 + 所有用户共享」的记忆，避免不同用户的事实互相污染
@@ -1859,10 +1845,8 @@ app.post("/api/chat", async (req, res) => {
       (toolDefs.length
         ? `\n\n你可以使用以下工具完成任务：${toolDefs.map((t) => t.name).join("、")}。用户请求适合用工具完成时，调用工具而不是凭空编造；危险工具会先征得用户同意。`
         : "") +
-      skillPrompts.map((p) => "\n" + p).join("") +
       memoryBlock +
-      rememberRule +
-      (mcpErrors.length ? `\n\n（MCP 连接提示：${mcpErrors.join("；")}）` : "");
+      rememberRule;
 
     // 表情包注入：全局共享库（关闭档不注入）
     system += await buildEmojiPrompt(card.voice?.message_style?.emoji ?? "克制", "inline", card.emojiGroups);
@@ -1889,9 +1873,12 @@ app.post("/api/chat", async (req, res) => {
     logInfo("聊天", `${card.name} 用 ${llm.provider}/${llm.model}` + (toolDefs.length ? ` · 工具 ${toolDefs.length} 个` : "") + (presetExamples.length ? " · 破甲示范注入" : ""));
     // 记录用户活跃（AI 生命调度用：重置该用户 missedBeats）
     void recordUserContact(card.slug, "local").catch(() => {});
-    // 统一会话日志：网页聊天的轮次也落盘（绑定后网页与通道互传、记录相同）
+    // 统一会话日志：网页聊天轮次也落盘（通道消息由观察器同步进来；本地聊天不发送到通道）
     void appendConv(slug, { role: "user", content: String(message ?? ""), surface: "web", ns }).catch(() => {});
-    const result = await runToolLoop(llm, messages, toolDefs, chatCtx(slug, ns), card.tools?.policy === "ask", reasoning);
+    // 客户端断开（截断）→ 中止模型请求，省 API
+    const chatCtrl = new AbortController();
+    req.on("close", () => { if (!res.writableEnded) chatCtrl.abort(); });
+    const result = await runToolLoop(llm, messages, toolDefs, chatCtx(slug, ns), card.tools?.policy === "ask", reasoning, chatCtrl.signal);
     // 出站清理：剥离低级模型泄漏的纯文本思维链（「分析：」「（思考）」等前缀行）
     if (result.type === "reply" && typeof result.reply === "string") {
       const cleaned = sanitizeChatReply(card, result.reply);
@@ -1996,7 +1983,7 @@ async function autoMemorize(
 
 app.post("/api/chat/approve", async (req, res) => {
   try {
-    const { slug, messages, approve, tools, useMCP, model, userKey } = req.body ?? {};
+    const { slug, messages, approve, tools, model, userKey } = req.body ?? {};
     if (!slug || !Array.isArray(messages)) return res.status(400).json({ error: "请选择卡片并输入内容" });
     // 与 /api/chat 保持一致：用卡片单独配置的模型（否则审批续聊会静默换回默认模型）
     const card = await store.get(slug).catch(() => null);
@@ -2005,7 +1992,7 @@ app.post("/api/chat/approve", async (req, res) => {
     const llm = await resolveChatLLM(overrideCardModel(card, model));
     if (!llm || !llm.apiKey) return res.status(400).json({ error: "未配置模型 API（API 页）" });
     const enabledTools = Array.isArray(tools) ? (tools as string[]) : [];
-    const { defs: toolDefs } = await resolveChatTools(enabledTools, useMCP === true);
+    const { defs: toolDefs } = await resolveChatTools(enabledTools);
     const last = messages[messages.length - 1] as { tool_calls?: ToolCallMsg[] };
     const toolCalls = (last?.tool_calls ?? []).filter((tc) => tc.function?.name);
     if (approve) {
@@ -2015,7 +2002,10 @@ app.post("/api/chat/approve", async (req, res) => {
         messages.push({ role: "tool", tool_call_id: tc.id ?? "", content: "用户拒绝执行此工具调用" });
       }
     }
-    const result = await runToolLoop(llm, messages, toolDefs, chatCtx(slug, ns), card.tools?.policy === "ask");
+    // 客户端断开（截断）→ 中止模型请求，省 API
+    const chatCtrl = new AbortController();
+    req.on("close", () => { if (!res.writableEnded) chatCtrl.abort(); });
+    const result = await runToolLoop(llm, messages, toolDefs, chatCtx(slug, ns), card.tools?.policy === "ask", undefined, chatCtrl.signal);
     if (result.type === "reply") {
       // 与 /api/chat 一致：审批续聊后的回复同样计入自动记忆（用户消息取 messages 里最后一条 user）
       const lastUser = [...messages].reverse().find((m) => (m as { role?: string }).role === "user");
@@ -2083,27 +2073,6 @@ app.post("/api/presets/reset", async (_req, res) => {
   }
 });
 
-// ---------- MCP 配置 ----------
-app.get("/api/mcp/config", requireFeature("mcp"), async (_req, res) => {
-  try {
-    res.json(await loadMCPConfig());
-  } catch (e) {
-    res.status(500).json({ error: toUserError(e) });
-  }
-});
-
-app.post("/api/mcp/config", requireFeature("mcp"), async (req, res) => {
-  try {
-    const servers = req.body?.servers;
-    if (!Array.isArray(servers)) return res.status(400).json({ error: "servers 必须是数组" });
-    const clean = await saveMCPConfig({ servers: servers as MCPServerConfig[] });
-    await reloadMCP();
-    res.json({ ok: true, servers: clean.servers.length });
-  } catch (e) {
-    res.status(500).json({ error: toUserError(e) });
-  }
-});
-
 /** 功能未启用时挡在 API 层：前端藏了界面，这里保证接口也不生效 */
 function requireFeature(name: keyof typeof FEATURES): express.RequestHandler {
   return (_req, res, next) => {
@@ -2111,38 +2080,6 @@ function requireFeature(name: keyof typeof FEATURES): express.RequestHandler {
     res.status(404).json({ error: `该功能当前未启用（${name}）` });
   };
 }
-
-// ---------- 技能库（内置 + 用户自定义） ----------
-app.get("/api/skills", requireFeature("skills"), async (_req, res) => {
-  try {
-    res.json({ skills: await allSkills() });
-  } catch (e) {
-    res.status(500).json({ error: toUserError(e) });
-  }
-});
-
-// 只保存用户自定义的部分（内置技能不可改）
-app.post("/api/skills", requireFeature("skills"), async (req, res) => {
-  try {
-    const skills = req.body?.skills;
-    if (!Array.isArray(skills)) return res.status(400).json({ error: "skills 必须是数组" });
-    const saved = await saveUserSkills(skills as Array<Partial<UserSkill>>);
-    res.json({ ok: true, count: saved.length, skills: saved });
-  } catch (e) {
-    res.status(500).json({ error: toUserError(e) });
-  }
-});
-
-// 测试单个 MCP 服务器：连接 + 拉取工具列表（不保存），供配置表单的「测试连接」用
-app.post("/api/mcp/test", requireFeature("mcp"), async (req, res) => {
-  try {
-    const server = req.body?.server;
-    if (!server || typeof server !== "object") return res.status(400).json({ error: "server 不能为空" });
-    res.json(await testMCPServer(server as MCPServerConfig));
-  } catch (e) {
-    res.status(500).json({ error: toUserError(e) });
-  }
-});
 
 // ---------- 工作区文件管理（共享单目录 data/workspace-files） ----------
 // 所有卡片共用同一份文件；换卡只换对话，不换工作区。请求里的 slug 已不再决定目录，
@@ -2309,7 +2246,7 @@ app.get("/api/active-persona", async (_req, res) => {
   }
 });
 
-// ---------- 数据备份（卡片 + 长期记忆 + MCP + 各类配置 → 单个 JSON） ----------
+// ---------- 数据备份（卡片 + 长期记忆 + 各类配置 → 单个 JSON） ----------
 app.get("/api/backup", async (_req, res) => {
   try {
     const cards: Record<string, unknown> = {};
@@ -2323,7 +2260,6 @@ app.get("/api/backup", async (_req, res) => {
       exported_at: new Date().toISOString(),
       cards,
       memory,
-      mcp: await loadMCPConfig(),
       providers: await readJson("providers.json"), // 含 API key（本地备份，仅供本人持有）
       tts: await readJson("ttsConfig.json"),
       ttsKeys: await readJson("ttsKeys.json"),
