@@ -36,6 +36,7 @@ import {
   resolveCardPresetBlocks,
   resolveCardPresetExamples,
   type PresetKind,
+  type PresetRole,
 } from "./core/presets.js";
 import { sanitizeChatReply } from "./core/sanitize.js";
 import { claimGreeting, isGreeted, clearGreeted } from "./core/greetedStore.js";
@@ -2034,9 +2035,9 @@ app.get("/api/presets", async (_req, res) => {
 
 app.post("/api/presets", async (req, res) => {
   try {
-    const { kind, name, content } = req.body ?? {};
+    const { kind, name, content, role } = req.body ?? {};
     if (!isPresetKind(kind)) return res.status(400).json({ error: "kind 必须是 tier 或 style" });
-    res.status(201).json(await addPreset(kind, String(name ?? ""), String(content ?? "")));
+    res.status(201).json(await addPreset(kind, String(name ?? ""), String(content ?? ""), role));
   } catch (e) {
     res.status(500).json({ error: toUserError(e) });
   }
@@ -2046,9 +2047,10 @@ app.put("/api/presets/:kind/:id", async (req, res) => {
   try {
     const kind = String(req.params.kind);
     if (!isPresetKind(kind)) return res.status(400).json({ error: "kind 必须是 tier 或 style" });
-    const patch: { name?: string; content?: string } = {};
+    const patch: { name?: string; content?: string; role?: PresetRole } = {};
     if (typeof req.body?.name === "string") patch.name = req.body.name;
     if (typeof req.body?.content === "string") patch.content = req.body.content;
+    if (typeof req.body?.role === "string") patch.role = req.body.role as PresetRole;
     res.json(await updatePreset(kind, String(req.params.id), patch));
   } catch (e) {
     res.status(500).json({ error: toUserError(e) });

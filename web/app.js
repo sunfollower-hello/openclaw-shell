@@ -4179,8 +4179,9 @@ function renderPresetEditor(kind, list) {
   const title = kind === "tier" ? "档位（扮演模式与内容尺度）" : "风格（叙述风格）";
   const hint =
     kind === "tier"
-      ? "档位决定扮演模式与内容尺度：不破甲=标准沉浸（剧情内克制处理敏感内容）；破甲（最高）=最高破限（露骨尺度，对齐 RP-Hub）。由卡片选择是否启用。"
-      : "风格决定输出形式：纯对话（只有对白）/ 重描写（对白＋动作心理，（）包裹）。两种风格均带对话示例，跟随风格联动。";
+      ? "档位决定扮演模式与内容尺度：目前只保留「破甲（最高）」（不破甲已整合进破甲，不再区分）。"
+      : "风格决定输出形式：纯对话（只有对白，一条消息最多 2 个逗号）/ 重描写（心理用（）包裹、动作用 {} 包裹）。";
+  const roleLabel = (r) => (r === "user" ? "用户消息" : r === "assistant" ? "AI 消息" : "系统提示词");
   return `
   <div class="card-box">
     <h3>${icon("sliders")} ${title}</h3>
@@ -4193,6 +4194,7 @@ function renderPresetEditor(kind, list) {
         <div class="preset-item-head">
           <b>${escapeHtml(p.name)}</b>
           <span class="preset-badge ${p.builtin ? "builtin" : "custom"}">${p.builtin ? "内置" : "自定义"}</span>
+          <span class="preset-badge" style="background:var(--bg-soft)">插入：${roleLabel(p.role || "system")}</span>
           <div class="row" style="margin-left:auto">
             <button class="ghost small-btn preset-edit" title="编辑">${icon("pen")}</button>
             <button class="ghost small-btn preset-del" title="删除" ${p.builtin ? "disabled" : ""}>${icon("trash")}</button>
@@ -4225,8 +4227,9 @@ function renderPresets() {
       <h3>${icon("info")} 说明</h3>
       <ul class="guide">
         <li>卡片高级配置（编辑卡 → 右上角 ⚙ 高级配置）里可选「档位」与「风格」，选了才生效，默认不启用。</li>
-        <li>档位不破甲/破甲（最高）可分别与两种风格自由组合（如 破甲×纯对话、不破甲×重描写）。</li>
-        <li>示例对话跟随风格（对话开头注入，弱模型靠模仿更稳）：纯对话示例只有对白，重描写示例动作心理用（）包裹。</li>
+        <li>档位只保留「破甲（最高）」（不破甲的内容已整合进破甲）；风格两种：纯对话 / 重描写，可自由组合。</li>
+        <li>纯对话：一条消息最多 3 次断句（QQ 气泡里最多 2 个逗号），只有对白；重描写：心理用（）包裹、动作用 {} 包裹。</li>
+        <li>每条预设可设「插入位置」：系统提示词 / 用户消息 / AI 消息；内容里也可用 <code>[系统提示词]</code> <code>[AI消息]</code> <code>[用户消息]</code> 分段标记，把一条拆成多段注入不同位置（RP-Hub 式）。</li>
         <li>全局「输出铁律」护栏所有档位/风格生效：剥离思维链、禁止跳出角色、末句不加句号。</li>
         <li>能力触发：卡开了「生图」能力后，AI 会在场景需要时主动生图发图（配置见 生图配置 页）。</li>
         <li>改完预设文本后，网页试聊立即生效；QQ/微信 机器人需在卡片 🤖 机器人里点「重编译」。</li>
@@ -4252,6 +4255,7 @@ function bindPresets() {
   const openEditor = (kind, item, isNew) => {
     const name = isNew ? "" : item.name;
     const content = isNew ? "" : item.content;
+    const role = isNew ? "system" : item.role || "system";
     const overlay = document.createElement("div");
     overlay.className = "bot-overlay";
     overlay.id = "preset-editor-overlay";
@@ -4262,7 +4266,15 @@ function bindPresets() {
       </div>
       <div class="bot-form">
         <label>名称<input id="pe-name" value="${escapeHtml(name)}" placeholder="${kind === "tier" ? "如：我的档位" : "如：日记体"}"></label>
-        <label>内容（注入 system prompt 的文本，支持多行）<textarea id="pe-content" rows="14" placeholder="# 角色扮演模式（自定义）&#10;&#10;……">${escapeHtml(content)}</textarea></label>
+        <label>插入位置
+          <select id="pe-role">
+            <option value="system" ${role === "system" ? "selected" : ""}>系统提示词</option>
+            <option value="user" ${role === "user" ? "selected" : ""}>用户消息</option>
+            <option value="assistant" ${role === "assistant" ? "selected" : ""}>AI 消息</option>
+          </select>
+        </label>
+        <label>内容<textarea id="pe-content" rows="14" placeholder="# 角色扮演模式（自定义）&#10;&#10;……">${escapeHtml(content)}</textarea></label>
+        <p class="hint">内容里可插入分段标记 <code>[系统提示词]</code> <code>[AI消息]</code> <code>[用户消息]</code>，把一条预设拆成多段注入不同位置；不写标记时整条用上方「插入位置」。</p>
       </div>
       <div class="row" style="justify-content:flex-end;margin-top:6px">
         <button id="pe-save" class="primary">保存</button>
@@ -4274,11 +4286,12 @@ function bindPresets() {
     overlay.querySelector("#pe-save").addEventListener("click", async () => {
       const name = overlay.querySelector("#pe-name").value.trim();
       const content = overlay.querySelector("#pe-content").value;
+      const role = overlay.querySelector("#pe-role").value;
       try {
         if (isNew) {
-          presetStoreData = await api.send("/api/presets", { method: "POST", body: JSON.stringify({ kind, name, content }) });
+          presetStoreData = await api.send("/api/presets", { method: "POST", body: JSON.stringify({ kind, name, content, role }) });
         } else {
-          presetStoreData = await api.send(`/api/presets/${kind}/${item.id}`, { method: "PUT", body: JSON.stringify({ name, content }) });
+          presetStoreData = await api.send(`/api/presets/${kind}/${item.id}`, { method: "PUT", body: JSON.stringify({ name, content, role }) });
         }
         overlay.remove();
         refreshPresetView();
