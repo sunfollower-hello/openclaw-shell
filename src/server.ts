@@ -29,9 +29,12 @@ import { RELATION_ROLES } from "./core/schema.js";
 import { buildChatSystemAsync } from "./core/chatPrompt.js";
 import {
   listPresets,
-  addPreset,
-  updatePreset,
-  deletePreset,
+  addGroup as addPresetGroup,
+  renameGroup as renamePresetGroup,
+  deleteGroup as deletePresetGroup,
+  addItem as addPresetItem,
+  updateItem as updatePresetItem,
+  deleteItem as deletePresetItem,
   resetBuiltinPresets,
   resolveCardPresetBlocks,
   resolveCardPresetExamples,
@@ -2022,8 +2025,8 @@ app.post("/api/chat/approve", async (req, res) => {
   }
 });
 
-// ---------- 角色扮演预设库（档位/风格，卡片高级配置引用） ----------
-const isPresetKind = (k: string): k is PresetKind => k === "tier" || k === "style" || k === "rule";
+// ---------- 角色扮演预设库（档位/风格 = 预设组，组内一条一条独立条目，卡片高级配置引用组） ----------
+const isPresetKind = (k: string): k is PresetKind => k === "tier" || k === "style";
 
 app.get("/api/presets", async (_req, res) => {
   try {
@@ -2033,35 +2036,72 @@ app.get("/api/presets", async (_req, res) => {
   }
 });
 
+// 新增档位/风格组（空组，可往里加条目）
 app.post("/api/presets", async (req, res) => {
   try {
-    const { kind, name, content, role } = req.body ?? {};
-    if (!isPresetKind(kind)) return res.status(400).json({ error: "kind 必须是 tier / style / rule" });
-    res.status(201).json(await addPreset(kind, String(name ?? ""), String(content ?? ""), role));
+    const { kind, name } = req.body ?? {};
+    if (!isPresetKind(kind)) return res.status(400).json({ error: "kind 必须是 tier 或 style" });
+    res.status(201).json(await addPresetGroup(kind, String(name ?? "")));
   } catch (e) {
     res.status(500).json({ error: toUserError(e) });
   }
 });
 
-app.put("/api/presets/:kind/:id", async (req, res) => {
+// 重命名档位/风格组
+app.put("/api/presets/:kind/:groupId", async (req, res) => {
   try {
     const kind = String(req.params.kind);
-    if (!isPresetKind(kind)) return res.status(400).json({ error: "kind 必须是 tier / style / rule" });
+    if (!isPresetKind(kind)) return res.status(400).json({ error: "kind 必须是 tier 或 style" });
+    res.json(await renamePresetGroup(kind, String(req.params.groupId), String(req.body?.name ?? "")));
+  } catch (e) {
+    res.status(500).json({ error: toUserError(e) });
+  }
+});
+
+// 删除档位/风格组（内置组不可删）
+app.delete("/api/presets/:kind/:groupId", async (req, res) => {
+  try {
+    const kind = String(req.params.kind);
+    if (!isPresetKind(kind)) return res.status(400).json({ error: "kind 必须是 tier 或 style" });
+    res.json(await deletePresetGroup(kind, String(req.params.groupId)));
+  } catch (e) {
+    res.status(500).json({ error: toUserError(e) });
+  }
+});
+
+// 组内新增条目
+app.post("/api/presets/:kind/:groupId/items", async (req, res) => {
+  try {
+    const kind = String(req.params.kind);
+    if (!isPresetKind(kind)) return res.status(400).json({ error: "kind 必须是 tier 或 style" });
+    const { name, content, role } = req.body ?? {};
+    res.status(201).json(await addPresetItem(kind, String(req.params.groupId), { name: String(name ?? ""), content: String(content ?? ""), role }));
+  } catch (e) {
+    res.status(500).json({ error: toUserError(e) });
+  }
+});
+
+// 编辑组内条目（名称/内容/插入位置）
+app.put("/api/presets/:kind/:groupId/items/:itemId", async (req, res) => {
+  try {
+    const kind = String(req.params.kind);
+    if (!isPresetKind(kind)) return res.status(400).json({ error: "kind 必须是 tier 或 style" });
     const patch: { name?: string; content?: string; role?: PresetRole } = {};
     if (typeof req.body?.name === "string") patch.name = req.body.name;
     if (typeof req.body?.content === "string") patch.content = req.body.content;
     if (typeof req.body?.role === "string") patch.role = req.body.role as PresetRole;
-    res.json(await updatePreset(kind, String(req.params.id), patch));
+    res.json(await updatePresetItem(kind, String(req.params.groupId), String(req.params.itemId), patch));
   } catch (e) {
     res.status(500).json({ error: toUserError(e) });
   }
 });
 
-app.delete("/api/presets/:kind/:id", async (req, res) => {
+// 删除组内条目（内置条目不可删，可编辑或恢复内置）
+app.delete("/api/presets/:kind/:groupId/items/:itemId", async (req, res) => {
   try {
     const kind = String(req.params.kind);
-    if (!isPresetKind(kind)) return res.status(400).json({ error: "kind 必须是 tier / style / rule" });
-    res.json(await deletePreset(kind, String(req.params.id)));
+    if (!isPresetKind(kind)) return res.status(400).json({ error: "kind 必须是 tier 或 style" });
+    res.json(await deletePresetItem(kind, String(req.params.groupId), String(req.params.itemId)));
   } catch (e) {
     res.status(500).json({ error: toUserError(e) });
   }

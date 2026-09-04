@@ -4166,82 +4166,97 @@ async function wsLoadOverview() {
 }
 
 // ============================================================
-//  视图：预设库（侧边栏「预设」）—— 档位/风格管理，卡片高级配置里引用
+//  视图：预设库（侧边栏「预设」）—— 档位/风格 = 预设组，组内一条一条条目
+//  两级结构：首页只显示组名（看不见内容）→ 点进组看条目名 → 点条目单独编辑
 // ============================================================
-let presetStoreData = { tiers: [], styles: [], rules: [] };
+let presetStoreData = { tiers: [], styles: [] };
+let presetView = null; // null=首页；{kind:'tier'|'style', groupId}=组内
 
 async function loadPresetStore() {
-  presetStoreData = await api.get("/api/presets").catch(() => ({ tiers: [], styles: [], rules: [] }));
+  presetStoreData = await api.get("/api/presets").catch(() => ({ tiers: [], styles: [] }));
   return presetStoreData;
 }
 
-function renderPresetEditor(kind, list) {
-  const meta = {
-    tier: { title: "档位（扮演模式与内容尺度）", hint: "档位决定扮演模式与内容尺度：目前只保留「破甲（最高）」（不破甲的内容已整合进来）。" },
-    style: { title: "风格（叙述风格）", hint: "风格决定输出形式：纯对话（只有对白，一条消息最多 2 个逗号）/ 重描写（心理（）动作 {}）。" },
-    rule: { title: "全局规则（独立条目，不跟卡片绑定）", hint: "每条规则是一个独立条目，可单独改插入位置或编辑内容；聊天时全部按各自位置注入。" },
-  }[kind];
-  const roleLabel = (r) => (r === "user" ? "用户消息" : r === "assistant" ? "AI 消息" : "系统提示词");
-  return `
-  <div class="card-box">
-    <h3>${icon("sliders")} ${meta.title}</h3>
-    <p class="hint">${meta.hint}</p>
-    <div class="preset-list" id="preset-${kind}-list">
-      ${list
-        .map(
-          (p) => `
-      <div class="preset-item" data-kind="${kind}" data-id="${escapeHtml(p.id)}">
-        <div class="preset-item-head">
-          <b>${escapeHtml(p.name)}</b>
-          <span class="preset-badge ${p.builtin ? "builtin" : "custom"}">${p.builtin ? "内置" : "自定义"}</span>
-          <span class="preset-badge" style="background:var(--bg-soft)">插入：${roleLabel(p.role || "system")}</span>
-          <div class="row" style="margin-left:auto">
-            <button class="ghost small-btn preset-edit" title="编辑">${icon("pen")}</button>
-            <button class="ghost small-btn preset-del" title="删除" ${p.builtin ? "disabled" : ""}>${icon("trash")}</button>
-          </div>
-        </div>
-        <pre class="preset-preview">${escapeHtml(p.content.slice(0, 220))}${p.content.length > 220 ? "…" : ""}</pre>
-      </div>`
-        )
-        .join("")}
-    </div>
-    <div class="row" style="margin-top:10px">
-      <button class="ghost small-btn preset-add" data-kind="${kind}">${icon("plus")} 新增自定义${kind === "tier" ? "档位" : kind === "style" ? "风格" : "规则"}</button>
-      <button class="ghost small-btn preset-reset-all" data-kind="${kind}" style="margin-left:8px">恢复内置</button>
-    </div>
-  </div>`;
-}
+const presetRoleLabel = (r) => (r === "user" ? "用户消息" : r === "assistant" ? "AI 消息" : "系统提示词");
 
+/** 首页：只显示档位/风格组名，不显示内容 */
 function renderPresets() {
-  const { tiers, styles, rules } = presetStoreData;
+  if (presetView) return renderPresetGroupView(presetView.kind, presetView.groupId);
+  const groupCard = (kind, g) => `
+    <div class="preset-group-card" data-kind="${kind}" data-group="${escapeHtml(g.id)}" title="点击查看组内条目">
+      <div class="preset-group-name">${escapeHtml(g.name)}</div>
+      <div class="preset-group-meta">${g.items.length} 条${g.builtin ? " · 内置" : ""}</div>
+    </div>`;
+  const section = (kind, title, hint, groups) => `
+    <div class="card-box">
+      <h3>${icon("sliders")} ${title}</h3>
+      <p class="hint">${hint}</p>
+      <div class="preset-group-grid">
+        ${groups.length ? groups.map((g) => groupCard(kind, g)).join("") : '<div class="muted">还没有组，点下方「新增」创建</div>'}
+      </div>
+      <div class="row" style="margin-top:10px">
+        <button class="ghost small-btn preset-group-add" data-kind="${kind}">${icon("plus")} 新增${kind === "tier" ? "档位" : "风格"}</button>
+        <button class="ghost small-btn preset-reset-all" data-kind="${kind}" style="margin-left:8px">恢复内置</button>
+      </div>
+    </div>`;
   return `
   <div class="view">
     <div class="page-head">
       <h2>${icon("sliders")} 角色扮演预设</h2>
-      <p class="hint">预设是一条一条的独立条目：档位和风格在卡片的「高级配置」里选用，全局规则默认全部生效。每条可选插入位置（系统提示词 / AI 消息 / 用户消息）。</p>
+      <p class="hint">档位/风格是「预设组」：点进组看里面的条目（如 破甲组里有 破甲/防神化/防抢话/防跑偏），点条目单独编辑。预设页不显示内容。</p>
     </div>
-    ${renderPresetEditor("tier", tiers)}
+    ${section("tier", "档位", "档位决定扮演模式与内容尺度（当前：破甲）。点进「破甲」可分别编辑破甲、防神化、防抢话、防跑偏等条目。", presetStoreData.tiers)}
     <div style="height:12px"></div>
-    ${renderPresetEditor("style", styles)}
-    <div style="height:12px"></div>
-    ${renderPresetEditor("rule", rules)}
+    ${section("style", "风格", "风格决定输出形式：纯对话（≤2 逗号）/ 重描写（心理（）动作 {}）。点进风格可编辑文风规则与示范对话条目。", presetStoreData.styles)}
     <div class="card-box" style="margin-top:12px">
       <h3>${icon("info")} 说明</h3>
       <ul class="guide">
-        <li>档位只保留「破甲（最高）」（不破甲的内容已整合进破甲）；风格两种：纯对话 / 重描写。</li>
-        <li>纯对话：一条消息最多 3 次断句（QQ 气泡里最多 2 个逗号），只有对白；重描写：心理用（）包裹、动作用 {} 包裹。</li>
-        <li>每条预设可设「插入位置」：系统提示词 / 用户消息 / AI 消息；内容里也可用 <code>[系统提示词]</code> <code>[AI消息]</code> <code>[用户消息]</code> 分段标记，把一条拆成多段注入不同位置。</li>
-        <li>风格条目里的示范对话段（[AI消息]/[用户消息]）会注入真实对话开头，让 AI 模仿语气（few-shot）。</li>
-        <li>全局规则（防神化 / 防抢话 / 防跑偏）不跟卡片绑定，默认全部生效；不想用某条就把它改成自定义内容或删掉。</li>
+        <li>点任意组（如「破甲」）进入组内条目列表；点某条（如「防神化」）单独编辑内容与插入位置（系统提示词 / 用户消息 / AI 消息）。</li>
+        <li>档位只保留「破甲（最高）」，组内含 破甲/防神化/防抢话/防跑偏 四条；风格组内含 文风规则 + 示范对话（AI/用户）。</li>
+        <li>示范对话条目（AI 消息/用户消息）会注入真实对话开头，让 AI 模仿语气（few-shot）。</li>
         <li>全局「输出铁律」护栏所有档位/风格生效：剥离思维链、禁止跳出角色、末句不加句号。</li>
-        <li>能力触发：卡开了「生图」能力后，AI 会在场景需要时主动生图发图（配置见 生图配置 页）。</li>
         <li>改完预设文本后，网页试聊立即生效；QQ/微信 机器人需在卡片 🤖 机器人里点「重编译」。</li>
       </ul>
     </div>
   </div>`;
 }
 
+/** 组内视图：只显示条目名与插入位置，点条目编辑 */
+function renderPresetGroupView(kind, groupId) {
+  const list = kind === "tier" ? presetStoreData.tiers : presetStoreData.styles;
+  const g = list.find((x) => x.id === groupId);
+  if (!g) { presetView = null; return renderPresets(); }
+  return `
+  <div class="view">
+    <div class="page-head">
+      <h2>${icon("sliders")} ${escapeHtml(g.name)}</h2>
+      <p class="hint">组内 ${g.items.length} 条预设：点条目编辑内容与插入位置；条目名右侧显示插入位置。</p>
+    </div>
+    <div class="card-box">
+      <div class="preset-list" id="preset-item-list">
+        ${g.items.length ? g.items.map((it) => `
+          <div class="preset-item" data-item="${escapeHtml(it.id)}">
+            <div class="preset-item-head">
+              <b>${escapeHtml(it.name)}</b>
+              <span class="preset-badge ${it.builtin ? "builtin" : "custom"}">${it.builtin ? "内置" : "自定义"}</span>
+              <span class="preset-badge" style="background:var(--bg-soft)">插入：${presetRoleLabel(it.role || "system")}</span>
+              <div class="row" style="margin-left:auto">
+                <button class="ghost small-btn preset-item-edit" title="编辑">${icon("pen")}</button>
+                <button class="ghost small-btn preset-item-del" title="删除" ${it.builtin ? "disabled" : ""}>${icon("trash")}</button>
+              </div>
+            </div>
+          </div>`).join("") : '<div class="muted">这个组还没有条目，点下方「新增条目」</div>'}
+      </div>
+      <div class="row" style="margin-top:10px">
+        <button class="ghost small-btn preset-item-add">${icon("plus")} 新增条目</button>
+        <button class="ghost small-btn preset-group-back" style="margin-left:8px">← 返回预设列表</button>
+      </div>
+    </div>
+  </div>`;
+}
+
 async function initPresets() {
+  presetView = null;
   await loadPresetStore();
   $("#view").innerHTML = renderPresets();
   bindPresets();
@@ -4255,34 +4270,29 @@ function refreshPresetView() {
 }
 
 function bindPresets() {
-  const openEditor = (kind, item, isNew) => {
+  // 条目编辑弹窗（组内条目：名称 + 插入位置 + 内容）
+  const openItemEditor = (kind, groupId, item, isNew) => {
     const name = isNew ? "" : item.name;
     const content = isNew ? "" : item.content;
     const role = isNew ? "system" : item.role || "system";
     const overlay = document.createElement("div");
     overlay.className = "bot-overlay";
     overlay.id = "preset-editor-overlay";
-    overlay.innerHTML = `<div class="bot-dialog adv-dialog" style="max-width:640px">
-      <div class="bot-dialog-head">
-        <h3>${isNew ? "新增" : "编辑"}${kind === "tier" ? "档位" : kind === "style" ? "风格" : "规则"}${isNew ? "" : " · " + escapeHtml(item.name)}</h3>
-        <button class="ghost small-btn" id="pe-close">${icon("x")}</button>
-      </div>
-      <div class="bot-form">
-        <label>名称<input id="pe-name" value="${escapeHtml(name)}" placeholder="${kind === "tier" ? "如：我的档位" : "如：日记体"}"></label>
-        <label>插入位置
-          <select id="pe-role">
-            <option value="system" ${role === "system" ? "selected" : ""}>系统提示词</option>
-            <option value="user" ${role === "user" ? "selected" : ""}>用户消息</option>
-            <option value="assistant" ${role === "assistant" ? "selected" : ""}>AI 消息</option>
-          </select>
-        </label>
-        <label>内容<textarea id="pe-content" rows="14" placeholder="# 角色扮演模式（自定义）&#10;&#10;……">${escapeHtml(content)}</textarea></label>
-        <p class="hint">内容里可插入分段标记 <code>[系统提示词]</code> <code>[AI消息]</code> <code>[用户消息]</code>，把一条预设拆成多段注入不同位置；不写标记时整条用上方「插入位置」。</p>
-      </div>
-      <div class="row" style="justify-content:flex-end;margin-top:6px">
-        <button id="pe-save" class="primary">保存</button>
-      </div>
-    </div>`;
+    overlay.innerHTML = '<div class="bot-dialog adv-dialog" style="max-width:640px">' +
+      '<div class="bot-dialog-head"><h3>' + (isNew ? "新增" : "编辑") + '条目' + (isNew ? "" : " · " + escapeHtml(item.name)) + '</h3>' +
+      '<button class="ghost small-btn" id="pe-close">' + icon("x") + '</button></div>' +
+      '<div class="bot-form">' +
+      '<label>名称<input id="pe-name" value="' + escapeHtml(name) + '" placeholder="如：防神化"></label>' +
+      '<label>插入位置<select id="pe-role">' +
+      '<option value="system"' + (role === "system" ? " selected" : "") + '>系统提示词</option>' +
+      '<option value="user"' + (role === "user" ? " selected" : "") + '>用户消息</option>' +
+      '<option value="assistant"' + (role === "assistant" ? " selected" : "") + '>AI 消息</option>' +
+      '</select></label>' +
+      '<label>内容<textarea id="pe-content" rows="14" placeholder="这条预设的内容……">' + escapeHtml(content) + '</textarea></label>' +
+      '<p class="hint">插入位置决定这条注入哪里：系统提示词 / 用户消息 / AI 消息（示范对话选 AI 消息或用户消息，注入对话开头供 AI 模仿）。</p>' +
+      '</div>' +
+      '<div class="row" style="justify-content:flex-end;margin-top:6px"><button id="pe-save" class="primary">保存</button></div>' +
+      '</div>';
     document.body.appendChild(overlay);
     overlay.addEventListener("click", (e) => { if (e.target === overlay) overlay.remove(); });
     overlay.querySelector("#pe-close").addEventListener("click", () => overlay.remove());
@@ -4292,51 +4302,82 @@ function bindPresets() {
       const role = overlay.querySelector("#pe-role").value;
       try {
         if (isNew) {
-          presetStoreData = await api.send("/api/presets", { method: "POST", body: JSON.stringify({ kind, name, content, role }) });
+          presetStoreData = await api.send("/api/presets/" + kind + "/" + groupId + "/items", { method: "POST", body: JSON.stringify({ name, content, role }) });
         } else {
-          presetStoreData = await api.send(`/api/presets/${kind}/${item.id}`, { method: "PUT", body: JSON.stringify({ name, content, role }) });
+          presetStoreData = await api.send("/api/presets/" + kind + "/" + groupId + "/items/" + item.id, { method: "PUT", body: JSON.stringify({ name, content, role }) });
         }
         overlay.remove();
         refreshPresetView();
-        toast("✓ 预设已保存");
+        toast("✓ 已保存");
       } catch (e) {
         toast("保存失败：" + e.message, false);
       }
     });
   };
 
-  const bindList = (kind) => {
-    $(`#preset-${kind}-list`)?.addEventListener("click", (e) => {
-      const edit = e.target.closest(".preset-edit");
-      const del = e.target.closest(".preset-del");
-      const itemEl = e.target.closest(".preset-item");
-      if (!itemEl) return;
-      const id = itemEl.dataset.id;
-      const item = presetStoreData[kind === "tier" ? "tiers" : "styles"].find((p) => p.id === id);
-      if (!item) return;
-      if (edit) openEditor(kind, item, false);
-      if (del) {
-        api.send(`/api/presets/${kind}/${id}`, { method: "DELETE" })
-          .then((data) => { presetStoreData = data; refreshPresetView(); toast("已删除"); })
-          .catch((err) => toast("删除失败：" + err.message, false));
-      }
+  // 首页：点组卡进入组内视图
+  document.querySelectorAll(".preset-group-card").forEach((card) => {
+    card.addEventListener("click", () => {
+      presetView = { kind: card.dataset.kind, groupId: card.dataset.group };
+      $("#view").innerHTML = renderPresets();
+      bindPresets();
     });
-  };
-  bindList("tier");
-  bindList("style");
-  bindList("rule");
-  document.querySelectorAll(".preset-add").forEach((btn) => {
-    btn.addEventListener("click", () => openEditor(btn.dataset.kind, null, true));
   });
+  // 首页：新增档位/风格组
+  document.querySelectorAll(".preset-group-add").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const kind = btn.dataset.kind;
+      const name = prompt("新" + (kind === "tier" ? "档位" : "风格") + "名称：");
+      if (!name || !name.trim()) return;
+      try {
+        presetStoreData = await api.send("/api/presets", { method: "POST", body: JSON.stringify({ kind, name: name.trim() }) });
+        refreshPresetView();
+        toast("✓ 已创建，点进组添加条目");
+      } catch (e) { toast("创建失败：" + e.message, false); }
+    });
+  });
+  // 首页：恢复内置
   document.querySelectorAll(".preset-reset-all").forEach((btn) => {
     btn.addEventListener("click", async () => {
-      if (!confirm("恢复内置档位/风格？自定义条目保留，内置条目的文本会重置为代码默认。")) return;
+      if (!confirm("恢复内置预设？自定义条目保留，内置条目的文本会重置为代码默认。")) return;
       try {
         presetStoreData = await api.send("/api/presets/reset", { method: "POST" });
         refreshPresetView();
         toast("✓ 已恢复内置");
-      } catch (e) {
-        toast("恢复失败：" + e.message, false);
+      } catch (e) { toast("恢复失败：" + e.message, false); }
+    });
+  });
+  // 组内：返回列表
+  document.querySelectorAll(".preset-group-back").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      presetView = null;
+      refreshPresetView();
+    });
+  });
+  // 组内：新增条目
+  document.querySelectorAll(".preset-item-add").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const g = (presetView.kind === "tier" ? presetStoreData.tiers : presetStoreData.styles).find((x) => x.id === presetView.groupId);
+      openItemEditor(presetView.kind, presetView.groupId, g, true);
+    });
+  });
+  // 组内：条目编辑/删除
+  document.querySelectorAll(".preset-item-edit, .preset-item-del").forEach((btn) => {
+    btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      const row = btn.closest(".preset-item");
+      if (!row) return;
+      const itemId = row.dataset.item;
+      const g = (presetView.kind === "tier" ? presetStoreData.tiers : presetStoreData.styles).find((x) => x.id === presetView.groupId);
+      const item = g && g.items.find((x) => x.id === itemId);
+      if (!item) return;
+      if (btn.classList.contains("preset-item-edit")) {
+        openItemEditor(presetView.kind, presetView.groupId, item, false);
+      } else {
+        if (!confirm("删除条目「" + item.name + "」？")) return;
+        api.send("/api/presets/" + presetView.kind + "/" + presetView.groupId + "/items/" + itemId, { method: "DELETE" })
+          .then((data) => { presetStoreData = data; refreshPresetView(); toast("已删除"); })
+          .catch((err) => toast("删除失败：" + err.message, false));
       }
     });
   });
