@@ -3,7 +3,8 @@
 import express from "express";
 import path from "node:path";
 import os from "node:os";
-import { promises as fs } from "node:fs";
+import crypto from "node:crypto";
+import { promises as fs, existsSync } from "node:fs";
 import { CardStore, dataDir, newCardId, nowIso } from "./core/cardStore.js";
 import { defaultCard, SCHEMA_VERSION, personaCardSchema, type PersonaCard } from "./core/schema.js";
 import { validateCard } from "./core/validator.js";
@@ -27,6 +28,7 @@ import { runDistill } from "./distiller/pipeline.js";
 import { parsePlainText } from "./distiller/parser.js";
 import { RELATION_ROLES } from "./core/schema.js";
 import { buildChatSystemAsync } from "./core/chatPrompt.js";
+import { splitReply, describeSplit, type SplitStyle } from "./core/splitter.js";
 import {
   listPresets,
   addGroup as addPresetGroup,
@@ -42,7 +44,7 @@ import {
   type PresetRole,
 } from "./core/presets.js";
 import { sanitizeChatReply } from "./core/sanitize.js";
-import { claimGreeting, isGreeted, clearGreeted } from "./core/greetedStore.js";
+import { claimGreeting, isGreeted, clearGreeted, markGreeted } from "./core/greetedStore.js";
 import {
   runLifeTick,
   applyLifeConfig,
@@ -69,6 +71,7 @@ import {
   listEdgeVoices,
   COMMON_EDGE_VOICES,
   TTS_KINDS,
+  TTS_PROVIDER_PRESETS,
   type TtsProvider,
 } from "./core/ttsConfig.js";
 import { recordUsage, getUsageSummary } from "./core/ttsUsage.js";
@@ -81,11 +84,13 @@ import {
   emojiUrl,
   buildEmojiPrompt,
   migrateLegacyEmojis,
+  importEmojisToGroup,
   listGroups,
   addGroup,
   renameGroup,
   deleteGroup,
   moveEmojiToGroup,
+  syncEmojisToChannelMedia,
   MAX_EMOJIS,
 } from "./core/emojiStore.js";
 import {
@@ -96,13 +101,31 @@ import {
   agentWorkspaceDir,
   applyAgentHumanDelay,
   applyAgentModel,
+  applyAgentBlockStreaming,
+  applyAgentSplitStyle,
+  applyAgentMemoryScope,
+  applyAllAgentMemoryScopes,
   updateBotAccount,
+  upsertAgentEntry,
+  bindAccountDirect,
+  unbindAccountDirect,
+  removeAgentEntry,
+  clearAgentSessions,
+  trimAgentSessionTail,
   CHANNEL_LABELS,
   MAX_QQ_BOTS,
   MAX_WEIXIN_BOTS,
+  MAX_QQ_ACCOUNTS,
+  MAX_WEIXIN_ACCOUNTS,
   type BotChannel,
   type BotInstance,
 } from "./core/botStore.js";
+import {
+  loadAccountLabels,
+  setAccountLabel,
+  removeAccountLabel,
+  displayName as accountDisplayName,
+} from "./core/accountLabels.js";
 import {
   recall,
   appendEntry,
@@ -113,12 +136,31 @@ import {
   exportMemoryToMarkdown,
   exportAllMemoriesToMarkdown,
   pushChatRound,
+  markChatRetry,
+  repairChatlogAfterDelete,
+  dissolveNewestMemory,
+  deleteMemoriesByRounds,
+  roundKeyOf,
 } from "./core/memoryStore.js";
-import { appendConv, readConv, clearConv, type ConvSurface } from "./core/conversationStore.js";
+import { appendConv, readConv, readConvSrcIds, deleteConvByIds, clearConv, type ConvSurface } from "./core/conversationStore.js";
+import {
+  listGroupsForCard,
+  getGroupDetail,
+  deleteGroup as deleteGroupChat,
+  renameMember as renameGroupMember,
+  recallGroupContext,
+  appendGroupTurn,
+  ensureGroup,
+  memberLabel,
+  formatGroupInject,
+} from "./core/groupChatStore.js";
+import { exportHistoryToMarkdown, exportAllHistoriesToMarkdown, readRecentLocalChat } from "./core/historyExport.js";
+import { readConfigState, recordConfigChange, buildConfigChangeReminder, buildConfigSectionForUserMd } from "./core/configState.js";
 import {
   pollSessionTurns,
   findSession,
   sessionKeyOf,
+  listAgentSessionUsers,
   clearObserveCursor,
   type MirrorTurn,
 } from "./core/sessionMirror.js";
@@ -145,11 +187,20 @@ const app = express();
 app.use(express.json({ limit: "20mb" }));
 const store = new CardStore();
 
+// 内容资源（表情/生图/封面）先于认证挂载：<img> 标签无法携带 Basic 凭证，
+// 之前挂在认证后导致图片 401 加载失败（实锤）。图片 URL 含随机文件名，同源内网/隧道可见，风险可接受。
+app.use("/emojis", express.static(path.join(dataDir(), "emojis")));
+app.use("/img", express.static(path.join(dataDir(), "images")));
+app.use("/covers", express.static(coversDir(), { etag: true, maxAge: 0 }));
+
 // 公网暴露时启用 Basic 认证（设置 OPENCLAW_SHELL_UI_USER / OPENCLAW_SHELL_UI_PASS）
 const UI_USER = process.env.OPENCLAW_SHELL_UI_USER;
 const UI_PASS = process.env.OPENCLAW_SHELL_UI_PASS;
 if (UI_USER && UI_PASS) {
   app.use((req, res, next) => {
+    const ip = String(req.ip || req.socket.remoteAddress || "");
+    const local = ip === "127.0.0.1" || ip === "::1" || ip.endsWith("127.0.0.1");
+    if (local && req.path.startsWith("/api/internal/")) return next();
     const auth = req.headers.authorization ?? "";
     const [type, token] = auth.split(" ");
     if (type === "Basic" && token) {
@@ -165,14 +216,65 @@ if (UI_USER && UI_PASS) {
 }
 
 const projectRoot = findProjectRoot();
-// 静态资源不缓存（版本号 query 也已加，双保险防旧 JS/CSS 残留）
-app.use(express.static(path.join(projectRoot, "web"), { etag: true, maxAge: 0, setHeaders: (res) => {
+
+/**
+ * index.html 的资源版本号自动跟随文件内容（mtime+大小的短哈希）。
+ * 背景：静态资源改成 immutable 长效缓存后，如果 html 里的 `?v=` 号忘了手动改，
+ * 浏览器会一直用旧的 app.js —— 开发时改了代码看不到效果（实测踩过）。
+ * 现在每次请求首页时按 web/app.js 与 style.css 的真实状态重写版本号，改完文件刷新即生效。
+ */
+async function serveIndexHtml(res: express.Response): Promise<void> {
+  const webDir = path.join(projectRoot, "web");
+  const stamp = async (file: string): Promise<string> => {
+    try {
+      const st = await fs.stat(path.join(webDir, file));
+      return (st.mtimeMs.toString(36) + st.size.toString(36)).slice(-10);
+    } catch {
+      return "0";
+    }
+  };
+  const [jsV, cssV] = await Promise.all([stamp("app.js"), stamp("style.css")]);
+  let html = await fs.readFile(path.join(webDir, "index.html"), "utf8");
+  html = html
+    .replace(/app\.js\?v=[^"']*/g, `app.js?v=${jsV}`)
+    .replace(/style\.css\?v=[^"']*/g, `style.css?v=${cssV}`);
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.setHeader("Cache-Control", "no-cache");
-} }));
-// 表情包与生图产物（挂在认证之后，公网同样受 Basic 保护）
-app.use("/emojis", express.static(path.join(dataDir(), "emojis")));
-app.use("/img", express.static(path.join(dataDir(), "images")));
-app.use("/covers", express.static(coversDir(), { etag: true, maxAge: 0 }));
+  res.send(html);
+}
+
+app.get("/", (_req, res, next) => {
+  void serveIndexHtml(res).catch(next);
+});
+app.get("/index.html", (_req, res, next) => {
+  void serveIndexHtml(res).catch(next);
+});
+
+/**
+ * 静态资源缓存策略（2026-09-08 优化）。
+ * 背景：走 Cloudflare 隧道时每个请求往返 0.5-1.7s，而原来全站 `Cache-Control: no-cache`
+ * → app.js（266KB）每次刷新都重新下载、Cloudflare 也 BYPASS 不缓存，首屏白屏 1-2s。
+ * 现在：
+ *  - app.js / style.css 带 `?v=` 版本号访问 → 视为不可变内容，长效缓存（改版号即刷新）；
+ *  - index.html 与无版本号访问 → 仍然 no-cache（保证发版后能立刻拿到新的 html 与版本号）。
+ */
+app.use(
+  express.static(path.join(projectRoot, "web"), {
+    etag: true,
+    lastModified: true,
+    maxAge: 0,
+    setHeaders: (res, filePath, stat) => {
+      const isVersioned = typeof res.req?.query?.v === "string" && res.req.query.v.length > 0;
+      const isAsset = /\.(js|css|png|jpe?g|gif|webp|svg|woff2?)$/i.test(filePath);
+      if (isVersioned && isAsset) {
+        // 版本号变了 URL 就变了，所以内容可以当作不可变（immutable）长期缓存
+        res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
+      } else {
+        res.setHeader("Cache-Control", "no-cache");
+      }
+    },
+  })
+);
 // 语音合成产物
 // 语音不再落盘（/api/tts/synthesize 直接回音频流），所以没有 /tts 静态目录
 
@@ -320,6 +422,136 @@ app.get("/api/cards/:slug/greeting", async (req, res) => {
   }
 });
 
+// ---------- 主动开场白（QQ / 微信）：给绑定该卡的账号下「互动过但还没开场」的用户主动推送开场白 ----------
+// QQ：known-users.json 记录 c2c 用户 openid，走 /app/getAppAccessToken + api.sgroup.qq.com/v2/users/{openid}/messages
+// 微信：accounts/<id>.context-tokens.json 记录互动用户 ilink_user_id → contextToken，走 ilink/bot/sendmessage
+// 只发私聊（c2c），群聊不主动开场；发过即 markGreeted，不重复。
+async function sendQQProactiveText(appId: string, clientSecret: string, openid: string, content: string): Promise<boolean> {
+  try {
+    const tr = await fetch("https://bots.qq.com/app/getAppAccessToken", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ appId, clientSecret }),
+      signal: AbortSignal.timeout(15000),
+    });
+    if (!tr.ok) return false;
+    const token = ((await tr.json()) as { access_token?: string }).access_token;
+    if (!token) return false;
+    const r = await fetch(`https://api.sgroup.qq.com/v2/users/${encodeURIComponent(openid)}/messages`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `QQBot ${token}` },
+      body: JSON.stringify({ msg_type: 0, content }),
+      signal: AbortSignal.timeout(15000),
+    });
+    return r.ok;
+  } catch {
+    return false;
+  }
+}
+
+/** 微信主动发消息：账号文件里有 token/baseUrl，context-tokens 文件里有互动用户的 ilink_user_id → contextToken */
+async function sendWeixinProactiveText(accountId: string, userKey: string, contextToken: string | undefined, content: string): Promise<boolean> {
+  try {
+    const accFile = path.join(os.homedir(), ".openclaw", "openclaw-weixin", "accounts", `${accountId}.json`);
+    const acc = JSON.parse(await fs.readFile(accFile, "utf8")) as { token?: string; baseUrl?: string };
+    if (!acc.token || !acc.baseUrl) return false;
+    // 与插件一致的请求头（iLink-App-Id=bot，版本 2.4.6 → clientVersion 0x020406）
+    const uin = Buffer.from(String(crypto.randomBytes(4).readUInt32BE(0)), "utf-8").toString("base64");
+    const r = await fetch(`${String(acc.baseUrl).replace(/\/+$/, "")}/ilink/bot/sendmessage`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        AuthorizationType: "ilink_bot_token",
+        "X-WECHAT-UIN": uin,
+        "iLink-App-Id": "bot",
+        "iLink-App-ClientVersion": String(((2 & 0xff) << 16) | ((4 & 0xff) << 8) | (6 & 0xff)),
+        Authorization: `Bearer ${acc.token}`,
+      },
+      body: JSON.stringify({
+        msg: {
+          from_user_id: "",
+          to_user_id: userKey,
+          client_id: `ocw-${Date.now().toString(36)}`,
+          message_type: 2, // MessageType.BOT
+          message_state: 2, // MessageState.FINISH
+          item_list: [{ type: 1, text_item: { text: content } }], // MessageItemType.TEXT
+          ...(contextToken ? { context_token: contextToken } : {}),
+        },
+        base_info: { channel_version: "2.4.6", bot_agent: "OpenClaw" },
+      }),
+      signal: AbortSignal.timeout(15000),
+    });
+    return r.ok;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * 给一张卡的所有已绑定通道（QQ/微信）下「互动过但未开场」的私聊用户主动发开场白。
+ * 绑定成功后自动调用；也供「清空对话」后补发。幂等：发过即标记，不会重复。
+ */
+async function pushGreetingForCard(slug: string): Promise<{ sent: string[]; skipped: string[]; channels: string[] }> {
+  const card = await store.get(slug).catch(() => null);
+  const firstMes = card?.sillytavern_v2?.first_mes?.trim();
+  if (!card || !firstMes) return { sent: [], skipped: [], channels: [] };
+  const sent: string[] = [];
+  const skipped: string[] = [];
+  const channels: string[] = [];
+  const bots = await listBots().catch(() => [] as { cardSlug: string; channel: string; accountId: string }[]);
+
+  for (const bot of bots.filter((b) => b.cardSlug === slug)) {
+    if (bot.channel === "qqbot") {
+      channels.push("qq");
+      const usersFile = path.join(os.homedir(), ".openclaw", "qqbot", "data", "known-users.json");
+      const known = JSON.parse(await fs.readFile(usersFile, "utf8").catch(() => "[]")) as {
+        type?: string; openid?: string; accountId?: string;
+      }[];
+      const targets = known.filter((u) => u.type === "c2c" && u.accountId === bot.accountId && u.openid);
+      const cfg = JSON.parse(await fs.readFile(path.join(os.homedir(), ".openclaw", "openclaw.json"), "utf8"));
+      const acc = cfg.channels?.qqbot?.accounts?.[bot.accountId];
+      if (!acc?.appId || !acc?.clientSecret) continue;
+      for (const u of targets) {
+        const key = `qq:${u.openid}`;
+        if (await isGreeted(slug, key)) { skipped.push(key); continue; }
+        const ok = await sendQQProactiveText(String(acc.appId), String(acc.clientSecret), String(u.openid), firstMes);
+        if (ok) { await markGreeted(slug, key); sent.push(key); } else { skipped.push(key); }
+      }
+    } else if (bot.channel === "openclaw-weixin") {
+      channels.push("wx");
+      const ctxFile = path.join(os.homedir(), ".openclaw", "openclaw-weixin", "accounts", `${bot.accountId}.context-tokens.json`);
+      const ctxMap = JSON.parse(await fs.readFile(ctxFile, "utf8").catch(() => "{}")) as Record<string, string>;
+      for (const [userKey, contextToken] of Object.entries(ctxMap)) {
+        const key = `wx:${userKey}`;
+        if (await isGreeted(slug, key)) { skipped.push(key); continue; }
+        const ok = await sendWeixinProactiveText(bot.accountId, userKey, contextToken, firstMes);
+        if (ok) { await markGreeted(slug, key); sent.push(key); } else { skipped.push(key); }
+      }
+    }
+  }
+  return { sent, skipped, channels };
+}
+
+app.post("/api/cards/:slug/greeting/push", async (req, res) => {
+  try {
+    const r = await pushGreetingForCard(req.params.slug);
+    res.json({
+      ok: r.sent.length > 0,
+      sent: r.sent,
+      skipped: r.skipped,
+      info: r.channels.length === 0
+        ? "这张卡没绑 QQ/微信机器人"
+        : r.sent.length
+          ? `✓ 已主动发送开场白 ${r.sent.length} 条${r.skipped.length ? `（${r.skipped.length} 个已开场过/发送失败，跳过）` : ""}`
+          : r.skipped.length
+            ? "没有可发送的用户：都已开场过，或发送失败（检查 48h 互动窗口）"
+            : "还没有互动过的用户——用户先给机器人发一条消息后，才能主动开场",
+    });
+  } catch (e) {
+    res.status(500).json({ error: toUserError(e) });
+  }
+});
+
 app.post("/api/cards/:slug/greeting/clear", async (req, res) => {
   try {
     const { userKey } = req.body ?? {};
@@ -376,6 +608,8 @@ app.put("/api/cards/:slug", async (req, res) => {
     if (body.life) {
       await applyLifeConfig(body.slug, body.life).catch(() => {});
     }
+    // 记录扮演配置变更（风格/条数/预设档位）→ 供网页与通道的「变更强提醒」注入
+    await recordConfigChange(body as PersonaCard).catch(() => {});
     // 卡的变化 → 通道端（QQ/微信）：有绑定机器人时自动重编译 workspace + 同步模型/节奏。
     // 之前只靠手动点「重新应用」，改模型/人设后通道端一直用旧配置。
     let channelSyncNote = "";
@@ -430,6 +664,7 @@ app.delete("/api/cards/:slug", async (req, res) => {
     }
     if (removedBots > 0) invalidateAgentsCache();
     invalidateChannelStatus();
+    invalidateBindingsCache();
     res.json({ ok: true, removedBots });
   } catch (e) {
     res.status(500).json({ error: toUserError(e) });
@@ -464,10 +699,16 @@ async function syncCardToChannel(card: PersonaCard): Promise<string> {
   if (llm) {
     const model = `${llm.provider}/${llm.model}`;
     const changed = await applyAgentModel(bot.agentId, model).catch(() => false);
-    if (changed) notes.push(`模型已切到 ${model}（重启网关后生效）`);
+    if (changed) notes.push(`模型已切到 ${model}`);
   }
   // ③ 节奏：humanDelay 同步（与创建/重编译接口一致）
   await applyAgentHumanDelay(bot.agentId, card.chat?.delay).catch(() => {});
+  // ④ 拆条：blockStreaming 安全值写渠道账号（真正的语义拆条在通道插件补丁）+ 风格写侧车表（每卡独立）
+  const splitStyle: SplitStyle = card.presets?.style === "rich" ? "rich" : "chat";
+  await applyAgentBlockStreaming(bot.channel, bot.accountId, { style: splitStyle }).catch(() => {});
+  await applyAgentSplitStyle(bot.agentId, splitStyle).catch(() => {});
+  // ⑤ 检索隔离：该 agent 只搜本卡的记忆/本地聊天原文（defaults 全局检索池已关闭）
+  await applyAgentMemoryScope(bot.agentId, bot.cardSlug).catch(() => {});
   return notes.join("；");
 }
 
@@ -566,7 +807,16 @@ app.get("/api/channels/wechat/status", async (req, res) => {
   }
 });
 
-app.post("/api/channels/wechat/login", (_req, res) => {
+app.post("/api/channels/wechat/login", async (_req, res) => {
+  // 槽位满了就不生成二维码：必须先彻底删掉一个账号（用户拍板的语义）
+  const slot = await accountSlotState("openclaw-weixin").catch(() => null);
+  if (slot?.full) {
+    return res.status(400).json({
+      error: `微信账号已存满（${slot.used}/${slot.max}）。请先在下方账号列表里彻底删除一个，再扫码添加新的。`,
+      accountSlotFull: true,
+      slot,
+    });
+  }
   res.json(startChannelLogin("openclaw-weixin"));
 });
 
@@ -641,7 +891,15 @@ app.get("/api/channels/qq/status", async (req, res) => {
   }
 });
 
-app.post("/api/channels/qq/login", (_req, res) => {
+app.post("/api/channels/qq/login", async (_req, res) => {
+  const slot = await accountSlotState("qqbot").catch(() => null);
+  if (slot?.full) {
+    return res.status(400).json({
+      error: `QQ 账号已存满（${slot.used}/${slot.max}）。请先在下方账号列表里彻底删除一个，再扫码添加新的。`,
+      accountSlotFull: true,
+      slot,
+    });
+  }
   res.json(startChannelLogin("qqbot"));
 });
 
@@ -705,6 +963,18 @@ interface KnownAccount {
   authed: boolean; // 凭证在 → 可免扫码复用
 }
 
+/**
+ * 账号槽位是否还有空位（与「绑卡上限」不是一回事）。
+ * 本机最多保存 QQ 5 / 微信 2 个已认证账号；满了就不再生成二维码，
+ * 必须先在通道连接页「彻底删除」一个账号（连凭证一起删）才能扫新的。
+ */
+async function accountSlotState(channel: BotChannel): Promise<{ used: number; max: number; full: boolean }> {
+  const all = await scanKnownAccounts();
+  const used = all.filter((a) => a.channel === channel).length;
+  const max = channel === "qqbot" ? MAX_QQ_ACCOUNTS : MAX_WEIXIN_ACCOUNTS;
+  return { used, max, full: used >= max };
+}
+
 /** 扫描已认证渠道账号：QQ 读 openclaw.json channels.qqbot（默认+多账号），微信读插件账号索引 */
 async function scanKnownAccounts(): Promise<KnownAccount[]> {
   const out: KnownAccount[] = [];
@@ -758,6 +1028,7 @@ async function reconcileBotAccount(bot: BotInstance): Promise<BotInstance | null
   const updated = await updateBotAccount(bot.id, target.accountId);
   invalidateAgentsCache();
     invalidateChannelStatus();
+    invalidateBindingsCache();
   return updated;
 }
 
@@ -768,11 +1039,39 @@ async function reconcileBotAccount(bot: BotInstance): Promise<BotInstance | null
  * 成因：agents add 时 bind 失败/后来被 agents delete 顺带清掉/手工改过配置。
  * 这里查一遍 bindings，缺的补上（幂等，已存在的不动）。
  */
+// bindings 查询缓存：这条 CLI 实测 5-15s，进通道页/换卡刷新都要用，没缓存等于每次都卡住
+let bindingsCache: { text: string; at: number } | null = null;
+let bindingsInflight: Promise<{ text: string; ok: boolean }> | null = null;
+const BINDINGS_CACHE_MS = 60000;
+
+function invalidateBindingsCache(): void {
+  bindingsCache = null;
+}
+
+async function getBindingsText(force = false): Promise<{ text: string; ok: boolean }> {
+  if (!force && bindingsCache && Date.now() - bindingsCache.at < BINDINGS_CACHE_MS) {
+    return { text: bindingsCache.text, ok: true };
+  }
+  if (bindingsInflight) return bindingsInflight; // 并发合并：并行跑 openclaw 会互相拖慢
+  bindingsInflight = (async () => {
+    const r = await runOpenclaw(["agents", "bindings"], { timeoutMs: 60000 });
+    const text = stripAnsi(r.stdout + r.stderr);
+    const ok = r.code === 0 && /Routing bindings|No routing bindings/i.test(text);
+    if (ok) bindingsCache = { text, at: Date.now() };
+    return { text, ok };
+  })();
+  try {
+    return await bindingsInflight;
+  } finally {
+    bindingsInflight = null;
+  }
+}
+
 async function repairBotBindings(bots: BotInstance[]): Promise<string[]> {
   if (bots.length === 0) return [];
-  const r = await runOpenclaw(["agents", "bindings"], { timeoutMs: 60000 });
-  const text = stripAnsi(r.stdout + r.stderr);
-  if (r.code !== 0 || !/Routing bindings|No routing bindings/i.test(text)) return []; // CLI 没跑通就别乱补
+  const r = await getBindingsText();
+  const text = r.text;
+  if (!r.ok) return []; // CLI 没跑通就别乱补
   const repaired: string[] = [];
   for (const b of bots) {
     // 形如 "- <agentId> <- qqbot accountId=qq-xxxx"
@@ -791,22 +1090,32 @@ async function repairBotBindings(bots: BotInstance[]): Promise<string[]> {
   return repaired;
 }
 
-/** 通道连接页数据：机器人实例 + 已知账号（含未绑定的可复用账号） */
+/**
+ * 通道连接页数据：机器人实例 + 已知账号（含未绑定的可复用账号）。
+ * 【提速 2026-09-08】默认只读本地文件（bots.json / openclaw.json / 微信 accounts.json），毫秒级返回。
+ * 原来每次进页面都跑 reconcile + repair 两轮 openclaw CLI（5-15s 起），换完卡刷新要等它跑完才更新，
+ * 用户体感就是"换卡没成功"。现在自愈动作只在 `?repair=1` 时做（前端渲染完再后台补一次）。
+ */
 app.get("/api/channels/connections", async (req, res) => {
   try {
+    const doRepair = req.query.repair === "1";
     const bots = await listBots();
     const accounts = await scanKnownAccounts();
-    // 顺手校正微信这类"真实账号 id 由服务器下发"的占位绑定（错过登录轮询也能自愈）
-    let reconciled = 0;
-    for (const b of bots) {
-      if (!accounts.some((a) => a.channel === b.channel && a.accountId === b.accountId)) {
-        const fixed = await reconcileBotAccount(b).catch(() => null);
-        if (fixed) reconciled++;
+    let repaired: string[] = [];
+    let freshBots = bots;
+    if (doRepair) {
+      // 顺手校正微信这类"真实账号 id 由服务器下发"的占位绑定（错过登录轮询也能自愈）
+      let reconciled = 0;
+      for (const b of bots) {
+        if (!accounts.some((a) => a.channel === b.channel && a.accountId === b.accountId)) {
+          const fixed = await reconcileBotAccount(b).catch(() => null);
+          if (fixed) reconciled++;
+        }
       }
+      freshBots = reconciled > 0 ? await listBots() : bots;
+      // 补齐缺失的路由绑定（否则消息会落到默认 agent，表现为"回的不是这张卡"）
+      repaired = await repairBotBindings(freshBots).catch(() => []);
     }
-    const freshBots = reconciled > 0 ? await listBots() : bots;
-    // 补齐缺失的路由绑定（否则消息会落到默认 agent，表现为"回的不是这张卡"）
-    const repaired = req.query.repair === "0" ? [] : await repairBotBindings(freshBots).catch(() => []);
     // 关联：账号 → 绑定它的 bot
     const boundByAccount = new Map<string, BotInstance>();
     for (const b of freshBots) boundByAccount.set(`${b.channel}:${b.accountId}`, b);
@@ -817,21 +1126,129 @@ app.get("/api/channels/connections", async (req, res) => {
       const c = await store.get(b.cardSlug).catch(() => null);
       cardNames.set(b.cardSlug, c?.name ?? b.cardSlug);
     }
-    const limits = { maxQq: MAX_QQ_BOTS, maxWeixin: MAX_WEIXIN_BOTS };
+    const labels = await loadAccountLabels();
+    const limits = {
+      maxQq: MAX_QQ_BOTS,
+      maxWeixin: MAX_WEIXIN_BOTS,
+      maxQqAccounts: MAX_QQ_ACCOUNTS,
+      maxWeixinAccounts: MAX_WEIXIN_ACCOUNTS,
+    };
+    // 账号槽位用量：前端据此显示 3/5 与「已存满」，并禁掉扫码按钮
+    const slots = {
+      qqbot: {
+        used: accounts.filter((a) => a.channel === "qqbot").length,
+        max: MAX_QQ_ACCOUNTS,
+      },
+      "openclaw-weixin": {
+        used: accounts.filter((a) => a.channel === "openclaw-weixin").length,
+        max: MAX_WEIXIN_ACCOUNTS,
+      },
+    };
     res.json({
-      bots: freshBots.map((b) => ({ ...b, cardName: cardNames.get(b.cardSlug) ?? b.cardSlug })),
+      bots: freshBots.map((b) => ({
+        ...b,
+        cardName: cardNames.get(b.cardSlug) ?? b.cardSlug,
+        // 机器人行显示昵称，accountId 只在详情里露出
+        accountLabel: accountDisplayName(labels, b.channel, b.accountId),
+      })),
       accounts: accounts.map((a) => {
         const bound = boundByAccount.get(`${a.channel}:${a.accountId}`);
         return {
           ...a,
+          label: accountDisplayName(labels, a.channel, a.accountId, a.name),
+          hasLabel: Boolean(labels[`${a.channel}:${a.accountId}`]),
           boundBotId: bound?.id ?? null,
           boundCardSlug: bound?.cardSlug ?? null,
           boundCardName: bound ? cardNames.get(bound.cardSlug) ?? bound.cardSlug : null,
         };
       }),
       limits,
+      slots,
       repaired,
     });
+  } catch (e) {
+    res.status(500).json({ error: toUserError(e) });
+  }
+});
+
+// ---------- 账号昵称：用户自己起名，底层仍按 accountId 路由 ----------
+app.post("/api/channels/accounts/label", async (req, res) => {
+  try {
+    const { channel, accountId, label } = req.body ?? {};
+    if (channel !== "qqbot" && channel !== "openclaw-weixin") return res.status(400).json({ error: "通道选择不正确" });
+    const acc = String(accountId ?? "").trim();
+    if (!acc) return res.status(400).json({ error: "缺少账号 id" });
+    const labels = await setAccountLabel(channel, acc, String(label ?? ""));
+    res.json({ ok: true, labels });
+  } catch (e) {
+    res.status(500).json({ error: toUserError(e) });
+  }
+});
+
+/**
+ * 彻底删除渠道账号（连凭证一起删）——账号槽位满了之后腾位置的唯一手段。
+ * 顺序：先卸掉占用它的 bot 实例与 agent → openclaw channels remove --delete 删配置与会话
+ * → 清插件侧残留（微信 accounts.json / accounts 下的 json、QQ 的账号目录）→ 清昵称。
+ */
+app.post("/api/channels/accounts/delete", async (req, res) => {
+  try {
+    const { channel, accountId } = req.body ?? {};
+    if (channel !== "qqbot" && channel !== "openclaw-weixin") return res.status(400).json({ error: "通道选择不正确" });
+    const acc = String(accountId ?? "").trim();
+    if (!acc) return res.status(400).json({ error: "缺少账号 id" });
+    const notes: string[] = [];
+
+    // ① 该账号若还绑着卡，先把 bot 实例和 agent 一起卸掉
+    for (const b of (await listBots()).filter((x) => x.channel === channel && x.accountId === acc)) {
+      await runOpenclaw(["agents", "delete", b.agentId, "--force"], { timeoutMs: 60000 }).catch(() => null);
+      await removeBot(b.id).catch(() => null);
+      notes.push(`已卸下机器人（卡 ${b.cardSlug}）`);
+    }
+
+    // ② 官方 CLI 删账号配置（--delete 直接删条目，不留 disabled 残壳）
+    const rm = await runOpenclaw(
+      ["channels", "remove", "--channel", channel, "--account", acc, "--delete"],
+      { timeoutMs: 60000 }
+    ).catch(() => null);
+    if (rm && rm.code === 0) notes.push("已删除通道账号配置");
+
+    // ③ 清残留：CLI 对插件私有目录不负责，不清会被 scanKnownAccounts 再扫出来
+    if (channel === "openclaw-weixin") {
+      const base = path.join(os.homedir(), ".openclaw", "openclaw-weixin");
+      const idxPath = path.join(base, "accounts.json");
+      try {
+        const list = JSON.parse(await fs.readFile(idxPath, "utf8"));
+        if (Array.isArray(list)) {
+          const next = list.filter((id) => id !== acc);
+          await fs.writeFile(idxPath, JSON.stringify(next, null, 2), "utf8");
+          notes.push("已从微信账号索引移除");
+        }
+      } catch { /* 索引不存在就不用清 */ }
+      // 账号态文件：<acc>.json / .sync.json / .context-tokens.json
+      const accDir = path.join(base, "accounts");
+      for (const f of await fs.readdir(accDir).catch(() => [] as string[])) {
+        if (f.startsWith(acc)) await fs.rm(path.join(accDir, f), { force: true }).catch(() => {});
+      }
+    } else {
+      // QQ：openclaw.json 里的账号条目 + ~/.openclaw/qqbot/<acc> 目录
+      const cfgPath = path.join(os.homedir(), ".openclaw", "openclaw.json");
+      try {
+        const conf = JSON.parse(await fs.readFile(cfgPath, "utf8"));
+        if (conf?.channels?.qqbot?.accounts?.[acc]) {
+          delete conf.channels.qqbot.accounts[acc];
+          await fs.writeFile(cfgPath, JSON.stringify(conf, null, 2), "utf8");
+          notes.push("已从配置移除 QQ 账号");
+        }
+      } catch { /* 配置读不到就跳过 */ }
+      await fs.rm(path.join(os.homedir(), ".openclaw", "qqbot", acc), { recursive: true, force: true }).catch(() => {});
+    }
+
+    await removeAccountLabel(channel, acc).catch(() => {});
+    invalidateAgentsCache();
+    invalidateChannelStatus();
+    invalidateBindingsCache();
+    logInfo("通道", `彻底删除账号 ${channel}:${acc}（${notes.join("；") || "无残留"}）`);
+    res.json({ ok: true, notes, hint: "账号已彻底删除，槽位已释放，可以扫码添加新账号了" });
   } catch (e) {
     res.status(500).json({ error: toUserError(e) });
   }
@@ -843,10 +1260,16 @@ app.get("/api/bots", async (req, res) => {
     const limits = { maxQq: MAX_QQ_BOTS, maxWeixin: MAX_WEIXIN_BOTS };
     // 没有实例就不必查 agent 状态，省掉 CLI 冷启动
     if (bots.length === 0) return res.json({ bots: [], limits });
+    const labels = await loadAccountLabels();
     // skipStatus=1：只要实例数据不查存活（前端开面板首屏用，秒回）
     if (req.query.skipStatus === "1") {
       return res.json({
-        bots: bots.map((b) => ({ ...b, channelLabel: CHANNEL_LABELS[b.channel], agentExists: null })),
+        bots: bots.map((b) => ({
+          ...b,
+          channelLabel: CHANNEL_LABELS[b.channel],
+          accountLabel: accountDisplayName(labels, b.channel, b.accountId),
+          agentExists: null,
+        })),
         limits,
       });
     }
@@ -855,6 +1278,7 @@ app.get("/api/bots", async (req, res) => {
       bots: bots.map((b) => ({
         ...b,
         channelLabel: CHANNEL_LABELS[b.channel],
+        accountLabel: accountDisplayName(labels, b.channel, b.accountId),
         // CLI 跑挂/超时时输出不完整，不能断言"不存在"，返回 null 表示未知
         agentExists: listOk ? new RegExp(`^-\\s+${b.agentId}(\\s|$)`, "m").test(agentsText) : null,
       })),
@@ -867,7 +1291,7 @@ app.get("/api/bots", async (req, res) => {
 
 app.post("/api/bots", async (req, res) => {
   try {
-    const { cardSlug, channel, accountId } = req.body ?? {};
+    const { cardSlug, channel, accountId, replace } = req.body ?? {};
     if (channel !== "qqbot" && channel !== "openclaw-weixin") {
       return res.status(400).json({ error: "请选择 QQ 或微信" });
     }
@@ -879,9 +1303,23 @@ app.post("/api/bots", async (req, res) => {
       return res.status(400).json({ error: "这张卡的英文标识含特殊字符，无法接入机器人，请重新建卡" });
     }
     const account = String(accountId ?? "").trim() || (channel === "qqbot" ? `qq-${Date.now().toString(36).slice(-4)}` : "wx-main");
+    // 新建扫码账号（没传 accountId）前先看槽位：满了就别让用户白扫一次码
+    if (!String(accountId ?? "").trim()) {
+      const slot = await accountSlotState(channel);
+      if (slot.full) {
+        return res.status(400).json({
+          error: `${channel === "qqbot" ? "QQ" : "微信"}账号已存满（${slot.used}/${slot.max}）。请先到「通道连接」页彻底删除一个账号，再扫码添加新的。`,
+          accountSlotFull: true,
+          slot,
+        });
+      }
+    }
     let bot: BotInstance;
+    let evictedBots: BotInstance[] = [];
     try {
-      bot = await addBot({ cardSlug: card.slug, channel, accountId: account });
+      const added = await addBot({ cardSlug: card.slug, channel, accountId: account, replace: replace === true });
+      bot = added.bot;
+      evictedBots = added.evicted;
     } catch (e) {
       const msg = toUserError(e);
       // 账号被其他卡占用 → 409 + 占用者信息，前端引导"一键转移"
@@ -900,6 +1338,16 @@ app.post("/api/bots", async (req, res) => {
       return res.status(400).json({ error: msg });
     }
 
+    // ⓿ 被顶掉的旧实例（同卡替换 / 微信超额）：直写配置卸绑定 + 清会话（原来两条 CLI 要 5-15s）
+    const evictedNames: string[] = [];
+    for (const ev of evictedBots) {
+      await unbindAccountDirect(ev.channel, ev.accountId).catch(() => null);
+      await clearAgentSessions(ev.agentId).catch(() => 0);
+      const evCard = await store.get(ev.cardSlug).catch(() => null);
+      evictedNames.push(evCard?.name ?? ev.cardSlug);
+      logInfo("通道", `已卸下旧卡 ${ev.cardSlug}（${ev.channel}:${ev.accountId}）`);
+    }
+
     // ① 编译卡（agent 专属 workspace + 共享 workspace 兜底，见 compileForBot 注释）
     const compile = await compileForBot(card);
 
@@ -911,42 +1359,47 @@ app.post("/api/bots", async (req, res) => {
       return res.status(400).json({ error: "没有可用模型（先在 API 页配置模型提供商）" });
     }
 
-    // ③ 创建隔离 agent 并绑定渠道路由；若 agent 已存在（上次残留），退化为补绑定
-    const add = await runOpenclaw(
-      [
-        "agents", "add", bot.agentId,
-        "--workspace", agentWorkspaceDir(bot.cardSlug),
-        "--model", `${llm.provider}/${llm.model}`,
-        "--bind", `${bot.channel}:${bot.accountId}`,
-        "--non-interactive", "--json",
-      ],
-      { timeoutMs: 60000 }
-    );
+    // ③ 创建隔离 agent 并绑定渠道路由（直写 openclaw.json，毫秒级；原来 agents add 要 5-15s）
+    const upserted = await upsertAgentEntry({
+      agentId: bot.agentId,
+      workspace: agentWorkspaceDir(bot.cardSlug),
+      model: `${llm.provider}/${llm.model}`,
+    });
+    if (!upserted) {
+      await removeBot(bot.id);
+      return res.status(500).json({ error: "写入 openclaw 配置失败（~/.openclaw/openclaw.json 不可读写）" });
+    }
+    const bound = await bindAccountDirect({ agentId: bot.agentId, channel: bot.channel, accountId: bot.accountId });
+    if (!bound.ok) {
+      await removeBot(bot.id);
+      return res.status(500).json({ error: "写入绑定失败（~/.openclaw/openclaw.json 不可读写）" });
+    }
+    // 新绑定先清一次会话：这个 agent 可能残留上次绑定时的上下文，不清会带着旧对话回来
+    await clearAgentSessions(bot.agentId).catch(() => 0);
+    if (bound.previousAgentId && bound.previousAgentId !== bot.agentId) {
+      await clearAgentSessions(bound.previousAgentId).catch(() => 0);
+    }
     invalidateAgentsCache();
-    invalidateChannelStatus(); // agent 列表变了，缓存作废
+    invalidateChannelStatus();
+    invalidateBindingsCache(); // agent 列表变了，缓存作废
     // 拟真节奏：用卡里的 chat.delay 配 OpenClaw 原生 humanDelay（分段回复之间自然停顿）
     await applyAgentHumanDelay(bot.agentId, card.chat?.delay).catch(() => {});
-    let addOutput = stripAnsi(add.stdout + add.stderr);
-    if (add.code !== 0 && !/already exist|已存在/i.test(addOutput)) {
-      await removeBot(bot.id);
-      return res.status(500).json({ error: `创建 agent 失败：${addOutput.slice(-800)}` });
-    }
-    if (add.code !== 0) {
-      const bind = await runOpenclaw(
-        ["agents", "bind", "--agent", bot.agentId, "--bind", `${bot.channel}:${bot.accountId}`, "--json"],
-        { timeoutMs: 30000 }
-      );
-      addOutput += "\n" + stripAnsi(bind.stdout + bind.stderr);
-    }
+    const addOutput = `agent ${bot.agentId} 已就绪，绑定 ${bot.channel}:${bot.accountId}`;
 
     res.json({
+      ok: true,
       bot,
       compileFiles: compile.files,
       model: `${llm.provider}/${llm.model}`,
-      output: addOutput.slice(-1500),
-      hint: "机器人已创建。下一步点「扫码绑定」登录账号；如果服务在跑，重启后生效。",
+      output: addOutput,
+      hint: evictedNames.length
+        ? `机器人已创建。微信只能绑 1 张卡，已自动卸下「${evictedNames.join("、")}」。`
+        : "机器人已创建。下一步点「扫码绑定」登录账号。",
+      evicted: evictedNames,
       agentExists: true, // 刚 add 成功，前端直接采信，不必再等 CLI 查一遍
     });
+    // 绑定成功后自动发开场白（有互动过的私聊用户就发，没有就等下次触发）
+    void pushGreetingForCard(card.slug).catch(() => {});
   } catch (e) {
     res.status(400).json({ error: toUserError(e) });
   }
@@ -969,11 +1422,14 @@ app.post("/api/bots/:id/bind", async (req, res) => {
     if (others.some((b) => b.channel === channel && b.accountId === acc)) {
       return res.status(409).json({ error: "该账号已被其他卡占用，可先删除或一键转移", conflict: true });
     }
-    // 换绑：先解旧绑定，再绑新账号
-    const unbind = await runOpenclaw(["agents", "unbind", "--agent", bot.agentId, "--bind", `${bot.channel}:${bot.accountId}`], { timeoutMs: 30000 });
-    const bind = await runOpenclaw(["agents", "bind", "--agent", bot.agentId, "--bind", `${channel}:${acc}`], { timeoutMs: 30000 });
-    if (bind.code !== 0) {
-      return res.status(500).json({ error: `换绑失败：${stripAnsi(bind.stdout + bind.stderr).slice(-500)}` });
+    // 换绑：直写配置（解旧账号路由 → 绑新账号），毫秒级；原来两条 CLI 要 10-30s
+    await unbindAccountDirect(bot.channel, bot.accountId).catch(() => null);
+    const bound = await bindAccountDirect({ agentId: bot.agentId, channel, accountId: acc });
+    if (!bound.ok) return res.status(500).json({ error: "写入绑定失败（~/.openclaw/openclaw.json 不可读写）" });
+    // 换了账号 = 换了对话对象，清掉旧会话避免带着上一个账号的上下文
+    const cleared = await clearAgentSessions(bot.agentId).catch(() => 0);
+    if (bound.previousAgentId && bound.previousAgentId !== bot.agentId) {
+      await clearAgentSessions(bound.previousAgentId).catch(() => 0);
     }
     // 更新实例记录
     const bots = await listBots();
@@ -982,7 +1438,10 @@ app.post("/api/bots/:id/bind", async (req, res) => {
     await fs.writeFile(path.join(dataDir(), "bots.json"), JSON.stringify({ bots }, null, 2), "utf8");
     invalidateAgentsCache();
     invalidateChannelStatus();
-    res.json({ ok: true, output: stripAnsi((unbind.stdout + bind.stdout + unbind.stderr + bind.stderr)).slice(-500), hint: "已换绑到已认证账号，网关重启后生效" });
+    invalidateBindingsCache();
+    res.json({ ok: true, output: `已绑定 ${channel}:${acc}，清理会话 ${cleared} 个文件`, hint: "已换绑到已认证账号，已立即生效" });
+    // 换绑成功后自动发开场白（新账号下互动过的私聊用户）
+    void pushGreetingForCard(bot.cardSlug).catch(() => {});
   } catch (e) {
     res.status(500).json({ error: toUserError(e) });
   }
@@ -1000,28 +1459,36 @@ app.post("/api/bots/transfer", async (req, res) => {
     // 目标卡已有 bot？先顶掉它（以传入的 botId 为准）
     const targetExisting = (await listBots()).find((b) => b.cardSlug === toCardSlug && b.id !== oldBot.id);
     if (targetExisting) {
-      const del = await runOpenclaw(["agents", "delete", targetExisting.agentId, "--force"], { timeoutMs: 60000 });
-      if (del.code !== 0 && !/not found|no plugin/i.test(stripAnsi(del.stdout + del.stderr))) {
-        return res.status(500).json({ error: `清理目标卡旧 agent 失败：${stripAnsi(del.stdout + del.stderr).slice(-400)}` });
-      }
+      await unbindAccountDirect(targetExisting.channel, targetExisting.accountId).catch(() => null);
     }
     // ① 编译新卡
     const compile = await compileForBot(card);
     // ② 解析模型
     const llm = await resolveChatLLM(card);
     if (!llm) return res.status(400).json({ error: "没有可用模型（先在 API 页配置模型提供商）" });
-    // ③ 建新 agent（复用旧账号，免扫码）+ bind
-    const add = await runOpenclaw(
-      ["agents", "add", card.slug, "--workspace", agentWorkspaceDir(card.slug), "--model", `${llm.provider}/${llm.model}`, "--bind", `${oldBot.channel}:${oldBot.accountId}`, "--non-interactive", "--json"],
-      { timeoutMs: 60000 }
-    );
-    if (add.code !== 0 && !/already exist|已存在/i.test(stripAnsi(add.stdout + add.stderr))) {
-      return res.status(500).json({ error: `创建新 agent 失败：${stripAnsi(add.stdout + add.stderr).slice(-500)}` });
+    // ③ 直写配置完成换卡（原来跑 3 条 openclaw CLI，每条冷启动 5-15s；直接改
+    //    openclaw.json 的 agents.list + bindings 是毫秒级，网关会重读配置）
+    const upserted = await upsertAgentEntry({
+      agentId: card.slug,
+      workspace: agentWorkspaceDir(card.slug),
+      model: `${llm.provider}/${llm.model}`,
+    });
+    if (!upserted) {
+      return res.status(500).json({ error: "写入 openclaw 配置失败（~/.openclaw/openclaw.json 不可读写）" });
     }
-    // ④ 删旧 agent（旧卡被顶掉）
-    const delOld = await runOpenclaw(["agents", "delete", oldBot.agentId, "--force"], { timeoutMs: 60000 });
+    const bound = await bindAccountDirect({ agentId: card.slug, channel: oldBot.channel, accountId: oldBot.accountId });
+    if (!bound.ok) return res.status(500).json({ error: "写入绑定失败（~/.openclaw/openclaw.json 不可读写）" });
+    // ④ 清掉旧 agent 的会话：不清的话同一用户继续发消息会沿用旧会话（连带旧人格上下文），
+    //    表现就是"网页换卡成功但聊起来还是原来的卡"。这一步是换卡真正生效的关键。
+    const clearedOld = await clearAgentSessions(oldBot.agentId).catch(() => 0);
+    // 新卡也清一次：它可能残留上一次绑定时的会话，否则会带着上次的上下文回来
+    const clearedNew = oldBot.agentId === card.slug ? 0 : await clearAgentSessions(card.slug).catch(() => 0);
+    if (targetExisting && targetExisting.agentId !== card.slug) {
+      await clearAgentSessions(targetExisting.agentId).catch(() => 0);
+    }
     invalidateAgentsCache();
     invalidateChannelStatus();
+    invalidateBindingsCache();
     // ⑤ 更新记录：旧 bot 记录改为新卡（同一 id，账号不变）
     const bots = await listBots();
     const idx = bots.findIndex((b) => b.id === oldBot.id);
@@ -1035,9 +1502,11 @@ app.post("/api/bots/transfer", async (req, res) => {
       ok: true,
       bot: cleaned[idx],
       compileFiles: compile.files,
-      output: stripAnsi((add.stdout + add.stderr + delOld.stdout + delOld.stderr)).slice(-600),
-      hint: `已将 ${oldBot.channel === "qqbot" ? "QQ" : "微信"} 账号 ${oldBot.accountId} 从旧卡转移到「${card.name}」，凭证复用未重新扫码，网关重启后生效`,
+      output: `绑定已切到 ${card.slug}${bound.previousAgentId ? `（顶掉 ${bound.previousAgentId}）` : ""}；清理会话 ${clearedOld + clearedNew} 个文件`,
+      hint: `已将 ${oldBot.channel === "qqbot" ? "QQ" : "微信"} 账号 ${oldBot.accountId} 转移到「${card.name}」，已立即生效（下一条消息就是新卡）`,
     });
+    // 换绑成功后自动发开场白（新卡对互动过的私聊用户）
+    void pushGreetingForCard(card.slug).catch(() => {});
   } catch (e) {
     res.status(500).json({ error: toUserError(e) });
   }
@@ -1047,6 +1516,19 @@ app.post("/api/bots/:id/login", async (req, res) => {
   try {
     const bot = (await listBots()).find((b) => b.id === req.params.id);
     if (!bot) return res.status(404).json({ error: "机器人实例不存在" });
+    // 这个 bot 的账号还不在已认证列表里 = 要占一个新槽位，满了就别扫（已认证账号重扫不受限）
+    const known = await scanKnownAccounts();
+    const isNewSlot = !known.some((a) => a.channel === bot.channel && a.accountId === bot.accountId);
+    if (isNewSlot) {
+      const slot = await accountSlotState(bot.channel);
+      if (slot.full) {
+        return res.status(400).json({
+          error: `${bot.channel === "qqbot" ? "QQ" : "微信"}账号已存满（${slot.used}/${slot.max}）。请先到「通道连接」页彻底删除一个账号，再扫码。`,
+          accountSlotFull: true,
+          slot,
+        });
+      }
+    }
     res.json(startChannelLogin(bot.channel, bot.accountId));
   } catch (e) {
     res.status(500).json({ error: toUserError(e) });
@@ -1088,7 +1570,7 @@ app.post("/api/bots/:id/recompile", async (req, res) => {
     if (llm) {
       const model = `${llm.provider}/${llm.model}`;
       const changed = await applyAgentModel(bot.agentId, model).catch(() => false);
-      if (changed) modelNote = `，模型已切到 ${model}（网关重启后生效）`;
+      if (changed) modelNote = `，模型已切到 ${model}`;
     }
     res.json({ ok: true, files: out.files, workspace: out.workspace, modelNote });
   } catch (e) {
@@ -1100,13 +1582,17 @@ app.delete("/api/bots/:id", async (req, res) => {
   try {
     const bot = await removeBot(req.params.id);
     if (!bot) return res.status(404).json({ error: "机器人实例不存在" });
-    const del = await runOpenclaw(["agents", "delete", bot.agentId, "--force"], { timeoutMs: 60000 });
+    // 直写配置移除 agent 条目 + 路由，并清掉会话（原来 agents delete CLI 要 5-15s）
+    await unbindAccountDirect(bot.channel, bot.accountId).catch(() => null);
+    await removeAgentEntry(bot.agentId).catch(() => null);
+    const cleared = await clearAgentSessions(bot.agentId).catch(() => 0);
     invalidateAgentsCache();
     invalidateChannelStatus();
+    invalidateBindingsCache();
     res.json({
       ok: true,
-      output: stripAnsi(del.stdout + del.stderr).slice(-800),
-      hint: "机器人已删除。重启服务后彻底移除。",
+      output: `已移除 agent ${bot.agentId} 与其绑定，清理会话 ${cleared} 个文件`,
+      hint: "机器人已删除，已立即生效。",
     });
   } catch (e) {
     res.status(500).json({ error: toUserError(e) });
@@ -1147,46 +1633,88 @@ app.post("/api/cards/ai-draft", async (req, res) => {
       imgCfg.provider === "novelai"
         ? `"cover_prompt": "角色卡封面的生图提示词：用英文 Danbooru 标签风格（逗号分隔的英文标签，禁止中文和自然语言），体现角色外观（发型/瞳色/服装/气质）、角色所处场景与氛围（贴合世界观）、封面式构图（角色融入场景、适合竖版封面，不是证件照头像）；若是同人/已有作品角色，官方英文名或常用角色 Tag 放最前；只输出标签串",`
         : `"cover_prompt": "角色卡封面的生图提示词：用英文自然语言写 2-3 句连贯的英文句子（必须全英文，内容含角色外观、服饰、所处场景、氛围光线、竖版封面构图，角色融入场景而不是证件照头像）",`;
-    const sys = `你是角色卡创作助手。用户会给你一段角色想法，请把它扩展成一张完整的角色卡草稿。
-要求：
-1. 输出严格 JSON（不要 Markdown、不要多余文字）
-2. 结构：
+    const sys = `你是角色卡创作助手。目标是做出一张「聊天就能立刻贴上人设」的卡，不是提纲卡。
+好卡的核心是：大量情景判别 + 大量真实台词 + 解释她为什么会这样说话。性格不是单一的，要有转折、有多种说话方式、有缘由。
+
+输出严格 JSON（不要 Markdown、不要多余文字）：
 {
   "name": "角色名（用户没给就起一个贴切的）",
-  "bio": "一句话简介",
-  "tags": ["标签1", "标签2"],
-  "first_mes": "开场白：一段有画面感的小场景（3-5 句，包含动作和环境描写，别只写一句问候）",
-  "voice": { "tone_rules": ["说话方式1（具体到语气/句式）", "说话方式2"], "catchphrases": ["口头禅"] },
-  "personality": { "traits": ["性格特质"], "values": ["价值观"], "boundaries": ["雷区/不可逾越的"] },
-  "worldbook": [
-    { "name": "人物形象", "content": "完整角色设定（基本信息/外貌/性格/语言风格/背景/喜好/雷区，写成结构化文本）", "constant": true },
-    { "name": "世界观", "content": "角色所在世界/场景的设定", "constant": true },
-    { "name": "人物关系", "content": "与{{user}}的关系设定，{{user}}即用户，可自定义关系", "constant": true },
-    { "name": "（其他条目，带关键词）", "keys": ["关键词1", "关键词2"], "content": "触发内容", "constant": false }
-  ],
+  "bio": "一句话简介（≤40 字，点出身份 + 最鲜明的性格反差）",
+  "tags": ["标签"],
+  "first_mes": "开场白（只一句话，见下方规则）",
+  "voice": { "tone_rules": ["说话方式规则"], "catchphrases": ["口头禅"] },
+  "personality": { "traits": ["性格特质"], "values": ["价值观"], "boundaries": ["雷区"] },
+  "worldbook": [ 见下方三块内容，条目数量不限 ],
   "regex": [],
   ${coverPromptRule}
 }
-3. 世界书 3-6 条；「人物形象」必须 constant=true 且内容完整（这是角色扮演的核心依据）
-4. 语言风格要具体可执行：给出日常/情绪波动时不同的说话方式示例
-5. 全程中文输出（cover_prompt 必须全英文，除外）；regex 一般留空数组
-6. cover_prompt 根据角色设定生成：必须全英文，体现"根据角色内容生成的封面"（角色在其世界场景中的画面），不要写成头像/证件照
 
-## 写卡铁律（必须遵守，违反即不合格）
-1. 所有设定用「陈述性条目」写，禁止小说式描写、禁止环境铺陈、禁止形容词堆砌。
-   ❌ 错误示例："她站在月光下的窗前，微风拂过她的发梢，眼神中带着一丝落寞……"
-   ✅ 正确示例："外貌：银白色长发，蓝瞳；性格：外冷内热，嘴硬心软；习惯：紧张时咬嘴唇。"
-2. 「人物形象」只写角色的静态事实（身份/外貌/性格/语言习惯/喜好/雷区），
-   不要写动态剧情、不要写场景、不要写任何叙事性文字。
-3. 「世界观」只写角色需要知道的规则与背景，≤3 条核心事实；不写风土人情的长篇介绍。
-4. 字数上限：人物形象 ≤400 字，世界观 ≤200 字，其余条目 ≤150 字。
-5. 语言风格给「可执行规则 + 1-2 个对话示例」，不要抽象形容词（如"温柔""可爱"要落到具体句式）。
-6. 整张卡的目的是「让模型能扮演这个角色」，不是「写一篇小说」——所有内容都要是
-   扮演时可直接依据的设定，禁止任何与扮演无关的叙事、抒情或氛围描写。`;
+每个世界书条目对象键名固定为：{ "name": "条目名", "keys": [...], "content": "...", "constant": true/false }
+条目名必须放在 "name" 键。keys 数组可空。
+
+## 三块内容（最低字数，宁多勿少；条目数量不限）
+
+你可以选择：把同一块写成一条上千字的长条目（爱语那种写法），也可以按关键词拆成多条（用 keys 区分不同场景/性格侧面）。怎么规划由你根据角色决定，只要三块都写满、不互相抄。
+
+### 第一块：人物档案　合计不少于 1000 字　全部 constant=true
+写清能让模型「认识这个人」的静态事实：姓名年龄性别身高体重生日职业身份居住地家庭；外貌（发瞳肤五官身材服饰配饰，以及和外表相关的习惯）；经历（发生了什么、在她身上留下了什么，要能解释现在的性格）；与 {{user}} 的关系纽带（怎么认识、现在什么关系、对 {{user}} 平时/亲密/生气分别怎么称呼、她记得 {{user}} 哪些事、她怕 {{user}} 做什么）。
+【禁止写「重要 NPC」这类配角名单】这是一对一聊天软件里的对话，不是小说也不是群像剧，多余的配角只会让模型跑偏去演别人。要提别人只能顺带一句（例如"她提过室友爱抢她外卖"），不要单独立条目、不要列人物表。
+这一块少写对话。对话放到第二块。
+
+### 第二块：对话与性格　合计不少于 2000 字　这是整张卡的灵魂
+这是聊天卡能不能立住的关键。必须把「性格特点 + 语言特色的缘由 + 情景转变 + 大量台词」写在一起。
+必须包含：
+- 她对 {{user}} 说话的总基调，以及为什么会这样说（经历/性格怎么造成这种语气）
+- 性格不是单一的：至少写出几种说话方式，以及什么条件下从一种切到另一种（表面 vs 底色、温柔突然变脸、占有欲上来、示弱、吃醋等）
+- 每种说话方式都要解释缘由（例如：因为怕被抛弃，所以先用刺把人推开）
+- 大量情景判别：{{user}} 做什么时，她怎么接、怎么转折、下一句会变成什么样。情景数量不设上限，写到这个人说话的变化被覆盖住为止
+- 每个情景都要有：触发条件 → 她为什么会这样反应 → 至少 2 句真实台词（刚触发时一句，持续/被安抚后一句）
+- 对 {{user}} 的称呼变化、哪些话只对 {{user}} 说、关系升温/受伤后话术怎么变
+整块台词要多。宁可多写情景和例句，不要写空洞总结。
+如果拆条：keys 用场景或性格侧面（如 ["吃醋","冷落","示弱","被夸奖"]），每条写透那一个侧面；如果合写：可以一条写满两千字。
+
+### 第三块：动作心理描写　合计不少于 1200 字　【必须生成】
+keys 必须包含 "<重描写>"（可另加场景词）。constant=false。
+这条只在用户选「重描写」风格时生效，纯对话风格下系统会自动跳过。
+
+【最重要的前提：她和 {{user}} 是隔着手机在 QQ / 微信上聊天，不在同一个地方，彼此看不见对方。】
+所以动作和心理必须**依托"打字发消息"这件事本身**来写，全部围绕：她握着手机时的身体反应、打字这个动作的变化、看到 {{user}} 消息时的反应、她所在环境里她自己能做的事。
+
+✅ 正确（依托聊天）：
+- 被骂时：眼睛发酸浮起泪花，手指颤抖着打字，删了三遍才发出去；心里想"他是不是真的讨厌我了"
+- 等回复时：一直盯着屏幕不敢锁屏，看到"正在输入"又消失，指甲掐进掌心
+- 高兴时：抱着手机在床上打滚，回得飞快还打错字，又赶紧撤回重发
+- 吃醋时：盯着那条消息看了很久，故意等了十分钟才回，打了一长段又全删掉，只发一个"哦"
+- 想靠近又怕被拒绝：打了"你想我吗"，盯着看了半天，最后删掉改成"睡了吗"
+
+❌ 禁止（现实同处一室的描写，聊天里根本不成立）：
+- "死死盯着我"、"凑到你耳边"、"抓住你的手腕"、"把你按在墙上"、"贴着你的胸口"
+- 任何需要两人身体在同一空间才能发生的动作
+- 例外：她在**用文字描述自己想对 {{user}} 做什么**（那属于台词内容，写在第二块），不是这一块的动作
+
+按情绪/情景写细：高兴、生气、紧张、害羞、难过、吃醋、被冷落、示弱、心软、想靠近又怕被拒绝、深夜发消息……每种都要写：手机/打字的具体动作 + 她当时的身体反应 + 心里真实想法，以及「发出去的字」和「心里想的」怎么不一致。
+不要写括号、不要写排版格式（（）和 {} 由系统按风格自动加）。
+
+（可选）「世界观」：仅异世界/末世/特定作品才加。现代日常不要加。
+
+## 开场白（first_mes）
+只有一句话。不许环境描写、不许动作、不许括号。事由全用说话带出来，结尾留话头。≤40 字。
+✅ "哥哥你终于回消息了，我便当都热第三遍了，你到底还要不要吃？"
+❌ "夕阳透过窗帘，她抬起头：你回来了。"
+
+## 铁律
+1. 聊天卡靠「情景 + 台词 + 缘由」立人，不靠提纲。写完自问：模型只看第二块，能不能连续演她说话而不塌成普通人。
+2. 性格要有转折，不要从头到尾一种味道。
+3. 禁止条目之间互相抄；同一句台词只出现一次。密度靠新信息，不靠重复。
+4. 禁止在条目里写（）、{}、*星号*。动作心理只放第三块。
+5. 禁止抒情散文/环境铺陈。要的是可执行信息：什么情境说什么、为什么、伴随什么动作心理。
+6. 全程中文（cover_prompt 全英文除外）。regex 一般 []。
+7. cover_prompt 全英文，角色在其世界场景中的竖版封面，不要证件照。`;
 
     const userMsg = `角色的想法：${ideaText}\n关系类型：${ROLE_ZH_MAP[r] ?? "朋友"}`;
     const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), 90000);
+    // 世界书约 4200 字（档案+对话+重描写），慢模型可能要几分钟
+    const timer = setTimeout(() => ctrl.abort(), 300000);
     let llmRes: Response;
     try {
       llmRes = await fetch(`${llm.baseUrl.replace(/\/+$/, "")}/chat/completions`, {
@@ -1195,14 +1723,15 @@ app.post("/api/cards/ai-draft", async (req, res) => {
         body: JSON.stringify({
           model: llm.model,
           messages: [{ role: "system", content: sys }, { role: "user", content: userMsg }],
-          temperature: 0.8,
-          max_tokens: 4000,
+          temperature: 0.85,
+          // 三块合计约 4200 字，12000 tokens 容易截断成坏 JSON
+          max_tokens: 16000,
         }),
         signal: ctrl.signal, // 必须在 fetch options 层；放进 body 会被当成请求字段，超时永不生效
       });
     } catch (e) {
       clearTimeout(timer);
-      return res.status(500).json({ error: e instanceof Error && e.name === "AbortError" ? "模型响应超时（90 秒），换个模型或稍后再试" : toUserError(e, "调用模型失败") });
+      return res.status(500).json({ error: e instanceof Error && e.name === "AbortError" ? "模型响应超时（5 分钟），换个更快的模型或稍后再试" : toUserError(e, "调用模型失败") });
     }
     clearTimeout(timer);
     if (!llmRes.ok) {
@@ -1256,15 +1785,16 @@ app.post("/api/cards/ai-draft", async (req, res) => {
     if (Array.isArray(parsed.worldbook)) {
       st.character_book = {
         entries: (parsed.worldbook as Record<string, unknown>[])
-          .slice(0, 8)
+          .slice(0, 24)
           .map((wb) => {
             const constant = wb.constant === true;
             return {
               keys: Array.isArray(wb.keys) ? (wb.keys as unknown[]).map(String).slice(0, 8) : [],
               secondary_keys: [],
               content: String(wb.content ?? "").trim(),
-              name: String(wb.name ?? "").trim() || undefined,
-              comment: String(wb.name ?? "").trim() || undefined,
+              // 条目名：模型可能用 name/title/comment 任一键，全都兼容（缺了会导致条目显示成 undefined）
+              name: String(wb.name ?? wb.title ?? wb.comment ?? "").trim() || undefined,
+              comment: String(wb.name ?? wb.title ?? wb.comment ?? "").trim() || undefined,
               constant,
               enabled: true,
               insertion_order: constant ? 0 : 100,
@@ -1409,14 +1939,18 @@ app.post("/api/providers/toggle", async (req, res) => {
 // ---------- 蒸馏工厂 ----------
 app.post("/api/distill", async (req, res) => {
   try {
-    const { fileContent, fileName, name, role, target, selfNames, blockedWords } = req.body ?? {};
+    const { fileContent, fileName, name, role, target, selfNames, blockedWords, model } = req.body ?? {};
     if (!fileContent || !name || !role) {
       return res.status(400).json({ error: "fileContent / name / role 不能为空" });
     }
     if (!RELATION_ROLES.includes(role)) {
       return res.status(400).json({ error: `无效角色: ${role}` });
     }
-    const llm = await resolveChatLLM();
+    // 允许指定模型（"提供商::模型"）；不传用默认提供商
+    const chosenModel = typeof model === "string" && model.trim() ? model.trim() : "";
+    const llm = chosenModel
+      ? await resolveChatLLM({ model: { provider: chosenModel.split("::")[0], model: chosenModel.split("::")[1] ?? undefined } })
+      : await resolveChatLLM();
     if (!llm || !llm.apiKey) {
       return res.status(400).json({ error: "未配置模型 API。请先到「API」页添加提供商并设为默认" });
     }
@@ -1624,11 +2158,15 @@ app.post("/api/weflow/probe", async (req, res) => {
 
 app.post("/api/distill/weflow", async (req, res) => {
   try {
-    const { token, talker, limit, name, role, target, selfNames, blockedWords } = req.body ?? {};
+    const { token, talker, limit, name, role, target, selfNames, blockedWords, model } = req.body ?? {};
     if (!token || !talker || !name || !role) {
       return res.status(400).json({ error: "token / talker / name / role 不能为空" });
     }
-    const llm = await resolveChatLLM();
+    // 允许指定模型（"提供商::模型"）；不传用默认提供商
+    const chosenModel = typeof model === "string" && model.trim() ? model.trim() : "";
+    const llm = chosenModel
+      ? await resolveChatLLM({ model: { provider: chosenModel.split("::")[0], model: chosenModel.split("::")[1] ?? undefined } })
+      : await resolveChatLLM();
     if (!llm || !llm.apiKey) return res.status(400).json({ error: "未配置模型 API（API 页）" });
     const url = `${WEFLOW_BASE}/api/v1/messages?access_token=${encodeURIComponent(token)}&talker=${encodeURIComponent(talker)}&limit=${Number(limit) || 500}`;
     const r = await fetch(url, { signal: AbortSignal.timeout(30000) });
@@ -1703,13 +2241,68 @@ interface ToolCallMsg {
   function?: { name?: string; arguments?: string };
 }
 
-async function executeToolCalls(tools: ToolDef[], toolCalls: ToolCallMsg[], messages: unknown[], ctx: ToolCtx): Promise<void> {
+// 工具结果里提取图片 URL（"已生成图片：/img/xxx.png" 形态）；模型可能不复述工具结果，
+// 服务端在返回回复时强制附加，前端 CHAT_IMG_RE 渲染成图
+const TOOL_IMG_URL_RE = /\/img\/[A-Za-z0-9_./-]+\.(?:png|jpe?g|webp|gif)/g;
+
+/**
+ * 剔除回复里「指向不存在文件」的 /img/ 地址（模型没调工具却编造图片地址时，
+ * 前端渲染 <img> 会 404 显示 alt 文本，实锤现象「AI生成的图片」）。
+ * 只针对 /img/（本地文件，可直接校验）；http 地址不做校验（远程图）。
+ */
+function stripFakeImgUrls(text: string): string {
+  const urls = text.match(TOOL_IMG_URL_RE);
+  if (!urls) return text;
+  let bad = false;
+  const imgRoot = path.join(dataDir(), "images");
+  for (const u of urls) {
+    // /img/<dir>/<file> → data/images/<dir>/<file>
+    const rel = u.replace(/^\/img\//, "");
+    if (rel && rel.split("/").length === 2) {
+      const file = path.join(imgRoot, rel);
+      try {
+        if (!existsSync(file)) bad = true;
+      } catch {
+        bad = true;
+      }
+    }
+  }
+  if (!bad) return text;
+  // 有不存在的 → 逐个剔除，顺带清理残留空行
+  return text
+    .split("\n")
+    .map((line) => {
+      const m = line.match(TOOL_IMG_URL_RE);
+      if (!m) return line;
+      let out = line;
+      for (const u of m) {
+        const rel = u.replace(/^\/img\//, "");
+        const file = path.join(imgRoot, rel);
+        let ok = false;
+        try {
+          ok = existsSync(file);
+        } catch {
+          ok = false;
+        }
+        if (!ok) out = out.replace(u, "");
+      }
+      return out.trim();
+    })
+    .filter(Boolean)
+    .join("\n");
+}
+
+async function executeToolCalls(tools: ToolDef[], toolCalls: ToolCallMsg[], messages: unknown[], ctx: ToolCtx): Promise<string[]> {
+  const imgs: string[] = [];
   for (const tc of toolCalls) {
     const def = tools.find((t) => t.id === tc.function?.name);
     let result = `未知工具: ${tc.function?.name ?? "?"}`;
     if (def) {
       try {
         result = await def.run(JSON.parse(tc.function?.arguments || "{}"), ctx);
+        for (const m of result.matchAll(TOOL_IMG_URL_RE)) {
+          if (!imgs.includes(m[0])) imgs.push(m[0]);
+        }
       } catch (e) {
         logError("工具", `${tc.function?.name ?? "?"} 执行出错`, e);
         result = `工具执行出错: ${String(e)}`;
@@ -1717,10 +2310,11 @@ async function executeToolCalls(tools: ToolDef[], toolCalls: ToolCallMsg[], mess
     }
     messages.push({ role: "tool", tool_call_id: tc.id ?? "", content: result });
   }
+  return imgs;
 }
 
 type LoopResult =
-  | { type: "reply"; reply: string }
+  | { type: "reply"; reply: string; toolImages?: string[] }
   | { type: "pending"; pending: { id: string; name: string; args: string }[]; messages: unknown[] };
 
 async function runToolLoop(
@@ -1732,12 +2326,15 @@ async function runToolLoop(
   reasoning?: string,
   externalSignal?: AbortSignal // 客户端断开/截断时中止模型请求
 ): Promise<LoopResult> {
+  const toolImages: string[] = [];
   for (let i = 0; i < 4; i++) {
     if (externalSignal?.aborted) return { type: "reply", reply: "（已截断）" };
     const data = await chatCompletions(llm, messages, tools.length ? toolsToOpenAI(tools) : undefined, reasoning, externalSignal);
     const msg = data.choices?.[0]?.message;
     const toolCalls = ((msg?.tool_calls ?? []) as ToolCallMsg[]).filter((tc) => tc.function?.name);
-    if (toolCalls.length === 0) return { type: "reply", reply: msg?.content ?? "（空回复）" };
+    if (toolCalls.length === 0) {
+      return { type: "reply", reply: msg?.content ?? "（空回复）", toolImages };
+    }
     messages.push({ role: "assistant", content: msg?.content ?? "", tool_calls: toolCalls });
     const hasDangerous = toolCalls.some((tc) => tools.find((t) => t.id === tc.function?.name)?.dangerous);
     if (askAll || hasDangerous) {
@@ -1751,11 +2348,11 @@ async function runToolLoop(
         messages,
       };
     }
-    await executeToolCalls(tools, toolCalls, messages, ctx);
+    const imgs = await executeToolCalls(tools, toolCalls, messages, ctx);
+    if (imgs.length) toolImages.push(...imgs);
   }
-  return { type: "reply", reply: "（达到工具轮次上限）" };
+  return { type: "reply", reply: "（达到工具轮次上限）", toolImages };
 }
-
 async function resolveChatTools(enabledTools: string[]): Promise<{ defs: ToolDef[] }> {
   // 未启用的功能在这里统一拦掉：即使请求里带了这些工具也不会生效
   const allowed = filterDisabledTools(enabledTools);
@@ -1807,9 +2404,11 @@ app.post("/api/chat", async (req, res) => {
     const enabledTools = Array.isArray(tools) ? (tools as string[]) : [];
     const { defs: toolDefs } = await resolveChatTools(enabledTools);
 
-    // 相关召回：按关键词重合 + 新鲜度取与当前话题最相关的记忆（最多 20 条）。
-    // 只召回「当前用户私密 + 所有用户共享」的记忆，避免不同用户的事实互相污染
-    const memories = await recall(slug, message, 30, ns).catch(() => []);
+    // 相关召回：按关键词重合 + 新鲜度取与当前话题最相关的记忆（最多 30 条）。
+    // 【关键】记忆恒置顶（稳定排序，组内仍按相关度），不被高分普通记忆挤掉。
+    const memories = (await recall(slug, message, 30, ns).catch(() => [])).slice().sort(
+      (a, b) => (b.important ? 1 : 0) - (a.important ? 1 : 0)
+    );
     const memoryBlock = memories.length
       ? `\n\n【长期记忆（关于你的事实，仅在相关时使用；【关键】为必须遵守的长期约定；要新增事实时调用 memory_save 工具）】\n- ${memories
           .map((m) => `${m.important ? "【关键】" : ""}${m.fact}`)
@@ -1847,13 +2446,18 @@ app.post("/api/chat", async (req, res) => {
       (await buildChatSystemAsync(card, await resolveCardPresetBlocks(card), recentText)) +
       userBlock +
       (toolDefs.length
-        ? `\n\n你可以使用以下工具完成任务：${toolDefs.map((t) => t.name).join("、")}。用户请求适合用工具完成时，调用工具而不是凭空编造；危险工具会先征得用户同意。`
+        ? `\n\n你可以使用以下工具完成任务：${toolDefs.map((t) => t.name).join("、")}。用户请求适合用工具完成时，调用工具而不是凭空编造；危险工具会先征得用户同意。${toolDefs.some((t) => t.id === "image_gen") ? "\n【生图强约束】如果角色设定/剧情让你拒绝用户的图片请求，可以直接拒绝（符合人设）；但只要你【同意】生成图片，就必须立即调用 image_gen 工具真实生成——绝不能只口头描述画面、编造图片地址或假装已生成（那样用户什么也收不到）。图片生成后系统会自动附带在回复末尾，你【不要】在回复正文里写图片地址/路径。" : ""}`
         : "") +
       memoryBlock +
       rememberRule;
 
     // 表情包注入：全局共享库（关闭档不注入）
     system += await buildEmojiPrompt(card.voice?.message_style?.emoji ?? "克制", "inline", card.emojiGroups);
+
+    // 配置变更强提醒：风格/条数/预设档位最近改过 → system 最顶部注入（覆盖上下文惯性）
+    const cfgState = await readConfigState(card.slug).catch(() => ({}));
+    const cfgReminder = buildConfigChangeReminder(cfgState);
+    if (cfgReminder) system = cfgReminder + "\n\n" + system;
 
     // 破甲示范对话（few-shot 锚定）：从所选档位预设的 <example> 块解析，注入在真实对话开头。
     // 对齐 RP-Hub 的「system 破限 + user/AI 消息注入」三重结构，弱模型靠模仿比靠指令更稳。
@@ -1878,7 +2482,7 @@ app.post("/api/chat", async (req, res) => {
     // 记录用户活跃（AI 生命调度用：重置该用户 missedBeats）
     void recordUserContact(card.slug, "local").catch(() => {});
     // 统一会话日志：网页聊天轮次也落盘（通道消息由观察器同步进来；本地聊天不发送到通道）
-    void appendConv(slug, { role: "user", content: String(message ?? ""), surface: "web", ns }).catch(() => {});
+    const userEntry = await appendConv(slug, { role: "user", content: String(message ?? ""), surface: "web", ns }).catch(() => null);
     // 客户端断开（截断）→ 中止模型请求，省 API
     const chatCtrl = new AbortController();
     req.on("close", () => { if (!res.writableEnded) chatCtrl.abort(); });
@@ -1891,12 +2495,32 @@ app.post("/api/chat", async (req, res) => {
         result.reply = cleaned;
       }
     }
+    let convIds: string[] = userEntry ? [userEntry.id] : [];
     if (result.type === "reply") {
-      void appendConv(slug, { role: "assistant", content: String(result.reply ?? ""), surface: "web", ns }).catch(() => {});
+      // 模型可能不复述工具结果里的图片 URL → 服务端强制附加（前端 CHAT_IMG_RE 渲染成图）；
+      // 落盘/拆条用附加后的文本（刷新后图仍在），记忆总结用原始回复（避免路径噪音进记忆）
+      const rawReply = String(result.reply ?? "");
+      const toolImages = (result.toolImages ?? []).filter((u) => !rawReply.includes(u));
+      const displayReply = stripFakeImgUrls(toolImages.length ? `${rawReply}\n\n${toolImages.join("\n")}` : rawReply);
+      // 回复拆条（活人感分段）：按卡配置的条数区间 + 风格字数约束拆成多条。
+      // 段落/句号/逗号四级拆法见 core/splitter.ts；表情包/图片由通道侧独立发送，这里只拆文本。
+      const style: SplitStyle = card.presets?.style === "rich" ? "rich" : "chat";
+      const splitCfg = card.chat?.split ?? { min: 1, max: 7 };
+      const splitRes = splitReply(displayReply, { style, min: splitCfg.min, max: splitCfg.max });
+      if (splitRes.count > 1) {
+        logInfo("拆条", `${card.name} 回复拆成 ${describeSplit(splitRes)}`);
+      }
+      const aEntry = await appendConv(slug, { role: "assistant", content: displayReply, surface: "web", ns, parts: splitRes.parts }).catch(() => null);
+      if (aEntry) convIds.push(aEntry.id);
       // 滑动分批自动总结记忆（后台执行，不阻塞回复）
-      void autoMemorize(slug, card, message, (result as { reply?: string }).reply ?? "", ns).catch(() => {});
+      void autoMemorize(slug, card, message, rawReply, ns).catch(() => {});
+      // 本地聊天原文 → 通道侧刷新（防抖 6s）：history md 导出（100 轮可检索）+ USER.md 注入近 3 轮
+      scheduleChannelMemoryRefresh(slug);
+      res.json({ ...result, reply: displayReply, parts: splitRes.parts, convIds });
+      return;
     }
-    res.json(result);
+    // convIds：这轮对话在统一日志里的 id（网页端长按删除消息要用）
+    res.json({ ...result, convIds });
   } catch (e) {
     res.status(500).json({ error: toUserError(e) });
   }
@@ -1910,9 +2534,10 @@ async function autoMemorize(
   reply: string,
   ns = "local"
 ): Promise<void> {
-  const rounds = card.memoryConfig?.auto_rounds ?? 10;
+  const rounds = card.memoryConfig?.auto_rounds ?? 5;
   if (!rounds || rounds < 1) return;
-  // 追加本轮并取回「最早的一段」（若未到 保护20+N 则返回空，最近 20 轮原样保留不总结）。
+  // 每 N 轮总结一批（含最新轮，无保护门槛）；最近 20 轮原文仍由聊天历史窗口完整注入，不被记忆替代。
+  // 总结失败的记忆巡回：失败段标记回日志（markChatRetry），下次总结搭车补记。
   // 网页与通道（QQ/微信）对话进同一份日志、同一份记忆（整卡通用）
   const segment = await pushChatRound(
     slug,
@@ -1923,7 +2548,12 @@ async function autoMemorize(
   if (!segment.length) return;
   // 记忆总结固定用这张卡的聊天模型
   const llm = await resolveChatLLM(card as never);
-  if (!llm?.apiKey) return;
+  if (!llm?.apiKey) {
+    // 无可用模型时不能静默丢段：标回日志等下次搭车，否则聊天轮次会凭空消失、记忆永不总结
+    logWarn("记忆", `${slug} 总结失败：卡无可用模型/API Key，${segment.length} 轮已标回待重试`);
+    await markChatRetry(slug, segment, ns).catch(() => {});
+    return;
+  }
   // 总结字数上限随 N：1-10 轮 ≤100 字；11-20 轮 ≤200 字（批次越大允许越详实）
   const maxLen = rounds <= 10 ? 100 : 200;
   // 已记住的只带最近 100 条给 LLM，避免 token 随文件膨胀
@@ -1961,27 +2591,45 @@ async function autoMemorize(
       }),
       signal: AbortSignal.timeout(45000),
     });
-    if (!r.ok) return;
+    if (!r.ok) {
+      // 记忆巡回：总结失败 → 该段标记回日志，下次总结搭车补记
+      logWarn("记忆", `${slug} 总结失败：HTTP ${r.status}，${segment.length} 轮已标回`);
+      await markChatRetry(slug, segment, ns).catch(() => {});
+      return;
+    }
     const data = await r.json();
     const text = String(data.choices?.[0]?.message?.content ?? "").replace(/```json|```/g, "").trim();
     const start = text.indexOf("{");
     const end = text.lastIndexOf("}");
-    if (start === -1 || end === -1) return;
+    if (start === -1 || end === -1) {
+      logWarn("记忆", `${slug} 总结失败：模型未返回 JSON（${text.slice(0, 60)}），${segment.length} 轮已标回`);
+      await markChatRetry(slug, segment, ns).catch(() => {});
+      return;
+    }
     const o = JSON.parse(text.slice(start, end + 1)) as { summary?: unknown; important?: unknown; keywords?: unknown; skip?: unknown };
-    if (o.skip === true) return;
+    if (o.skip === true) return; // 没有值得记的内容：正常消费，不巡回
     const fact = typeof o.summary === "string" ? o.summary.trim().slice(0, maxLen) : "";
-    if (!fact) return;
+    if (!fact) {
+      logWarn("记忆", `${slug} 总结失败：模型返回空摘要，${segment.length} 轮已标回`);
+      await markChatRetry(slug, segment, ns).catch(() => {});
+      return;
+    }
     const keywords = Array.isArray(o.keywords)
       ? o.keywords.map((k) => String(k).trim()).filter(Boolean).slice(0, 5)
       : [];
     const important = o.important === true;
-    await appendEntry(slug, { fact, keywords, important, src: "auto", ns }).catch(() => {});
+    // 记下这条记忆总结自哪几轮：用户删掉那些聊天记录时，这条记忆要一并删掉（不给被删内容留底）
+    const roundKeys = segment.map((r) => roundKeyOf(r));
+    await appendEntry(slug, { fact, keywords, important, src: "auto", ns, roundKeys }).catch(() => {});
+    logInfo("记忆", `${slug} 自动总结 1 条${important ? "（关键）" : ""}：${fact.slice(0, 40)}`);
     void (async () => {
       await exportMemoryToMarkdown(slug).catch(() => {});
       await syncAgentUserMemory(slug).catch(() => {});
     })().catch(() => {});
-  } catch {
-    /* 自动记忆失败不影响聊天 */
+  } catch (e) {
+    // 记忆巡回：网络异常/解析异常 → 该段标记回日志，下次总结搭车补记
+    logWarn("记忆", `${slug} 总结异常：${String((e as Error)?.message ?? e).slice(0, 80)}，${segment.length} 轮已标回`);
+    await markChatRetry(slug, segment, ns).catch(() => {});
   }
 }
 
@@ -2347,6 +2995,121 @@ app.post("/api/memory/clear", async (req, res) => {
   }
 });
 
+app.get("/api/groupchat/:slug", async (req, res) => {
+  try {
+    res.json({ groups: await listGroupsForCard(req.params.slug) });
+  } catch (e) {
+    res.status(500).json({ error: toUserError(e) });
+  }
+});
+
+app.get("/api/groupchat/:slug/:gid", async (req, res) => {
+  try {
+    const detail = await getGroupDetail(req.params.slug, req.params.gid);
+    if (!detail) return res.status(404).json({ error: "没有这个群聊记录" });
+    res.json(detail);
+  } catch (e) {
+    res.status(500).json({ error: toUserError(e) });
+  }
+});
+
+app.post("/api/groupchat/:slug/:gid/delete", async (req, res) => {
+  try {
+    const ok = await deleteGroupChat(req.params.slug, req.params.gid);
+    if (!ok) return res.status(404).json({ error: "没有这个群聊记录" });
+    res.json({ ok: true, groups: await listGroupsForCard(req.params.slug) });
+  } catch (e) {
+    res.status(500).json({ error: toUserError(e) });
+  }
+});
+
+app.post("/api/groupchat/:slug/:gid/member", async (req, res) => {
+  try {
+    const { memberId, name } = req.body ?? {};
+    if (!memberId) return res.status(400).json({ error: "缺少成员 id" });
+    const g = await renameGroupMember(req.params.slug, req.params.gid, String(memberId), String(name ?? ""));
+    if (!g) return res.status(404).json({ error: "没有这个群聊记录" });
+    res.json({ ok: true, group: await getGroupDetail(req.params.slug, req.params.gid) });
+  } catch (e) {
+    res.status(500).json({ error: toUserError(e) });
+  }
+});
+
+function internalOk(req: express.Request): boolean {
+  const ip = String(req.ip || req.socket.remoteAddress || "");
+  if (ip === "127.0.0.1" || ip === "::1" || ip.endsWith("127.0.0.1")) return true;
+  if (!UI_USER || !UI_PASS) return true;
+  const auth = req.headers.authorization ?? "";
+  const [type, token] = auth.split(" ");
+  if (type === "Basic" && token) {
+    const decoded = Buffer.from(token, "base64").toString("utf8");
+    const idx = decoded.indexOf(":");
+    const user = idx >= 0 ? decoded.slice(0, idx) : "";
+    const pass = idx >= 0 ? decoded.slice(idx + 1) : "";
+    return user === UI_USER && pass === UI_PASS;
+  }
+  return false;
+}
+
+async function resolveGroupSlug(body: { slug?: unknown; accountId?: unknown; agentId?: unknown }): Promise<string> {
+  const direct = String(body.slug ?? "").trim();
+  if (direct) return direct;
+  const agentId = String(body.agentId ?? "").trim();
+  const accountId = String(body.accountId ?? "").trim();
+  const bots = await listBots().catch(() => []);
+  const hit = bots.find((b) => (agentId && b.agentId === agentId) || (accountId && b.accountId === accountId && b.channel === "qqbot"));
+  return hit?.cardSlug ?? "";
+}
+
+app.post("/api/internal/groupchat/recall", async (req, res) => {
+  try {
+    if (!internalOk(req)) return res.status(401).json({ error: "需要登录" });
+    const { gid, memberId, memberName, text, groupName } = req.body ?? {};
+    const slug = await resolveGroupSlug(req.body ?? {});
+    if (!slug || !gid || !memberId) return res.status(400).json({ error: "缺少参数" });
+    await ensureGroup(slug, String(gid), groupName ? String(groupName) : undefined);
+    const who = await memberLabel(slug, String(gid), String(memberId), memberName ? String(memberName) : undefined);
+    const ctx = await recallGroupContext(slug, String(gid), String(memberId), String(text ?? ""));
+    res.json({ ok: true, slug, memberName: who, context: ctx, inject: formatGroupInject(ctx, who, String(text ?? "")) });
+  } catch (e) {
+    res.status(500).json({ error: toUserError(e) });
+  }
+});
+
+app.post("/api/internal/groupchat/turn", async (req, res) => {
+  try {
+    if (!internalOk(req)) return res.status(401).json({ error: "需要登录" });
+    const { gid, memberId, memberName, user, assistant, groupName } = req.body ?? {};
+    const slug = await resolveGroupSlug(req.body ?? {});
+    if (!slug || !gid || !memberId || !user || !assistant) return res.status(400).json({ error: "缺少参数" });
+    const turn = await appendGroupTurn(slug, {
+      gid: String(gid),
+      groupName: groupName ? String(groupName) : undefined,
+      memberId: String(memberId),
+      memberName: memberName ? String(memberName) : undefined,
+      user: String(user),
+      assistant: String(assistant),
+    });
+    res.json({ ok: true, turn });
+  } catch (e) {
+    res.status(500).json({ error: toUserError(e) });
+  }
+});
+
+app.post("/api/internal/groupchat/join", async (req, res) => {
+  try {
+    if (!internalOk(req)) return res.status(401).json({ error: "需要登录" });
+    const { gid, groupName } = req.body ?? {};
+    const slug = await resolveGroupSlug(req.body ?? {});
+    if (!slug || !gid) return res.status(400).json({ error: "缺少参数" });
+    const g = await ensureGroup(slug, String(gid), groupName ? String(groupName) : undefined);
+    logInfo("群聊", `${slug} 加入群 ${g.name} (${g.gid})`);
+    res.json({ ok: true, group: g });
+  } catch (e) {
+    res.status(500).json({ error: toUserError(e) });
+  }
+});
+
 // 一键重置（网页聊天页「重置」按钮）：清空该卡全部记忆 + 对话日志 + 开场状态，
 // 让 AI 忘掉之前的所有事（含通道用户记住的事实），可重新开场、重塑角色形象。不可恢复。
 app.post("/api/cards/:slug/reset", async (req, res) => {
@@ -2404,21 +3167,25 @@ async function writeMirrorState(slug: string, s: { openid?: string; sessionId?: 
   await fs.writeFile(file, JSON.stringify(s, null, 2), "utf8");
 }
 
-/** 绑定的目标用户：优先上次用过的 openid（用户说了机器人只跟一个人聊，不弹选择），
- *  否则取该通道最近互动的已知用户；通道还没人聊过时返回 null。
- *  已知用户里带 accountId 的（QQ known-users.json）先按当前 bot 的账号过滤，
- *  避免 bot 绑 A 账号却把消息投给 B 账号的用户（串台）。 */
+/**
+ * 绑定的目标用户：优先上次用过的 openid（用户说了机器人只跟一个人聊，不弹选择），
+ * 否则取该 agent 会话索引里最近互动的用户。
+ * 不依赖 QQ known-users.json（openid 大写与会话 key 小写不一致）和微信 accounts.json
+ * （里面是账号 id 不是用户）——会话索引的 origin.from/label 是权威来源。
+ */
 async function mirrorTargetOf(bot: BotInstance): Promise<{ openid: string } | null> {
   const state = await readMirrorState(bot.cardSlug);
-  if (state.openid) return { openid: state.openid };
-  const users = bot.channel === "qqbot" ? await readQQKnownUsers() : await readWXKnownUsers();
+  if (state.openid) {
+    // 校验旧 openid 是否仍对应当前会话（换绑/换渠道后旧值会失配——曾出现 QQ 时代的
+    // openid 残留导致微信消息一直同步不到网页）
+    const stillValid = await findSession(bot.agentId, bot.accountId, state.openid).catch(() => null);
+    if (stillValid) return { openid: state.openid };
+    await writeMirrorState(bot.cardSlug, { sessionId: "", lastSyncAt: "" }).catch(() => {});
+  }
+  const users = await listAgentSessionUsers(bot.agentId, bot.accountId);
   if (!users.length) return null;
-  const lastAt = (u: { openid: string; lastInteractionAt?: number }): number => u.lastInteractionAt ?? 0;
-  // 优先取当前账号下的用户；账号无记录时才回退到全局最近互动（老数据/微信无账号维度）
-  const mine = users.filter((u) => !("accountId" in u) || u.accountId === bot.accountId);
-  const pool = mine.length ? mine : users;
-  const sorted = [...pool].sort((a, b) => lastAt(b) - lastAt(a));
-  return { openid: sorted[0].openid };
+  users.sort((a, b) => b.updatedAt - a.updatedAt);
+  return { openid: users[0].openid };
 }
 
 /** 观察一张卡的通道会话：增量同步进统一日志 + 喂自动记忆。返回新增轮次数。 */
@@ -2430,13 +3197,29 @@ async function observeCard(slug: string): Promise<number> {
   const ns = `${nsOfChannel(bot.channel)}:${target.openid}`;
   const { sessionId, turns } = await pollSessionTurns(slug, bot, target.openid);
   if (!turns.length) return 0;
-  for (const t of turns) {
-    void appendConv(slug, { role: t.role, content: t.content, surface: surfaceOfChannel(bot.channel), ns }).catch(() => {});
+  // 按来源消息 id 去重：游标重置（会话文件重建/截断）会把整段会话当新消息返回，
+  // 不去重的话同一批消息会被反复追加进日志（网页端出现重复气泡）
+  const seen = await readConvSrcIds(slug);
+  const fresh = turns.filter((t) => !t.id || !seen.has(t.id));
+  if (!fresh.length) return 0;
+  for (const t of fresh) {
+    // 通道回合在 OpenClaw 会话里被合并成一条 assistant 消息（含换行）——网页端按换行拆回多条气泡，
+    // 还原通道端逐条发送的消息边界；【表情:名】全角标签统一转半角（网页端只认 [表情:名]）
+    const raw = String(t.content ?? "");
+    const normed = raw.replace(/【表情:([^】]+)】/g, "[表情:$1]");
+    if (t.role === "assistant" && normed.includes("\n")) {
+      const parts = normed.split(/\n+/).map((s) => s.trim()).filter(Boolean);
+      for (const p of parts) {
+        void appendConv(slug, { role: "assistant", content: p, surface: surfaceOfChannel(bot.channel), ns, srcId: t.id || undefined }).catch(() => {});
+      }
+    } else {
+      void appendConv(slug, { role: t.role, content: normed, surface: surfaceOfChannel(bot.channel), ns, srcId: t.id || undefined }).catch(() => {});
+    }
   }
   // 配对 user/assistant 喂自动记忆（assistant 与前一条 user 组成一轮；单条不配对等下一批）
   const card = await store.get(slug).catch(() => null);
   let pendingUser = "";
-  for (const t of turns) {
+  for (const t of fresh) {
     if (t.role === "user") pendingUser = t.content;
     else if (t.role === "assistant" && pendingUser) {
       if (card) void autoMemorize(slug, card, pendingUser, t.content, ns).catch(() => {});
@@ -2447,7 +3230,9 @@ async function observeCard(slug: string): Promise<number> {
   if (sessionId) {
     await writeMirrorState(slug, { openid: target.openid, sessionId, lastSyncAt: new Date().toISOString() });
   }
-  return turns.length;
+  // 通道有新消息 → 刷新 USER.md（当前配置/变更提醒/记忆随每轮注入，及时反映最新设置）
+  void syncAgentUserMemory(slug).catch(() => {});
+  return fresh.length;
 }
 
 /** 解析 `openclaw agent --json` 输出里的回复文本（实测结构：result.payloads[].text /
@@ -2500,6 +3285,129 @@ app.get("/api/cards/:slug/conversation", async (req, res) => {
     const entries = await readConv(slug);
     const list = bot ? entries : entries.filter((e) => e.surface === "web");
     res.json({ bound: !!bot, entries: list });
+  } catch (e) {
+    res.status(500).json({ error: toUserError(e) });
+  }
+});
+
+// 删除指定消息（网页长按多选删除用），并做记忆修复：
+// ① 对话日志里同内容的未总结轮次一并移除（不再被总结）；
+// ② 删掉的轮数 ≥ N/2（或一次删掉大量已总结消息）→ 最新一条记忆按「解散」处理，由后续总结自然重算
+/**
+ * 把被删掉的消息按「user + 紧随的 assistant」配对成轮次，用于和记忆里的 roundKeys 对齐。
+ * 对话日志一轮 = {u, a}，所以这里要还原成同样的形状才能算出一致的指纹。
+ */
+function pairRounds(msgs: { role: string; content: string }[]): { u: string; a: string }[] {
+  const sorted = [...msgs]; // 传入顺序已是会话顺序（deleteConvByIds 按原文件序返回）
+  const out: { u: string; a: string }[] = [];
+  for (let i = 0; i < sorted.length; i++) {
+    if (sorted[i].role !== "user") continue;
+    const next = sorted[i + 1];
+    if (next && next.role === "assistant") {
+      out.push({ u: String(sorted[i].content ?? ""), a: String(next.content ?? "") });
+      i++; // 这条 assistant 已配对
+    } else {
+      out.push({ u: String(sorted[i].content ?? ""), a: "" });
+    }
+  }
+  return out;
+}
+
+app.post("/api/cards/:slug/conversation/delete", async (req, res) => {
+  try {
+    const slug = req.params.slug;
+    const ids = Array.isArray(req.body?.ids) ? req.body.ids.map(String) : [];
+    if (!ids.length) return res.status(400).json({ error: "ids 不能为空" });
+    const removed = await deleteConvByIds(slug, ids);
+    if (!removed.length) return res.json({ ok: true, removed: 0, rounds: 0, dissolved: false });
+    // 前端多选删除是「从最早选中项删到底」，所以可以安全地把通道会话链也从尾部截掉同样的轮数
+    // （通道链只能尾部截断，中间删会断链——这也是前端强制连带删除后续消息的原因）
+    let channelTrimmed = 0;
+    let channelNote = "";
+    if (req.body?.trimChannel) {
+      const bot = await getBotByCard(slug);
+      if (bot) {
+        const wantRounds = removed.filter((e) => e.role === "assistant").length || 1;
+        const n = await trimAgentSessionTail(bot.agentId, wantRounds).catch(() => 0);
+        if (n < 0) channelNote = "通道上下文结构异常，未改动（可用「清空此卡记忆」重开会话）";
+        else channelTrimmed = n;
+      }
+    }
+    const rounds = await repairChatlogAfterDelete(slug, removed);
+    // 记忆不给被删内容留底：凡「总结自被删轮次」的记忆一并删掉，之后按剩余原文重新总结。
+    // 被删消息按 user/assistant 配对成轮次，与记忆里的 roundKeys 对齐。
+    const delRounds = pairRounds(removed);
+    const memGone = delRounds.length ? await deleteMemoriesByRounds(slug, delRounds).catch(() => 0) : 0;
+    const card = await store.get(slug).catch(() => null);
+    const N = Math.max(1, Math.min(20, card?.memoryConfig?.auto_rounds ?? 5));
+    let dissolved = false;
+    // 老记忆没有 roundKeys（无法溯源）→ 沿用原有兜底：删得多就把最新一条解散重算
+    if (!memGone && (rounds >= Math.max(1, Math.floor(N / 2)) || removed.length >= Math.max(2, N))) {
+      const m = await dissolveNewestMemory(slug);
+      dissolved = !!m;
+    }
+    if (memGone || dissolved) {
+      void exportMemoryToMarkdown(slug).catch(() => {});
+      void syncAgentUserMemory(slug).catch(() => {});
+    }
+    res.json({ ok: true, removed: removed.length, rounds, dissolved, memGone, channelTrimmed, channelNote });
+  } catch (e) {
+    res.status(500).json({ error: toUserError(e) });
+  }
+});
+
+/**
+ * 撤掉最近若干轮对话（网页记录 + 通道上下文一起摘）。
+ * 用途：破甲被模型拒绝时，把那轮从上下文里彻底摘掉，避免「上次拒绝过」持续污染后续回复。
+ * 通道侧只从会话链尾部截断（中间不能删，会断链），所以只支持「最新 N 轮」。
+ */
+app.post("/api/cards/:slug/conversation/undo", async (req, res) => {
+  try {
+    const slug = req.params.slug;
+    const rounds = Math.max(1, Math.min(20, Number(req.body?.rounds) || 1));
+    // ① 网页记录：从尾部取出对应的消息（一轮 = 最后一条 assistant + 它前面的 user）
+    const all = await readConv(slug, 0);
+    const ids: string[] = [];
+    let got = 0;
+    for (let i = all.length - 1; i >= 0 && got < rounds; i--) {
+      ids.push(all[i].id);
+      // 遇到 user 且已经收过 assistant，算凑满一轮
+      if (all[i].role === "user") got++;
+    }
+    const removed = ids.length ? await deleteConvByIds(slug, ids) : [];
+    // ② 通道上下文：从 agent 会话链尾部截断同样的轮数
+    const bot = await getBotByCard(slug);
+    let channelTrimmed = 0;
+    let channelNote = "";
+    if (bot) {
+      const n = await trimAgentSessionTail(bot.agentId, rounds).catch(() => 0);
+      if (n < 0) {
+        // 结构异常（有分叉）→ 不硬删，提示用户可以整会话清空
+        channelNote = "通道上下文结构异常，未改动（可用「清空此卡记忆」重开会话）";
+      } else {
+        channelTrimmed = n;
+      }
+    }
+    // ③ 记忆同步：总结自被撤轮次的记忆一并删除（不给被删内容留底）
+    let dissolved = false;
+    let memGone = 0;
+    if (removed.length) {
+      const r = await repairChatlogAfterDelete(slug, removed);
+      const delRounds = pairRounds(removed);
+      memGone = delRounds.length ? await deleteMemoriesByRounds(slug, delRounds).catch(() => 0) : 0;
+      const card = await store.get(slug).catch(() => null);
+      const N = Math.max(1, Math.min(20, card?.memoryConfig?.auto_rounds ?? 5));
+      // 老记忆无 roundKeys 时的兜底（同多选删除口径）
+      if (!memGone && (r >= Math.max(1, Math.floor(N / 2)) || removed.length >= Math.max(2, N))) {
+        const m = await dissolveNewestMemory(slug);
+        dissolved = !!m;
+      }
+      if (memGone || dissolved) {
+        void exportMemoryToMarkdown(slug).catch(() => {});
+        void syncAgentUserMemory(slug).catch(() => {});
+      }
+    }
+    res.json({ ok: true, removed: removed.length, rounds: got, channelTrimmed, channelNote, dissolved, memGone });
   } catch (e) {
     res.status(500).json({ error: toUserError(e) });
   }
@@ -2705,6 +3613,20 @@ app.delete("/api/emojis/groups/:id", async (req, res) => {
 });
 
 // 移动 / 复制表情到其他分组（copy=true 复制，false 移动）
+
+// 从其他分组导入表情（路径复用：新条目指向原文件，不复制图片）
+app.post("/api/emojis/import", async (req, res) => {
+  try {
+    const ids = Array.isArray(req.body?.ids) ? req.body.ids.map(String) : [];
+    const group = String(req.body?.group ?? "");
+    if (!ids.length) return res.status(400).json({ error: "ids 不能为空" });
+    if (!group) return res.status(400).json({ error: "group 不能为空" });
+    res.json(await importEmojisToGroup(ids, group));
+  } catch (e) {
+    res.status(400).json({ error: toUserError(e) });
+  }
+});
+
 app.post("/api/emojis/:id/move", async (req, res) => {
   try {
     const { group, copy } = req.body ?? {};
@@ -3157,6 +4079,13 @@ app.post("/api/tts/fetch-models", async (req, res) => {
       models = ["speech-2.8-hd", "speech-2.8-turbo", "speech-2.6-hd", "speech-2.6-turbo", "speech-02-hd", "speech-02-turbo", "speech-01-hd", "speech-01-turbo"];
     } else if (k === "volc") {
       models = ["seed-tts-1.0", "seed-tts-2.0", "seed-tts-1.0-concurr", "seed-icl-2.0"];
+    } else if (k === "mimo") {
+      models = ["mimo-v2-tts"];
+      voices = TTS_PROVIDER_PRESETS.mimo.voices?.map((v) => v.id) ?? [];
+    } else if (k === "elevenlabs") {
+      models = ["eleven_multilingual_v2", "eleven_multilingual_v1", "eleven_turbo_v2_5", "eleven_flash_v2_5"];
+    } else if (k === "fishaudio") {
+      models = ["fishaudio/s2.1-pro", "fishaudio/s2.1-pro-flash", "fishaudio/fish-speech-1.5"];
     }
     res.json({ models, voices });
   } catch (e) {
@@ -3170,6 +4099,11 @@ app.get("/api/tts/voices", async (_req, res) => {
   } catch (e) {
     res.status(500).json({ error: toUserError(e) });
   }
+});
+
+// 各家的官方预置（模型/音色列表），供前端添加/编辑提供商时下拉点选（仿 rikkahub）
+app.get("/api/tts/presets", async (_req, res) => {
+  res.json({ presets: TTS_PROVIDER_PRESETS });
 });
 
 // target: "local" 或 provider id
@@ -3483,27 +4417,12 @@ app.post("/api/plugins/toggle", async (req, res) => {
 // ---------- 记忆检索路径：确保 OpenClaw 能索引 memory-export（通道 agent 可搜到本地记忆） ----------
 // shell 把记忆导出到 data/memory-export/*.md；OpenClaw 靠 agents.defaults.memorySearch.extraPaths
 // 把这些 md 纳入 memory_search 索引，通道端（QQ/微信）agent 才能检索到网页聊出来的记忆。
-// 之前只做了导出、没配索引路径——"通道读不到本地记忆"的根因之一。路径用 dataDir() 动态算，不硬编码。
+// 检索隔离（2026-09-08）：不再全局共享检索池——每个绑定卡的 agent 只检索自己卡的
+// memory-export/history-export 两个 md（applyAgentMemoryScope 同时清空 defaults.extraPaths，
+// 因为 OpenClaw 的 agent 级与 defaults 级是合并关系，不清理就还是会跨卡互搜）。
 async function ensureMemorySearchExtraPaths(): Promise<boolean> {
-  const cfgPath = path.join(os.homedir(), ".openclaw", "openclaw.json");
-  let cfg: Record<string, any>;
-  try {
-    cfg = JSON.parse(await fs.readFile(cfgPath, "utf8"));
-  } catch {
-    return false; // 没有配置文件不动（网关首启会生成）
-  }
-  const exportDir = path.join(dataDir(), "memory-export");
-  cfg.agents ??= {};
-  cfg.agents.defaults ??= {};
-  cfg.agents.defaults.memorySearch ??= {};
-  const arr = Array.isArray(cfg.agents.defaults.memorySearch.extraPaths)
-    ? (cfg.agents.defaults.memorySearch.extraPaths as string[])
-    : [];
-  if (arr.includes(exportDir)) return false; // 已配置
-  arr.push(exportDir);
-  cfg.agents.defaults.memorySearch.extraPaths = arr;
-  await fs.writeFile(cfgPath, JSON.stringify(cfg, null, 2), "utf8");
-  return true;
+  const n = await applyAllAgentMemoryScopes().catch(() => 0);
+  return n > 0;
 }
 
 /**
@@ -3513,9 +4432,10 @@ const USER_MEMORY_START = "<!-- openclaw-shell:user-memory-start -->";
 const USER_MEMORY_END = "<!-- openclaw-shell:user-memory-end -->";
 
 /**
- * 通道读本地记忆（免向量、免搜索）：把该卡的记忆合并进绑定 agent 工作区根目录的 USER.md。
+ * 通道读本地记忆（免向量、免搜索）：把该卡的记忆 + 本地网页聊天近 RECENT_CHAT_INJECT_ROUNDS 轮
+ * 合并进绑定 agent 工作区根目录的 USER.md。
  * USER.md 是 OpenClaw 每轮必注入的"用户档案"文件（embedded 与网关都注入，已实测），
- * 所以记忆每次对话都自动带上——等价于"记忆代替聊天记录插入"，不依赖 memory_search/向量。
+ * 所以记忆与近期聊天每次对话都自动带上——等价于"记忆代替聊天记录插入"，不依赖 memory_search/向量。
  * 保留 USER.md 原有内容（OpenClaw 自己的用户档案），只追加一段带标记的记忆区。
  */
 async function syncAgentUserMemory(slug: string): Promise<void> {
@@ -3523,14 +4443,22 @@ async function syncAgentUserMemory(slug: string): Promise<void> {
   if (!bot) return;
   const mdPath = path.join(dataDir(), "memory-export", `${slug}.md`);
   const content = await fs.readFile(mdPath, "utf8").catch(() => "");
+  // 本地网页聊天近 N 轮（爱语式近记忆物化：换端也能接上最近聊过的话题）
+  const recent = await readRecentLocalChat(slug);
+  const chatSection = recent.length
+    ? `\n\n### 网页端近期聊天（最近 ${Math.ceil(recent.length / 2)} 轮，用户可能在任意端继续话题）\n` +
+      recent.map((r) => `- ${r.role === "user" ? "用户" : "你"}：${r.content}`).join("\n")
+    : "\n\n### 网页端近期聊天\n- （暂无网页端聊天记录）";
+  // 记忆为空也注入占位说明，保证段结构始终存在、模型知道有记忆系统
   const userMd = path.join(agentWorkspaceDir(slug), "USER.md");
   // 剥离旧的记忆段（若存在），保留原档案
   const existing = await fs.readFile(userMd, "utf8").catch(() => "");
   const base = existing.replace(new RegExp(`${USER_MEMORY_START}[\\s\\S]*?${USER_MEMORY_END}\\s*`, "g"), "").trimEnd();
-  const memSection = content.trim()
-    ? `\n\n${USER_MEMORY_START}\n${content.trim()}\n${USER_MEMORY_END}`
+  // 当前扮演配置 + 变更提醒（每轮注入，对抗上下文惯性）
+  const cfgSection = buildConfigSectionForUserMd(await readConfigState(slug).catch(() => ({})));
+  const memSection = (content.trim() || chatSection || cfgSection)
+    ? `\n\n${USER_MEMORY_START}\n${cfgSection.trim()}\n${content.trim() || "\n### 长期记忆\n- （暂无自动总结的记忆，靠对话自然积累）"}\n${chatSection.trim()}\n${USER_MEMORY_END}`
     : "";
-  await fs.mkdir(agentWorkspaceDir(slug), { recursive: true });
   await fs.writeFile(userMd, base + memSection + "\n", "utf8");
 }
 
@@ -3552,6 +4480,20 @@ function startMirrorObserver(): void {
   if (mirrorTimer.unref) mirrorTimer.unref();
 }
 
+// 本地聊天落盘后防抖刷新通道侧（导出 history md + 重写 USER.md 记忆/近3轮聊天）
+const channelMemTimers = new Map<string, NodeJS.Timeout>();
+function scheduleChannelMemoryRefresh(slug: string): void {
+  const old = channelMemTimers.get(slug);
+  if (old) clearTimeout(old);
+  channelMemTimers.set(slug, setTimeout(() => {
+    channelMemTimers.delete(slug);
+    void (async () => {
+      await exportHistoryToMarkdown(slug).catch(() => {});
+      await syncAgentUserMemory(slug).catch(() => {});
+    })();
+  }, 6000));
+}
+
 // 确保 OpenClaw 索引 memory-export（通道 agent 可搜索本地记忆）。必须在 listen 前完成：
 // start-stack 先起 server 再起 gateway，这里 await 落盘后网关读到的一定是新配置。
 await ensureMemorySearchExtraPaths().then((changed) => {
@@ -3569,12 +4511,20 @@ app.listen(PORT, HOST, () => {
   // 记忆导出：启动时同步全部卡的记忆到 md（供 OpenClaw memorySearch.extraPaths 索引）
   void exportAllMemoriesToMarkdown().then((slugs) => {
     if (slugs.length) logInfo("记忆", `已导出 ${slugs.length} 张卡的记忆`);
-    // 免向量方案：绑定卡的记忆同步进 agent 工作区 user-memory.md（通道 agent 直接读取）
+    // 免向量方案：绑定卡的记忆 + 本地聊天近3轮同步进 agent 工作区 USER.md（通道 agent 每轮自动带上）
     void (async () => {
       for (const b of await listBots().catch(() => [])) {
         await syncAgentUserMemory(b.cardSlug).catch(() => {});
       }
     })();
+  });
+  // 本地聊天原文导出（最近 100 轮，通道 agent 可检索网页聊天记录）
+  void exportAllHistoriesToMarkdown().then((slugs) => {
+    if (slugs.length) logInfo("记忆", `已导出 ${slugs.length} 张卡的本地聊天记录（通道可检索）`);
+  });
+  // 表情库 → 通道媒体目录同步（~/.openclaw/media/emojis/，QQ/微信插件出口按名查图）
+  void syncEmojisToChannelMedia().then((files) => {
+    if (files.length) logInfo("表情", `已同步 ${files.length} 个表情到通道媒体目录`);
   });
   // 通道会话观察器：网页 ↔ 微信/QQ 互传、通道对话进记忆（每 5 秒）
   startMirrorObserver();

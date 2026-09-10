@@ -120,9 +120,25 @@ export function cardToCCv2(card: PersonaCard): Record<string, unknown> {
   };
 }
 
+/** 兼容「prompts 包装」导出（如 { data: { prompts: { 名字: { spec, data } } } }）：取内层真正的 CCv2 数据 */
+function unwrapPrompts(root: Record<string, unknown>): Record<string, unknown> {
+  const data = root.data as Record<string, unknown> | undefined;
+  if (!data || !data.prompts) return root;
+  const list = Array.isArray(data.prompts) ? data.prompts : Object.values(data.prompts);
+  for (const e of list) {
+    const en = (e ?? {}) as Record<string, unknown>;
+    const enData = (en.data ?? {}) as Record<string, unknown>;
+    const isCard = typeof enData.name === "string" && enData.name.length > 0;
+    if (!isCard) continue;
+    // 用内层 data 作为新的数据源（外层包装键不动）
+    return { ...root, data: enData, extensions: (enData.extensions ?? en.extensions) as Record<string, unknown> | undefined };
+  }
+  return root;
+}
+
 /** CCv2 JSON（{data:{...}} 或平铺）→ persona 卡 */
 export function ccv2ToCard(cc: unknown, avatarDataUrl?: string): PersonaCard {
-  const root = (cc ?? {}) as {
+  const root = unwrapPrompts((cc ?? {}) as Record<string, unknown>) as {
     data?: Record<string, unknown>;
     extensions?: Record<string, unknown>;
   };

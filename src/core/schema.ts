@@ -156,6 +156,13 @@ const chatSchema = z.object({
       merge_burst: z.boolean().default(true),
     })
     .default({}),
+  split: z
+    .object({
+      // 回复拆条条数区间：最少 1 条、最多 7 条（每卡独立，高级配置里选）
+      min: z.number().int().min(1).max(7).default(1),
+      max: z.number().int().min(1).max(7).default(7),
+    })
+    .default({}),
   trigger: z
     .object({
       dm: z.enum(["any", "allowlist", "disabled"]).default("any"),

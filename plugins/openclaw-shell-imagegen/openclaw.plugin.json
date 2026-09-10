@@ -1,8 +1,8 @@
 {
   "id": "openclaw-shell-imagegen",
   "name": "Openclaw Shell Imagegen",
-  "description": "openclaw-shell 生图工具：NovelAI / OpenAI 兼容 / 本地 SD WebUI",
-  "version": "0.1.0",
+  "description": "openclaw-shell 通道生图（指令式）：模型输出 <生图:描述> 由 QQ/微信插件补丁解析调独立生图接口出图",
+  "version": "0.2.0",
   "configSchema": {
     "type": "object",
     "additionalProperties": false,
@@ -12,8 +12,6 @@
     "onStartup": true
   },
   "contracts": {
-    "tools": [
-      "image_gen"
-    ]
+    "tools": []
   }
 }

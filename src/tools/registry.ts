@@ -337,7 +337,7 @@ const imageGen: ToolDef = {
   id: "image_gen",
   name: "生图（AI 绘画）",
   description:
-    "根据文字描述生成图片并发送（需先在「生图配置」页配置提供商与 Key）。prompt 的写法取决于当前生效的提供商：若配置的是 NovelAI，prompt 必须用英文 Danbooru 标签风格（逗号分隔、含角色/服饰/动作/场景/光线/画质词，不要用自然语言）；若配置的是 OpenAI 兼容，prompt 用自然语言详细描述画面即可。若不确定当前提供商，默认按 NovelAI 的标签风格写。negative 为负面词（可选），aspect 为比例（square 方图/portrait 竖图/landscape 横图/auto 自动按画面内容选，可选，默认 auto——人物肖像/竖构图选竖图，风景横场景选横图，一般选方图），seed 为随机种子（可选，相同种子可复现）。内容尺度：图片必须得体（SFW），即使对话氛围开放也绝不使用裸体/性相关标签（nude、nsfw、nipples、explicit 等），用完整衣着与含蓄描述表达。",
+    "根据文字描述生成图片并发送（需先在「生图配置」页配置提供商与 Key）。【同意才调用】用户要求看图片/生成图片/换一张时，你可以按角色设定拒绝（直接说不发即可）；但只要你【同意】生成图片，就必须调用本工具真实生成——绝不能只描述画面、编造图片地址或假装已生成。【不要写地址】图片生成后系统会自动附带在回复末尾，不要在回复正文里写图片地址/路径。prompt 的写法取决于当前生效的提供商：若配置的是 NovelAI，prompt 必须用英文 Danbooru 标签风格（逗号分隔、含角色/服饰/动作/场景/光线/画质词，不要用自然语言）；若配置的是 OpenAI 兼容，prompt 用自然语言详细描述画面即可。若不确定当前提供商，默认按 NovelAI 的标签风格写。negative 为负面词（可选），aspect 为比例（square 方图/portrait 竖图/landscape 横图/auto 自动按画面内容选，可选，默认 auto——人物肖像/竖构图选竖图，风景横场景选横图，一般选方图），seed 为随机种子（可选，相同种子可复现）。",
   parameters: {
     type: "object",
     properties: {

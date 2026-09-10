@@ -22,6 +22,10 @@ export interface ConvEntry {
   /** 该消息所属用户作用域（local / qq:<openid> / wx:<openid>） */
   ns: string;
   t: string; // ISO
+  /** 来源消息 id（通道观察器写入 = OpenClaw 会话消息 id；用于游标重置后去重，防止重复导入） */
+  srcId?: string;
+  /** 本地聊天回复的拆条结果（刷新页面后按条渲染；无此字段的老数据按换行兜底拆分） */
+  parts?: string[];
 }
 
 export function convFile(slug: string): string {
@@ -35,7 +39,7 @@ function newConvId(): string {
 /** 追加一条记录（自动补 id/t）；返回完整条目 */
 export async function appendConv(
   slug: string,
-  input: { role: "user" | "assistant"; content: string; surface: ConvSurface; ns: string }
+  input: { role: "user" | "assistant"; content: string; surface: ConvSurface; ns: string; srcId?: string; parts?: string[] }
 ): Promise<ConvEntry> {
   const entry: ConvEntry = {
     id: newConvId(),
@@ -44,6 +48,8 @@ export async function appendConv(
     surface: input.surface,
     ns: input.ns || "local",
     t: new Date().toISOString(),
+    ...(input.srcId ? { srcId: input.srcId } : {}),
+    ...(Array.isArray(input.parts) && input.parts.length ? { parts: input.parts.map((p) => String(p).slice(0, 5000)) } : {}),
   };
   const file = convFile(slug);
   await fs.mkdir(path.dirname(file), { recursive: true });
@@ -69,6 +75,10 @@ export async function readConv(slug: string, limit = 0): Promise<ConvEntry[]> {
             : "web",
           ns: typeof o.ns === "string" && o.ns ? o.ns : "local",
           t: typeof o.t === "string" ? o.t : "",
+          ...(typeof o.srcId === "string" && o.srcId ? { srcId: o.srcId } : {}),
+          ...(Array.isArray(o.parts) && o.parts.length
+            ? { parts: o.parts.filter((p): p is string => typeof p === "string").map((p) => p.slice(0, 5000)) }
+            : {}),
         });
       }
     } catch {
@@ -76,6 +86,25 @@ export async function readConv(slug: string, limit = 0): Promise<ConvEntry[]> {
     }
   }
   return limit > 0 ? out.slice(-limit) : out;
+}
+
+/** 某卡已导入过的来源消息 id 集合（通道观察器去重用） */
+export async function readConvSrcIds(slug: string): Promise<Set<string>> {
+  const entries = await readConv(slug);
+  return new Set(entries.map((e) => e.srcId).filter(Boolean) as string[]);
+}
+
+/** 按条目 id 删除消息；返回被删的完整条目（供 chatlog / 记忆修复判断） */
+export async function deleteConvByIds(slug: string, ids: string[]): Promise<ConvEntry[]> {
+  const entries = await readConv(slug);
+  const idSet = new Set(ids);
+  const removed = entries.filter((e) => idSet.has(e.id));
+  if (!removed.length) return [];
+  const kept = entries.filter((e) => !idSet.has(e.id));
+  const file = convFile(slug);
+  const text = kept.map((e) => JSON.stringify(e)).join("\n");
+  await fs.writeFile(file, text + (text ? "\n" : ""), "utf8");
+  return removed;
 }
 
 /** 清空某卡的会话日志（「重置」按钮用） */

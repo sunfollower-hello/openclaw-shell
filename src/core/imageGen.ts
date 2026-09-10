@@ -38,9 +38,7 @@ const NAI_NEGATIVE =
   "artist:gaoo (frpjx283), artist:matsunaga kouyou, artist:nameo (judgemasterkou), artist:bb (baalbuddy), " +
   "{{{bad anatomy}}}, {bad hands}, {{{too many fingers}}}, extra fingers, extra digits, fewer digits, {{{fused fingers}}}, interlocked fingers, badly drawn hands, anatomically incorrect hands, poorly drawn hands, malformed limbs, " +
   "{{{extra arms}}}, {{{extra legs}}}, extra limbs, {{missing arms}}, {missing fingers}, {{missing legs}}, {{{long neck}}}, gross proportions, {{{bad proportions}}}, {bad feet}, " +
-  "{{{deformed}}}, {{{disfigured}}}, {{{mutation}}}, cloned face, poorly drawn face, undetailed eyes, very displeasing, colored inner hair, " +
-  // 内容尺度：图片一律 SFW（至少不露三点）。破甲档只管聊天文字，生图全局禁露骨标签
-  "nsfw, {nudity}, {nude}, {naked}, topless, bottomless, exposed breasts, bare breasts, nipples, areola, crotch, pussy, penis, genitals, pubic hair, sex, sexual, intercourse, penetration, porn, hentai, uncensored, no clothes, undressing";
+  "{{{deformed}}}, {{{disfigured}}}, {{{mutation}}}, cloned face, poorly drawn face, undetailed eyes, very displeasing, colored inner hair";
 
 // OpenAI 兼容固定默认（配置里未选模型时的兜底）
 const OAI_DEFAULT_MODEL = "agnes-image-2.0-flash";
@@ -91,9 +89,10 @@ export async function generateImage(params: GenParams, saveDir?: string): Promis
   if (!prompt) return { ok: false, error: "提示词为空" };
   const [w, h] = resolveAspect(prompt, params.aspect);
 
-  // 画师串：当前生效的画师串拼到提示词末尾
+  // 画师串只拼 NovelAI（Danbooru 标签风格；OpenAI 兼容端点吃自然语言，拼标签会污染画面——
+  // 2026-09-08 用户确认分流：OpenAI 生图走纯 prompt）
   const artist = cfg.artists.find((a) => a.name === cfg.activeArtist)?.content ?? "";
-  const usedPrompt = artist ? `${prompt}, ${artist}` : prompt;
+  const usedPrompt = cfg.provider === "novelai" && artist ? `${prompt}, ${artist}` : prompt;
 
   let buf: Buffer | null = null;
   let mimeType = "image/png";

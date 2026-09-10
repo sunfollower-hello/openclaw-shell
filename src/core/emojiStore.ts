@@ -5,6 +5,7 @@
 //   已移除内置 QQ 原生表情（face id）：腾讯官方 API 无 face 消息段，发不出去，留了是虚假功能。
 import { promises as fs } from "node:fs";
 import path from "node:path";
+import os from "node:os";
 import { dataDir } from "./cardStore.js";
 
 export interface EmojiItem {
@@ -117,6 +118,50 @@ export async function listEmojis(): Promise<EmojiItem[]> {
   }
 }
 
+// ---------- 通道侧媒体同步 ----------
+// QQ/微信插件补丁（patch-channels.mjs v9）发表情靠查 ~/.openclaw/media/emojis/<安全名>.<ext>
+// 这个目录以前由 emoji_send 工具执行时拷贝，工具已移除（AI 不再能调它，表情走 [表情:名] 指令），
+// 改为表情库管理时自动同步，保证通道侧随时拿得到图。
+
+/** 与插件补丁/旧工具一致的文件名安全化 */
+function safeEmojiName(name: string): string {
+  return String(name).replace(/[\\/:*?"<>|\s]+/g, "_");
+}
+
+export function channelMediaDir(): string {
+  return path.join(os.homedir(), ".openclaw", "media", "emojis");
+}
+
+/** 把表情库全部表情同步到 ~/.openclaw/media/emojis/（缺什么拷什么，不删孤儿文件） */
+export async function syncEmojisToChannelMedia(): Promise<string[]> {
+  const emojis = await listEmojis();
+  const out: string[] = [];
+  await fs.mkdir(channelMediaDir(), { recursive: true }).catch(() => {});
+  for (const e of emojis) {
+    const src = path.join(emojiDir(), e.file);
+    const ext = path.extname(e.file).toLowerCase() || ".png";
+    const dst = path.join(channelMediaDir(), `${safeEmojiName(e.name)}${ext}`);
+    try {
+      await fs.access(dst); // 已存在跳过
+      continue;
+    } catch {
+      /* 不存在 → 拷贝 */
+    }
+    try {
+      await fs.copyFile(src, dst);
+      out.push(dst);
+    } catch {
+      /* 源文件缺失/权限 → 跳过该表情 */
+    }
+  }
+  return out;
+}
+
+/** CRUD 后异步同步（不阻塞主流程） */
+function scheduleChannelSync(): void {
+  void syncEmojisToChannelMedia().catch(() => {});
+}
+
 async function saveLibrary(emojis: EmojiItem[]): Promise<void> {
   await fs.mkdir(path.dirname(libraryPath()), { recursive: true });
   await fs.writeFile(libraryPath(), JSON.stringify({ emojis }, null, 2), "utf8");
@@ -152,6 +197,7 @@ export async function addEmoji(input: AddEmojiInput): Promise<EmojiItem> {
     createdAt: new Date().toISOString(),
   };
   await saveLibrary([...emojis, item]);
+    scheduleChannelSync();
   return item;
 }
 
@@ -167,6 +213,7 @@ export async function updateEmoji(id: string, patch: { name?: string; explanatio
   if (typeof patch.explanation === "string") item.explanation = patch.explanation.trim().slice(0, 200);
   if (typeof patch.group === "string" && patch.group) item.group = patch.group;
   await saveLibrary(emojis);
+    scheduleChannelSync();
   return item;
 }
 
@@ -174,8 +221,11 @@ export async function removeEmoji(id: string): Promise<boolean> {
   const emojis = await listEmojis();
   const item = emojis.find((e) => e.id === id);
   if (!item) return false;
-  await saveLibrary(emojis.filter((e) => e.id !== id));
-  await fs.rm(path.join(emojiDir(), item.file), { force: true }).catch(() => {});
+  const rest = emojis.filter((e) => e.id !== id);
+  await saveLibrary(rest);
+  // 路径复用的导入条目共享同一文件：还有其他条目引用时不删文件
+  const stillReferenced = rest.some((e) => e.file === item.file);
+  if (!stillReferenced) await fs.rm(path.join(emojiDir(), item.file), { force: true }).catch(() => {});
   return true;
 }
 
@@ -197,11 +247,37 @@ export async function moveEmojiToGroup(id: string, targetGroup: string, copy: bo
     await fs.writeFile(path.join(emojiDir(), newFile), buf);
     newItem.file = newFile;
     await saveLibrary([...emojis, newItem]);
-    return newItem;
+      scheduleChannelSync();
+  return newItem;
   }
   item.group = targetGroup;
   await saveLibrary(emojis);
   return item;
+}
+
+/**
+ * 从其他分组导入表情（路径复用）：新条目直接指向原文件，不复制图片、不占额外磁盘。
+ * 名字需全库唯一：重名自动加数字后缀，可在编辑里改。
+ */
+export async function importEmojisToGroup(ids: string[], targetGroup: string): Promise<{ imported: EmojiItem[]; skipped: number }> {
+  const emojis = await listEmojis();
+  const out: EmojiItem[] = [];
+  let skipped = 0;
+  for (const id of ids) {
+    const item = emojis.find((e) => e.id === id);
+    if (!item || item.group === targetGroup) { skipped++; continue; }
+    let name = item.name;
+    let n = 2;
+    while (emojis.some((e) => e.name === name) || out.some((e) => e.name === name)) { name = item.name + n; n++; }
+    const newId = `em${Date.now().toString(36)}${Math.random().toString(36).slice(2, 5)}${out.length}`;
+    out.push({ ...item, id: newId, name, file: item.file, group: targetGroup, createdAt: new Date().toISOString() });
+  }
+  if (out.length) {
+    if (emojis.length + out.length > MAX_EMOJIS) throw new Error(`表情库已满（最多 ${MAX_EMOJIS} 个），装不下 ${out.length} 个导入`);
+    await saveLibrary([...emojis, ...out]);
+    scheduleChannelSync();
+  }
+  return { imported: out, skipped };
 }
 
 /**
@@ -270,9 +346,9 @@ export async function buildEmojiPrompt(
   const lines = picked.map((e) => `- ${e.name}：${e.explanation || "（无解释）"}`).join("\n");
   const how =
     mode === "tool"
-      ? "想发表情时调用 emoji_send 工具（参数 name 填表情名），不要在文字里写 [表情:名字]。"
-      : "想发表情时在回复里写 [表情:名字]（会被渲染成图片）。";
-  // P4：频率礼仪——单条回复最多 1-2 个表情，禁止刷屏
-  const etiquette = "表情是点缀不是主体：单条回复最多用 1-2 个，不要连续堆叠，不要为了用而用。";
+      ? "想发表情时调用 emoji_send 工具（参数 name 填表情名），不要在文字里写 [表情:名字]。【重要】调用工具只是准备好图片、不会自动发送：工具返回的以 MEDIA: 开头的那一行，你必须原样抄进你的回复（放在回复最前面，不要改写、不要加引号）——只有把这行写进回复，图片才会真正发出去；不写的话对方什么也收不到。"
+      : "想发表情时在回复里写 [表情:名字]（必须用英文半角方括号，不要用全角【】，会被渲染成图片）。用户说「发个开心的表情」这类话时，从下面列表里选语义最接近的名字（如 大笑），名字必须与列表完全一致——列表里没有的名字（如「开心」）就是不存在，绝不编造。";
+  // P4：频率礼仪——一次回复最多 1 个表情，禁止刷屏
+  const etiquette = "表情是点缀不是主体：一次回复最多用 1 个，不要连续堆叠，不要为了用而用。";
   return `\n\n【表情包】你有以下表情包可用，${usage}。${how}名字必须与下面完全一致，不要编造。${etiquette}\n` + lines;
 }

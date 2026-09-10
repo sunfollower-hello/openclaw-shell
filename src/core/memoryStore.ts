@@ -22,10 +22,20 @@ export interface MemEntry {
   src: MemorySource;
   /** 记忆作用域：统一为 shared（整卡通用）。保留字段仅为兼容旧数据，读入时强制 shared。 */
   ns: string;
+  /**
+   * 溯源指纹：这条记忆是从哪几轮对话总结出来的（每轮一个 roundKey）。
+   * 用途：用户删聊天记录时，凡「总结自被删轮次」的记忆一并删除——
+   * 记忆不该替被删内容留底，删了就按剩余原文重新总结。旧数据无此字段，视为不可溯源（不动）。
+   */
+  roundKeys?: string[];
 }
 
-/** 每卡记忆条数上限，超出后淘汰最旧的 */
-export const MAX_FACTS = 300;
+/** 轮次指纹：与 repairChatlogAfterDelete 的内容匹配口径一致（各取前 500 字） */
+export function roundKeyOf(round: { u?: string; a?: string }): string {
+  const u = String(round.u ?? "").slice(0, 500);
+  const a = String(round.a ?? "").slice(0, 500);
+  return crypto.createHash("sha1").update(u + "\u0000" + a).digest("hex").slice(0, 16);
+}
 
 export function memoryFile(slug: string): string {
   return path.join(dataDir(), "memory", `${slug}.mem`);
@@ -108,6 +118,9 @@ function parseLine(line: string): MemEntry | null {
         ? (o.src as MemorySource)
         : "auto",
       ns: "shared", // 旧数据里的 qq:/wx:/local 标签一律并入 shared（整卡通用）
+      ...(Array.isArray(o.roundKeys) && o.roundKeys.length
+        ? { roundKeys: o.roundKeys.map((k) => String(k)).filter(Boolean) }
+        : {}),
     };
   } catch {
     return null;
@@ -165,12 +178,12 @@ export interface AppendResult {
   entry?: MemEntry;
 }
 
-/** 追加一条记忆：自动去重（精确 + 相似）、容量上限（淘汰最旧）。重复时返回 duplicate。
+/** 追加一条记忆：自动去重（精确 + 相似）。重复时返回 duplicate。
  *  keywords：关键词（聊天出现这些词时优先注入）；important：关键记忆（始终优先注入）。
  *  记忆对整张卡所有入口通用，ns 恒为 shared（保留入参仅为兼容旧调用，不再产生隔离）。 */
 export function appendEntry(
   slug: string,
-  input: { fact: string; keywords?: string[]; important?: boolean; src?: MemorySource; ns?: string }
+  input: { fact: string; keywords?: string[]; important?: boolean; src?: MemorySource; ns?: string; roundKeys?: string[] }
 ): Promise<AppendResult> {
   return withLock(slug, async () => {
     const fact = String(input.fact ?? "").trim();
@@ -186,26 +199,12 @@ export function appendEntry(
         return { ok: false, duplicate: true };
       }
     }
-    const entry: MemEntry = { id: newId(), fact, keywords, important, ts: new Date().toISOString(), src, ns: "shared" };
-    const next = [...entries, entry];
-    // 超上限：优先淘汰普通记忆中最旧的（关键记忆 important 保留），仍超则淘汰最旧
-    if (next.length > MAX_FACTS) {
-      const excess = next.length - MAX_FACTS;
-      const evictable = next.filter((e) => !e.important);
-      const victims = new Set<MemEntry>();
-      if (evictable.length >= excess) {
-        evictable.sort((a, b) => a.ts.localeCompare(b.ts));
-        for (const v of evictable.slice(0, excess)) victims.add(v);
-      }
-      let trimmed = next.filter((e) => !victims.has(e));
-      if (trimmed.length > MAX_FACTS) {
-        trimmed.sort((a, b) => a.ts.localeCompare(b.ts));
-        trimmed = trimmed.slice(trimmed.length - MAX_FACTS);
-      }
-      await writeEntries(slug, trimmed);
-    } else {
-      await writeEntries(slug, next);
-    }
+    const roundKeys = Array.isArray(input.roundKeys) ? input.roundKeys.map(String).filter(Boolean) : [];
+    const entry: MemEntry = {
+      id: newId(), fact, keywords, important, ts: new Date().toISOString(), src, ns: "shared",
+      ...(roundKeys.length ? { roundKeys } : {}),
+    };
+    await writeEntries(slug, [...entries, entry]);
     return { ok: true, entry };
   });
 }
@@ -262,6 +261,7 @@ export interface ChatRound {
   u: string; // 用户消息（截断）
   a: string; // 角色回复（截断）
   t: string; // 时间戳
+  r?: number; // 巡回标记：1 = 上次总结失败待补记（下次总结时与新段一起重试）
 }
 
 /** 对话日志文件：统一为每卡单文件 <slug>.chatlog.jsonl（ns 参数保留仅为兼容旧调用，不再按用户拆分） */
@@ -277,7 +277,12 @@ export async function readChatLog(slug: string, _ns?: string): Promise<ChatRound
     if (!line.trim()) continue;
     try {
       const o = JSON.parse(line) as Partial<ChatRound>;
-      out.push({ u: String(o.u ?? ""), a: String(o.a ?? ""), t: String(o.t ?? "") });
+      out.push({
+        u: String(o.u ?? ""),
+        a: String(o.a ?? ""),
+        t: String(o.t ?? ""),
+        ...(o.r === 1 ? { r: 1 } : {}),
+      });
     } catch {
       /* 跳过损坏行 */
     }
@@ -286,27 +291,96 @@ export async function readChatLog(slug: string, _ns?: string): Promise<ChatRound
 }
 
 /**
- * 追加一轮对话到日志，并按「最近 20 轮保护」的滑动分批规则处理：
- * 日志里永远保留最近 20 轮不总结；超过后每攒够 batch 轮「超额」，
- * 就把最早 batch 轮取出返回（已从日志删除，之后不再参与总结）。
+ * 追加一轮对话到日志，并按「N 轮一批」规则处理（含最新轮，无保护门槛）：
+ * 新轮次攒够 batch 轮就把「失败巡回段 + 最早 batch 轮新段」取出返回（已从日志删除），
+ * 之前总结失败被标记的轮次（r=1）会搭车下一次总结一起补记（记忆巡回）。
+ * 最近 20 轮的原文仍由聊天历史窗口完整注入，不被记忆替代——总结只影响记忆产物。
  * 返回需要总结的段（数组为空 = 未到阈值）。整段操作在写锁内原子完成。
  * 网页与通道（QQ/微信）的对话进同一份日志、同一份记忆（整卡通用）。
  */
 export async function pushChatRound(slug: string, round: ChatRound, batch: number, _ns?: string): Promise<ChatRound[]> {
-  const b = Math.max(1, Math.min(50, batch || 20));
-  // 最近 20 轮保护窗口：不参与总结（20 条原对话一定原样保留）
-  const PROTECTED_RECENT_ROUNDS = 20;
+  const b = Math.max(1, Math.min(50, batch || 5));
   return withLock(slug, async () => {
     const file = chatLogFile(slug);
     await fs.mkdir(path.dirname(file), { recursive: true });
     await fs.appendFile(file, JSON.stringify(round) + "\n", "utf8");
     const lines = await readChatLog(slug);
-    if (lines.length < PROTECTED_RECENT_ROUNDS + b) return [];
-    const segment = lines.slice(0, b);
-    const rest = lines.slice(b);
+    const flagged = lines.filter((l) => l.r === 1); // 上次失败的巡回段
+    const fresh = lines.filter((l) => l.r !== 1);
+    if (fresh.length < b) return [];
+    const segment = [...flagged, ...fresh.slice(0, b)];
+    const rest = lines.filter((l) => !segment.includes(l));
     const text = rest.map((r) => JSON.stringify(r)).join("\n");
     await fs.writeFile(file, text + (text ? "\n" : ""), "utf8");
     return segment;
+  });
+}
+
+/**
+ * 记忆巡回：总结失败时把该段标记回日志头部（r=1），下次总结自动搭车重试。
+ * 在写锁内原子完成，避免与并发追加互相覆盖。
+ */
+export async function markChatRetry(slug: string, segment: ChatRound[], _ns?: string): Promise<void> {
+  if (!segment.length) return;
+  await withLock(slug, async () => {
+    const lines = await readChatLog(slug);
+    const marked = segment.map((r) => ({ ...r, r: 1 }));
+    const text = [...marked, ...lines].map((r) => JSON.stringify(r)).join("\n");
+    await fs.writeFile(chatLogFile(slug), text + "\n", "utf8");
+  });
+}
+
+/**
+ * 消息删除后的日志修复：从对话日志里移除与被删消息同内容的轮次
+ * （被删的未总结消息不再参与总结）。返回移除的轮数。
+ */
+export async function repairChatlogAfterDelete(
+  slug: string,
+  removed: { role: string; content: string }[]
+): Promise<number> {
+  if (!removed.length) return 0;
+  const delSet = new Set(removed.map((r) => (r.role === "user" ? "u:" : "a:") + String(r.content).slice(0, 500)));
+  return withLock(slug, async () => {
+    const lines = await readChatLog(slug);
+    const kept = lines.filter((r) => !delSet.has("u:" + r.u) && !delSet.has("a:" + r.a));
+    const removedRounds = lines.length - kept.length;
+    if (removedRounds > 0) {
+      const text = kept.map((r) => JSON.stringify(r)).join("\n");
+      await fs.writeFile(chatLogFile(slug), text + (text ? "\n" : ""), "utf8");
+    }
+    return removedRounds;
+  });
+}
+
+/**
+ * 按被删轮次清理记忆：凡「总结自这些轮次」的记忆一律删除。
+ * 用户诉求：记忆不能替被删的聊天内容留底——删了聊天记录，由它总结出的记忆也必须消失，
+ * 之后按剩余原文重新注入/重算。只对带 roundKeys 的记忆生效（旧数据无溯源信息，交给调用方兜底）。
+ * 返回被删掉的记忆条数。
+ */
+export function deleteMemoriesByRounds(slug: string, rounds: { u?: string; a?: string }[]): Promise<number> {
+  if (!rounds.length) return Promise.resolve(0);
+  const killSet = new Set(rounds.map(roundKeyOf));
+  return withLock(slug, async () => {
+    const entries = await readEntries(slug);
+    const kept = entries.filter((e) => !(e.roundKeys ?? []).some((k) => killSet.has(k)));
+    const gone = entries.length - kept.length;
+    if (gone > 0) await writeEntries(slug, kept);
+    return gone;
+  });
+}
+
+/**
+ * 记忆解散：删掉最新一条记忆（消息删除破坏了它时用），
+ * 其内容会在后续总结周期里随剩余对话自然重算。
+ */
+export function dissolveNewestMemory(slug: string): Promise<MemEntry | null> {
+  return withLock(slug, async () => {
+    const entries = await readEntries(slug);
+    if (!entries.length) return null;
+    const newest = entries.reduce((a, b) => (a.ts >= b.ts ? a : b));
+    await writeEntries(slug, entries.filter((e) => e.id !== newest.id));
+    return newest;
   });
 }
 

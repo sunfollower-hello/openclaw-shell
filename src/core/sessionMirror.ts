@@ -22,6 +22,8 @@ export interface SessionInfo {
   sessionId: string;
   updatedAt: number; // epoch ms
   kind?: string;
+  /** 会话来源（OpenClaw 会话索引里的 origin 字段：accountId/from/label），findSession 用它兜底匹配 */
+  origin?: { accountId?: string; from?: string; label?: string };
 }
 
 /** 会话键（agent CLI 用）：agent:<agentId>:<accountId>:<openid> */
@@ -61,15 +63,63 @@ export async function listAgentSessions(agentId: string): Promise<SessionInfo[]>
       sessionId: String(s.sessionId ?? ""),
       updatedAt: Number(s.updatedAt ?? 0),
       kind: typeof s.kind === "string" ? s.kind : undefined,
+      origin:
+        s.origin && typeof s.origin === "object"
+          ? {
+              accountId: typeof (s.origin as Record<string, unknown>).accountId === "string" ? String((s.origin as Record<string, unknown>).accountId) : undefined,
+              from: typeof (s.origin as Record<string, unknown>).from === "string" ? String((s.origin as Record<string, unknown>).from) : undefined,
+              label: typeof (s.origin as Record<string, unknown>).label === "string" ? String((s.origin as Record<string, unknown>).label) : undefined,
+            }
+          : undefined,
     }))
     .filter((s) => s.sessionId);
+}
+
+/** 收集某 agent 会话索引里的最近互动用户（按 origin 的 from/label，过滤账号）。
+ *  QQ/微信统一走这里：QQ known-users.json 的 openid 是大写、微信 accounts.json 是账号 id，
+ *  都不如会话索引的 origin 可靠。 */
+export function isGroupSessionKey(key: string): boolean {
+  return /:(group|channel):/i.test(String(key ?? ""));
+}
+
+export async function listAgentSessionUsers(
+  agentId: string,
+  accountId: string
+): Promise<{ openid: string; updatedAt: number }[]> {
+  const sessions = await listAgentSessions(agentId);
+  const out: { openid: string; updatedAt: number }[] = [];
+  const seen = new Set<string>();
+  for (const s of sessions) {
+    // 群会话不进网页单聊镜像，避免群消息污染本地聊天
+    if (isGroupSessionKey(s.key) || s.kind === "group") continue;
+    const o = s.origin ?? {};
+    if (o.accountId && o.accountId !== accountId) continue;
+    const openid = String(o.from ?? o.label ?? "").trim();
+    if (!openid || openid === accountId || seen.has(openid)) continue;
+    seen.add(openid);
+    out.push({ openid, updatedAt: s.updatedAt ?? 0 });
+  }
+  return out;
 }
 
 /** 找与 (agentId, accountId, openid) 对应的会话：先精确匹配键，再按 openid 后缀兜底 */
 export async function findSession(agentId: string, accountId: string, openid: string): Promise<SessionInfo | null> {
   const sessions = await listAgentSessions(agentId);
   const exact = sessionKeyOf(agentId, accountId, openid);
-  const hit = sessions.find((s) => s.key === exact) ?? sessions.find((s) => s.key.endsWith(`:${openid}`));
+  const norm = (s: string) => s.toLowerCase();
+  const hit =
+    sessions.find((s) => s.key === exact && !isGroupSessionKey(s.key) && s.kind !== "group") ??
+    sessions.find((s) => norm(s.key) === norm(exact) && !isGroupSessionKey(s.key) && s.kind !== "group") ??
+    sessions.find((s) => (s.key.endsWith(`:${openid}`) || norm(s.key).endsWith(`:${norm(openid)}`)) && !isGroupSessionKey(s.key) && s.kind !== "group") ??
+    // 兜底：按会话索引的 origin 匹配（QQ 会话 key 是小写 openid、微信 key 是 agent:<id>:main，
+    // 精确/结尾匹配都对不上，origin.from/label 是权威来源）
+    sessions.find((s) => {
+      if (isGroupSessionKey(s.key) || s.kind === "group") return false;
+      const o = s.origin ?? {};
+      const oa = o.accountId ?? "";
+      const of = String(o.from ?? o.label ?? "");
+      return (!oa || oa === accountId) && (of === openid || norm(of) === norm(openid));
+    });
   return hit ?? null;
 }
 

@@ -12,9 +12,25 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import type { PersonaCard } from "./schema.js";
 import { RELATION_ROLES } from "./schema.js";
-import { resolveCardPresetBlocks, resolveCardPresetExamples } from "./presets.js";
+import { resolveCardPresetBlocks, resolveCardPresetExamples, ABILITY_IMAGE_RULE, ABILITY_IMAGE_RULE_CHANNEL } from "./presets.js";
 import { applyMacros, userName, type MacroValues } from "./macros.js";
 import { buildEmojiPrompt } from "./emojiStore.js";
+import { readEntries } from "./memoryStore.js";
+import { readRecentLocalChat } from "./historyExport.js";
+
+// ---------- 重描写专属世界书条目 ----------
+// 约定：关键词写 <重描写>（尖括号是标记，聊天内容里不会误打出来）的条目只在重描写档编译进产物；
+// 纯对话档整条跳过——否则该档会漏出括号动作/心理，与「零括号」规则打架。
+// 对酒馆而言它只是一条普通关键词条目，导出导入都不受影响。
+export const RICH_ONLY_KEY = "<重描写>";
+
+function isRichOnlyEntry(e: { keys?: string[] }): boolean {
+  return (e.keys ?? []).some((k) => String(k).trim() === RICH_ONLY_KEY);
+}
+
+function isRichStyle(card: PersonaCard): boolean {
+  return card.presets?.style === "rich";
+}
 
 const ROLE_EMOJI: Record<(typeof RELATION_ROLES)[number], string> = {
   self: "🪞",
@@ -223,10 +239,12 @@ async function renderSkill(card: PersonaCard, presetBlocks: string[] = [], emoji
   lines.push(`- 触发：私聊 ${chat.trigger.dm}，群聊 ${chat.trigger.group === "@" ? "仅 @ 机器人" : chat.trigger.group}`);
 
   const tools = card.tools?.enabled ?? [];
-  if (tools.length > 0) {
+  // 通道侧不引导 image_gen 工具：生图走 <生图:描述> 指令（v10），工具留着但不在 SKILL 里教
+  const channelTools = tools.filter((t) => t !== "image_gen");
+  if (channelTools.length > 0) {
     lines.push("");
     lines.push("## 可用工具");
-    lines.push(`- 允许：${tools.join("、")}`);
+    lines.push(`- 允许：${channelTools.join("、")}`);
     lines.push(`- 使用策略：${card.tools?.policy === "ask" ? "调用前先征得用户同意" : "自动调用（适合时直接使用）"}`);
     if (card.tools?.deny?.length) lines.push(`- 禁止：${card.tools.deny.join("、")}`);
     lines.push("- 用户请求适合用工具完成时（写代码、搜索、查天气等），调用工具而不是凭空编造结果");
@@ -264,13 +282,19 @@ async function renderSkill(card: PersonaCard, presetBlocks: string[] = [], emoji
   if (book.length > 0) {
     lines.push("");
     lines.push("## 世界书（背景设定与人物信息）");
+    const rich = isRichStyle(card);
     for (const e of book) {
       if (e.enabled === false) continue;
+      // 重描写专属条目：纯对话档整条不写入（该档要求零括号）
+      const richOnly = isRichOnlyEntry(e);
+      if (richOnly && !rich) continue;
       const title = e.comment || e.name || "未命名条目";
-      const keys = Array.isArray(e.keys) && e.keys.length ? e.keys.join("、") : "";
+      const keys = Array.isArray(e.keys) && e.keys.length ? e.keys.filter((k) => String(k).trim() !== RICH_ONLY_KEY).join("、") : "";
       lines.push("");
-      lines.push(`### ${title}${e.constant ? "（常驻）" : ""}`);
-      if (e.constant) {
+      lines.push(`### ${title}${richOnly ? "（重描写专属）" : e.constant ? "（常驻）" : ""}`);
+      if (richOnly) {
+        lines.push("- 当前为重描写风格，本条生效：按下面的特征写动作与心理（心理用（）、动作神态用 {}）");
+      } else if (e.constant) {
         lines.push("- 常驻生效：始终作为角色背景与行为依据");
       } else if (keys) {
         lines.push(`- 触发关键词：${keys}（聊天出现这些词时注入本条）`);
@@ -287,14 +311,55 @@ async function renderSkill(card: PersonaCard, presetBlocks: string[] = [], emoji
     lines.push(`- 这是本卡的默认开场白：\n\n${firstMes}`);
     lines.push("");
     lines.push(`- 自动开场规则（必须遵守）：`);
-    lines.push(`  1. 当这是与当前用户/群的【全新会话】（聊天历史为空，对方第一次来找你）时，把上面的开场白作为你的第一条消息主动发给对方，不要等对方先说话，不要省略、不要改写。`);
-    lines.push(`  2. 如果对方【已经聊过】（会话里有历史消息，包括对方再次发来消息），直接正常回应对方的话即可，绝不要重复发送开场白，也不要重头自我介绍。`);
-    lines.push(`  3. 无法确定是否聊过时，默认按"已聊过"处理，正常回应，不主动开场。`);
+    lines.push(`  1. 【新会话·私聊】用户私聊里第一次给你发消息（你的上下文里没有与这位用户的任何历史对话）时，`);
+    lines.push(`     把上面的开场白【原样】作为你的第一条回复发给对方——不要寒暄、不要自我介绍、不要另起话题，直接就是这句话。`);
+    lines.push(`  2. 【群聊】群里永远不要主动发开场白，即使聊天记录是空的。群里的第一条消息也按正常对话回应。`);
+    lines.push(`  3. 【已聊过】上下文里有与这位用户的过往对话（包括对方再次发来消息）时，直接正常回应即可，`);
+    lines.push(`     绝不要重复发送开场白，也不要重头自我介绍。`);
+    lines.push(`  4. 判断方法：翻看对话历史里有没有这位用户的消息记录。`);
+    lines.push(`     拿不准时，把「私聊第一条消息 → 用开场白回」当作默认动作（宁可多一句开场白，也不要让角色像失忆一样冷场）。`);
   }
   // 表情包：通道端也能发（真人聊天会发表情），清单来自全局共享库
   if (emojiBlock) {
     lines.push("");
     lines.push(emojiBlock.trim());
+    // v9.1 强化：模型曾受历史会话污染输出 MEDIA: 路径/编造表情名导致发送失败
+    lines.push("");
+    lines.push("【重要】发表情只允许使用上面列表里的 [表情:名字] 标签（必须用英文半角方括号 []，不要用全角【】）；绝对不要输出以 MEDIA: 开头的文件路径，也不要编造列表里不存在的表情名。");
+    // v9.2 强化：模型曾输出远程图片 URL（如 tenor 链接）导致下载失败
+    lines.push("【重要】绝对不要输出任何图片/表情的网址链接（http/https 开头），也不要使用 ![]() 图片语法——这些链接下载不到就会发送失败；发图片/表情一律用上面的 [表情:名字] 标签。");
+  }
+
+  // 共同记忆与近期聊天（爱语式物化）：把运行时记忆库全文 + 网页端最近 3 轮聊天原文固化进 SKILL.md，
+  // QQ/微信 agent 不用等检索就能接上以前的话题；更早/更多的本地聊天原文由 memory_search 检索
+  // （data/history-export 已挂 memorySearch.extraPaths）。聊天中新内容到下次编译才进，旧内容靠检索补。
+  lines.push("");
+  lines.push("## 共同记忆与近期聊天（用户可能换端继续话题，涉及以前聊过的内容时自然接续，不要复述「网页记录」这类字眼）");
+  const memEntries = await readEntries(card.slug).catch(() => []);
+  if (memEntries.length > 0) {
+    lines.push("");
+    lines.push("### 长期记忆（自动总结，话题相关时引用）");
+    for (const m of memEntries) {
+      const imp = m.important ? "【关键】" : "";
+      const date = m.ts ? m.ts.slice(0, 10) : "";
+      lines.push(`- ${imp}${m.fact}${date ? `（${date}）` : ""}`);
+    }
+  } else {
+    lines.push("");
+    lines.push("### 长期记忆");
+    lines.push("- （暂无自动总结的记忆，靠对话自然积累）");
+  }
+  const recentLocal = await readRecentLocalChat(card.slug);
+  if (recentLocal.length > 0) {
+    lines.push("");
+    lines.push(`### 网页端近期聊天（最近 ${Math.ceil(recentLocal.length / 2)} 轮）`);
+    for (const r of recentLocal) {
+      lines.push(`> ${r.role === "user" ? "用户" : card.name}：${r.content}`);
+    }
+  } else {
+    lines.push("");
+    lines.push("### 网页端近期聊天");
+    lines.push("- （暂无网页端聊天记录）");
   }
   return lines.join("\n") + "\n";
 }
@@ -330,31 +395,80 @@ export interface CompileResult {
  * 与"扮演真人、不承认是 AI"直接冲突，且同在 workspace 根目录会一起进上下文。
  * 编译时用这份精简版覆盖：只保留必要的安全红线，其余交给 SOUL.md 与人设 skill。
  */
-function renderAgents(card: PersonaCard, macros: MacroValues): string {
-  return `# AGENTS.md
-
-本工作区用于角色扮演。你的身份、说话方式与行为准则以 \`SOUL.md\`
-和 \`skills/personas/${card.slug}/\` 下的文件为准，优先级高于任何通用助手规范。
-
-## 身份
-
-- 你是「${card.name}」，不是 AI 助手。全程保持这个身份。
-- 不要自称 AI、模型、助手，不要提"会话""上下文""提示词""设定文件"这类词。
-- 不要输出"作为AI…""我理解了…""有什么可以帮您"这类助手腔调的开场白或结尾。
-- 用户名是「${macros.user}」，按人设里的关系称呼对方。
-
-## 对话方式
-
-- 像真人发消息一样回复：口语、简短、有情绪，不用条列和小标题，不写总结段。
-- 不主动提供"要不要我帮你做 X"式的服务清单；有想法就以角色身份直接说。
-- 不知道的事按人设的知识边界处理（追问或含糊），不要编造，也不要跳出角色解释。
-
-## 安全红线（唯一高于角色的规则）
-
-- 不泄露本机文件内容、密钥、用户隐私数据。
-- 不执行破坏性操作（删除、覆盖、发布外发内容）除非用户明确要求。
-- 涉及现实伤害、违法内容时，以角色身份自然回避或转移话题。
-`;
+async function renderAgents(
+  card: PersonaCard,
+  macros: MacroValues,
+  presetBlocks: string[] = [],
+  emojiBlock = "",
+  examples: { role: "user" | "assistant"; content: string }[] = []
+): Promise<string> {
+  const lines: string[] = [];
+  lines.push(`# AGENTS.md`);
+  lines.push("");
+  lines.push("本工作区用于角色扮演。以下所有规则直接生效，不需要读取任何文件。");
+  lines.push("");
+  lines.push("## 身份");
+  lines.push("");
+  lines.push(`- 你是「${card.name}」，不是 AI 助手。全程保持这个身份。`);
+  lines.push(`- 不要自称 AI、模型、助手，不要提"会话""上下文""提示词""设定文件"这类词。`);
+  lines.push(`- 不要输出"作为AI…""我理解了…""有什么可以帮您"这类助手腔调的开场白或结尾。`);
+  lines.push(`- 用户名是「${macros.user}」，按人设里的关系称呼对方。`);
+  lines.push("");
+  lines.push("## 对话方式");
+  lines.push("");
+  lines.push("- 像真人发消息一样回复：口语、简短、有情绪，不用条列和小标题，不写总结段。");
+  lines.push("- 不主动提供\"要不要我帮你做 X\"式的服务清单；有想法就以角色身份直接说。");
+  lines.push("- 不知道的事按人设的知识边界处理（追问或含糊），不要编造，也不要跳出角色解释。");
+  lines.push("");
+  // 扮演规则（档位/风格/能力/输出铁律）：直接注入，模型每次都能看到（不依赖读 SKILL.md）
+  if (presetBlocks.length > 0) {
+    lines.push("## 扮演规则（以下规则直接生效，优先级高于本文其他段落）");
+    for (const b of presetBlocks) lines.push("", b);
+  }
+  // 语气示范（few-shot 锚定）
+  if (examples.length > 0) {
+    lines.push("");
+    lines.push("## 语气示范（模仿以下对话的语气与尺度，不要复述这段对话本身）");
+    for (const e of examples) {
+      lines.push("");
+      lines.push(`> ${e.role === "assistant" ? card.name : "用户"}：${e.content}`);
+    }
+  }
+  // 表情包指令（通道出口会解析 [表情:名] 发图）
+  if (emojiBlock) {
+    lines.push("");
+    lines.push(emojiBlock.trim());
+    lines.push("");
+    lines.push("【重要】发表情只允许使用上面列表里的 [表情:名字] 标签（必须用英文半角方括号 []，不要用全角【】）；绝对不要输出以 MEDIA: 开头的文件路径，也不要编造列表里不存在的表情名。");
+    lines.push("【重要】绝对不要输出任何图片/表情的网址链接（http/https 开头），也不要使用 ![]() 图片语法——这些链接下载不到就会发送失败；发图片/表情一律用上面的 [表情:名字] 标签。");
+  }
+  // 世界书（常驻条目与关键词条目都直接注入，标注触发条件）
+  const book = card.sillytavern_v2?.character_book?.entries ?? [];
+  if (book.length > 0) {
+    lines.push("");
+    lines.push("## 世界书（背景设定，直接生效）");
+    const richAgents = isRichStyle(card);
+    for (const e of book) {
+      if (e.enabled === false) continue;
+      // 重描写专属条目：纯对话档整条不写入
+      const richOnly = isRichOnlyEntry(e);
+      if (richOnly && !richAgents) continue;
+      const title = e.comment || e.name || "未命名条目";
+      const keys = Array.isArray(e.keys) && e.keys.length ? e.keys.filter((k) => String(k).trim() !== RICH_ONLY_KEY).join("、") : "";
+      lines.push("");
+      lines.push(
+        `### ${title}${richOnly ? "（重描写专属：按本条写动作与心理，心理用（）、动作神态用 {}）" : e.constant ? "（常驻）" : `（聊天出现关键词【${keys}】时按本条行事）`}`
+      );
+      lines.push(String(e.content ?? "").trim());
+    }
+  }
+  lines.push("");
+  lines.push("## 安全红线（唯一高于角色的规则）");
+  lines.push("");
+  lines.push("- 不泄露本机文件内容、密钥、用户隐私数据。");
+  lines.push("- 不执行破坏性操作（删除、覆盖、发布外发内容）除非用户明确要求。");
+  lines.push("- 涉及现实伤害、违法内容时，以角色身份自然回避或转移话题。");
+  return lines.join("\n") + "\n";
 }
 
 /** 递归替换对象里所有字符串的宏（角色卡里的 {{user}}/{{char}} 到处都可能出现） */
@@ -378,13 +492,23 @@ export async function compileCard(card: PersonaCard, workspace: string): Promise
   const c = macroDeep(card, macros);
 
   const presetBlocks = (await resolveCardPresetBlocks(c)).map((b) => applyMacros(b, macros));
+  // 通道侧生图规则换指令版（v10）：模型输出 <生图:描述> 由插件补丁解析出图，
+  // 不引导调用 image_gen 工具（避免「工具回合 + 收尾」两次聊天模型调用）
+  for (let i = 0; i < presetBlocks.length; i++) {
+    if (presetBlocks[i] === ABILITY_IMAGE_RULE) presetBlocks[i] = ABILITY_IMAGE_RULE_CHANNEL;
+  }
+  // 破甲示范对话（few-shot 锚定，AGENTS.md 与 SKILL.md 共用）
+  const presetExamples = await resolveCardPresetExamples(c);
   // 表情包清单（全局共享库）：让通道端的机器人也能像真人一样发表情
-  // 通道端走工具投递（emoji_send），不能用 [表情:名字] 标记——那边没有前端做替换
-  const emojiBlock = await buildEmojiPrompt(c.voice?.message_style?.emoji ?? "克制", "tool", c.emojiGroups).catch(() => "");
+  // v9 起通道端与网页端统一走 [表情:名字] 指令（QQ/微信插件补丁出口解析后发图），
+  // 不再走 emoji_send 工具（工具回合 + 复读 MEDIA: 会白调一次聊天模型）
+  const emojiBlock = await buildEmojiPrompt(c.voice?.message_style?.emoji ?? "克制", "inline", c.emojiGroups).catch(() => "");
 
   const rel = (name: string): string => path.join("skills", "personas", c.slug, name);
   const files: Record<string, string> = {
-    "AGENTS.md": renderAgents(c, macros),
+    // AGENTS.md 是 OpenClaw 每轮自动注入的文件；风格/表情/世界书/示范必须直接写进来，
+    // 不能只放在 SKILL.md 里靠模型主动读（弱模型不会读 → 风格规则从未生效的根因）
+    "AGENTS.md": await renderAgents(c, macros, presetBlocks, emojiBlock, presetExamples),
     "SOUL.md": renderSoul(c),
     [rel("SKILL.md")]: await renderSkill(c, presetBlocks, emojiBlock),
     [rel("personality.md")]: renderPersonality(c),

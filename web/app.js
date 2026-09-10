@@ -31,6 +31,78 @@ const api = {
   },
 };
 
+// ================= 接口缓存（stale-while-revalidate） =================
+// 公网走 Cloudflare 隧道时每次往返 0.5-1.7s，而原来每切一次页面都重新请求全部数据，
+// 于是每次点击都要吃这个延迟（表现为「卡库每次重新生成」「切页全部重载」）。
+// 这里给低频变化的数据加一层内存缓存：命中就同步返回旧数据先渲染，同时后台静默刷新，
+// 新数据到了再回调重绘。数据变更处调 cacheInvalidate() 保证不会看到旧内容。
+const apiCache = new Map();   // path -> { data, ts, inflight }
+const CACHE_TTL = 60_000;     // 超过这个时间的缓存仍可先用（陈旧），但一定会后台刷新
+
+/** 同步取缓存数据（没有则 undefined），用于「先画后刷」的首帧渲染 */
+function cachePeek(path) {
+  return apiCache.get(path)?.data;
+}
+
+/**
+ * 带缓存的 GET。
+ * @param path 接口路径
+ * @param onFresh 后台刷新拿到新数据时的回调（用于重绘）。有缓存时本函数立即返回缓存数据。
+ */
+async function cachedGet(path, onFresh) {
+  const hit = apiCache.get(path);
+  const fresh = hit && Date.now() - hit.ts < CACHE_TTL;
+  // 后台刷新（同一路径并发只发一次请求）
+  const revalidate = () => {
+    if (hit?.inflight) return hit.inflight;
+    const p = api.get(path)
+      .then((data) => {
+        apiCache.set(path, { data, ts: Date.now(), inflight: null });
+        return data;
+      })
+      .catch((e) => {
+        const cur = apiCache.get(path);
+        if (cur) cur.inflight = null;
+        throw e;
+      });
+    apiCache.set(path, { ...(hit ?? { data: undefined, ts: 0 }), inflight: p });
+    return p;
+  };
+  if (hit && hit.data !== undefined) {
+    // 新鲜期内（CACHE_TTL）直接用缓存，连后台请求都不发——公网上每个请求 0.5-1.7s，
+    // 频繁切页反复重验会造成无谓流量与内容闪动。超过新鲜期才后台静默刷新。
+    if (fresh) return hit.data;
+    if (!hit.inflight) {
+      revalidate()
+        .then((data) => { if (onFresh && JSON.stringify(data) !== JSON.stringify(hit.data)) onFresh(data); })
+        .catch(() => {});
+    }
+    return hit.data;
+  }
+  // 没缓存：只能等（首次进入）
+  return revalidate();
+}
+
+/** 变更后失效缓存：传前缀，匹配的全清（如 "/api/cards" 会清掉带 query 的同族） */
+function cacheInvalidate(...prefixes) {
+  for (const p of prefixes) {
+    for (const key of [...apiCache.keys()]) {
+      if (key === p || key.startsWith(p)) apiCache.delete(key);
+    }
+  }
+}
+
+/** 失败自动重试一次（公网抖动时避免直接静默失败），仍失败则抛出让调用方显示错误 */
+async function apiGetRetry(path, retries = 1) {
+  try {
+    return await api.get(path);
+  } catch (e) {
+    if (retries <= 0) throw e;
+    await new Promise((r) => setTimeout(r, 400));
+    return apiGetRetry(path, retries - 1);
+  }
+}
+
 // 关系类型：卡里存的是英文枚举，界面上一律显示中文（原来卡库直接把 friend/family 打给用户看）
 const ROLE_LABEL = {
   self: "自己",
@@ -82,6 +154,9 @@ const FEATURES = {
   workspace: false,  // 工作区文件面板 / 沙箱读写 / 代码执行
 };
 
+// 回复拆条条数区间（每卡高级配置里选，最少 1 条、最多 7 条）
+const SPLIT_RANGE = { min: 1, max: 7 };
+
 const DEFAULTS_KEY = "ocs_cap_defaults";
 function capDefaults() {
   try { return JSON.parse(localStorage.getItem(DEFAULTS_KEY) || "{}"); } catch { return {}; }
@@ -124,11 +199,20 @@ const ICONS = {
   message: '<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>',
   book: '<path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/>',
   send: '<path d="m22 2-7 20-4-9-9-4z"/><path d="M22 2 11 13"/>',
+  emoji: '<circle cx="12" cy="12" r="9"/><path d="M8.5 13.5a4.5 4.5 0 0 0 7 0"/><line x1="9" y1="9.5" x2="9.01" y2="9.5"/><line x1="15" y1="9.5" x2="15.01" y2="9.5"/>',
   store: '<path d="M3 9.5 4.5 4h15L21 9.5"/><path d="M4 9.5V20h16V9.5"/><path d="M9 20v-6h6v6"/><path d="M2.5 9.5h19"/>',
   chevron: '<path d="m9 18 6-6-6-6"/>',
 };
 function icon(name, size) {
   return `<svg class="ic${size ? " ic-" + size : ""}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICONS[name] ?? ""}</svg>`;
+}
+
+/** 名字过长时省略中间（头尾保留，如「迟萤秋的一个很长很长…很长的名字」） */
+function middleEllipsis(str, max = 16) {
+  const s = String(str ?? "");
+  if (s.length <= max) return s;
+  const head = Math.ceil(max / 2) - 1;
+  return s.slice(0, head) + "…" + s.slice(-(max - head - 1));
 }
 
 // ================= 用户资料（昵称/头像，后端 data/user-profile.json） =================
@@ -309,7 +393,10 @@ function router() {
   closeDrawer();
   $("#view").scrollTop = 0;
   // 本地聊天是整页布局（自己内部滚动），容器要去掉内边距与外层滚动，避免双滚动条
-  $("#view").classList.toggle("lc-host", hash === "home" && workbenchOn());
+  const lcFull = hash === "home" && workbenchOn();
+  $("#view").classList.toggle("lc-host", lcFull);
+  // 本地聊天时整页接管：隐藏 SoulBox 顶栏，由卡头像+名字担任页头（RP-Hub 式）
+  document.body.classList.toggle("lc-fullscreen", lcFull);
   document.querySelectorAll(".drawer-nav a").forEach((a) =>
     a.classList.toggle("active", a.dataset.route === hash)
   );
@@ -330,22 +417,63 @@ const WB_POSITIONS = [
   ["assistant_top", "助手消息顶部"],
 ];
 
+// 重描写专属条目标记：关键词写 <重描写> 的条目只在「重描写」风格下生效（编译器按档位裁剪）
+const RICH_ONLY_KEY = "<重描写>";
+function isRichOnlyKeys(keys) {
+  return (Array.isArray(keys) ? keys : String(keys ?? "").split(/[,，、]/)).some((k) => String(k).trim() === RICH_ONLY_KEY);
+}
+
+// 世界书条目模板：选一个类型就自动填好名称/关键词/常驻，并在内容框给出「怎么写」的示例提示
+const WB_TEMPLATES = {
+  archive: {
+    label: "人物档案（基本信息/外貌/经历/关系）",
+    name: "人物档案", keys: "", constant: true,
+    ph: "写满约 1000 字的静态事实，少写对话：\n[姓名][年龄][身高][体重][生日][身份][居住地]\n外貌：发瞳肤五官身材服饰，以及和外表相关的习惯。\n经历：发生了什么、在她身上留下了什么。\n与 {{user}}：怎么认识、称呼分级、她记得你什么、她怕你做什么。",
+  },
+  dialogue: {
+    label: "对话与性格（情景+台词+缘由）",
+    name: "对话与性格", keys: "", constant: true,
+    ph: "写满约 2000 字。把性格、说话缘由、情景转变、大量台词写在一起：\n每种说话方式都要解释为什么会这样说，并写触发条件、转折、至少两句台词。\n也可把 keys 改成吃醋/冷落/示弱等，拆成多条。",
+  },
+  scene: {
+    label: "情景对话（按关键词拆条）",
+    name: "情景对话", keys: "吃醋, 冷落, 示弱", constant: false,
+    ph: "一条只写一个侧面。触发条件 → 为什么会这样反应 → 刚触发的台词 + 持续/被安抚后的台词。\n关键词用来区分不同情景，聊天里出现这些词时更容易对上。",
+  },
+  rich: {
+    label: "动作心理描写（重描写专属）",
+    name: "动作心理描写", keys: RICH_ONLY_KEY, constant: false,
+    ph: "写满约 1200 字。不要再抄对话台词。\n按情景写：说话时会出现什么动作、什么心理；嘴上说的和心里想的哪里不一致。\n不要写括号，系统会按风格自动加。",
+  },
+  world: {
+    label: "世界观（特殊设定才需要）",
+    name: "世界观", keys: "", constant: true,
+    ph: "只有异世界/末世/特定作品才需要。现代日常不用填。",
+  },
+  blank: { label: "空白条目", name: "", keys: "", constant: false, ph: "" },
+};
+
+const WB_DEFAULT_PH = "角色设定：外貌、性格、语言风格、背景、喜好、雷区……";
+
 // 世界书条目：表面只显示一行（名称 + 启用 + 编辑 + 删除），点「编辑」展开全部字段
 // idx：对应原 entries 下标，保存时用它取回表单没暴露的字段（secondary_keys/extensions/selective 等），避免编辑一次就削掉酒馆卡数据
-function wbRowHTML(e, expand, idx) {
+function wbRowHTML(e, expand, idx, phOverride) {
   const keys = Array.isArray(e?.keys) ? e.keys.join("、") : (e?.keys ?? "");
   const title = e?.comment || e?.name || "未命名条目";
   const pos = String(e?.position || "before_char");
   const keyList = keys.split("、").filter(Boolean);
-  const summaryMeta = e?.constant
-    ? "常驻"
-    : keyList.length
-      ? "触发：" + keyList.slice(0, 2).join("、") + (keyList.length > 2 ? "…" : "")
-      : "";
+  const richOnly = isRichOnlyKeys(e?.keys ?? keys);
+  const summaryMeta = richOnly
+    ? "重描写专属"
+    : e?.constant
+      ? "常驻"
+      : keyList.length
+        ? "触发：" + keyList.slice(0, 2).join("、") + (keyList.length > 2 ? "…" : "")
+        : "";
   return `<div class="wb-entry${expand ? " open" : ""}"${Number.isInteger(idx) ? ` data-idx="${idx}"` : ""}>
     <div class="wb-summary">
       <span class="wb-title">${escapeHtml(title)}</span>
-      ${summaryMeta ? `<span class="wb-summary-meta">${escapeHtml(summaryMeta)}</span>` : ""}
+      ${summaryMeta ? `<span class="wb-summary-meta${richOnly ? " rich-only" : ""}">${escapeHtml(summaryMeta)}</span>` : ""}
       <span class="wb-spacer-flex"></span>
       <label class="wb-enable" title="启用 / 停用此条目"><input type="checkbox" class="wb-enabled" ${e?.enabled !== false ? "checked" : ""}> 启用</label>
       <button class="wb-edit ghost small-btn" type="button" title="编辑条目">${icon("pen")} 编辑</button>
@@ -356,7 +484,7 @@ function wbRowHTML(e, expand, idx) {
         <div class="wb-field"><label>条目名称</label><input class="wb-comment" placeholder="如：人物形象 / 世界观 / 人物关系" value="${escapeHtml(title)}"></div>
         <div class="wb-field"><label>触发关键词（逗号分隔，常驻条目可留空）</label><input class="wb-keys" placeholder="关键词1, 关键词2" value="${escapeHtml(keys)}"></div>
       </div>
-      <div class="wb-field"><label>条目内容</label><textarea class="wb-content" rows="6" placeholder="角色设定：外貌、性格、语言风格、背景、喜好、雷区……">${escapeHtml(e?.content ?? "")}</textarea></div>
+      <div class="wb-field"><label>条目内容</label><textarea class="wb-content" rows="6" placeholder="${escapeHtml(phOverride || WB_DEFAULT_PH)}">${escapeHtml(e?.content ?? "")}</textarea></div>
       <div class="wb-grid wb-grid3">
         <div class="wb-field"><label>插入位置</label>
           <select class="wb-pos">${WB_POSITIONS.map(([v, l]) => `<option value="${v}" ${pos === v ? "selected" : ""}>${l}</option>`).join("")}</select>
@@ -493,11 +621,17 @@ function cardFormHTML(mode) {
   return `
   ${base}
   <div class="cf-section"><h3>开场白</h3>
-    <textarea id="cf-first" class="cf-autogrow" rows="3" placeholder="新对话开始时，角色说/做的第一段话。写成一个有画面感的小场景"></textarea>
+    <textarea id="cf-first" class="cf-autogrow" rows="2" placeholder="只写一句话，不要环境描写：把事由全用说话带出来，结尾留话头。如：哥哥你终于回消息了，我便当都热第三遍了，到底还要不要吃？"></textarea>
   </div>
   <div class="cf-section"><h3>世界书</h3>
+    <p class="hint" id="cf-book-hint">世界书分三块写：人物档案约一千字、对话与性格约两千字（情景+台词+缘由）、动作心理约一千二百字（重描写专属）。可以一条写满，也可以按关键词拆条。</p>
     <div id="cf-book"></div>
-    <button id="cf-book-add" class="ghost small-btn" type="button">＋ 添加条目</button>
+    <div class="wb-add-row">
+      <select id="cf-book-tpl">
+        ${Object.entries(WB_TEMPLATES).map(([k, v]) => `<option value="${k}">${escapeHtml(v.label)}</option>`).join("")}
+      </select>
+      <button id="cf-book-add" class="ghost small-btn" type="button">＋ 添加条目</button>
+    </div>
   </div>
   <details class="cf-section cf-fold">
     <summary>正则替换<span class="hint">（可选，一般留空）</span></summary>
@@ -520,9 +654,18 @@ function autoGrow(el) {
 function bindCardForm(card, mode) {
   fillFormFromCard(card, mode);
   $("#cf-book-add").addEventListener("click", () => {
-    $("#cf-book").insertAdjacentHTML("beforeend", wbRowHTML({}, true));
-    const last = $("#cf-book").lastElementChild?.querySelector(".wb-edit");
-    last?.classList.add("open");
+    // 按所选模板预填名称/关键词/常驻，内容框给出「这条该怎么写」的示例提示
+    const tpl = WB_TEMPLATES[$("#cf-book-tpl")?.value] ?? WB_TEMPLATES.blank;
+    const seed = {
+      name: tpl.name, comment: tpl.name,
+      keys: tpl.keys ? tpl.keys.split(/[,，、]/).map((s) => s.trim()).filter(Boolean) : [],
+      constant: tpl.constant, enabled: true, content: "",
+      insertion_order: tpl.constant ? 0 : 100, position: "before_char", probability: 100, depth: 4,
+    };
+    $("#cf-book").insertAdjacentHTML("beforeend", wbRowHTML(seed, true, undefined, tpl.ph));
+    const last = $("#cf-book").lastElementChild;
+    last?.querySelector(".wb-edit")?.classList.add("open");
+    last?.scrollIntoView({ behavior: "smooth", block: "nearest" });
   });
   $("#cf-regex-add")?.addEventListener("click", () => $("#cf-regex")?.insertAdjacentHTML("beforeend", rxRowHTML({}, true)));
   document.addEventListener("click", cardFormDelHandler);
@@ -718,8 +861,8 @@ async function refreshHome() {
         : escapeHtml((userProfile.name || "本").slice(0, 1));
     }
     const [ann, cards] = await Promise.all([
-      api.get("/api/announcement").catch(() => ({ text: "" })),
-      api.get("/api/cards").catch(() => ({ cards: [] })),
+      cachedGet("/api/announcement", () => refreshHome()).catch(() => ({ text: "" })),
+      cachedGet("/api/cards", () => refreshHome()).catch(() => ({ cards: [] })),
     ]);
     const noticeBody = $("#home-notice-body");
     if (noticeBody) {
@@ -740,10 +883,10 @@ async function refreshHome() {
     }
     for (const c of cards.cards.slice(-8).reverse()) {
       const d = document.createElement("div");
-      d.className = "mini-card";
+      d.className = "home-card-item";
       d.innerHTML = `
-        <div class="mini-avatar">${c.avatar ? `<img src="${c.avatar}" alt="">` : `<span>${escapeHtml(c.name.slice(0, 1))}</span>`}</div>
-        <div class="mini-name">${escapeHtml(c.name)}</div>`;
+        <div class="home-card-avatar">${c.avatar ? `<img src="${c.avatar}" alt="">` : `<span>${escapeHtml(c.name.slice(0, 1))}</span>`}</div>
+        <div class="home-card-name">${escapeHtml(c.name)}</div>`;
       d.addEventListener("click", () => {
         location.hash = "#/cards";
         setTimeout(() => loadCardIntoEditor(c.slug), 60);
@@ -769,51 +912,55 @@ let wbMirror = null;        // 跨端会话状态（绑定=联通；null=本地�
 let wbMirrorTimer = null;   // 通道消息轮询定时器
 let wbRenderedIds = new Set(); // 已渲染的会话条目 id（增量渲染防重复）
 
+/** 联通状态圆点：on=绿（已联通） err=红（同步异常） 默认=白（本地） */
+function setLcDot(cls, title) {
+  const dotEl = $("#lc-dot");
+  if (dotEl) { dotEl.className = "lc-dot " + cls; dotEl.title = title; }
+}
+
 function renderWorkbench() {
   return `
   <div class="lc-root">
-    <!-- 顶栏：头像 + 角色名 + 切卡 / 清空 / 退出 -->
+    <!-- 顶栏（本页即页头）：菜单 + 头像 + 名字 + 联通圆点 | 一键删除 / 退出 -->
     <div class="lc-top">
-      <div class="lc-who" id="lc-who">
+      <button id="lc-menu" class="menu-btn" title="菜单"><span></span><span></span><span></span></button>
+      <div class="lc-who" id="lc-who" title="点击修改这张卡的配置">
         <div class="lc-avatar" id="lc-avatar"></div>
         <div class="lc-who-text">
           <div class="lc-name" id="lc-name">选择角色卡</div>
-          <div class="lc-sub" id="lc-sub">本地聊天</div>
         </div>
+        <span class="lc-dot" id="lc-dot" title="联通状态：绿=已联通 红=联通异常 白=本地"></span>
       </div>
       <div class="lc-top-actions">
-        <select id="wb-card" class="lc-card-sel"><option value="">— 选择卡片 —</option></select>
-        <button id="wb-chat-clear" class="ghost small-btn" title="清空对话">${icon("trash")}</button>
-        <button id="wb-chat-reset" class="ghost small-btn reset" title="重置角色：清空全部记忆和聊天记录">${icon("x")}重置</button>
-        <button id="wb-exit" class="ghost small-btn">退出本地聊天</button>
+        <button id="wb-undo-round" class="ghost small-btn" title="撤掉最近一问一答（网页与 QQ/微信 上下文一起摘，破甲被拒时用）">撤掉上一轮</button>
+        <button id="wb-chat-clear" class="ghost small-btn" title="一键删除：清空聊天记录与全部记忆（不可恢复）">一键删除</button>
+        <button id="wb-exit" class="ghost small-btn" title="退出本地聊天">退出</button>
       </div>
     </div>
 
     <!-- 消息区 -->
     <div id="chat-log" class="lc-log"></div>
 
-    <!-- 底部输入浮岛：工具行（联网搜索/思考深度/模型） + 输入行 -->
+    <!-- 底部悬浮输入岛（RP-Hub 单聊式）：上排按键（模型商/模型/思考深度） + 下排输入 -->
     <div class="lc-dock">
       <div class="lc-island">
-        <div class="lc-tools">
-          <button type="button" id="wb-websearch" class="lc-icon-btn" title="联网搜索" aria-pressed="false">${icon("search")}</button>
-          <label class="lc-chip lc-chip-sel" title="思考深度">
-            ${icon("zap")}
-            <select id="wb-thinking">
-              <option value="off">不思考</option><option value="auto" selected>自动</option>
-              <option value="low">浅</option><option value="medium">中</option>
-              <option value="high">深</option><option value="extreme">极深</option>
-            </select>
-          </label>
-          <span class="lc-tools-gap"></span>
-          <label class="lc-chip lc-chip-sel" title="模型商">
-            <select id="lc-provider"><option value="">跟随卡片</option></select>
-          </label>
-          <label class="lc-chip lc-chip-sel lc-model-chip" title="模型">
-            <select id="lc-model"><option value="">—</option></select>
-          </label>
+        <div class="lc-tools-row">
+          <div class="lc-pop-wrap">
+            <button type="button" class="lc-pill" id="lc-prov-pill" title="模型商"><span id="lc-prov-label">模型商</span><span class="lc-pill-caret">▾</span></button>
+            <div class="lc-pop" id="lc-prov-pop" hidden></div>
+          </div>
+          <div class="lc-pop-wrap">
+            <button type="button" class="lc-pill" id="lc-model-pill" title="模型">模型<span class="lc-pill-caret">▾</span></button>
+            <div class="lc-pop" id="lc-model-pop" hidden></div>
+          </div>
+          <span style="flex:1"></span>
+          <div class="lc-pop-wrap">
+            <button type="button" class="lc-pill" id="lc-think-pill" title="思考深度"><span id="lc-think-label">自动</span><span class="lc-pill-caret">▾</span></button>
+            <div class="lc-pop lc-pop-right" id="lc-think-pop" hidden></div>
+          </div>
         </div>
         <div class="lc-input-row">
+          <button type="button" id="wb-emoji" class="lc-icon-btn" title="表情包">${icon("emoji")}</button>
           <textarea id="wb-input" rows="1" placeholder="回车换行，双击回车发送…"></textarea>
           <button id="wb-send" class="lc-send" title="发送">${icon("send")}</button>
         </div>
@@ -825,51 +972,111 @@ function renderWorkbench() {
 async function initWorkbench() {
   const cards = await api.get("/api/cards").catch(() => ({ cards: [] }));
   wbCards = cards.cards ?? [];
-  const sel = $("#wb-card");
-  sel.innerHTML = `<option value="">— 选择卡片 —</option>` + wbCards.map((c) => `<option value="${escapeHtml(c.slug)}">${escapeHtml(c.name)}</option>`).join("");
-  sel.addEventListener("change", () => wbPickCard(sel.value));
   $("#wb-send").addEventListener("click", wbSend);
+  // 三条横线：打开左侧抽屉（本地聊天接管整页后，菜单入口挪到这里）
+  $("#lc-menu").addEventListener("click", openDrawer);
   // 单击回车换行、双击回车发送（对齐 RP-Hub；中文输入法组字中不拦截）
   const input = $("#wb-input");
   input.addEventListener("keydown", wbInputEnter);
   input.addEventListener("input", () => wbAutoGrow(input));
-$("#wb-chat-clear").addEventListener("click", () => {
-  if (wbChatHistory.length && !confirm("清空当前对话？")) return;
-  wbChatHistory = []; wbPending = null; $("#chat-log").innerHTML = "";
-  // 清空对话 = 允许重新开场：清掉本卡「本地」的开场状态，下次打开卡会再次显示开场白
-  if (wbSlug) void api.send(`/api/cards/${encodeURIComponent(wbSlug)}/greeting/clear`, { method: "POST", body: JSON.stringify({ userKey: "local" }) }).catch(() => {});
+  // 一键删除：清空聊天记录 + 全部记忆 + 开场状态（原「清空对话/重置」两键合一）
+  $("#wb-undo-round").addEventListener("click", () => {
+    if (!wbSlug) return toast("先选一张卡", false);
+    void wbUndoLastRound();
   });
-// 一键重置：清空该卡全部记忆 + 聊天记录 + 开场状态（重塑角色形象，不可恢复）
-$("#wb-chat-reset").addEventListener("click", async () => {
-  if (!wbSlug) return;
-  const name = wbCardObj?.name ?? wbSlug;
-  if (!confirm(`重置「${name}」？\n将删除这张卡的全部记忆和聊天记录（包括通道里记住的事），AI 会忘掉之前的一切，此操作不可恢复。`)) return;
-  try {
-    await api.send(`/api/cards/${encodeURIComponent(wbSlug)}/reset`, { method: "POST", body: "{}" });
-    wbChatHistory = []; wbPending = null; $("#chat-log").innerHTML = "";
-    toast(`✓ 「${name}」已重置，可以重新开始`);
-  } catch (e) { toast("重置失败：" + e.message, false); }
-});
-  // 退出走 SPA 内部切换，不整页重载（重载会重新拉 200KB 脚本，明显卡顿）
-  $("#wb-exit").addEventListener("click", () => { setWorkbenchOn(false); router(); });
-  // 聊天选项记住上次的选择
+  $("#wb-chat-clear").addEventListener("click", async () => {
+    if (!wbSlug) return;
+    const name = wbCardObj?.name ?? wbSlug;
+    const ok = await wbConfirm({
+      title: `一键删除「${name}」`,
+      lead: "清空这张卡的全部聊天记录与记忆，AI 会忘掉之前的一切。",
+      points: [
+        "网页聊天记录全部清空",
+        "长期记忆全部删除（包括通道里记住的事）",
+        "QQ / 微信 的对话上下文一并重置",
+        "开场白状态复位，下次见面重新开场",
+      ],
+      note: "此操作不可恢复。",
+      okText: "全部删除",
+    });
+    if (!ok) return;
+    try {
+      await api.send(`/api/cards/${encodeURIComponent(wbSlug)}/reset`, { method: "POST", body: "{}" });
+      wbChatHistory = []; wbPending = null; $("#chat-log").innerHTML = "";
+      wbRenderedIds = new Set();
+      // 清空后只保留一条开场白：本地重新领取显示；绑了通道则主动补发（QQ/微信私聊用户）
+      const cardObj = wbCardObj ?? (await api.get(`/api/cards/${encodeURIComponent(wbSlug)}`).catch(() => null));
+      const first = cardObj?.sillytavern_v2?.first_mes?.trim();
+      if (first) {
+        try {
+          const g = await api.send(`/api/cards/${encodeURIComponent(wbSlug)}/greeting/claim`, {
+            method: "POST",
+            body: JSON.stringify({ userKey: "local" }),
+          });
+          if (g.greeted && g.text) addChatBubble("bot", g.text);
+        } catch { /* 忽略 */ }
+      }
+      void api.send(`/api/cards/${encodeURIComponent(wbSlug)}/greeting/push`, { method: "POST" }).catch(() => {});
+      toast(`✓ 「${name}」已全部删除，开场白已重新放上`);
+    } catch (e) { toast("删除失败：" + e.message, false); }
+  });
+  // 退出：回到刚才聊的那张卡的编辑页（而不是甩回首页，用户容易失去上下文）。
+  // 走 SPA 内部切换，不整页重载（重载会重新拉 266KB 脚本，明显卡顿）。
+  $("#wb-exit").addEventListener("click", () => {
+    const back = wbSlug;
+    setWorkbenchOn(false);
+    if (!back) { router(); return; }
+    if ((location.hash || "").replace(/^#\/?/, "") === "cards") {
+      router();
+      void loadCardIntoEditor(back);
+    } else {
+      // hashchange 会触发 router()，卡库渲染完再打开这张卡的编辑页
+      pendingOpenCardSlug = back;
+      location.hash = "#/cards";
+    }
+  });
+  // 头像/名字点击 → 直接改这张卡的配置（不用回卡库）
+  $("#lc-who").addEventListener("click", () => {
+    if (!wbCardObj) return toast("先选一张卡", false);
+    editingCard = wbCardObj;
+    openAdvConfig();
+  });
+  // 上排按键：模型商 / 模型 / 思考深度（弹层选择，RP-Hub 式）
   const wbOpts = wbChatOpts();
-  // 联网搜索：纯图标按钮，高亮即开启
-  const ws = $("#wb-websearch");
-  ws.classList.toggle("on", wbOpts.websearch === true);
-  ws.setAttribute("aria-pressed", wbOpts.websearch === true ? "true" : "false");
-  ws.addEventListener("click", () => {
-    const on = !ws.classList.contains("on");
-    ws.classList.toggle("on", on);
-    ws.setAttribute("aria-pressed", on ? "true" : "false");
-    saveWbChatOpts();
+  lcModelState.provider = wbOpts.provider ?? "";
+  lcModelState.model = wbOpts.model ?? "";
+  lcModelState.thinking = wbOpts.thinking ?? "auto";
+  bindLcPopovers();
+  // 表情包按钮：弹出当前卡配置分组的表情，点击插入 [表情:名]
+  $("#wb-emoji").addEventListener("click", openWbEmojiPicker);
+  // 长按消息进入多选删除（触屏长按 500ms；桌面右键同样生效）
+  const log = $("#chat-log");
+  let pressTimer = null;
+  const startPress = (e) => {
+    const row = e.target.closest?.(".bubble-row[data-conv-id]");
+    if (!row || wbSelectMode) return;
+    pressTimer = setTimeout(() => {
+      pressTimer = null;
+      wbEnterSelectMode();
+      wbToggleSelect(row);
+    }, 500);
+  };
+  const cancelPress = () => { if (pressTimer) { clearTimeout(pressTimer); pressTimer = null; } };
+  log.addEventListener("touchstart", startPress, { passive: true });
+  log.addEventListener("touchend", cancelPress);
+  log.addEventListener("touchmove", cancelPress);
+  log.addEventListener("contextmenu", (e) => {
+    const row = e.target.closest(".bubble-row[data-conv-id]");
+    if (!row || wbSelectMode) return;
+    e.preventDefault();
+    wbEnterSelectMode();
+    wbToggleSelect(row);
   });
-  $("#wb-thinking").value = wbOpts.thinking ?? "auto";
-  $("#wb-thinking").addEventListener("change", saveWbChatOpts);
-  // 模型两级联动：先选模型商，再选它的模型
-  $("#lc-provider").addEventListener("change", () => { fillLcModelOptions(""); saveWbChatOpts(); });
-  $("#lc-model").addEventListener("change", saveWbChatOpts);
-  await loadLcProviders(wbOpts.provider ?? "", wbOpts.model ?? "");
+  log.addEventListener("click", (e) => {
+    if (!wbSelectMode) return;
+    const row = e.target.closest(".bubble-row[data-conv-id]");
+    if (row) { e.preventDefault(); wbToggleSelect(row); }
+  });
   // 工作区文件面板（FEATURES.workspace 关闭时不渲染，跳过绑定）
   if (FEATURES.workspace) {
     $("#wb-refresh").addEventListener("click", wbLoadFiles);
@@ -882,7 +1089,7 @@ $("#wb-chat-reset").addEventListener("click", async () => {
     wbLoadFiles(); // 工作区共享，不等选卡
   }
   const last = localStorage.getItem("ocs_workbench_slug");
-  if (last) { sel.value = last; await wbPickCard(last); }
+  if (last) await wbPickCard(last);
 }
 
 async function wbPickCard(slug) {
@@ -891,22 +1098,21 @@ async function wbPickCard(slug) {
   wbChatHistory = [];
   wbPending = null;
   wbDir = "";
+  bubbleCardAvatarUrl = null; // 换卡后头像缓存失效（旧 Blob 留着给已渲染气泡用，不回收）
   $("#chat-log").innerHTML = "";
   localStorage.setItem("ocs_workbench_slug", slug);
   const nameEl = $("#lc-name");
-  const subEl = $("#lc-sub");
   const avEl = $("#lc-avatar");
   if (slug) {
     wbCardObj = await api.get(`/api/cards/${slug}`).catch(() => null);
     const c = wbCardObj;
-    if (nameEl) nameEl.textContent = c?.name ?? slug;
     if (avEl) {
       avEl.innerHTML = c?.identity?.avatar
         ? `<img src="${c.identity.avatar}" alt="">`
         : `<span>${escapeHtml((c?.name ?? "?").slice(0, 1))}</span>`;
     }
-    const m = c?.model;
-    if (subEl) subEl.textContent = m?.provider || m?.model ? `${m.provider ?? ""}${m.model ? " / " + m.model : ""}` : "跟随默认提供商";
+    if (nameEl) nameEl.textContent = middleEllipsis(c?.name ?? slug, 16);
+    void loadLcModelDefaults(); // 模型默认选中这张卡配置的
     // 跨端会话：绑定（联通）→ 网页聊天 = 通道会话（互传，记录相同）；未绑定 → 本地聊天
     wbMirror = null;
     if (wbMirrorTimer) { clearInterval(wbMirrorTimer); wbMirrorTimer = null; }
@@ -914,38 +1120,177 @@ async function wbPickCard(slug) {
     const mir = await api.get(`/api/cards/${encodeURIComponent(slug)}/mirror/status`).catch(() => ({ bound: false }));
     if (mir?.bound) {
       wbMirror = { ...mir, slug };
-      if (subEl) subEl.textContent = `已联通${mir.channel === "qqbot" ? "QQ" : "微信"} · 通道消息同步显示`;
+      setLcDot("on", "已联通" + (mir.channel === "qqbot" ? "QQ" : "微信") + "，通道消息同步中");
       // 单向同步：通道消息实时显示到本地，本地聊天不发送到通道（清空只清本地记录）
       $("#wb-chat-clear").disabled = false;
-      const conv = await api.get(`/api/cards/${encodeURIComponent(slug)}/conversation`).catch(() => ({ entries: [] }));
-      for (const e of conv.entries ?? []) {
-        if (e.surface !== "web") { // 通道消息直接渲染；本地消息由 wbChatHistory 管理
-          wbRenderedIds.add(e.id);
-          addChatBubble(e.role === "assistant" ? "bot" : "user", e.content);
-        }
-      }
       wbMirrorTimer = setInterval(() => wbMirrorSync(slug), 3000);
       void wbMirrorSync(slug); // 立即同步一次
     } else {
+      setLcDot("", "本地聊天（未联通通道）");
       $("#wb-chat-clear").disabled = false;
-      // 开场白（本地）：有 first_mes 且「本地」还没开场过 → 领取并显示（原子去重）
-      const first = c?.sillytavern_v2?.first_mes?.trim();
-      if (first) {
-        try {
-          const g = await api.send(`/api/cards/${encodeURIComponent(slug)}/greeting/claim`, {
-            method: "POST",
-            body: JSON.stringify({ userKey: "local" }),
-          });
-          if (g.greeted && g.text) addChatBubble("bot", g.text);
-        } catch { /* 领取失败不阻塞选卡 */ }
-      }
     }
+    // 开场白（网页版默认直接放上去）：本地没开场过就领取并显示（联通与否都显示）
+    const first = c?.sillytavern_v2?.first_mes?.trim();
+    if (first) {
+      try {
+        const g = await api.send(`/api/cards/${encodeURIComponent(slug)}/greeting/claim`, {
+          method: "POST",
+          body: JSON.stringify({ userKey: "local" }),
+        });
+        if (g.greeted && g.text) addChatBubble("bot", g.text);
+      } catch { /* 领取失败不阻塞选卡 */ }
+    }
+    // 恢复历史（网页消息回填 wbChatHistory 并渲染，重进不再丢历史；通道消息只在联通时渲染）
+    await wbReloadHistory();
   } else {
     if (nameEl) nameEl.textContent = "选择角色卡";
-    if (subEl) subEl.textContent = "本地聊天";
+    setLcDot("", "本地聊天（未联通通道）");
     if (avEl) avEl.innerHTML = "";
   }
   if (FEATURES.workspace) wbLoadFiles();
+}
+
+/** 从统一日志重载本地聊天历史（进入选卡 / 删除消息后共用） */
+async function wbReloadHistory() {
+  if (!wbSlug) return;
+  wbChatHistory = [];
+  wbPending = null;
+  wbRenderedIds = new Set();
+  $("#chat-log").innerHTML = "";
+  const conv = await api.get(`/api/cards/${encodeURIComponent(wbSlug)}/conversation`).catch(() => ({ entries: [] }));
+  for (const e of conv.entries ?? []) {
+    if (e.surface === "web") {
+      // 拆条消息按 parts 逐条渲染（刷新后不再合并成一大块）；老数据无 parts 时按换行兜底拆
+      if (e.role === "assistant" && Array.isArray(e.parts) && e.parts.length) {
+        for (const p of e.parts) {
+          if (!String(p ?? "").trim()) continue;
+          addChatBubble("bot", p, e.id);
+        }
+      } else if (e.role === "assistant" && String(e.content).includes("\n")) {
+        for (const line of String(e.content).split(/\n+/).map((s) => s.trim()).filter(Boolean)) {
+          addChatBubble("bot", line, e.id);
+        }
+      } else {
+        addChatBubble(e.role === "assistant" ? "bot" : "user", e.content, e.id);
+      }
+      wbChatHistory.push({ role: e.role, content: e.content });
+    } else if (wbMirror) {
+      if (wbRenderedIds.has(e.id)) continue;
+      wbRenderedIds.add(e.id);
+      addChatBubble(e.role === "assistant" ? "bot" : "user", e.content, e.id);
+    }
+  }
+}
+
+// ---------- 长按多选删除（消息删除会联动记忆修复，规则见后端 /conversation/delete） ----------
+let wbSelectMode = false;
+const wbSelectedIds = new Set();
+
+function wbEnterSelectMode() {
+  wbSelectMode = true;
+  wbSelectedIds.clear();
+  $("#chat-log")?.classList.add("selecting");
+  if (!$("#wb-select-bar")) {
+    const bar = document.createElement("div");
+    bar.id = "wb-select-bar";
+    bar.innerHTML = `<span id="wb-select-count">已选 0 条</span>
+      <button class="danger small-btn" id="wb-select-del">删除</button>
+      <button class="ghost small-btn" id="wb-select-cancel">取消</button>`;
+    document.body.appendChild(bar);
+    $("#wb-select-del").addEventListener("click", wbDeleteSelected);
+    $("#wb-select-cancel").addEventListener("click", wbExitSelectMode);
+  }
+}
+
+function wbExitSelectMode() {
+  wbSelectMode = false;
+  wbSelectedIds.clear();
+  $("#chat-log")?.classList.remove("selecting");
+  document.querySelectorAll(".bubble-row.sel").forEach((r) => r.classList.remove("sel"));
+  $("#wb-select-bar")?.remove();
+}
+
+function wbToggleSelect(row) {
+  const id = row.dataset.convId;
+  if (row.classList.contains("sel")) { row.classList.remove("sel"); wbSelectedIds.delete(id); }
+  else { row.classList.add("sel"); wbSelectedIds.add(id); }
+  const c = $("#wb-select-count");
+  if (c) c.textContent = `已选 ${wbSelectedIds.size} 条`;
+}
+
+/**
+ * 多选删除 = 「从最早的选中项开始，把它和它之后的全部删掉」。
+ * 为什么必须删到底：通道（QQ/微信）的上下文是一条单链，只能从尾部截断——
+ * 删中间会让链断开。所以选中中间某条时，一律连带它后面的所有消息一起清，
+ * 这样网页与通道两边的上下文才是一致的。
+ */
+async function wbDeleteSelected() {
+  if (!wbSelectedIds.size) return toast("先选几条消息", false);
+  // 按页面顺序找出最早的选中项，算出「它及之后」的所有消息
+  const rows = [...document.querySelectorAll("#chat-log .bubble-row[data-conv-id]")];
+  const firstIdx = rows.findIndex((r) => wbSelectedIds.has(r.dataset.convId));
+  if (firstIdx < 0) return toast("选中的消息已不在列表里，请重试", false);
+  const tailRows = rows.slice(firstIdx);
+  const ids = tailRows.map((r) => r.dataset.convId).filter(Boolean);
+  const extra = ids.length - wbSelectedIds.size;
+  const ok = await wbConfirm({
+    title: `删除这 ${ids.length} 条消息`,
+    lead: extra > 0
+      ? `你选了 ${wbSelectedIds.size} 条，位于它们之后的 ${extra} 条也会一起删除。`
+      : `将删除选中的 ${ids.length} 条消息。`,
+    points: [
+      "网页这边的聊天记录会被删掉",
+      "QQ / 微信 那边的对话上下文同步截断（下次回复不再带这些内容）",
+      "QQ / 微信 App 里已经发出的消息不会被撤回，只是机器人不再记得",
+      "删除量较大时，最新一条记忆会一并解散、之后自动重算",
+    ],
+    note: "此操作不可恢复。",
+    okText: `删除 ${ids.length} 条`,
+  });
+  if (!ok) return;
+  try {
+    const r = await api.send(`/api/cards/${encodeURIComponent(wbSlug)}/conversation/delete`, {
+      method: "POST",
+      body: JSON.stringify({ ids, trimChannel: true }),
+    });
+    wbExitSelectMode();
+    await wbReloadHistory();
+    const parts = [`✓ 已删除 ${r.removed ?? ids.length} 条`];
+    if (r.channelTrimmed) parts.push(`通道上下文截断 ${r.channelTrimmed} 轮`);
+    if (r.channelNote) parts.push(r.channelNote);
+    if (r.memGone) parts.push(`相关记忆删除 ${r.memGone} 条`);
+    if (r.dissolved) parts.push("最新记忆已解散");
+    toast(parts.join("，"));
+  } catch (e) { toast("删除失败：" + e.message, false); }
+}
+
+/** 撤掉上一轮（破甲被拒时最常用）：一问一答从网页与通道两边一起摘掉 */
+async function wbUndoLastRound() {
+  const ok = await wbConfirm({
+    title: "撤掉上一轮对话",
+    lead: "把最近的一问一答从上下文里摘掉，常用于回复被模型拒绝、不想让它影响后续。",
+    points: [
+      "网页记录里的这一轮会删掉",
+      "QQ / 微信 的对话上下文同步截断这一轮",
+      "QQ / 微信 App 里已发出的消息不会被撤回",
+    ],
+    note: "此操作不可恢复。",
+    okText: "撤掉这一轮",
+  });
+  if (!ok) return;
+  try {
+    const r = await api.send(`/api/cards/${encodeURIComponent(wbSlug)}/conversation/undo`, {
+      method: "POST",
+      body: JSON.stringify({ rounds: 1 }),
+    });
+    await wbReloadHistory();
+    const parts = [`✓ 已撤掉 ${r.rounds || 1} 轮`];
+    if (r.channelTrimmed) parts.push("通道上下文已同步");
+    if (r.channelNote) parts.push(r.channelNote);
+    if (r.memGone) parts.push(`相关记忆删除 ${r.memGone} 条`);
+    if (r.dissolved) parts.push("最新记忆已解散");
+    toast(parts.join("，"));
+  } catch (e) { toast("撤销失败：" + e.message, false); }
 }
 
 // 绑定（联通）模式：定期把通道新消息同步进网页（互传）；解绑时自动切回本地聊天
@@ -958,9 +1303,11 @@ async function wbMirrorSync(slug) {
       if (wbMirrorTimer) { clearInterval(wbMirrorTimer); wbMirrorTimer = null; }
       wbMirror = null;
       $("#wb-chat-clear").disabled = false;
+      setLcDot("", "本地聊天（未联通通道）");
       toast("已解除绑定，聊天切回本地模式");
       return;
     }
+    setLcDot("on", "已联通，通道消息同步中");
     const conv = await api.get(`/api/cards/${encodeURIComponent(slug)}/conversation`).catch(() => ({ entries: [] }));
     for (const e of conv.entries ?? []) {
       if (e.surface === "web") continue; // 本地消息走 wbChatHistory，不重复渲染
@@ -968,38 +1315,15 @@ async function wbMirrorSync(slug) {
       wbRenderedIds.add(e.id);
       addChatBubble(e.role === "assistant" ? "bot" : "user", e.content);
     }
-  } catch { /* 单次同步失败忽略，下轮重试 */ }
+  } catch {
+    // 单次同步失败：圆点变红提示联通异常，下轮重试
+    if (wbMirror) setLcDot("err", "联通异常（同步失败，自动重试中）");
+  }
 }
 
-// 本地聊天可用的模型商（已过滤停用项）
-let lcProviders = [];
-
-/** 模型商下拉：只列启用中的；选「跟随卡片」则用卡自己的模型设置 */
-async function loadLcProviders(curProvider, curModel) {
-  const sel = $("#lc-provider");
-  if (!sel) return;
-  try {
-    const prov = await api.get("/api/providers");
-    lcProviders = (prov.chat ?? []).filter((p) => p.enabled !== false);
-  } catch { lcProviders = []; }
-  const has = lcProviders.some((p) => p.name === curProvider);
-  sel.innerHTML = [`<option value="">跟随卡片</option>`]
-    .concat(lcProviders.map((p) => `<option value="${escapeHtml(p.name)}" ${has && p.name === curProvider ? "selected" : ""}>${escapeHtml(p.name)}</option>`))
-    .join("");
-  fillLcModelOptions(has ? curModel : "");
-}
-
-/** 按当前模型商填充模型下拉 */
-function fillLcModelOptions(curModel) {
-  const sel = $("#lc-model");
-  if (!sel) return;
-  const p = lcProviders.find((x) => x.name === $("#lc-provider")?.value);
-  if (!p) { sel.innerHTML = `<option value="">—</option>`; sel.disabled = true; return; }
-  sel.disabled = false;
-  const models = p.models ?? [];
-  sel.innerHTML = models.length
-    ? models.map((m) => `<option value="${escapeHtml(m)}" ${m === curModel ? "selected" : ""}>${escapeHtml(m)}</option>`).join("")
-    : `<option value="">—</option>`;
+/** 本次聊天的模型覆盖："提供商::模型"；没选则用卡片自己的模型 */
+function lcModelOverride() {
+  return lcModelState.provider && lcModelState.model ? `${lcModelState.provider}::${lcModelState.model}` : "";
 }
 
 /** 输入框随内容长高（上限 160px） */
@@ -1020,36 +1344,189 @@ function wbInputEnter(e) {
     if (lcEnterTimer) { clearTimeout(lcEnterTimer); lcEnterTimer = null; }
     e.preventDefault();
     const el = $("#wb-input");
-    el.value = el.value.replace(/(?:\r?\n)+$/, "").replace(/[ \t]+$/, ""); // 去掉第一次回车留下的空行
+    el.value = el.value.replace(/\r?\n+$/, "").replace(/[ \t]+$/, ""); // 去掉第一次回车留下的空行
     if (el.value.trim()) wbSend();
     return;
   }
   lcEnterPending = true;
   if (lcEnterTimer) clearTimeout(lcEnterTimer);
   lcEnterTimer = setTimeout(() => { lcEnterPending = false; lcEnterTimer = null; }, 420);
-  setTimeout(() => wbAutoGrow($("#wb-input")), 0);
+  setTimeout(() => wbAutoGrow(), 0);
 }
 
-// 工作台聊天选项（联网搜索 + 思考深度 + 模型），记在本地
+// 工作台聊天选项（模型商/模型/思考深度），记在本地
 const WB_OPTS_KEY = "ocs_wb_chat_opts";
+const LC_THINKING = [
+  ["off", "不思考"], ["auto", "自动"], ["low", "浅"], ["medium", "中"], ["high", "深"], ["extreme", "极深"],
+];
+/** 本地聊天选择状态：模型商 / 模型 / 思考深度 */
+let lcModelState = { provider: "", model: "", thinking: "auto" };
+
 function wbChatOpts() {
   try { return JSON.parse(localStorage.getItem(WB_OPTS_KEY) || "{}"); } catch { return {}; }
 }
 function saveWbChatOpts() {
   localStorage.setItem(WB_OPTS_KEY, JSON.stringify({
-    websearch: $("#wb-websearch")?.classList.contains("on") === true,
-    thinking: $("#wb-thinking")?.value ?? "auto",
-    provider: $("#lc-provider")?.value ?? "",
-    model: $("#lc-model")?.value ?? "",
+    provider: lcModelState.provider,
+    model: lcModelState.model,
+    thinking: lcModelState.thinking,
   }));
 }
 
-/** 本次聊天的模型覆盖："提供商::模型"；选「跟随卡片」返回空串 */
-function lcModelOverride() {
-  const p = $("#lc-provider")?.value ?? "";
-  const m = $("#lc-model")?.value ?? "";
-  return p && m ? `${p}::${m}` : "";
+/** 用当前状态刷新三个按键的文字 */
+function refreshLcPills() {
+  const prov = $("#lc-prov-label"), think = $("#lc-think-label");
+  if (prov) prov.textContent = lcModelState.provider || "模型商";
+  if (think) think.textContent = LC_THINKING.find((t) => t[0] === lcModelState.thinking)?.[1] ?? "自动";
 }
+
+/** 上排三个按键的弹层（RP-Hub 式：模型商列表 / 模型列表 / 思考深度竖排） */
+function bindLcPopovers() {
+  let providers = [];
+  const closeAll = () => { $("#lc-prov-pop").hidden = true; $("#lc-model-pop").hidden = true; $("#lc-think-pop").hidden = true; };
+  const toggle = async (popId, fill) => {
+    const pop = $(popId);
+    const wasHidden = pop.hidden;
+    closeAll();
+    if (wasHidden) { await fill(); pop.hidden = false; }
+  };
+  document.addEventListener("click", (e) => {
+    if (!e.target.closest(".lc-pop-wrap")) closeAll();
+  });
+  const item = (label, active) =>
+    `<button type="button" class="lc-pop-item${active ? " on" : ""}">${escapeHtml(label)}${active ? '<span class="lc-pop-check">✓</span>' : ""}</button>`;
+
+  // 模型商：全部已启用的提供商
+  $("#lc-prov-pill").addEventListener("click", () => toggle("#lc-prov-pop", async () => {
+    if (!providers.length) {
+      try {
+        const r = await api.get("/api/providers");
+        providers = (r.chat ?? []).filter((p) => p.enabled !== false);
+      } catch { providers = []; }
+    }
+    $("#lc-prov-pop").innerHTML = providers.length
+      ? providers.map((p) => item(p.name, p.name === lcModelState.provider).replace(
+          'class="lc-pop-item', `data-prov="${escapeHtml(p.name)}" class="lc-pop-item`
+        )).join("")
+      : '<div class="lc-pop-empty">没有启用的模型商</div>';
+    $("#lc-prov-pop").querySelectorAll("[data-prov]").forEach((b) =>
+      b.addEventListener("click", () => {
+        lcModelState.provider = b.dataset.prov;
+        // 换模型商后模型重置为该商的第一个
+        const p = providers.find((x) => x.name === lcModelState.provider);
+        lcModelState.model = p?.models?.[0] ?? "";
+        refreshLcPills();
+        saveWbChatOpts();
+        closeAll();
+      })
+    );
+  }));
+
+  // 模型：当前模型商下的模型（按键只写「模型」，点开看得见选了啥）
+  $("#lc-model-pill").addEventListener("click", () => toggle("#lc-model-pop", async () => {
+    if (!providers.length) {
+      try {
+        const r = await api.get("/api/providers");
+        providers = (r.chat ?? []).filter((p) => p.enabled !== false);
+      } catch { providers = []; }
+    }
+    const p = providers.find((x) => x.name === lcModelState.provider);
+    const models = p?.models ?? [];
+    $("#lc-model-pop").innerHTML = models.length
+      ? models.map((m) => item(m, m === lcModelState.model).replace(
+          'class="lc-pop-item', `data-model="${escapeHtml(m)}" class="lc-pop-item`
+        )).join("")
+      : '<div class="lc-pop-empty">先在左边选一个模型商</div>';
+    $("#lc-model-pop").querySelectorAll("[data-model]").forEach((b) =>
+      b.addEventListener("click", () => {
+        lcModelState.model = b.dataset.model;
+        refreshLcPills();
+        saveWbChatOpts();
+        closeAll();
+      })
+    );
+  }));
+
+  // 思考深度：竖排选择
+  $("#lc-think-pill").addEventListener("click", () => toggle("#lc-think-pop", async () => {
+    $("#lc-think-pop").innerHTML = LC_THINKING.map(([v, label]) =>
+      item(label, v === lcModelState.thinking).replace(
+        'class="lc-pop-item', `data-think="${v}" class="lc-pop-item`
+      )).join("");
+    $("#lc-think-pop").querySelectorAll("[data-think]").forEach((b) =>
+      b.addEventListener("click", () => {
+        lcModelState.thinking = b.dataset.think;
+        refreshLcPills();
+        saveWbChatOpts();
+        closeAll();
+      })
+    );
+  }));
+  refreshLcPills();
+}
+
+/** 换卡/进本地聊天：默认选中这张卡配置的模型（卡没配则用第一个启用的） */
+async function loadLcModelDefaults() {
+  let provs = [];
+  try {
+    const r = await api.get("/api/providers");
+    provs = (r.chat ?? []).filter((p) => p.enabled !== false);
+  } catch { provs = []; }
+  const cm = wbCardObj?.model;
+  if (cm?.provider && provs.some((p) => p.name === cm.provider)) {
+    lcModelState.provider = cm.provider;
+    const p = provs.find((x) => x.name === cm.provider);
+    lcModelState.model = (p?.models ?? []).includes(cm.model) ? cm.model : (p?.models?.[0] ?? "");
+  } else if (provs.length) {
+    lcModelState.provider = provs[0].name;
+    lcModelState.model = provs[0].models?.[0] ?? "";
+  }
+  refreshLcPills();
+}
+
+/** 表情包按钮：弹出当前卡配置分组的表情，点击插入 [表情:名] 到输入框 */
+async function openWbEmojiPicker() {
+  const groups = wbCardObj?.emojiGroups ?? [];
+  if (!groups.length) return toast("这张卡还没配表情包分组（卡片高级配置里选）", false);
+  let lib = [];
+  try {
+    const r = await cachedGet("/api/emojis");
+    lib = r.emojis ?? [];
+  } catch { return toast("表情库读取失败", false); }
+  const pool = lib.filter((e) => groups.includes(e.group));
+  if (!pool.length) return toast("配置的表情分组里还没有表情", false);
+  const ov = document.createElement("div");
+  ov.className = "bot-overlay";
+  ov.id = "wb-emoji-overlay";
+  ov.innerHTML = `<div class="bot-dialog" style="max-width:400px">
+    <div class="bot-dialog-head">
+      <h3>插入表情</h3>
+      <button class="ghost small-btn" id="wb-emoji-close">${icon("x")}</button>
+    </div>
+    <div class="emoji-grid" style="max-height:320px;overflow-y:auto">
+      ${pool.map((e) => `<div class="emoji-item emoji-pick" data-name="${escapeHtml(e.name)}" data-exp="${escapeHtml(e.explanation || "")}" title="${escapeHtml(e.explanation || e.name)}">
+        <img src="${escapeHtml(e.url)}" alt="${escapeHtml(e.name)}" loading="lazy">
+        <div class="emoji-name">${escapeHtml(e.name)}</div>
+      </div>`).join("")}
+    </div>
+  </div>`;
+  document.body.appendChild(ov);
+  const close = () => ov.remove();
+  ov.addEventListener("click", (e) => { if (e.target === ov) close(); });
+  $("#wb-emoji-close").addEventListener("click", close);
+  ov.querySelectorAll(".emoji-pick").forEach((el) =>
+    el.addEventListener("click", () => {
+      const input = $("#wb-input");
+      const tag = `[表情:${el.dataset.name}]`;
+      const at = input.selectionStart ?? input.value.length;
+      input.value = input.value.slice(0, at) + tag + input.value.slice(input.selectionEnd ?? at);
+      input.selectionStart = input.selectionEnd = at + tag.length;
+      input.focus();
+      close();
+    })
+  );
+}
+
 
 // 发送防抖与截断状态：2 秒内用户连续发消息合并成一次请求（减少 API 浪费、避免强行截断）；
 // 输出未完成时用户发新消息 → 截断当前生成，结合新消息重新输出。
@@ -1057,13 +1534,14 @@ let wbSendTimer = null;
 let wbSendQueue = [];
 let wbAbort = null;          // 当前 /api/chat 请求的 AbortController（截断用）
 let wbThinkingBubble = null; // "正在输出"占位气泡
+let wbPendingUserRows = [];  // 本轮已渲染、还没拿到统一日志 id 的用户气泡
 
 async function wbSend() {
   const input = $("#wb-input");
   const message = input.value.trim();
   if (!message) return;
   if (!wbSlug) { addChatBubble("bot", "请先在顶部选一张卡片当助手。"); return; }
-  addChatBubble("user", message);
+  wbPendingUserRows.push(addChatBubble("user", message));
   input.value = "";
   wbAutoGrow(input); // 清空后收回高度
   wbChatHistory.push({ role: "user", content: message });
@@ -1072,7 +1550,7 @@ async function wbSend() {
   if (wbAbort) {
     wbAbort.abort();
     wbAbort = null;
-    if (wbThinkingBubble) { wbThinkingBubble.remove(); wbThinkingBubble = null; }
+    if (wbThinkingBubble) { wbThinkingBubble.closest(".bubble-row")?.remove(); wbThinkingBubble = null; }
     addChatBubble("bot", "（已截断上一条输出，将结合你的新消息重新生成）");
   }
 
@@ -1091,11 +1569,11 @@ async function wbDoSend(msgs) {
   btn.disabled = true;
   // 能力跟随这张卡的「高级配置」；联网搜索由输入框旁的按钮临时叠加
   const cardTools = Array.isArray(wbCardObj?.tools?.enabled) ? [...wbCardObj.tools.enabled] : [];
+  // 联网搜索等能力跟随卡片高级配置（输入岛不再放开关）
   const tools = FEATURES.workspace ? cardTools : cardTools.filter((t) => !WORKSPACE_TOOL_IDS.includes(t));
-  if ($("#wb-websearch")?.classList.contains("on") && !tools.includes("web_search")) tools.push("web_search");
   wbLastOpts = {
     tools,
-    thinking: $("#wb-thinking")?.value ?? wbCardObj?.chat?.thinking ?? "auto",
+    thinking: lcModelState.thinking || wbCardObj?.chat?.thinking || "auto",
     model: lcModelOverride(),
   };
   const ctrl = new AbortController();
@@ -1108,12 +1586,20 @@ async function wbDoSend(msgs) {
       body: JSON.stringify({ slug: wbSlug, message: msgs.join("\n"), history: wbChatHistory.slice(0, -msgs.length), userKey: "local", ...wbLastOpts }),
     });
     if (ctrl.signal.aborted) return;
-    if (wbThinkingBubble) { wbThinkingBubble.remove(); wbThinkingBubble = null; }
+    if (wbThinkingBubble) { wbThinkingBubble.closest(".bubble-row")?.remove(); wbThinkingBubble = null; }
     await wbFinishTurn(r);
+    // 给这一轮的气泡挂上统一日志 id（长按删除要用）
+    const ids = Array.isArray(r.convIds) ? r.convIds : [];
+    const rows = wbPendingUserRows.splice(0);
+    if (ids[0] && rows.length) rows[rows.length - 1].dataset.convId = ids[0];
+    if (ids[1]) {
+      const bots = document.querySelectorAll("#chat-log .bubble-row.bot:not([data-conv-id])");
+      if (bots.length) bots[bots.length - 1].dataset.convId = ids[1];
+    }
   } catch (e) {
     if (ctrl.signal.aborted) return; // 截断不算错误
     wbChatHistory.pop();
-    if (wbThinkingBubble) { wbThinkingBubble.remove(); wbThinkingBubble = null; }
+    if (wbThinkingBubble) { wbThinkingBubble.closest(".bubble-row")?.remove(); wbThinkingBubble = null; }
     addChatBubble("bot", "⚠ " + e.message);
   } finally {
     if (wbAbort === ctrl) wbAbort = null;
@@ -1123,10 +1609,10 @@ async function wbDoSend(msgs) {
 
 async function wbFinishTurn(r) {
   if (r.type === "reply") {
-    // 走真人化渲染：应用卡里的正则替换，开了「拆条发送」时按空行拆成多条气泡逐条冒出
-    await addBotReplyHumanLike(r.reply);
+    // 走真人化渲染：后端拆好的 parts（段落/句号/逗号四级拆条）逐条冒出；没 parts 时退回按空行拆
+    await addBotReplyHumanLike(r.reply, r.parts);
     wbChatHistory.push({ role: "assistant", content: r.reply });
-    if (wbCardObj?.abilities?.tts) speakText(r.reply); // 卡的高级配置开了 TTS → 自动朗读
+    // 不自动朗读：只有点气泡右上角的喇叭才合成语音（手动触发）
   } else if (r.type === "pending") {
     const bubble = addChatBubble("bot", "需要确认：助手想调用\n" + r.pending.map((p) => "· " + p.name).join("\n"));
     const row = document.createElement("div");
@@ -1203,6 +1689,42 @@ function wbFilesClick(e) {
   else if (tag === "wbDl") { window.open(`/api/workspace/download?slug=${encodeURIComponent(wbSlug)}&file=${encodeURIComponent(wbPath(t.dataset.wbDl))}`); }
   else if (tag === "wbView") { wbPreview(wbPath(t.dataset.wbView)); }
   else if (tag === "wbDel") { wbDelete(wbPath(t.dataset.wbDel)); }
+}
+
+/**
+ * 危险操作确认弹窗（替代原生 confirm，可带要点列表）。
+ * 返回 Promise<boolean>，用 await 取用户选择。
+ */
+function wbConfirm({ title = "确认操作", lead = "", points = [], note = "", okText = "确定删除", cancelText = "取消", danger = true }) {
+  return new Promise((resolve) => {
+    $("#wb-confirm-ov")?.remove();
+    const ov = document.createElement("div");
+    ov.id = "wb-confirm-ov";
+    ov.className = "wb-confirm-ov";
+    ov.innerHTML = `<div class="wb-confirm ${danger ? "danger" : ""}" role="dialog" aria-modal="true">
+      <div class="wb-confirm-head">
+        <span class="wb-confirm-icon">${danger ? "⚠" : "?"}</span>
+        <h3>${escapeHtml(title)}</h3>
+      </div>
+      ${lead ? `<p class="wb-confirm-lead">${escapeHtml(lead)}</p>` : ""}
+      ${points.length ? `<ul class="wb-confirm-points">${points.map((p) => `<li>${escapeHtml(p)}</li>`).join("")}</ul>` : ""}
+      ${note ? `<p class="wb-confirm-note">${escapeHtml(note)}</p>` : ""}
+      <div class="wb-confirm-foot">
+        <button class="ghost" data-act="cancel">${escapeHtml(cancelText)}</button>
+        <button class="${danger ? "danger" : "primary"}" data-act="ok">${escapeHtml(okText)}</button>
+      </div>
+    </div>`;
+    document.body.appendChild(ov);
+    const close = (v) => { ov.remove(); document.removeEventListener("keydown", onKey); resolve(v); };
+    const onKey = (e) => { if (e.key === "Escape") close(false); };
+    document.addEventListener("keydown", onKey);
+    ov.addEventListener("click", (e) => {
+      if (e.target === ov) return close(false);
+      const act = e.target.closest("[data-act]")?.dataset.act;
+      if (act === "cancel") close(false);
+      if (act === "ok") close(true);
+    });
+  });
 }
 
 function wbModal(title, fieldsHtml, onOk) {
@@ -1290,6 +1812,8 @@ async function wbPreview(p) {
 let cardsGridData = [];
 let cardSearch = "";
 let botsData = { bots: [] };
+// 进卡库后要自动打开的卡（退出本地聊天时回到原来那张卡的编辑页）
+let pendingOpenCardSlug = "";
 
 function renderCards() {
   return `
@@ -1334,6 +1858,12 @@ function initCards() {
   $("#btn-save").addEventListener("click", saveCard);
 
   loadCardsGrid();
+  // 从本地聊天退出时带过来的卡：直接进它的编辑页（不用用户再点一次）
+  if (pendingOpenCardSlug) {
+    const slug = pendingOpenCardSlug;
+    pendingOpenCardSlug = "";
+    void loadCardIntoEditor(slug);
+  }
 }
 
 /** 本地聊天：以这张卡为形象进入聊天视图（SPA 内部切换，不整页重载） */
@@ -1348,16 +1878,35 @@ async function openLocalChat() {
 }
 
 async function loadCardsGrid() {
+  // 有缓存就先画（公网上避免 1-2s 空白），后台刷新后只在数据真变了才重绘
   try {
-    const { cards } = await api.get("/api/cards");
-    cardsGridData = cards;
+    const bots = cachePeek("/api/bots?skipStatus=1");
+    if (bots) botsData = bots;
+    const { cards } = await cachedGet("/api/cards", (fresh) => {
+      cardsGridData = fresh.cards ?? [];
+      renderCardsGrid();
+    });
+    cardsGridData = cards ?? [];
     renderCardsGrid();
-  } catch (e) { $("#cards-grid").innerHTML = `<div class="muted">读取失败：${escapeHtml(e.message)}</div>`; }
+  } catch (e) {
+    const grid = $("#cards-grid");
+    if (grid) {
+      grid.innerHTML = `<div class="muted">读取失败：${escapeHtml(e.message)} <button class="ghost small-btn" id="cards-retry">重试</button></div>`;
+      $("#cards-retry")?.addEventListener("click", loadCardsGrid);
+    }
+    return;
+  }
   // 角标只需知道"有没有绑机器人"，用 skipStatus 快路径（不跑 openclaw CLI）
-  api.get("/api/bots?skipStatus=1").then((b) => { botsData = b; renderCardsGrid(); }).catch(() => {});
+  cachedGet("/api/bots?skipStatus=1", (fresh) => { botsData = fresh; renderCardsGrid(); })
+    .then((b) => {
+      // 首帧已用缓存画过，这里只在内容变化时重绘，避免"卡片重新生成一遍"的闪动
+      if (JSON.stringify(b) !== JSON.stringify(botsData)) { botsData = b; renderCardsGrid(); }
+    })
+    .catch(() => {});
 }
 
 async function refreshBots() {
+  cacheInvalidate("/api/bots");
   botsData = await api.get("/api/bots?skipStatus=1").catch(() => ({ bots: [] }));
   renderCardsGrid();
 }
@@ -1418,6 +1967,66 @@ let botLoginTimer = null;
 let botDialogSlug = "";
 let botConnections = null;   // /api/channels/connections 快照（已认证账号 + 绑定状态）
 
+/**
+ * 统一取 connections 快照。
+ * 这份数据被三处共用（通道连接页列表、卡片机器人弹窗、高级配置的账号下拉），
+ * 以前各自抓各自缓存，换卡/解绑后另外两处还是旧快照——表现就是"换了卡但里面显示老卡，
+ * 刷新页面才对"。现在统一走这里，任何变更后调 invalidateConnections() 即可全局生效。
+ * 默认 repair=0（纯文件读，毫秒级）；repair=1 会跑 openclaw CLI 自愈绑定（5-15s），只在后台补。
+ */
+async function fetchConnections({ force = false, repair = false } = {}) {
+  if (!force && !repair && botConnections) return botConnections;
+  const data = await api.get("/api/channels/connections" + (repair ? "?repair=1" : "")).catch(() => null);
+  if (data) botConnections = data;
+  return botConnections;
+}
+
+function invalidateConnections() {
+  botConnections = null;
+}
+
+/** 绑定关系变更后：立刻重取共享快照并重绘所有可见的相关界面 */
+async function syncAfterBotChange() {
+  invalidateConnections();
+  const [conn, bots] = await Promise.all([
+    fetchConnections({ force: true }),
+    api.get("/api/bots?skipStatus=1").catch(() => ({ bots: [] })),
+  ]);
+  botsData = bots;
+  // 通道连接页开着就重绘列表；卡片弹窗/高级配置开着就重绘机器人区块
+  if ($("#conn-list")) renderConnections(conn);
+  if ($("#bot-dialog-body") || $("#adv-bot-body")) {
+    const cur = (bots.bots ?? []).find((b) => b.cardSlug === botDialogSlug);
+    if (!botLoginTimer) renderBotBody(cur ?? null); // 正在扫码时别重绘掉二维码
+  }
+  if ($("#cards-grid")) renderCardsGrid();
+  // 后台再跑一次带自愈的（补齐可能缺失的路由绑定），完成后静默刷新
+  fetchConnections({ repair: true }).then((fresh) => {
+    if (fresh && $("#conn-list")) renderConnections(fresh);
+  }).catch(() => {});
+}
+
+/** 账号显示名：昵称优先，没起名回落渠道名/accountId */
+function accountText(a) {
+  return a?.label || a?.name || a?.accountId || "";
+}
+
+function connChannelTag(channel) {
+  return channel === "qqbot" ? "QQ" : "微信";
+}
+
+function connBusyKey(channel, accountId) {
+  return `acc:${channel}|${accountId}`;
+}
+
+/** 换卡/绑卡进行中的整行：转圈，不响应重绘 */
+function connBusyRow(channel, accountId, accName) {
+  return `<div class="conn-row busy">
+    <span class="chip" title="${escapeHtml(accountId)}">${connChannelTag(channel)} · ${escapeHtml(accName)}</span>
+    <span class="conn-loading">更换中…</span>
+  </div>`;
+}
+
 let botLoginBotId = "";   // 正在扫码的机器人，关窗时通知后端把登录进程杀掉
 
 function closeBotDialog() {
@@ -1457,75 +2066,164 @@ async function openBotDialog(slug) {
     if (bot !== undefined) renderBotBody(bot);
   };
   render(undefined);
-  // 已认证渠道账号 + 绑定状态（供「直接连接已绑定账号」流程用）
-  botConnections = await api.get("/api/channels/connections").catch(() => null);
-  botsData = await api.get("/api/bots").catch(() => ({ bots: [] }));
+  // 已认证渠道账号 + 绑定状态（供「直接连接已绑定账号」流程用）。
+  // 两个请求都走快路径并行拉：connections 纯文件读、bots 带 skipStatus 不跑 CLI，秒开。
+  const [conn, bots] = await Promise.all([
+    fetchConnections({ force: true }),
+    api.get("/api/bots?skipStatus=1").catch(() => ({ bots: [] })),
+  ]);
+  botConnections = conn;
+  botsData = bots;
   const bot = (botsData.bots ?? []).find((b) => b.cardSlug === slug);
   render(bot ?? null);
+  // 存活状态要跑 openclaw CLI（5-15s），后台补，别挡首屏
+  api.get("/api/bots").then((full) => {
+    if (!$("#bot-dialog-body")) return;
+    botsData = full;
+    const fresh = (full.bots ?? []).find((b) => b.cardSlug === slug);
+    if (fresh && !botLoginTimer) renderBotBody(fresh);
+  }).catch(() => {});
+}
+
+/**
+ * 「保存配置」时顺带把账号绑定落实：
+ * - 账号下拉停在「新建（扫码）」档 → 不动（要走二维码，由「连接 / 创建」负责）
+ * - 选了未绑卡的已认证账号 → 直接连到本卡（免扫码）
+ * - 选了别的卡占用的账号 → 二次确认后换到本卡（凭证复用，旧卡自动让位）
+ * - 已经是本卡当前账号 → 什么都不做
+ * 返回一句给 toast 用的说明；不涉及绑定就返回空串。
+ */
+async function applyAdvAccountBinding() {
+  const sel = $("#adv-bot-body #bot-account");
+  if (!sel) return ""; // 已有实例的详情态，没有账号下拉
+  const acc = sel.value;
+  if (!acc) return ""; // 「新建」档：留给二维码流程
+  const chan = $("#adv-bot-body #bot-channel")?.value;
+  if (!chan) return "";
+  const conn = await fetchConnections();
+  const acct = (conn?.accounts ?? []).find((a) => a.channel === chan && a.accountId === acc);
+  const acctName = accountText(acct) || acc;
+  // 已经绑在本卡上，无需重复操作
+  if (acct?.boundCardSlug === editingCard.slug) return "";
+  const curName = editingCard.name || editingCard.slug;
+  if (acct?.boundCardSlug) {
+    // 被别的卡占用 → 确认后换卡
+    if (!confirm(`账号「${acctName}」当前绑定的是「${acct.boundCardName ?? acct.boundCardSlug}」。\n\n确认换到「${curName}」吗？换卡后旧卡不再接收该账号消息（凭证复用，不用重新扫码）。`)) {
+      return "账号未改动";
+    }
+    await api.send("/api/bots/transfer", { method: "POST", body: JSON.stringify({ botId: acct.boundBotId, toCardSlug: editingCard.slug }) });
+    await syncAfterBotChange();
+    return `已把「${acctName}」换到本卡`;
+  }
+  // 未绑卡 → 直接连
+  const r = await api.send("/api/bots", {
+    method: "POST",
+    body: JSON.stringify({ cardSlug: editingCard.slug, channel: chan, accountId: acc }),
+  });
+  await syncAfterBotChange();
+  return r.evicted?.length ? `已连接「${acctName}」，卸下「${r.evicted.join("、")}」` : `已连接「${acctName}」`;
+}
+
+/**
+ * 高级配置底部按钮的显隐：
+ * 「连接 / 创建」只在账号下拉停在「新建（扫码）」档时才需要——那时要走二维码流程。
+ * 选了已认证账号时，「保存配置」自己就会完成绑定/换绑，不该再出现第二个按钮。
+ * 机器人区块自带的按钮行在高级配置里隐藏（CSS .adv-dialog .bot-create-row），只当逻辑入口用。
+ */
+function syncAdvCreateBtn() {
+  const btn = $("#adv-create");
+  if (!btn) return;
+  const inner = $("#adv-bot-body #bot-create");
+  const sel = $("#adv-bot-body #bot-account");
+  // 没有创建入口（已有实例的详情态）→ 不显示
+  btn.hidden = !inner || !sel || Boolean(sel.value);
 }
 
 function renderBotBody(bot) {
-  const body = $("#bot-dialog-body");
+  // 机器人弹窗用 #bot-dialog-body；卡片高级配置内嵌的机器人区块用 #adv-bot-body（二者不会同时存在）
+  const body = $("#bot-dialog-body") ?? $("#adv-bot-body");
   if (!body) return;
+  // 当前卡名：这个函数里没有 card 对象（只有 botDialogSlug），换卡确认框要用到卡名，
+  // 从卡库缓存/正在编辑的卡里取，取不到就退回 slug（曾因直接写 card.name 报 card is not defined）
+  const curCardName =
+    cardsGridData.find((c) => c.slug === botDialogSlug)?.name ||
+    (editingCard?.slug === botDialogSlug ? editingCard.name : "") ||
+    botDialogSlug;
   if (!bot) {
-    const limits = botsData.limits ?? {};
+    const limits = botsData.limits ?? botConnections?.limits ?? {};
     const bots = botsData.bots ?? [];
     const qqCount = bots.filter((b) => b.channel === "qqbot").length;
-    const wxCount = bots.filter((b) => b.channel === "openclaw-weixin").length;
     const maxQq = limits.maxQq ?? 5;
-    const maxWx = limits.maxWeixin ?? 1;
-    const wxUsed = wxCount >= maxWx;
-    // 已认证账号（本渠道）：可直接连接，免扫码
+    // 已认证账号（本渠道）：全部列出来，各自标状态——未绑卡可直连、已绑别的卡选了就换卡。
+    // 渠道一律不禁用：微信「最多绑 1 个」不该挡住"把微信换到这张卡"这个操作（旧卡会自动掉落）。
     const accounts = (botConnections?.accounts ?? []).filter((a) => a.authed);
     const qqAccounts = accounts.filter((a) => a.channel === "qqbot");
     const wxAccounts = accounts.filter((a) => a.channel === "openclaw-weixin");
-    // 按选中渠道判断是否满额（渠道切换时同步）
+    const slots = botConnections?.slots ?? {};
+    // 账号槽位满 = 不能再扫新码（只能选已有账号）；绑卡数满只影响 QQ 新增
     const updateFullState = () => {
-      const full = $("#bot-channel")?.value === "qqbot" ? qqCount >= maxQq : wxCount >= maxWx;
+      const chan = $("#bot-channel")?.value;
       const btn = $("#bot-create");
-      if (btn) { btn.disabled = full; btn.title = full ? "该渠道已达上限" : ""; }
+      const sel = $("#bot-account");
+      if (!btn || !sel) return;
+      const isNew = !sel.value; // 空值 = 新建扫码
+      const slot = slots[chan] ?? null;
+      const slotFull = slot ? slot.used >= slot.max : false;
+      const qqBotFull = chan === "qqbot" && qqCount >= maxQq;
+      const blocked = isNew && (slotFull || qqBotFull);
+      btn.disabled = blocked;
+      btn.title = blocked
+        ? slotFull
+          ? `账号已存满（${slot.used}/${slot.max}），请先到「通道连接」页彻底删除一个账号`
+          : "该渠道绑卡已达上限"
+        : "";
     };
-    // 已认证账号下拉的选项 + 选中态
     const renderAccountSelect = (preserve) => {
       const chan = $("#bot-channel").value;
       const list = chan === "qqbot" ? qqAccounts : wxAccounts;
       const sel = $("#bot-account");
       if (!sel) return;
-      const hasAccounts = list.length > 0;
-      sel.innerHTML = hasAccounts
-        ? [`<option value="">（新建机器人，扫码绑定）</option>`]
-            .concat(list.map((a) => {
-              const label = a.boundCardName ? `${a.name ?? a.accountId} — 已被「${a.boundCardName}」占用` : `${a.name ?? a.accountId}`;
-              return `<option value="${escapeHtml(a.accountId)}" ${preserve && a.accountId === $("#bot-account").value ? "selected" : ""}>${escapeHtml(label)}</option>`;
-            }))
-            .join("")
-        : `<option value="">（该渠道还没有已认证账号，选此项新建扫码）</option>`;
+      const prev = preserve ? sel.value : "";
+      const slot = slots[chan] ?? null;
+      const slotFull = slot ? slot.used >= slot.max : false;
+      const newOpt = slotFull
+        ? `<option value="" disabled>（账号已存满 ${slot.used}/${slot.max}，先删一个才能扫码）</option>`
+        : `<option value="">（新建机器人，扫码绑定）</option>`;
+      sel.innerHTML = [newOpt]
+        .concat(list.map((a) => {
+          const nm = accountText(a);
+          const state = !a.boundCardSlug
+            ? "未绑卡，可直接连接"
+            : a.boundCardSlug === botDialogSlug
+              ? "当前"
+              : `现绑「${a.boundCardName ?? a.boundCardSlug}」，选它=换到本卡`;
+          return `<option value="${escapeHtml(a.accountId)}" ${prev === a.accountId ? "selected" : ""}>${escapeHtml(nm)} · ${escapeHtml(state)}</option>`;
+        }))
+        .join("");
       sel.disabled = false;
-      const tip = $("#bot-account-tip");
-      if (tip) tip.textContent = hasAccounts
-        ? "选一个已认证账号可直接连接（免扫码）；选「新建机器人」则走扫码绑定。"
-        : "当前渠道还没有已认证账号：先在「通道连接」页扫码登录，或直接用下方新建流程扫码。";
+      // 槽位满时默认选第一个已有账号，避免停在禁用项上
+      if (slotFull && !sel.value && list.length) sel.selectedIndex = 1;
     };
     body.innerHTML = `
-      <p class="muted">给这张卡接机器人：可直连已认证账号（免扫码），或新建后扫码绑定。已认证账号若被别的卡占用，连接时会二次确认换卡。</p>
       <div class="bot-form">
         <label>渠道：
           <select id="bot-channel">
-            <option value="qqbot">QQ 机器人${qqCount >= maxQq ? "（已达上限）" : ""}</option>
-            <option value="openclaw-weixin" ${wxUsed ? "disabled" : ""}>微信机器人${wxUsed ? "（已有 1 个，最多 1 个）" : ""}</option>
+            <option value="qqbot">QQ 机器人</option>
+            <option value="openclaw-weixin">微信机器人</option>
           </select>
         </label>
         <label>账号：
           <select id="bot-account"></select>
         </label>
-        <p class="hint" id="bot-account-tip"></p>
       </div>
-      <div class="row" style="justify-content:flex-end">
+      <div class="row bot-create-row" style="justify-content:flex-end">
         <button id="bot-create" class="primary">连接 / 创建</button>
       </div>`;
-    $("#bot-channel").addEventListener("change", () => { updateFullState(); renderAccountSelect(true); });
+    $("#bot-channel").addEventListener("change", () => { renderAccountSelect(false); updateFullState(); syncAdvCreateBtn(); });
+    $("#bot-account").addEventListener("change", () => { updateFullState(); syncAdvCreateBtn(); });
     renderAccountSelect(false);
     updateFullState();
+    syncAdvCreateBtn();
     $("#bot-create").addEventListener("click", async () => {
       const btn = $("#bot-create");
       btn.disabled = true; btn.textContent = "处理中…";
@@ -1534,20 +2232,19 @@ function renderBotBody(bot) {
       try {
         if (acc) {
           // ── 直连已认证账号 ──
-          const conn = botConnections ?? await api.get("/api/channels/connections").catch(() => null);
+          const conn = await fetchConnections();
           const acct = (conn?.accounts ?? []).find((a) => a.channel === chan && a.accountId === acc);
+          const acctName = accountText(acct) || acc;
           if (acct?.boundCardSlug && acct.boundCardSlug !== botDialogSlug) {
             // 该账号已绑定别的卡 → 二次确认换卡
-            if (!confirm(`账号「${acct.name ?? acc}」当前已绑定「${acct.boundCardName ?? acct.boundCardSlug}」这张卡。\n\n确认把它换到当前卡「${card.name}」吗？换卡后旧卡不再接收该账号消息（凭证复用，不重新扫码）。`)) {
+            if (!confirm(`账号「${acctName}」当前已绑定「${acct.boundCardName ?? acct.boundCardSlug}」这张卡。\n\n确认把它换到当前卡「${curCardName}」吗？换卡后旧卡不再接收该账号消息（凭证复用，不重新扫码）。`)) {
               btn.disabled = false; btn.textContent = "连接 / 创建";
               return;
             }
             try {
-              const r = await api.send("/api/bots/transfer", { method: "POST", body: JSON.stringify({ botId: acct.boundBotId, toCardSlug: botDialogSlug }) });
-              if (!r.ok) throw new Error(r.error ?? "换卡失败");
+              await api.send("/api/bots/transfer", { method: "POST", body: JSON.stringify({ botId: acct.boundBotId, toCardSlug: botDialogSlug }) });
               toast("✓ 已换到当前卡并连接");
-              if (r.bot) renderBotBody({ ...r.bot, agentExists: true });
-              refreshBots(); refreshConnections();
+              await syncAfterBotChange();
               return;
             } catch (err) {
               toast("换卡失败：" + err.message, false);
@@ -1560,9 +2257,11 @@ function renderBotBody(bot) {
             method: "POST",
             body: JSON.stringify({ cardSlug: botDialogSlug, channel: chan, accountId: acc }),
           });
-          toast("✓ 已连接「" + (acct?.name ?? acc) + "」");
-          renderBotBody({ ...r.bot, channelLabel: chan === "qqbot" ? "QQ 机器人" : "微信机器人", agentExists: true });
-          refreshBots(); refreshConnections();
+          // 微信只能绑 1 张卡：后端会把旧卡顶下来，这里如实告诉用户被卸掉的是哪张
+          toast(r.evicted?.length
+            ? `✓ 已连接「${acctName}」，已卸下「${r.evicted.join("、")}」`
+            : `✓ 已连接「${acctName}」`);
+          await syncAfterBotChange();
           return;
         }
         // ── 新建机器人（扫码绑定） ──
@@ -1570,20 +2269,20 @@ function renderBotBody(bot) {
           method: "POST",
           body: JSON.stringify({ cardSlug: botDialogSlug, channel: chan, accountId: "" }),
         });
-        toast("机器人已创建，接下来扫码绑定");
+        toast(r.evicted?.length ? `机器人已创建，已卸下「${r.evicted.join("、")}」，接下来扫码绑定` : "机器人已创建，接下来扫码绑定");
         renderBotBody({ ...r.bot, channelLabel: r.bot.channel === "qqbot" ? "QQ 机器人" : "微信机器人", agentExists: r.agentExists ?? null });
+        invalidateConnections();
         refreshBots();
       } catch (e) {
         // 账号被其他卡占用 → 一键转移（凭证复用不重新扫码）
         if (/占用/.test(e.message)) {
-          const conn = botConnections ?? await api.get("/api/channels/connections").catch(() => null);
+          const conn = await fetchConnections();
           const occupier = conn?.bots?.find((b) => b.channel === chan && b.accountId === acc);
-          if (occupier && confirm(`该账号已被「${occupier.cardSlug}」占用。一键转移：把账号从旧卡顶到当前卡？（凭证复用，不重新扫码）`)) {
+          if (occupier && confirm(`该账号已被「${occupier.cardName ?? occupier.cardSlug}」占用。一键转移：把账号从旧卡顶到当前卡？（凭证复用，不重新扫码）`)) {
             try {
-              const r = await api.send("/api/bots/transfer", { method: "POST", body: JSON.stringify({ botId: occupier.id, toCardSlug: botDialogSlug }) });
-              toast(r.ok ? "✓ 已转移" : "转移失败：" + (r.error ?? ""), r.ok);
-              if (r.bot) renderBotBody({ ...r.bot, agentExists: true });
-              refreshBots(); refreshConnections();
+              await api.send("/api/bots/transfer", { method: "POST", body: JSON.stringify({ botId: occupier.id, toCardSlug: botDialogSlug }) });
+              toast("✓ 已转移");
+              await syncAfterBotChange();
               return;
             } catch (err) { toast("转移失败：" + err.message, false); }
           } else {
@@ -1592,23 +2291,45 @@ function renderBotBody(bot) {
         } else {
           toast("创建失败：" + e.message, false);
         }
-        updateFullState(); btn.textContent = "连接 / 创建";
+        btn.disabled = false;
+        btn.textContent = "连接 / 创建";
+        updateFullState();
       }
     });
     return;
   }
   // 已有实例：详情 + 操作
+  // 换绑账号下拉：把这张卡换成别的已认证账号。账号被别的卡占用时，确认后自动顶掉旧卡换过来——
+  // 不要求用户先自己去解绑/换卡（用户拍板的机制）。
+  const allAccs = (botConnections?.accounts ?? []).filter((a) => a.authed && a.channel === bot.channel);
+  const rebindOpts = [`<option value="">（保持当前账号）</option>`]
+    .concat(allAccs
+      .filter((a) => a.accountId !== bot.accountId)
+      .map((a) => {
+        const nm = accountText(a) || a.accountId;
+        const state = !a.boundCardSlug
+          ? "未绑卡"
+          : a.boundCardSlug === botDialogSlug
+            ? "当前"
+            : `现绑「${a.boundCardName ?? a.boundCardSlug}」`;
+        return `<option value="${escapeHtml(a.accountId)}" ${a.boundCardSlug && a.boundCardSlug !== botDialogSlug ? "data-occupied=\"1\"" : ""}>${escapeHtml(nm)} · ${escapeHtml(state)}</option>`;
+      }))
+    .join("");
   body.innerHTML = `
     <div class="bot-detail">
       <div class="bot-detail-row"><span>接到哪</span><b>${bot.channelLabel ?? (bot.channel === "qqbot" ? "QQ 机器人" : "微信机器人")}</b></div>
-      <div class="bot-detail-row"><span>机器人编号</span><code>${escapeHtml(bot.accountId)}</code></div>
+      <div class="bot-detail-row"><span>账号</span><b>${escapeHtml(bot.accountLabel || bot.accountId)}</b>${bot.accountLabel && bot.accountLabel !== bot.accountId ? ` <code class="muted">${escapeHtml(bot.accountId)}</code>` : ""}</div>
       <div class="bot-detail-row"><span>运行状态</span>${bot.agentExists === true ? '<span class="ok-badge">正常 ✓</span>' : bot.agentExists === false ? '<span class="warn-badge">需要重新创建</span>' : '<span class="muted">检测中…</span>'}</div>
     </div>
+    <div class="bot-form" style="margin-top:8px">
+      <label>换绑账号：
+        <select id="bot-rebind">${rebindOpts}</select>
+      </label>
+    </div>
+    <p class="hint" id="bot-rebind-msg"></p>
     <div class="bot-login-area">
       <div class="row">
         <button id="bot-login" class="primary small-btn">扫码绑定此账号</button>
-        <button id="bot-recompile" class="ghost small-btn">重新应用（卡更新后）</button>
-        <button id="bot-delete" class="danger small-btn">删除机器人</button>
       </div>
       <p class="hint" id="bot-login-msg"></p>
       <pre id="bot-qr" class="qr-box" style="display:none"></pre>
@@ -1616,21 +2337,45 @@ function renderBotBody(bot) {
       <a id="bot-qr-link" class="qr-link" target="_blank" style="display:none">扫不了？点这里在浏览器打开链接</a>
     </div>`;
   $("#bot-login").addEventListener("click", () => startBotLogin(bot.id));
-  $("#bot-recompile").addEventListener("click", async () => {
+  // 换绑账号：选占用账号 → 确认后 transfer 顶掉旧卡；选空闲账号 → 本 agent 直接换绑
+  $("#bot-rebind")?.addEventListener("change", async () => {
+    const sel = $("#bot-rebind");
+    const acc = sel?.value;
+    if (!sel || !acc) return;
+    const acct = (botConnections?.accounts ?? []).find((a) => a.channel === bot.channel && a.accountId === acc);
+    const accName = accountText(acct) || acc;
+    const msg = $("#bot-rebind-msg");
+    sel.disabled = true;
     try {
-      const r = await api.send(`/api/bots/${bot.id}/recompile`, { method: "POST" });
-      toast(`已同步 ${r.files?.length ?? 0} 项内容给机器人`);
-    } catch (e) { toast("重新应用失败：" + e.message, false); }
+      if (acct?.boundCardSlug && acct.boundCardSlug !== botDialogSlug) {
+        // 账号被别的卡占用：问一句，确定后自动把旧卡顶掉换过来
+        if (!confirm(`账号「${accName}」现绑「${acct.boundCardName ?? acct.boundCardSlug}」这张卡。\n\n确定把它换到当前卡吗？旧卡上的绑定会解除（凭证复用，不重新扫码）。`)) {
+          sel.value = ""; sel.disabled = false;
+          return;
+        }
+        await api.send("/api/bots/transfer", { method: "POST", body: JSON.stringify({ botId: acct.boundBotId, toCardSlug: botDialogSlug }) });
+        toast("✓ 已换到当前卡");
+      } else {
+        // 空闲账号：本卡 agent 直接换绑到它
+        if (!confirm(`把当前卡换绑到账号「${accName}」？`)) {
+          sel.value = ""; sel.disabled = false;
+          return;
+        }
+        await api.send(`/api/bots/${bot.id}/bind`, { method: "POST", body: JSON.stringify({ channel: bot.channel, accountId: acc }) });
+        toast("✓ 已换绑账号");
+      }
+      await syncAfterBotChange(); // 重绘成新账号
+    } catch (e) {
+      toast("换绑失败：" + e.message, false);
+      const s2 = $("#bot-rebind");
+      if (s2) { s2.disabled = false; s2.value = ""; }
+    }
+    if (msg) msg.textContent = "";
   });
-  $("#bot-delete").addEventListener("click", async () => {
-    if (!confirm("删除这个机器人？你在 QQ/微信 平台侧的账号不受影响")) return;
-    try {
-      await api.send(`/api/bots/${bot.id}`, { method: "DELETE" });
-      toast("已删除");
-      await refreshBots();
-      renderBotBody(null);
-    } catch (e) { toast("删除失败：" + e.message, false); }
-  });
+  // 「重新应用」「删除机器人」两个按钮已移除（2026-09-08）：
+  // 前者与「保存配置」重复——卡片保存时 syncCardToChannel 已自动重编译并同步模型/节奏；
+  // 后者是历史遗留，换卡直接用上面的「换绑账号」，不需要先删机器人。
+  // 后端 /recompile 与 DELETE /api/bots/:id 端点保留（供脚本/排障使用）。
 }
 
 async function startBotLogin(botId) {
@@ -1664,7 +2409,7 @@ async function startBotLogin(botId) {
       }
       if (s.done) {
         clearInterval(botLoginTimer); botLoginTimer = null;
-        msg.textContent = s.ok ? "扫码成功，账号已绑定（网关重启后路由生效）" : "未成功，检查输出后重试";
+        msg.textContent = s.ok ? "扫码成功，账号已绑定，已立即生效" : "未成功，检查输出后重试";
         refreshBots();
       }
     } catch { /* 轮询失败忽略 */ }
@@ -1688,7 +2433,7 @@ function closeAdvConfig() {
 async function openEmojiGroupPicker() {
   if (!$("#adv-overlay")) return;
   let data;
-  try { data = await api.get("/api/emojis"); } catch { return toast("读取表情库失败", false); }
+  try { data = await cachedGet("/api/emojis"); } catch { return toast("读取表情库失败", false); }
   const groups = data.groups ?? [];
   const countBy = {};
   for (const e of data.emojis ?? []) countBy[e.group] = (countBy[e.group] ?? 0) + 1;
@@ -1751,16 +2496,10 @@ function openLifePicker() {
       <button class="ghost small-btn" id="life-picker-close">${icon("x")}</button>
     </div>
     <div class="adv-sec">
-      <p class="hint">开启后，AI 会每隔你选的时间主动给用户发一条消息（以角色身份自然发起，不同时段不同情绪）。</p>
-      <div style="margin:14px 0 6px">
+      <div class="slider-wrap" style="margin:18px 0 10px">
+        <b class="slider-val" id="life-interval-label"></b>
         <input type="range" id="life-interval" min="0" max="24" step="1" value="${cur}" style="width:100%">
-        <div class="row" style="justify-content:space-between;margin-top:6px">
-          <span class="muted">0 = 关闭</span>
-          <b id="life-interval-label">${cur === 0 ? "关闭" : cur + " 小时一次"}</b>
-          <span class="muted">最多 24 小时</span>
-        </div>
       </div>
-      <p class="hint">深夜 0 点 - 6 点自动静默，不会打扰休息。用户连续不回会降低频率，久不互动自动停发。</p>
     </div>
     <div class="row" style="justify-content:flex-end;gap:8px">
       <button class="ghost" id="life-picker-cancel">取消</button>
@@ -1772,7 +2511,9 @@ function openLifePicker() {
   const syncLabel = () => {
     const v = Number(range.value);
     label.textContent = v === 0 ? "关闭" : v + " 小时一次";
+    label.style.left = (v / 24) * 100 + "%";
   };
+  syncLabel();
   range.addEventListener("input", syncLabel);
   const close = () => wrap.remove();
   $("#life-picker-close").addEventListener("click", close);
@@ -1792,20 +2533,82 @@ function openLifePicker() {
   });
 }
 
+/** 高级配置数据拉取失败：给明确错误 + 重试按钮（不再画一个空下拉框让用户猜） */
+function showAdvError(msg) {
+  const ov = document.createElement("div");
+  ov.id = "adv-overlay";
+  ov.className = "bot-overlay";
+  ov.innerHTML = `<div class="bot-dialog adv-dialog" style="max-width:420px">
+    <div class="bot-dialog-head"><h3>${icon("settings")} 高级配置</h3>
+      <button class="ghost small-btn" id="adv-err-close">${icon("x")}</button></div>
+    <div class="adv-sec"><p class="hint">读取配置失败：${escapeHtml(msg)}</p>
+      <p class="hint">公网访问偶发超时，点重试通常就好。</p></div>
+    <div class="row" style="justify-content:flex-end"><button class="primary" id="adv-err-retry">重试</button></div>
+  </div>`;
+  document.body.appendChild(ov);
+  ov.addEventListener("click", (e) => { if (e.target === ov) closeAdvConfig(); });
+  $("#adv-err-close").addEventListener("click", closeAdvConfig);
+  $("#adv-err-retry").addEventListener("click", () => { closeAdvConfig(); void openAdvConfig(); });
+}
+
+/**
+ * 拉高级配置需要的四份数据。
+ * 都走快路径：providers 读本地配置、bots 带 skipStatus、connections 纯文件读（都不跑 openclaw CLI）。
+ * connections 必须一起拉：账号下拉靠它，缺了就会错报「该渠道还没有已认证账号」。
+ * **失败会抛出**：原来每个请求各自 `.catch()` 成空数组，弹窗照样画出来但下拉框是空的
+ * （用户看到的「模型/预设加载不出来，关掉重开才好」就是这个）。现在失败即报错 + 可重试。
+ */
+async function fetchAdvData() {
+  const [prov, bots, conn, presets] = await Promise.all([
+    apiGetRetry("/api/providers"),
+    apiGetRetry("/api/bots?skipStatus=1"),
+    apiGetRetry("/api/channels/connections"),
+    apiGetRetry("/api/presets"),
+  ]);
+  // 回填缓存，后续开弹窗可以秒开
+  apiCache.set("/api/providers", { data: prov, ts: Date.now(), inflight: null });
+  apiCache.set("/api/bots?skipStatus=1", { data: bots, ts: Date.now(), inflight: null });
+  apiCache.set("/api/presets", { data: presets, ts: Date.now(), inflight: null });
+  return { prov, bots, conn, presets };
+}
+
 async function openAdvConfig() {
   if (!editingCard) return;
   closeAdvConfig();
   closeBotDialog();
   botDialogSlug = editingCard.slug;
-  // 两个都走快路径：providers 读本地配置、bots 带 skipStatus 不跑 openclaw CLI（否则要等 5-15s）
-  const [prov, bots] = await Promise.all([
-    api.get("/api/providers").catch(() => ({ chat: [] })),
-    api.get("/api/bots?skipStatus=1").catch(() => ({ bots: [] })),
-    loadPresetStore(),
-  ]);
+  // 先用缓存立即开窗（公网上四个请求串起来要 1-2s，硬等就是「点了没反应」）；
+  // 缓存缺失才等网络，且失败给明确错误 + 重试，不再静默画空下拉框。
+  const cProv = cachePeek("/api/providers");
+  const cBots = cachePeek("/api/bots?skipStatus=1");
+  const cPresets = cachePeek("/api/presets");
+  let prov = cProv, bots = cBots, conn = botConnections;
+  if (!cProv || !cBots || !cPresets || !conn) {
+    try {
+      const got = await fetchAdvData();
+      prov = got.prov; bots = got.bots; conn = got.conn;
+      presetStoreData = got.presets;
+    } catch (e) {
+      showAdvError(e.message);
+      return;
+    }
+  } else {
+    presetStoreData = cPresets;
+    // 缓存开窗后台静默刷新，数据变了就重开一次（保证不会一直用旧的）
+    void fetchAdvData().then((got) => {
+      const changed = JSON.stringify(got.prov) !== JSON.stringify(cProv)
+        || JSON.stringify(got.presets) !== JSON.stringify(cPresets);
+      if (changed && $("#adv-overlay") && !botLoginTimer) {
+        botConnections = got.conn;
+        presetStoreData = got.presets;
+        openAdvConfig();
+      }
+    }).catch(() => {});
+  }
   // 停用的提供商不出现在选择框里
   advChatProviders = (prov.chat ?? []).filter((p) => p.enabled !== false);
   botsData = bots;
+  botConnections = conn;
   const bot = (botsData.bots ?? []).find((b) => b.cardSlug === editingCard.slug);
   const cur = editingCard.model ?? {};
   // 未指定时，直接落到真实默认值（第一个启用的提供商 + 它的第一个模型），不显示"默认…"之类提示
@@ -1823,11 +2626,14 @@ async function openAdvConfig() {
     .map((m) => `<option value="${escapeHtml(m)}" ${m === curModel ? "selected" : ""}>${escapeHtml(m)}</option>`)
     .join("") || `<option value=""></option>`;
   const memCfg = editingCard.memoryConfig ?? {};
+  const splitCfg = editingCard.chat?.split ?? { min: 1, max: 7 };
   const enabledTools = new Set(editingCard.tools?.enabled ?? []);
   const ab = editingCard.abilities ?? {};
   const cardPresets = editingCard.presets ?? {};
-  const tierOpts = [`<option value="">（不使用档位）</option>`]
-    .concat(presetStoreData.tiers.map((t) => `<option value="${escapeHtml(t.id)}" ${cardPresets.tier === t.id ? "selected" : ""}>${escapeHtml(t.name)}</option>`))
+  // 档位默认「破甲」：没选过（或选的组已删）就落到 break，不再提供「不使用档位」
+  const curTier = presetStoreData.tiers.some((t) => t.id === cardPresets.tier) ? cardPresets.tier : "break";
+  const tierOpts = presetStoreData.tiers
+    .map((t) => `<option value="${escapeHtml(t.id)}" ${t.id === curTier ? "selected" : ""}>${escapeHtml(t.name)}</option>`)
     .join("");
   const styleOpts = [`<option value="">（不使用风格）</option>`]
     .concat(presetStoreData.styles.map((s) => `<option value="${escapeHtml(s.id)}" ${cardPresets.style === s.id ? "selected" : ""}>${escapeHtml(s.name)}</option>`))
@@ -1857,7 +2663,6 @@ async function openAdvConfig() {
       <div class="cap-toggles">
         ${capBtn("web_search", "联网搜索", enabledTools.has("web_search"))}
         ${capBtn("image_gen", "生图", enabledTools.has("image_gen"))}
-        ${capBtn("memory_save", "记忆", enabledTools.has("memory_save"))}
         ${capBtn("tts", "TTS 朗读", ab.tts === true)}
         ${capBtn("emoji", "表情包", (editingCard.emojiGroups ?? []).length > 0)}
         ${capBtn("life", "主动发消息", (editingCard.life?.intervalHours ?? 0) > 0)}
@@ -1869,7 +2674,10 @@ async function openAdvConfig() {
     <div class="adv-sec">
       <h4>${icon("database")} 记忆</h4>
       <div class="adv-grid2">
-        <label>每几轮总结一次<input id="adv-mem-rounds" type="number" min="1" max="20" value="${memCfg.auto_rounds ?? 10}">（最近 20 轮保护，超额攒够 N 轮总结最早 N 轮；N=1-20）</label>
+        <div class="slider-wrap">
+          <b class="slider-val" id="adv-mem-rounds-label"></b>
+          <input type="range" id="adv-mem-rounds" min="0" max="20" step="1" value="${memCfg.auto_rounds ?? 5}">
+        </div>
       </div>
     </div>
 
@@ -1882,11 +2690,20 @@ async function openAdvConfig() {
     </div>
 
     <div class="adv-sec">
-      <h4>${icon("bot")} 接入 QQ / 微信</h4>
-      <div id="bot-dialog-body"></div>
+      <h4>${icon("message")} 回复拆条</h4>
+      <div class="adv-grid2">
+        <label>最少条数<input type="number" id="adv-split-min" min="${SPLIT_RANGE.min}" max="${SPLIT_RANGE.max}" step="1" value="${splitCfg.min}"></label>
+        <label>最多条数<input type="number" id="adv-split-max" min="${SPLIT_RANGE.min}" max="${SPLIT_RANGE.max}" step="1" value="${splitCfg.max}"></label>
+      </div>
     </div>
 
-    <div class="row" style="justify-content:flex-end;margin-top:6px">
+    <div class="adv-sec">
+      <h4>${icon("bot")} 接入 QQ / 微信</h4>
+      <div id="adv-bot-body"></div>
+    </div>
+
+    <div class="adv-foot">
+      <button id="adv-create" class="ghost" hidden>连接 / 创建</button>
       <button id="adv-save" class="primary">保存配置</button>
     </div>
   </div>`;
@@ -1894,6 +2711,9 @@ async function openAdvConfig() {
   ov.addEventListener("click", (e) => { if (e.target === ov) closeAdvConfig(); });
   $("#adv-close").addEventListener("click", closeAdvConfig);
   renderBotBody(bot ?? null);
+  // 底部「连接 / 创建」：只在账号选了「新建」档时出现（其它情况用「保存配置」就能换绑）
+  $("#adv-create").addEventListener("click", () => $("#bot-create")?.click());
+  syncAdvCreateBtn();
   // 有实例时后台补 agent 存活状态（这一步要跑 openclaw CLI，不能挡面板显示）
   if (bot) {
     api.get("/api/bots").then((full) => {
@@ -1910,6 +2730,17 @@ async function openAdvConfig() {
       .map((m) => `<option value="${escapeHtml(m)}">${escapeHtml(m)}</option>`)
       .join("") || `<option value=""></option>`;
   });
+  // 记忆滑杆：标签跟随滑块位置（0=关闭在最左，其他显示轮数）
+  const memSlider = $("#adv-mem-rounds"), memLabel = $("#adv-mem-rounds-label");
+  if (memSlider && memLabel) {
+    const syncMemLabel = () => {
+      const v = Number(memSlider.value);
+      memLabel.textContent = v === 0 ? "关闭" : v + " 轮";
+      memLabel.style.left = (v / 20) * 100 + "%";
+    };
+    syncMemLabel();
+    memSlider.addEventListener("input", syncMemLabel);
+  }
   // 能力：点一下切换高亮（表情包/主动发消息除外——它们弹配置框）
   ov.querySelectorAll(".cap-toggle").forEach((b) =>
     b.addEventListener("click", () => {
@@ -1925,7 +2756,7 @@ async function openAdvConfig() {
   }
   // 已选分组的卡：回显分组名
   if ((editingCard.emojiGroups ?? []).length) {
-    api.get("/api/emojis").then((r) => {
+    cachedGet("/api/emojis").then((r) => {
       if (!$("#adv-overlay")) return;
       const names = (editingCard.emojiGroups ?? [])
         .map((id) => (r.groups ?? []).find((x) => x.id === id)?.name ?? id)
@@ -1944,19 +2775,30 @@ async function openAdvConfig() {
       // 能力：高亮的即启用（tts 归 abilities，其余归 tools.enabled；emoji 是独立字段不进 tools）
       const onCaps = [...ov.querySelectorAll(".cap-toggle.on")].map((b) => b.dataset.cap);
       editingCard.tools = editingCard.tools ?? { enabled: [], policy: "auto", deny: [] };
-      editingCard.tools.enabled = onCaps.filter((c) => c !== "tts" && c !== "emoji");
+      const memRounds = Math.min(20, Math.max(0, Number($("#adv-mem-rounds").value) || 0));
+      // 滑杆归零 = 记忆整体关闭（memory_save 工具一并摘掉）；>0 时自动带上
+      editingCard.tools.enabled = onCaps.filter((c) => c !== "tts" && c !== "emoji" && c !== "memory_save");
+      if (memRounds > 0) editingCard.tools.enabled.push("memory_save");
       editingCard.abilities = { ...(editingCard.abilities ?? {}), tts: onCaps.includes("tts") };
-      editingCard.memoryConfig = {
-        auto_rounds: Math.min(20, Math.max(1, Number($("#adv-mem-rounds").value) || 10)),
-      };
+      editingCard.memoryConfig = { auto_rounds: memRounds };
       editingCard.presets = {
         ...(editingCard.presets ?? {}),
         tier: $("#adv-tier").value || null,
         style: $("#adv-style").value || null,
       };
+      // 回复拆条：min≤max、1≤min、max≤7（后端 schema 再兜底校验）
+      const splitMin = Math.min(SPLIT_RANGE.max, Math.max(SPLIT_RANGE.min, Number($("#adv-split-min").value) || 1));
+      const splitMax = Math.min(SPLIT_RANGE.max, Math.max(splitMin, Number($("#adv-split-max").value) || 7));
+      editingCard.chat = {
+        ...(editingCard.chat ?? {}),
+        split: { min: splitMin, max: splitMax },
+      };
       const res = await api.send(`/api/cards/${editingCard.slug}`, { method: "PUT", body: JSON.stringify(editingCard) });
       editingCard = res.card ?? editingCard;
-      toast("✓ 高级配置已保存 v" + editingCard.version);
+      // 顺带处理账号绑定：选了已认证账号就一并完成连接/换绑（选「新建」档不动，
+      // 那种情况要走二维码，由「连接 / 创建」按钮负责）
+      const botNote = await applyAdvAccountBinding();
+      toast("✓ 高级配置已保存 v" + editingCard.version + (botNote ? "，" + botNote : ""));
       closeAdvConfig();
     } catch (e) {
       toast("保存失败：" + e.message, false);
@@ -1994,6 +2836,17 @@ async function loadCardIntoEditor(slug) {
     $("#card-form-area").innerHTML = cardFormHTML("edit");
     bindCardForm(editingCard, "edit");
     $("#view").scrollTop = 0;
+    // 聊天测试开场白：本地没开场过就显示气泡（和进入工作台一致）
+    const first = editingCard.sillytavern_v2?.first_mes?.trim();
+    if (first && $("#chat-log")) {
+      try {
+        const g = await api.send(`/api/cards/${encodeURIComponent(slug)}/greeting/claim`, {
+          method: "POST",
+          body: JSON.stringify({ userKey: "local" }),
+        });
+        if (g.greeted && g.text) addChatBubble("bot", g.text);
+      } catch { /* 忽略 */ }
+    }
   } catch (e) { toast("加载失败：" + e.message, false); }
 }
 
@@ -2005,6 +2858,7 @@ async function saveCard() {
   try {
     const res = await api.send(`/api/cards/${editingCard.slug}`, { method: "PUT", body: JSON.stringify(editingCard) });
     toast("✓ 已保存 v" + res.card.version);
+    cacheInvalidate("/api/cards");
     loadCardsGrid();
   } catch (e) { toast("保存失败：" + e.message, false); }
 }
@@ -2015,6 +2869,7 @@ async function deleteCardBySlug(slug, name) {
   try {
     await api.send(`/api/cards/${slug}`, { method: "DELETE" });
     toast("已删除");
+    cacheInvalidate("/api/cards", "/api/bots");
     loadCardsGrid();
   } catch (e) { toast("删除失败：" + e.message, false); }
 }
@@ -2037,6 +2892,7 @@ async function importCard() {
     $("#import-file").value = "";
     // 同名卡默认另存不覆盖，告知用户实际入库的名字
     toast(r.renamedFrom ? `✓ 已导入：${r.card.name} · ${r.hint}` : `✓ 已导入：${r.card.name}`);
+    cacheInvalidate("/api/cards");
     await loadCardsGrid();
     loadCardIntoEditor(r.card.slug);
   } catch (e) { toast("导入失败：" + e.message, false); }
@@ -2056,7 +2912,7 @@ function renderCreate() {
           <div class="cf-cover-empty">角色封面</div>
         </div>
         <div class="cf-cover-actions">
-          <label class="btn-like ghost">上传图片<input type="file" id="cf-cover-file" accept=".png,.jpg,.jpeg,.webp" hidden></label>
+          <label class="btn-like ghost small-btn">上传图片<input type="file" id="cf-cover-file" accept=".png,.jpg,.jpeg,.webp" hidden></label>
           <button id="btn-ai-cover" class="ghost small-btn">AI 生成</button>
           <button id="btn-cover-remove" class="ghost small-btn" hidden>移除</button>
         </div>
@@ -2143,7 +2999,7 @@ function removeCover(silent) {
 }
 
 // ---------- AI 辅助做卡 ----------
-/** 做卡页：加载启用中的模型商到 AI 草稿下拉（跟随默认 = 空） */
+/** 做卡页：加载启用中的模型商到 AI 草稿下拉（默认 = 第一个启用的提供商，直接选中可换） */
 async function loadAiDraftProviders() {
   const sel = $("#ai-provider");
   if (!sel) return;
@@ -2151,9 +3007,7 @@ async function loadAiDraftProviders() {
     const prov = await api.get("/api/providers");
     lcProviders = (prov.chat ?? []).filter((p) => p.enabled !== false);
   } catch { lcProviders = []; }
-  sel.innerHTML = [`<option value="">跟随默认</option>`]
-    .concat(lcProviders.map((p) => `<option value="${escapeHtml(p.name)}">${escapeHtml(p.name)}</option>`))
-    .join("");
+  sel.innerHTML = lcProviders.map((p) => `<option value="${escapeHtml(p.name)}">${escapeHtml(p.name)}</option>`).join("");
   fillAiDraftModels(false);
 }
 
@@ -2177,7 +3031,7 @@ async function aiDraft() {
   const btn = $("#btn-ai-draft");
   const msg = $("#ai-msg");
   btn.disabled = true;
-  btn.textContent = "生成中…（约 1 分钟）";
+  btn.textContent = "生成中…（2-5 分钟，内容较多）";
   msg.textContent = "";
   try {
     // 选了具体模型才传（"提供商::模型"），跟随默认则交给后端
@@ -2447,7 +3301,7 @@ function renderImagegen() { return renderImgGenPage(); }
 function renderImgGenPage() {
   return `
   <div class="view">
-    <div class="page-head"><h2>生图配置</h2><p class="hint">网页聊天与 QQ/微信机器人共用这一套生图配置。</p></div>
+    <div class="page-head"><h2>生图配置</h2></div>
     <div class="card-box">
       <div class="form">
         <label>提供商（互斥，开启一个另一个关闭）</label>
@@ -2456,11 +3310,11 @@ function renderImgGenPage() {
           <button type="button" class="cap-toggle" data-provider="openai">OpenAI</button>
         </div>
         <div id="ig-pane-novelai" class="ig-pane">
-          <p class="hint">NovelAI 官方接口在国内直连不通（会报网络错误），需要能访问它的网络环境才能用。国内建议用 OpenAI 兼容那栏。</p>
+          
           <label>API Key（留空 = 保留原值）</label>
           <input id="ig-nai-key" type="password" placeholder="NovelAI 官方 key（pst-… 开头）">
           <div class="artists-box" style="margin-top:10px">
-            <label>画师串（生成时自动拼到提示词末尾。可以存多条，点右边「启用」切换；再点一下取消，取消后就不拼画师串）</label>
+            <label>画师串（仅 NovelAI 生效：生成时自动拼到提示词末尾；OpenAI 兼容生图走纯提示词不拼。可以存多条，点右边「启用」切换；再点一下取消，取消后就不拼）</label>
             <div id="ig-artists-list"></div>
             <button id="ig-artist-add" class="ghost small-btn" style="margin-top:6px">${icon("plus")} 添加画师串</button>
             <div id="ig-artist-edit" style="display:none;margin-top:6px;border:1px dashed var(--border);border-radius:8px;padding:8px">
@@ -2663,6 +3517,7 @@ function deleteArtist(i) {
 async function saveImgConfig() {
   const f = collectImgForm();
   const r = await api.send("/api/image/config", { method: "POST", body: JSON.stringify(f) });
+  cacheInvalidate("/api/image/config");
   if (r.ok) setStatus("#ig-status", "✓ 已保存", true);
   else setStatus("#ig-status", "保存失败：" + (r.error ?? "未知错误"), false);
 }
@@ -2698,6 +3553,7 @@ async function initImgGenPage() {
   $("#ig-save").addEventListener("click", async () => {
     const f = collectImgForm();
     const r = await api.send("/api/image/config", { method: "POST", body: JSON.stringify(f) });
+    cacheInvalidate("/api/image/config");
     if (r.ok) {
       toast(r.hint || "已保存");
       setStatus("#ig-status", "✓ 已保存", true);
@@ -2747,7 +3603,7 @@ async function initImgGenPage() {
         setStatus("#ig-test-status", "生成失败：" + (r.error ?? "未知错误"), false);
       } else {
         setStatus("#ig-test-status", `✓ 生成完成（${r.width}×${r.height}）`, true);
-        $("#ig-test-img").innerHTML = `<img src="${r.url}" alt="测试图" onclick="showLightbox('${r.url}')">`;
+        $("#ig-test-img").innerHTML = `<img src="${r.url}" alt="测试图" data-lb="${escapeHtml(r.url)}" style="cursor:zoom-in">`;
       }
     } catch (e) {
       setStatus("#ig-test-status", "生成失败：" + e.message, false);
@@ -2756,7 +3612,9 @@ async function initImgGenPage() {
     }
   });
   try {
-    const cfg = await api.get("/api/image/config");
+    // 走缓存先填表单（公网上省掉一次 0.5-1.7s 往返）。后台刷新只更新缓存，
+    // 不回填正在编辑的表单（否则会覆盖用户没保存的输入）。
+    const cfg = await cachedGet("/api/image/config");
     fillImgForm(cfg);
   } catch (e) {
     setStatus("#ig-status", "读取配置失败：" + e.message, false);
@@ -2780,7 +3638,7 @@ async function loadImgGallery() {
     }
     box.innerHTML = imgs.map((it) => `
       <div class="ig-item">
-        <img src="${it.url}" alt="${escapeHtml(it.file)}" loading="lazy" onclick="showLightbox('${it.url}')">
+        <img src="${it.url}" alt="${escapeHtml(it.file)}" loading="lazy" data-lb="${escapeHtml(it.url)}" style="cursor:zoom-in">
         <div class="ig-item-meta">${escapeHtml(it.dir)}/${escapeHtml(it.file)}<br>${(it.size / 1024).toFixed(0)} KB</div>
         <button class="danger small-btn" data-del="${it.url}">删除</button>
       </div>`).join("");
@@ -2805,6 +3663,11 @@ function showLightbox(src) {
   ov.addEventListener("click", () => ov.remove());
   document.body.appendChild(ov);
 }
+// data-lb 委托：替代内联 onclick 拼接 URL（URL 含引号时会炸）
+document.addEventListener("click", (e) => {
+  const t = e.target.closest("[data-lb]");
+  if (t) showLightbox(t.dataset.lb);
+});
 
 function initProvidersPage(type) {
   provState = { type, editing: null, allModels: [], selected: [] };
@@ -2819,7 +3682,8 @@ async function loadProvList() {
   const box = $("#prov-list");
   if (!box) return;
   try {
-    const data = await api.get("/api/providers");
+    // 走缓存先渲染，后台刷新到新数据再重绘（公网上省掉一次往返）
+    const data = await cachedGet("/api/providers", () => { if ($("#prov-list")) loadProvList(); });
     const list = provState.type === "chat" ? data.chat : data.image;
     box.innerHTML = "";
     if (!list.length) {
@@ -2856,14 +3720,17 @@ async function loadProvList() {
         else if (b.dataset.act === "del") {
           if (!confirm(`删除提供商 ${name}？`)) return;
           await api.send("/api/providers/delete", { method: "POST", body: JSON.stringify({ type: provState.type, name }) });
+          cacheInvalidate("/api/providers");
           loadProvList();
         } else if (b.dataset.act === "default") {
           await api.send("/api/providers/set-default", { method: "POST", body: JSON.stringify({ type: provState.type, name }) });
+          cacheInvalidate("/api/providers");
           loadProvList();
           toast("✓ 已设为默认");
         } else if (b.dataset.act === "toggle") {
           const turnOn = b.dataset.on === "1";
           await api.send("/api/providers/toggle", { method: "POST", body: JSON.stringify({ type: provState.type, name, enabled: turnOn }) });
+          cacheInvalidate("/api/providers");
           loadProvList();
           toast(turnOn ? `✓ 已启用 ${name}` : `已停用 ${name}（配置保留）`);
         }
@@ -2876,27 +3743,85 @@ async function loadProvList() {
 //  视图：语音合成 TTS（独立页：默认通道/本地兜底 + 提供商管理，同 API 页添加模式）
 // ============================================================
 const TTS_PRESETS = [
-  { kind: "openai", name: "硅基流动", baseUrl: "https://api.siliconflow.cn/v1", voice: "FunAudioLLM/CosyVoice2-0.5B:alex", speed: 1, label: "OpenAI 兼容" },
-  { kind: "openai", name: "OpenAI 官方", baseUrl: "https://api.openai.com/v1", voice: "alloy", speed: 1, label: "OpenAI 兼容" },
-  { kind: "minimax", name: "MiniMax 海螺", baseUrl: "https://api.minimaxi.com/v1", voice: "male-qn-qingse", speed: 1, label: "MiniMax 海螺（t2a_v2）" },
-  { kind: "volc", name: "火山豆包", baseUrl: "https://openspeech.bytedance.com/api/v3/tts/unidirectional", voice: "zh_female_qingxin_mars_bigtts", speed: 1, label: "火山豆包（openspeech V3）" },
-  { kind: "openai", name: "", baseUrl: "", voice: "", speed: 1, label: "自定义 OpenAI 兼容" },
+  { kind: "openai", name: "硅基流动", baseUrl: "https://api.siliconflow.cn/v1", model: "FunAudioLLM/CosyVoice2-0.5B", voice: "FunAudioLLM/CosyVoice2-0.5B:alex", speed: 1, label: "OpenAI 兼容" },
+  { kind: "openai", name: "OpenAI 官方", baseUrl: "https://api.openai.com/v1", model: "gpt-4o-mini-tts", voice: "alloy", speed: 1, label: "OpenAI 兼容", models: ["gpt-4o-mini-tts", "gpt-4o-tts", "tts-1", "tts-1-hd"], voices: [{ id: "alloy", label: "Alloy" }, { id: "echo", label: "Echo" }, { id: "fable", label: "Fable" }, { id: "onyx", label: "Onyx" }, { id: "nova", label: "Nova" }, { id: "shimmer", label: "Shimmer" }] },
+  { kind: "openai", name: "Gemini", baseUrl: "https://generativelanguage.googleapis.com/v1beta/openai", model: "gemini-2.5-flash-preview-tts", voice: "Kore", speed: 1, label: "OpenAI 兼容", models: ["gemini-2.5-flash-preview-tts", "gemini-2.0-flash-tts"] },
+  { kind: "openai", name: "通义 Qwen", baseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1", model: "qwen-audio-3.0-tts-flash", voice: "longanhuan_v3.6", speed: 1, label: "OpenAI 兼容", models: ["qwen-audio-3.0-tts-flash", "qwen-audio-3.0-tts-plus"], voices: [{ id: "longanfengyue", label: "longanfengyue" }, { id: "longanyuanfei", label: "longanyuanfei" }, { id: "longanlingxi", label: "longanlingxi" }, { id: "longanxiaoxin", label: "longanxiaoxin" }, { id: "longanhuan_v3.6", label: "longanhuan_v3.6" }, { id: "longjielidou_v3.6", label: "longjielidou_v3.6" }, { id: "longpaopao_v3.6", label: "longpaopao_v3.6" }, { id: "longhuohuo_v3.6", label: "longhuohuo_v3.6" }, { id: "longchuanshu_v3.6", label: "longchuanshu_v3.6" }, { id: "loongmary", label: "loongmary" }, { id: "loongeva_v3.6", label: "loongeva_v3.6" }, { id: "loongjohn", label: "loongjohn" }, { id: "longanlingxin", label: "longanlingxin" }, { id: "longanlufeng", label: "longanlufeng" }] },
+  { kind: "openai", name: "Groq", baseUrl: "https://api.groq.com/openai/v1", model: "canopylabs/orpheus-v1-english", voice: "austin", speed: 1, label: "OpenAI 兼容", voices: [{ id: "austin", label: "Austin" }, { id: "natalie", label: "Natalie" }, { id: "kailin", label: "Kailin" }] },
+  { kind: "openai", name: "xAI", baseUrl: "https://api.x.ai/v1", model: "", voice: "eve", speed: 1, label: "OpenAI 兼容", voices: [{ id: "eve", label: "Eve" }, { id: "ara", label: "Ara" }, { id: "rex", label: "Rex" }, { id: "sal", label: "Sal" }, { id: "leo", label: "Leo" }] },
+  { kind: "openai", name: "阶跃 Step", baseUrl: "https://api.stepfun.com/v1", model: "step-tts-mini", voice: "elegantgentle-female", speed: 1, label: "OpenAI 兼容", models: ["step-tts-mini", "step-tts-vivid", "stepaudio-2.5-tts", "step-tts-2"], voices: [{ id: "elegantgentle-female", label: "气质温婉" }, { id: "livelybreezy-female", label: "活力轻快" }, { id: "energeticconfident-female", label: "活力自信" }, { id: "jingdiannvsheng", label: "经典女声" }, { id: "wenroushunv", label: "温柔熟女" }, { id: "tianmeinvsheng", label: "甜美女声" }, { id: "qingchunshaonv", label: "清纯少女" }, { id: "wenrounvsheng", label: "温柔女声" }, { id: "ruanmengnvsheng", label: "软萌女生" }, { id: "youyanvsheng", label: "优雅女生" }, { id: "lengyanyujie", label: "冷艳御姐" }, { id: "shuangkuaijiejie", label: "爽快姐姐" }, { id: "wenjingxuejie", label: "文静学姐" }, { id: "linjiajiejie", label: "邻家姐姐" }, { id: "linjiameimei", label: "邻家妹妹" }, { id: "zhixingjiejie", label: "知性姐姐" }, { id: "cixingnansheng", label: "磁性男声" }, { id: "wenrounansheng", label: "温柔男声" }, { id: "yuanqinansheng", label: "元气男声" }, { id: "zhengpaiqingnian", label: "正派青年" }, { id: "ruyananshi", label: "儒雅男士" }, { id: "boyinnansheng", label: "播音男声" }] },
+  { kind: "minimax", name: "MiniMax 海螺", baseUrl: "https://api.minimaxi.com/v1", model: "speech-2.6-turbo", voice: "female-shaonv", speed: 1, label: "MiniMax 海螺（t2a_v2）", voices: [{ id: "male-qn-qingse", label: "青涩青年（男）" }, { id: "male-qn-jingying", label: "精英青年（男）" }, { id: "male-qn-badao", label: "霸道青年（男）" }, { id: "male-qn-daxuesheng", label: "大学生（男）" }, { id: "female-shaonv", label: "少女" }, { id: "female-yujie", label: "御姐" }, { id: "female-chengshu", label: "成熟女声" }, { id: "female-tianmei", label: "甜美女声" }, { id: "audiobook_male_1", label: "有声书男 1" }, { id: "audiobook_female_1", label: "有声书女 1" }, { id: "cartoon_pig", label: "卡通小猪" }] },
+  { kind: "volc", name: "火山豆包", baseUrl: "https://openspeech.bytedance.com/api/v3/tts/unidirectional", model: "seed-tts-2.0", voice: "zh_female_qingxin_mars_bigtts", speed: 1, label: "火山豆包（openspeech V3）" },
+  { kind: "mimo", name: "小米 MiMo", baseUrl: "https://api.xiaomimimo.com/v1", model: "mimo-v2.5-tts", voice: "mimo_default", speed: 1, label: "小米 MiMo（SSE 流式）", models: ["mimo-v2.5-tts", "mimo-v2-tts"], voices: [{ id: "mimo_default", label: "默认" }, { id: "冰糖", label: "冰糖" }, { id: "茉莉", label: "茉莉" }, { id: "苏打", label: "苏打" }, { id: "白桦", label: "白桦" }, { id: "Mia", label: "Mia" }, { id: "Chloe", label: "Chloe" }, { id: "Milo", label: "Milo" }, { id: "Dean", label: "Dean" }] },
+  { kind: "elevenlabs", name: "ElevenLabs", baseUrl: "https://api.elevenlabs.io/v1", model: "eleven_multilingual_v2", voice: "JBFqnCBsd6RMkjVDRZzb", speed: 1, label: "ElevenLabs", models: ["eleven_multilingual_v2", "eleven_v3", "eleven_flash_v2_5"] },
+  { kind: "fishaudio", name: "Fish Audio", baseUrl: "https://api.fish.audio/v1", model: "s2.1-pro", voice: "", speed: 1, label: "Fish Audio", models: ["s2.1-pro", "s2.1-pro-free", "s2-pro", "s1"] },
+  { kind: "openai", name: "", baseUrl: "", model: "", voice: "", speed: 1, label: "自定义 OpenAI 兼容" },
 ];
-const TTS_KIND_LABEL = { openai: "OpenAI 兼容", minimax: "MiniMax 海螺（t2a_v2）", volc: "火山豆包（openspeech V3）" };
+const TTS_KIND_LABEL = {
+  openai: "OpenAI 兼容", minimax: "MiniMax 海螺（t2a_v2）", volc: "火山豆包（openspeech V3）",
+  mimo: "小米 MiMo", elevenlabs: "ElevenLabs", fishaudio: "Fish Audio",
+};
 
 function renderTtsPage() {
   return `
   <div class="view">
-    <div class="page-head"><h2>语音合成</h2><p class="hint">配置 TTS 上游与本地兜底；聊天气泡右上角的喇叭可朗读回复。</p></div>
+    <div class="page-head"><h2>语音合成</h2></div>
 
     <div class="card-box">
-      <h3>默认通道与本地兜底</h3>
+      <h3>TTS 通道</h3>
+      <div id="tts-prov-list"><div class="muted">加载中…</div></div>
+      <button id="tts-prov-add" class="primary" style="margin-top:10px">${icon("plus")} 添加提供商</button>
+      <div id="tts-prov-form" class="card-box" style="display:none;margin-top:12px">
+        <h3 id="tts-pv-title">添加提供商</h3>
+        <div class="form">
+          <div class="cf-grid2">
+            <div><label>选择 TTS 服务商</label>
+              <select id="tts-pv-preset">
+                <option value="">— 选择 —</option>
+                ${TTS_PRESETS.map((p, i) => `<option value="${i}">${p.name || p.label}</option>`).join("")}
+              </select>
+            </div>
+            <div><label>名称</label><input id="tts-pv-name" placeholder="如 硅基流动"></div>
+          </div>
+          <div class="cf-grid2">
+            <div><label>Base URL</label><input id="tts-pv-url" placeholder="OpenAI 兼容以 /v1 结尾；豆包填完整接口地址"></div>
+            <div><label>API Key（编辑留空=保留）</label><input id="tts-pv-key" type="password"></div>
+          </div>
+          <div class="cf-grid2" id="tts-pv-appid-wrap" style="display:none">
+            <div><label>App ID（仅火山豆包旧版鉴权）</label><input id="tts-pv-appid" placeholder="豆包新版单 Key 鉴权留空"></div>
+            <div></div>
+          </div>
+          <div class="cf-grid2">
+            <div>
+              <label>模型</label><input id="tts-pv-model" placeholder="选服务商自动填入，可手改">
+            </div>
+            <div>
+              <label>音色</label>
+              <div class="tts-combo">
+                <input id="tts-pv-voice" placeholder="点右侧箭头选官方音色，或手输">
+                <button type="button" class="tts-combo-btn" id="tts-pv-voice-btn" title="官方音色列表">▾</button>
+                <div class="tts-combo-menu" id="tts-pv-voice-menu" style="display:none"></div>
+              </div>
+            </div>
+          </div>
+          <div class="cf-grid">
+            <div><label>语速 (0.25~4)</label><input id="tts-pv-speed" type="number" step="0.1" value="1"></div>
+            <div></div><div></div>
+          </div>
+          <div class="row">
+            <button id="tts-pv-save" class="primary">保存</button>
+            <button id="tts-pv-fetch" class="ghost">拉取</button>
+            <button id="tts-pv-cancel" class="ghost">取消</button>
+          </div>
+          <div id="tts-pv-msg" class="status"></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card-box" id="tts-local-box" style="display:none">
+      <h3>本地语音设置</h3>
       <div class="form">
         <div class="cf-grid">
-          <div>
-            <label>默认合成通道</label>
-            <select id="tts-default"></select>
-          </div>
           <div>
             <label>本地引擎</label>
             <select id="tts-local-engine">
@@ -2918,58 +3843,8 @@ function renderTtsPage() {
           </div>
         </div>
         <div class="row">
-          <button id="tts-save-local" class="primary">保存设置</button>
+          <button id="tts-save-local" class="primary">保存本地设置</button>
           <button id="tts-test-local" class="ghost">测试本地</button>
-          <span id="tts-test-msg" class="status"></span>
-        </div>
-      </div>
-    </div>
-
-    <div class="card-box">
-      <h3>TTS 提供商 <span class="hint">选择服务商 → 填 Key → 自动拉取模型与音色</span></h3>
-      <div id="tts-prov-list"></div>
-      <button id="tts-prov-add" class="primary" style="margin-top:10px">${icon("plus")} 添加提供商</button>
-      <div id="tts-prov-form" class="card-box" style="display:none;margin-top:12px">
-        <h3 id="tts-pv-title">添加提供商</h3>
-        <div class="form">
-          <div class="cf-grid2">
-            <div><label>选择 TTS 服务商</label>
-              <select id="tts-pv-preset">
-                <option value="">— 选择 —</option>
-                ${TTS_PRESETS.map((p, i) => `<option value="${i}">${p.name || p.label}</option>`).join("")}
-              </select>
-            </div>
-            <div><label>协议</label><input id="tts-pv-kind" readonly placeholder="选择服务商后自动填入"></div>
-          </div>
-          <div class="cf-grid2">
-            <div><label>名称</label><input id="tts-pv-name" placeholder="如 硅基流动"></div>
-            <div><label>Base URL</label><input id="tts-pv-url" placeholder="OpenAI 兼容以 /v1 结尾；豆包填完整接口地址"></div>
-          </div>
-          <div class="cf-grid2">
-            <div><label>API Key（编辑留空=保留）</label><input id="tts-pv-key" type="password"></div>
-            <div><label>App ID（仅火山豆包旧版鉴权）</label><input id="tts-pv-appid" placeholder="豆包新版单 Key 鉴权留空"></div>
-          </div>
-          <div class="cf-grid2">
-            <div><label>默认模型</label><input id="tts-pv-model" placeholder="保存并拉取后点选填入"></div>
-            <div><label>默认音色</label><input id="tts-pv-voice" placeholder="如 FunAudioLLM/CosyVoice2-0.5B:alex"></div>
-          </div>
-          <div class="cf-grid">
-            <div><label>语速 (0.25~4)</label><input id="tts-pv-speed" type="number" step="0.1" value="1"></div>
-            <div></div><div></div>
-          </div>
-          <label class="row"><input id="tts-pv-enabled" type="checkbox" checked> 启用此提供商（未启用时默认通道自动兜底本地）</label>
-          <div class="row">
-            <button id="tts-pv-save-fetch" class="primary">保存并拉取模型</button>
-            <button id="tts-pv-done" class="ghost" style="display:none">完成</button>
-            <button id="tts-pv-cancel" class="ghost">取消</button>
-          </div>
-          <div id="tts-pv-msg" class="status"></div>
-          <div id="tts-pv-fetch" style="display:none">
-            <label>拉取到的模型（点击填入「默认模型」）</label>
-            <div id="tts-pv-models" class="model-chips"></div>
-            <label>音色（如有，点击填入「默认音色」）</label>
-            <div id="tts-pv-voices" class="model-chips"></div>
-          </div>
         </div>
       </div>
     </div>
@@ -2981,34 +3856,48 @@ function renderTtsPage() {
   </div>`;
 }
 
-let ttsState = { providers: [], commonVoices: [], editingId: null, models: [], voices: [], editKind: "openai" };
+let ttsState = { providers: [], commonVoices: [], editingId: null, models: [], voices: [], editKind: "openai", defProvider: "local", localEngine: "edge", localVoice: "" };
 
 async function initTtsPage() {
-  ttsState = { providers: [], commonVoices: [], editingId: null, models: [], voices: [], editKind: "openai" };
+  ttsState = { providers: [], commonVoices: [], editingId: null, models: [], voices: [], editKind: "openai", defProvider: "local", localEngine: "edge", localVoice: "" };
   $("#tts-save-local").addEventListener("click", saveTtsLocal);
   $("#tts-test-local").addEventListener("click", () => testTtsTarget("local"));
   $("#tts-prov-add").addEventListener("click", () => showTtsProvForm(null));
   $("#tts-pv-cancel").addEventListener("click", () => ($("#tts-prov-form").style.display = "none"));
   $("#tts-pv-preset").addEventListener("change", ttsApplyPreset);
-  $("#tts-pv-save-fetch").addEventListener("click", ttsProvSaveAndFetch);
-  $("#tts-pv-done").addEventListener("click", saveTtsProvider);
-  $("#tts-default").addEventListener("change", async (e) => {
-    await saveTtsConfigOnly({ defaultProvider: e.target.value });
-    toast("✓ 默认通道已切换");
+  $("#tts-pv-save").addEventListener("click", saveTtsProvider);
+  $("#tts-pv-fetch").addEventListener("click", ttsProvFetch);
+  // 音色 combo：右侧箭头弹出官方音色列表，点选填入；点外部关闭
+  $("#tts-pv-voice-btn").addEventListener("click", (e) => {
+    e.stopPropagation();
+    const menu = $("#tts-pv-voice-menu");
+    const open = menu.style.display !== "none";
+    document.querySelectorAll(".tts-combo-menu").forEach((m) => (m.style.display = "none"));
+    if (!open) renderTtsVoiceMenu();
+    menu.style.display = open ? "none" : "block";
   });
+  // 音色 combo：右侧箭头弹出官方音色列表，点选填入；点外部关闭（document 监听只绑一次，防多次进出页面叠加）
+  if (!window.__ttsComboDocBound) {
+    window.__ttsComboDocBound = true;
+    document.addEventListener("click", (e) => {
+      if (!e.target.closest?.(".tts-combo")) {
+        document.querySelectorAll(".tts-combo-menu").forEach((m) => (m.style.display = "none"));
+      }
+    });
+  }
   await loadTtsConfig();
 }
 
 async function loadTtsConfig() {
   try {
-    const cfg = await api.get("/api/tts/config");
+    // 走缓存先渲染（公网上省掉一次往返）。后台刷新拿到新数据时只更新缓存，
+    // 不在回调里再调本函数（会递归），下次进页面自然用到新值。
+    const cfg = await cachedGet("/api/tts/config");
     ttsState.providers = cfg.providers || [];
     ttsState.commonVoices = cfg.commonVoices || [];
-    const sel = $("#tts-default");
-    sel.innerHTML =
-      '<option value="local">本地兜底</option>' +
-      (cfg.providers || []).map((p) => `<option value="${escapeHtml(p.id)}">${escapeHtml(p.name)}${p.enabled ? "" : "（未启用）"}</option>`).join("");
-    sel.value = cfg.defaultProvider || "local";
+    ttsState.defProvider = cfg.defaultProvider || "local";
+    ttsState.localEngine = cfg.local?.engine || "edge";
+    ttsState.localVoice = cfg.local?.voice || "";
     $("#tts-local-engine").value = cfg.local?.engine || "edge";
     const vSel = $("#tts-local-voice");
     vSel.innerHTML = (cfg.commonVoices || []).map((v) => `<option value="${escapeHtml(v.id)}">${escapeHtml(v.label)}</option>`).join("");
@@ -3022,56 +3911,113 @@ async function loadTtsConfig() {
   }
 }
 
+function ttsKindTag(kind) {
+  return TTS_KIND_LABEL[kind] || "OpenAI 兼容";
+}
+
+/** 单选列表：本地条目固定最前，其余是各提供商；radio 选中 = 当前生效通道（同一时间只开一个） */
 function renderTtsProviders() {
   const box = $("#tts-prov-list");
   if (!box) return;
-  if (!ttsState.providers.length) {
-    box.innerHTML = '<div class="card-box muted">还没有 TTS 提供商，点下方按钮添加（如 硅基流动）</div>';
-    return;
-  }
-  box.innerHTML = "";
-  ttsState.providers.forEach((p) => {
-    const d = document.createElement("div");
-    d.className = "prov-item";
-    d.innerHTML = `
-      <div class="prov-head">
-        <b>${escapeHtml(p.name)}</b>
-        ${p.enabled ? '<span class="chip ok">启用</span>' : '<span class="chip">停用</span>'}
-        <span class="prov-btns">
-          <button class="ghost small-btn" data-act="test">测试</button>
-          <button class="ghost small-btn" data-act="edit">编辑</button>
-          <button class="danger small-btn" data-act="del">删除</button>
-        </span>
-      </div>
-      <div class="meta">${escapeHtml(p.baseUrl)} · key ${p.key ? "••••••" : "未填"} · ${escapeHtml(TTS_KIND_LABEL[p.kind] || p.kind || "openai")}</div>
-      <div class="meta">模型 ${escapeHtml(p.model || "—")} · 音色 ${escapeHtml(p.voice || "—")} · 语速 ${p.speed ?? 1}</div>`;
-    box.appendChild(d);
-    d.querySelectorAll("button[data-act]").forEach((b) =>
-      b.addEventListener("click", async () => {
-        if (b.dataset.act === "test") testTtsTarget(p.id);
-        else if (b.dataset.act === "edit") showTtsProvForm(p);
-        else if (b.dataset.act === "del") {
-          if (!confirm(`删除提供商 ${p.name}？`)) return;
-          await api.send(`/api/tts/providers/${p.id}`, { method: "DELETE" });
-          toast("✓ 已删除");
-          loadTtsConfig();
-        }
-      })
-    );
+  const cur = ttsState.defProvider ?? "local";
+  const rows = [];
+
+  // 本地条目（Edge/SAPI 也算一个可选项，编辑/试听与普通提供商一致）
+  rows.push(ttsRowHtml({
+    id: "local",
+    name: "本地（" + (ttsState.localEngine === "sapi" ? "Windows SAPI 离线" : "Edge 在线免费") + "）",
+    kind: "local",
+    selected: cur === "local",
+  }));
+
+  (ttsState.providers || []).forEach((p) => {
+    rows.push(ttsRowHtml({
+      id: p.id,
+      name: p.name,
+      kind: p.kind,
+      selected: cur === p.id,
+    }));
   });
+
+  if (!rows.length) box.innerHTML = '<div class="card-box muted">还没有 TTS 提供商，点下方按钮添加（如 硅基流动）</div>';
+  else box.innerHTML = rows.join("");
+
+  // 事件：最右「使用」小按键 = 切换当前通道；按钮：试听/编辑/删除/本地编辑
+  box.querySelectorAll("[data-tts-use]").forEach((b) =>
+    b.addEventListener("click", async () => {
+      const target = b.dataset.ttsUse;
+      await saveTtsConfigOnly({ defaultProvider: target });
+      ttsState.defProvider = target;
+      toast(target === "local" ? "✓ 当前通道：本地" : "✓ 当前通道已切换");
+      renderTtsProviders();
+    })
+  );
+  box.querySelectorAll("[data-act]").forEach((b) =>
+    b.addEventListener("click", async () => {
+      const act = b.dataset.act;
+      if (act === "test") testTtsTarget(b.dataset.target);
+      else if (act === "edit") {
+        if (b.dataset.target === "local") {
+          $("#tts-local-box").style.display = "block";
+          $("#tts-local-box").scrollIntoView({ behavior: "smooth", block: "nearest" });
+        } else {
+          const p = ttsState.providers.find((x) => x.id === b.dataset.target);
+          if (p) showTtsProvForm(p);
+        }
+      } else if (act === "del") {
+        const p = ttsState.providers.find((x) => x.id === b.dataset.target);
+        if (!p || !confirm(`删除提供商「${p.name}」？`)) return;
+        await api.send(`/api/tts/providers/${p.id}`, { method: "DELETE" });
+        toast("✓ 已删除");
+        loadTtsConfig();
+      }
+    })
+  );
 }
 
+function ttsRowHtml({ id, name, kind, selected }) {
+  return `<div class="prov-item${selected ? " on" : ""}">
+    <div class="prov-head">
+      <b>${escapeHtml(name)}</b>
+      <span class="chip">${ttsKindTag(kind)}</span>
+      <span class="prov-btns">
+        <button type="button" class="ghost small-btn" data-act="test" data-target="${escapeHtml(id)}">试听</button>
+        <button type="button" class="ghost small-btn" data-act="edit" data-target="${escapeHtml(id)}">编辑</button>
+        ${kind !== "local" ? `<button type="button" class="danger small-btn" data-act="del" data-target="${escapeHtml(id)}">删除</button>` : ""}
+        <button type="button" class="tts-use-btn${selected ? " on" : ""}" data-tts-use="${escapeHtml(id)}" title="设为当前通道"></button>
+      </span>
+    </div>
+    <div class="tts-player" data-player="${escapeHtml(id)}" style="display:none"></div>
+  </div>`;
+}
+
+/** 试听：合成后出播放器（不自动播），可停止；学 rikkahub 的喇叭但用可控播放器形式 */
 async function testTtsTarget(target) {
-  const msg = $("#tts-test-msg");
-  if (msg) { msg.textContent = "测试中…"; msg.className = "status"; }
-  const r = await api.send("/api/tts/test", { method: "POST", body: JSON.stringify({ target }) });
-  if (msg) { msg.textContent = (r.ok ? "✓ " : "✗ ") + r.info; msg.className = "status " + (r.ok ? "ok" : "err"); }
+  const player = document.querySelector(`[data-player="${CSS.escape(target)}"]`);
+  const msgEl = player?.previousElementSibling;
+  if (player) {
+    player.style.display = "block";
+    player.innerHTML = '<span class="status">合成中…</span>';
+  }
+  try {
+    const r = await api.send("/api/tts/test", { method: "POST", body: JSON.stringify({ target }) });
+    if (!player) { toast(r.ok ? r.info : r.info, r.ok); return; }
+    if (!r.ok) {
+      player.innerHTML = `<span class="status err">合成失败：${escapeHtml(r.info)}</span>`;
+      return;
+    }
+    player.innerHTML =
+      `<span class="status ok">${escapeHtml(r.info)}</span>
+       <audio controls preload="metadata" style="width:100%;margin-top:6px"><source src="${r.dataUrl}" type="audio/mpeg">你的浏览器不支持播放</audio>`;
+  } catch (e) {
+    if (player) player.innerHTML = `<span class="status err">测试失败：${escapeHtml(e.message)}</span>`;
+    else toast("测试失败：" + e.message, false);
+  }
 }
 
 async function saveTtsLocal() {
   try {
     await saveTtsConfigOnly({
-      defaultProvider: $("#tts-default").value,
       local: {
         engine: $("#tts-local-engine").value,
         voice: $("#tts-local-voice").value,
@@ -3079,11 +4025,13 @@ async function saveTtsLocal() {
         pitch: $("#tts-local-pitch").value,
       },
     });
-    toast("✓ TTS 设置已保存");
+    toast("✓ 本地设置已保存");
+    loadTtsConfig();
   } catch (e) { toast("保存失败：" + e.message, false); }
 }
 
 async function saveTtsConfigOnly(body) {
+  cacheInvalidate("/api/tts/config"); // 所有 TTS 写操作的统一出口，改完让缓存失效
   return api.send("/api/tts/config", { method: "POST", body: JSON.stringify(body) });
 }
 
@@ -3102,18 +4050,16 @@ function showTtsProvForm(p) {
   // 已配置过密钥：点表示已添加（留空保存 = 保留原值），避免用户以为密钥丢了
   $("#tts-pv-key").placeholder = p?.key ? "•••••• 已设置（留空保留）" : "sk-...";
   $("#tts-pv-speed").value = p?.speed ?? 1;
-  $("#tts-pv-enabled").checked = p ? p.enabled : true;
-  // 服务商预设回显：编辑时 kind+baseUrl 都匹配才选中，否则归「自定义」；新添加默认「— 选择 —」让用户先选
+  // 服务商预设回显：编辑时 kind 匹配就选中（预填官方模型/音色），否则归「自定义」
   if (p) {
     const idx = TTS_PRESETS.findIndex((x) => x.kind === p.kind && x.baseUrl && x.baseUrl === p.baseUrl);
     $("#tts-pv-preset").value = idx >= 0 ? String(idx) : String(TTS_PRESETS.length - 1);
   } else {
     $("#tts-pv-preset").value = "";
   }
-  $("#tts-pv-kind").value = TTS_KIND_LABEL[ttsState.editKind] || "OpenAI 兼容";
-  $("#tts-pv-fetch").style.display = "none";
-  $("#tts-pv-done").style.display = "none";
   $("#tts-pv-msg").textContent = "";
+  $("#tts-pv-appid-wrap").style.display = ttsFormKind() === "volc" ? "" : "none"; // App ID 只豆包显示
+  $("#tts-pv-voice-menu").style.display = "none";
   $("#tts-prov-form").style.display = "block";
 }
 
@@ -3135,7 +4081,7 @@ function ttsFormBody() {
     voice: $("#tts-pv-voice").value.trim(),
     key: $("#tts-pv-key").value.trim(),
     speed: Number($("#tts-pv-speed").value) || 1,
-    enabled: $("#tts-pv-enabled").checked,
+    enabled: true, // 单选机制：保存后一律启用，defaultProvider 由列表单选控制
   };
 }
 
@@ -3147,63 +4093,59 @@ function ttsApplyPreset() {
   ttsState.editKind = p.kind;
   $("#tts-pv-name").value = p.name;
   $("#tts-pv-url").value = p.baseUrl;
-  $("#tts-pv-kind").value = p.label;
-  $("#tts-pv-voice").value = p.voice;
-  $("#tts-pv-speed").value = p.speed;
+  $("#tts-pv-model").value = p.model || "";
+  $("#tts-pv-voice").value = p.voice || "";
+  $("#tts-pv-speed").value = p.speed ?? 1;
   $("#tts-pv-key").value = "";
-  $("#tts-pv-model").value = "";
   $("#tts-pv-appid").value = "";
-  ttsState.models = [];
-  ttsState.voices = [];
-  $("#tts-pv-fetch").style.display = "none";
-  $("#tts-pv-done").style.display = "none";
   $("#tts-pv-msg").textContent = "";
+  $("#tts-pv-appid-wrap").style.display = p.kind === "volc" ? "" : "none"; // App ID 只豆包显示
+  // 官方音色列表进下拉菜单（输入框右侧箭头点开可选，也可手输）
+  ttsState.voices = p.voices || (p.voice ? [{ id: p.voice, label: p.voice }] : []);
+  $("#tts-pv-voice-menu").style.display = "none";
 }
 
-async function ttsProvSaveAndFetch() {
+// 拉取官方模型/音色（openai 兼容走 /models；其他走内置预置）
+async function ttsProvFetch() {
   const body = ttsFormBody();
-  if (!body.name || !body.baseUrl) { toast("名称 / Base URL 必填", false); return; }
-  $("#tts-pv-msg").textContent = "保存中，随后拉取模型…";
+  if (!body.baseUrl) { toast("Base URL 必填", false); return; }
+  $("#tts-pv-msg").textContent = "拉取中…";
   try {
-    const r = await api.send("/api/tts/providers", { method: "POST", body: JSON.stringify(body) });
-    if (r.id) ttsState.editingId = r.id;
     const fr = await api.send("/api/tts/fetch-models", {
       method: "POST",
-      body: JSON.stringify({ id: ttsState.editingId, kind: body.kind, baseUrl: body.baseUrl, key: body.key || undefined }),
+      body: JSON.stringify({ id: body.id, kind: body.kind, baseUrl: body.baseUrl, key: body.key || undefined }),
     });
     ttsState.models = fr.models || [];
     ttsState.voices = fr.voices || [];
-    renderTtsChips("#tts-pv-models", ttsState.models, "#tts-pv-model", body.model);
-    renderTtsChips("#tts-pv-voices", ttsState.voices, "#tts-pv-voice", body.voice);
-    $("#tts-pv-fetch").style.display = "block";
-    $("#tts-pv-done").style.display = "inline-block";
-    $("#tts-pv-msg").textContent = ttsState.models.length
-      ? `✓ 已保存；拉取到 ${ttsState.models.length} 个模型${ttsState.voices.length ? `、${ttsState.voices.length} 个音色` : ""}。点击模型/音色填入后点「完成」`
-      : "✓ 已保存；该接口没返回模型，请在「默认模型/默认音色」手动填写后点「完成」";
-    loadTtsConfig();
+    $("#tts-pv-msg").textContent = `✓ 拉取到 ${ttsState.models.length} 个模型${ttsState.voices.length ? `、${ttsState.voices.length} 个音色` : ""}。模型可直接填在「模型」框，音色点右侧箭头选择`;
+    renderTtsVoiceMenu();
   } catch (e) {
-    $("#tts-pv-msg").textContent = "拉取失败：" + e.message + "——可手动填写「默认模型/默认音色」后点「完成」保存";
-    $("#tts-pv-done").style.display = "inline-block";
+    $("#tts-pv-msg").textContent = "拉取失败：" + e.message + "——可手动填写「模型/音色」后保存";
   }
 }
 
-function renderTtsChips(boxId, items, inputId, chosen) {
-  const box = $(boxId[0] === "#" ? boxId : "#" + boxId);
-  if (!box) return;
-  if (!items || !items.length) { box.innerHTML = '<div class="hint">（无，手动填写上方输入框）</div>'; return; }
-  box.innerHTML = "";
+/** 填充音色下拉菜单（输入框右侧箭头点开）；items 可为字符串数组或 {id,label} 数组 */
+function renderTtsVoiceMenu() {
+  const menu = $("#tts-pv-voice-menu");
+  if (!menu) return;
+  const items = ttsState.voices || [];
+  if (!items.length) {
+    menu.innerHTML = '<div class="tts-combo-empty">（暂无官方音色列表，手动填写上方输入框）</div>';
+    return;
+  }
+  menu.innerHTML = "";
   items.forEach((m) => {
-    const chip = document.createElement("button");
-    chip.type = "button";
-    chip.className = "model-chip" + (m === chosen ? " on" : "");
-    chip.textContent = m;
-    chip.addEventListener("click", () => {
-      const inp = $(inputId[0] === "#" ? inputId : "#" + inputId);
-      if (inp) inp.value = m;
-      box.querySelectorAll(".model-chip").forEach((c) => c.classList.remove("on"));
-      chip.classList.add("on");
+    const id = typeof m === "string" ? m : m.id;
+    const label = typeof m === "string" ? m : m.label;
+    const item = document.createElement("button");
+    item.type = "button";
+    item.className = "tts-combo-item";
+    item.textContent = label && label !== id ? `${label} · ${id}` : id;
+    item.addEventListener("click", () => {
+      $("#tts-pv-voice").value = id;
+      menu.style.display = "none";
     });
-    box.appendChild(chip);
+    menu.appendChild(item);
   });
 }
 
@@ -3281,6 +4223,7 @@ async function provSaveAndFetch() {
     renderModelChips();
     $("#pv-models-wrap").style.display = "block";
     $("#pv-fetch-msg").textContent = `✓ 拉取到 ${r.models.length} 个模型`;
+    cacheInvalidate("/api/providers");
     loadProvList();
   } catch (e) {
     $("#pv-fetch-msg").textContent = "失败：" + e.message;
@@ -3316,6 +4259,7 @@ async function provDone() {
     });
     $("#prov-form").style.display = "none";
     toast("✓ 已保存");
+    cacheInvalidate("/api/providers");
     loadProvList();
   } catch (e) { toast("保存失败：" + e.message, false); }
 }
@@ -3342,7 +4286,7 @@ function fmtTime(iso) {
 function renderMemory() {
   return `
   <div class="view">
-    <div class="page-head"><h2>记忆</h2><p class="hint">每张卡独立的长期记忆（由聊天自动总结生成，可单条编辑/删除）。自动总结：最近 20 轮对话保护不总结，之后每攒够 N 轮（1-20）总结最早 N 轮，每段只总结一次。顶部「关键记忆」为必须长期遵守的约定</p></div>
+    <div class="page-head"><h2>记忆</h2></div>
     <div id="mem-cards-head" class="mem-cards-head">选择角色卡</div>
     <div id="mem-cards" class="card-grid"></div>
     <div id="mem-detail" class="card-box" style="display:none">
@@ -3352,12 +4296,22 @@ function renderMemory() {
         <button id="mem-save-rounds" class="primary small-btn">保存</button>
         <button id="mem-clear" class="danger small-btn">清空此卡记忆</button>
       </div>
-      <input id="mem-search" type="text" placeholder="搜索记忆…" style="width:100%">
-      <div id="mem-key-section" class="mem-key-section" style="display:none">
-        <div class="mem-sec-head"><span class="mem-sec-icon">${icon("shield")}</span> 关键记忆（必须遵守）</div>
-        <div id="mem-key-entries" class="small-out" style="padding:4px 10px"></div>
+      <div class="mem-tabs">
+        <button id="mem-tab-solo" class="mem-tab on" type="button">单聊记忆</button>
+        <button id="mem-tab-group" class="mem-tab" type="button">群聊记录</button>
       </div>
-      <div id="mem-entries" class="small-out tall" style="max-height:520px;padding:4px 10px"></div>
+      <div id="mem-solo-pane">
+        <input id="mem-search" type="text" placeholder="搜索记忆…" style="width:100%">
+        <div id="mem-key-section" class="mem-key-section" style="display:none">
+          <div class="mem-sec-head"><span class="mem-sec-icon">${icon("shield")}</span> 关键记忆（必须遵守）</div>
+          <div id="mem-key-entries" class="small-out" style="padding:4px 10px"></div>
+        </div>
+        <div id="mem-entries" class="small-out tall" style="max-height:520px;padding:4px 10px"></div>
+      </div>
+      <div id="mem-group-pane" hidden>
+        <p class="hint">群聊记录与单聊/网页完全分开存放，只按人名存原文、不做总结。这里不展示聊天内容，只能整群删除。</p>
+        <div id="mem-groups" class="mem-group-list"></div>
+      </div>
     </div>
   </div>`;
 }
@@ -3365,7 +4319,7 @@ function renderMemory() {
 let memCard = null;
 function initMemory() {
   (async () => {
-    const { cards } = await api.get("/api/cards");
+    const { cards } = await cachedGet("/api/cards");
     const box = $("#mem-cards");
     box.innerHTML = "";
     if (!cards.length) { box.innerHTML = '<div class="muted">还没有卡片</div>'; return; }
@@ -3388,15 +4342,119 @@ function initMemory() {
   $("#mem-clear").addEventListener("click", clearMem);
   $("#mem-search").addEventListener("input", loadMemEntries);
   $("#mem-entries").addEventListener("click", onMemRowClick);
+  $("#mem-groups")?.addEventListener("click", onMemGroupClick);
+  $("#mem-tab-solo")?.addEventListener("click", () => switchMemTab("solo"));
+  $("#mem-tab-group")?.addEventListener("click", () => switchMemTab("group"));
 }
 
 async function openMemDetail(slug) {
   memCard = await api.get(`/api/cards/${slug}`);
   $("#mem-detail").style.display = "block";
   $("#mem-title").textContent = `${memCard.name} 的记忆`;
-  $("#mem-rounds").value = memCard.memoryConfig?.auto_rounds ?? 10;
+  $("#mem-rounds").value = memCard.memoryConfig?.auto_rounds ?? 5;
+  switchMemTab("solo"); // 换卡时回到默认的单聊视图
   await loadMemEntries();
   $("#mem-detail").scrollIntoView({ behavior: "smooth" });
+}
+
+// ---------- 群聊对话记忆（与网页/私聊完全分开，不做总结） ----------
+async function loadMemGroups() {
+  if (!memCard) return;
+  const box = $("#mem-groups");
+  if (!box) return;
+  const r = await api.get(`/api/groupchat/${memCard.slug}`).catch(() => ({ groups: [] }));
+  const groups = r.groups ?? [];
+  if (!groups.length) {
+    box.innerHTML = '<div class="muted" style="padding:12px 0">这张卡还没有群聊记录</div>';
+    return;
+  }
+  // 只显示群名 + 规模；不展示任何聊天内容（用户拍板）。
+  // 「起名」保留：给群成员起的名字会用在 AI 检索与称呼上，属于配置不是聊天内容。
+  box.innerHTML = groups
+    .map(
+      (g) => `<div class="mem-group-item" data-gid="${escapeHtml(g.gid)}">
+        <div class="mem-group-box">
+          <span class="mem-group-name">${escapeHtml(g.name)}</span>
+          <span class="mem-group-meta">${g.turns} 轮 · ${g.members} 人</span>
+        </div>
+        <button class="small-btn ghost" data-act="name" data-gid="${escapeHtml(g.gid)}" title="给群成员起名字（用于 AI 称呼与检索）">起名</button>
+        <button class="small-btn danger" data-act="del" data-gid="${escapeHtml(g.gid)}" title="删除机器人在这个群的全部聊天记录">删除</button>
+      </div>`
+    )
+    .join("");
+}
+
+/** 单聊 / 群聊切换：默认单聊；群聊只列群、不展示内容 */
+function switchMemTab(which) {
+  const solo = which !== "group";
+  $("#mem-solo-pane").hidden = !solo;
+  $("#mem-group-pane").hidden = solo;
+  $("#mem-tab-solo").classList.toggle("on", solo);
+  $("#mem-tab-group").classList.toggle("on", !solo);
+  // 「清空此卡记忆」只对单聊记忆有效，切到群聊时藏起来避免误解
+  const clr = $("#mem-clear");
+  if (clr) clr.hidden = !solo;
+  const rounds = $("#mem-rounds")?.closest("label");
+  if (rounds) rounds.hidden = !solo;
+  const saveRounds = $("#mem-save-rounds");
+  if (saveRounds) saveRounds.hidden = !solo;
+  if (!solo) void loadMemGroups();
+}
+
+async function onMemGroupClick(ev) {
+  const btn = ev.target.closest("button[data-act]");
+  if (!btn || !memCard) return;
+  const gid = btn.dataset.gid;
+  if (btn.dataset.act === "del") {
+    if (!confirm("删除机器人在这个群的全部聊天记录？\n只影响这个群，单聊/网页记忆不受影响，此操作不可恢复。")) return;
+    await api.send(`/api/groupchat/${memCard.slug}/${encodeURIComponent(gid)}/delete`, { method: "POST", body: "{}" });
+    await loadMemGroups();
+    toast("✓ 已删除该群记录");
+    return;
+  }
+  if (btn.dataset.act === "name") await openGroupMembers(gid);
+}
+
+async function openGroupMembers(gid) {
+  const d = await api.get(`/api/groupchat/${memCard.slug}/${encodeURIComponent(gid)}`).catch(() => null);
+  if (!d) { toast("读取失败", false); return; }
+  const rows = (d.members ?? [])
+    .map(
+      (m) => `<div class="row" style="align-items:center;gap:6px">
+        <input class="gm-name" data-id="${escapeHtml(m.id)}" value="${escapeHtml(m.name)}" placeholder="给这个人起个名字" style="flex:1">
+        <span class="muted" style="font-size:12px">${m.turns} 轮</span>
+      </div>`
+    )
+    .join("");
+  // 注意：wbModal 的确定回调触发时弹窗已被移除，所以先把输入值收集到闭包变量里
+  const pending = [];
+  wbModal(
+    `${escapeHtml(d.meta.name)} · 成员`,
+    `<p class="hint">QQ 开放平台不提供群成员昵称，默认显示成员短码。这里起的名字会用在 AI 的检索与称呼上。</p>
+     <div id="gm-list">${rows || '<div class="muted">还没有人在群里跟她说过话</div>'}</div>`,
+    async () => {
+      for (const { memberId, name } of pending) {
+        await api
+          .send(`/api/groupchat/${memCard.slug}/${encodeURIComponent(gid)}/member`, {
+            method: "POST",
+            body: JSON.stringify({ memberId, name }),
+          })
+          .catch(() => {});
+      }
+      if (pending.length) toast("✓ 已保存成员名字");
+      await loadMemGroups();
+    }
+  );
+  // 输入即记录（弹窗移除后仍能拿到最终值）
+  for (const el of document.querySelectorAll("#gm-list .gm-name")) {
+    el.addEventListener("input", () => {
+      const memberId = el.dataset.id;
+      const name = el.value.trim();
+      const idx = pending.findIndex((p) => p.memberId === memberId);
+      if (idx >= 0) pending[idx].name = name;
+      else pending.push({ memberId, name });
+    });
+  }
 }
 
 async function loadMemEntries() {
@@ -3504,7 +4562,7 @@ async function onMemRowClick(ev) {
 
 async function saveMemRounds() {
   if (!memCard) return;
-  const rounds = Math.min(20, Math.max(1, Number($("#mem-rounds").value) || 10));
+  const rounds = Math.min(20, Math.max(1, Number($("#mem-rounds").value) || 5));
   memCard.memoryConfig = { auto_rounds: rounds };
   try {
     await api.send(`/api/cards/${memCard.slug}`, { method: "PUT", body: JSON.stringify(memCard) });
@@ -3523,7 +4581,9 @@ async function clearMem() {
 //  聊天（模型由服务端按卡解析）
 // ============================================================
 const CHAT_IMG_RE = /(\/img\/[A-Za-z0-9_./-]+\.(?:png|jpe?g|webp|gif))/gi;
+// 半角/全角方括号都认（模型在通道常把 [表情:名] 写成【表情:名】，同步时已转半角，这里双保险）
 const CHAT_EMOJI_RE = /\[表情:([^\]]+)\]/g;
+const CHAT_EMOJI_NORM_RE = /【表情:([^】]+)】/g;
 
 /** 当前聊天用的卡片：卡片编辑器里是 editingCard，工作台里是 wbCardObj */
 function curCard() { return wbCardObj || editingCard; }
@@ -3556,7 +4616,7 @@ function applyRegexScripts(text) {
 let emojiLib = [];
 async function loadEmojiLib() {
   try {
-    const r = await api.get("/api/emojis");
+    const r = await cachedGet("/api/emojis");
     emojiLib = r.emojis ?? [];
   } catch { emojiLib = []; }
   return emojiLib;
@@ -3564,7 +4624,8 @@ async function loadEmojiLib() {
 
 /** 把回复文本渲染进气泡：[表情:名字] → 共享表情库图片；/img/... → 可点击放大的生图；其余纯文本 */
 function appendChatContent(div, text) {
-  const emojiParts = String(text).split(CHAT_EMOJI_RE);
+  // 全角【表情:名】归一化为半角 [表情:名]（通道模型常写全角）
+  const emojiParts = String(text).replace(CHAT_EMOJI_NORM_RE, "[表情:$1]").split(CHAT_EMOJI_RE);
   for (let i = 0; i < emojiParts.length; i++) {
     const seg = emojiParts[i];
     if (!seg) continue;
@@ -3594,6 +4655,13 @@ function appendChatContent(div, text) {
         img.className = "chat-img";
         img.alt = "AI 生成的图片";
         img.loading = "lazy";
+        // 图片加载失败（文件不存在/被删/网络问题）→ 换成灰色提示，不显示难看的裂图/alt 文本
+        img.addEventListener("error", () => {
+          const tip = document.createElement("span");
+          tip.className = "chat-img-fail";
+          tip.textContent = "（图片加载失败）";
+          img.replaceWith(tip);
+        });
         img.addEventListener("click", () => showLightbox(p));
         div.appendChild(img);
       } else {
@@ -3603,25 +4671,86 @@ function appendChatContent(div, text) {
   }
 }
 
-function addChatBubble(role, text) {
+function addChatBubble(role, text, convId) {
+  // bot 消息里含 [表情:名] 标签时，表情独立成气泡（文本一个、每个表情一个），
+  // 不再让图片挤在文本气泡里；未命中的表情名按原文显示（appendChatContent 兜底）
+  if (role === "bot" && /\[表情:/.test(String(text ?? ""))) {
+    const segs = String(text).split(CHAT_EMOJI_RE);
+    for (let i = 0; i < segs.length; i++) {
+      const seg = segs[i];
+      if (!seg) continue;
+      renderBubbleRow(role, i % 2 === 1 ? `[表情:${seg}]` : seg, i > 0 ? undefined : convId);
+    }
+    return;
+  }
+  renderBubbleRow(role, text, convId);
+}
+
+/** 渲染单个气泡行（addChatBubble 的底层实现；bot 表情拆分时逐条调用） */
+function renderBubbleRow(role, text, convId) {
   const log = $("#chat-log");
+  const row = document.createElement("div");
+  row.className = "bubble-row " + (role === "user" ? "me" : "bot");
+  if (convId) row.dataset.convId = convId;
+  // 头像：角色用卡面（圆形裁剪），用户用资料头像；整个会话只取一次，气泡复用同一份，不重复下载
+  const av = document.createElement("img");
+  av.className = "bubble-avatar";
+  av.alt = "";
+  av.loading = "lazy";
+  const src = role === "user" ? getUserAvatarCached() : getCardAvatarCached();
+  if (src) av.src = src;
+  else av.src = "data:image/svg+xml;utf8," + encodeURIComponent(
+    `<svg xmlns='http://www.w3.org/2000/svg' width='72' height='72'><rect width='72' height='72' fill='#e8e4da'/><text x='36' y='46' font-size='30' text-anchor='middle' fill='#9a948a'>${role === "user" ? "我" : "AI"}</text></svg>`
+  );
+  row.appendChild(av);
   const div = document.createElement("div");
   div.className = "bubble " + (role === "user" ? "me" : "bot");
   appendChatContent(div, String(text));
   if (role === "bot") {
-    const btn = document.createElement("button");
-    btn.className = "tts-speak-btn";
-    btn.innerHTML = icon("volume");
-    btn.title = "朗读这条回复（播放中再点停止）";
-    btn.addEventListener("click", (ev) => {
-      ev.stopPropagation();
-      speakText(text, btn); // 传按钮 → 支持"再点一次停止"
-    });
-    div.appendChild(btn);
+    // 朗读按钮只给纯文本气泡：带图片/表情的气泡（内容里已渲染出 <img>）不朗读
+    const hasMedia = div.querySelector(".chat-img, .chat-emoji");
+    if (!hasMedia) {
+      const btn = document.createElement("button");
+      btn.className = "tts-speak-btn";
+      btn.innerHTML = icon("volume");
+      btn.title = "朗读这条回复（播放中再点停止）";
+      btn.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        speakText(text, btn); // 传按钮 → 支持"再点一次停止"
+      });
+      div.appendChild(btn);
+    }
   }
-  log.appendChild(div);
+  row.appendChild(div);
+  log.appendChild(row);
   log.scrollTop = log.scrollHeight;
   return div;
+}
+
+// 会话级头像缓存：dataURL 只转一次 Blob URL，所有气泡复用同一个短字符串
+// （不这么做的话，几百条气泡每条内嵌一份完整 dataURL，DOM 内存会像 RP-Hub 群聊那样涨上去）
+let bubbleCardAvatarUrl = null;
+let bubbleUserAvatarUrl = null;
+function toBubbleAvatarUrl(raw) {
+  if (!raw) return "";
+  if (raw.startsWith("data:")) {
+    try {
+      const bin = atob(raw.slice(raw.indexOf(",") + 1));
+      const mime = raw.slice(5, raw.indexOf(";")) || "image/png";
+      const bytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+      return URL.createObjectURL(new Blob([bytes], { type: mime }));
+    } catch { return raw; }
+  }
+  return raw; // http 路径走浏览器缓存，天然不重复下载
+}
+function getCardAvatarCached() {
+  if (bubbleCardAvatarUrl === null) bubbleCardAvatarUrl = toBubbleAvatarUrl(wbCardObj?.identity?.avatar || "");
+  return bubbleCardAvatarUrl;
+}
+function getUserAvatarCached() {
+  if (bubbleUserAvatarUrl === null) bubbleUserAvatarUrl = toBubbleAvatarUrl(userProfile?.avatar || "");
+  return bubbleUserAvatarUrl;
 }
 let ttsAudio = null;
 let ttsOwner = null;   // 正在朗读的那个按钮，用于高亮与"再点一次停止"
@@ -3674,16 +4803,22 @@ async function speakText(text, btn) {
   }
 }
 /**
- * 像真人一样分条显示回复：按空行切段，逐条冒出来，每条之间按卡里的 chat.delay 停顿。
- * 与通道端一致（OpenClaw 用 humanDelay 在 block 之间停顿）。
+ * 像真人一样分条显示回复。优先用后端拆好的 parts（splitter.ts 的段落/句号/逗号
+ * 四级拆条 + 条数/字数约束）；没有 parts 时退回旧逻辑：multi_send 开 → 按空行切。
+ * 逐条冒出来，每条之间按卡里的 chat.delay 停顿（与通道端 humanDelay 一致）。
  */
-async function addBotReplyHumanLike(rawText) {
+async function addBotReplyHumanLike(rawText, serverParts) {
   const card = curCard();
   const text = applyRegexScripts(rawText); // 卡里的正则替换（酒馆 regex_scripts）
-  const multi = card?.voice?.message_style?.multi_send === true;
-  const parts = multi
-    ? String(text).split(/\n{2,}/).map((s) => s.trim()).filter(Boolean)
-    : [String(text)];
+  let parts;
+  if (Array.isArray(serverParts) && serverParts.length > 0) {
+    parts = serverParts.map((s) => applyRegexScripts(String(s ?? "").trim())).filter(Boolean);
+  } else {
+    const multi = card?.voice?.message_style?.multi_send === true;
+    parts = multi
+      ? String(text).split(/\n{2,}/).map((s) => s.trim()).filter(Boolean)
+      : [String(text)];
+  }
   if (parts.length <= 1) {
     addChatBubble("bot", text);
     return;
@@ -3731,6 +4866,10 @@ function renderDistill() {
           </div>
           <label>屏蔽词（逗号分隔）</label>
           <input id="distill-blocked" placeholder="工资,敏感词">
+          <div class="cf-grid2">
+            <div><label>模型商（蒸馏用）</label><select id="distill-provider"><option value="">跟随默认</option></select></div>
+            <div><label>模型</label><select id="distill-model"><option value="">—</option></select></div>
+          </div>
           <div class="row"><button id="btn-distill-run" class="primary">开始蒸馏</button></div>
           <div id="distill-msg" class="status"></div>
         </div>
@@ -3757,6 +4896,43 @@ function initDistill() {
   $("#btn-distill-export-png").addEventListener("click", () => exportDistillCard("png"));
   $("#btn-wf-probe").addEventListener("click", probeWeFlow);
   $("#btn-wf-distill").addEventListener("click", distillFromWeFlow);
+  loadDistillProviders();
+  $("#distill-provider").addEventListener("change", () => fillDistillModels(false));
+}
+
+/** 蒸馏页：加载启用中的模型商（默认 = 第一个启用的提供商 + 它的第一个模型，直接选中可换） */
+async function loadDistillProviders() {
+  const sel = $("#distill-provider");
+  if (!sel) return;
+  if (!lcProviders.length) {
+    try {
+      const prov = await api.get("/api/providers");
+      lcProviders = (prov.chat ?? []).filter((p) => p.enabled !== false);
+    } catch { lcProviders = []; }
+  }
+  sel.innerHTML = lcProviders.map((p) => `<option value="${escapeHtml(p.name)}">${escapeHtml(p.name)}</option>`).join("");
+  fillDistillModels(false);
+}
+
+/** 按选中的模型商填充蒸馏模型下拉 */
+function fillDistillModels(keepModel) {
+  const sel = $("#distill-model");
+  if (!sel) return;
+  const p = lcProviders.find((x) => x.name === $("#distill-provider")?.value);
+  if (!p) { sel.innerHTML = `<option value="">—</option>`; sel.disabled = true; return; }
+  sel.disabled = false;
+  const cur = keepModel ? sel.value : "";
+  const models = p.models ?? [];
+  sel.innerHTML = models.length
+    ? models.map((m) => `<option value="${escapeHtml(m)}" ${m === cur ? "selected" : ""}>${escapeHtml(m)}</option>`).join("")
+    : `<option value="">—</option>`;
+}
+
+/** 蒸馏页当前选择的模型（"提供商::模型"，跟随默认 = 空串） */
+function distillModelChoice() {
+  const prov = $("#distill-provider")?.value || "";
+  const model = $("#distill-model")?.value || "";
+  return prov && model ? `${prov}::${model}` : "";
 }
 
 async function runDistill() {
@@ -3777,6 +4953,7 @@ async function runDistill() {
         target: $("#distill-target").value.trim() || undefined,
         selfNames: $("#distill-self").value.split(",").map((s) => s.trim()).filter(Boolean),
         blockedWords: $("#distill-blocked").value.split(",").map((s) => s.trim()).filter(Boolean),
+        model: distillModelChoice(),
       }),
     });
     lastDistilledCard = r.card;
@@ -3831,6 +5008,7 @@ async function distillFromWeFlow() {
         target: $("#distill-target").value.trim() || undefined,
         selfNames: $("#distill-self").value.split(",").map((s) => s.trim()).filter(Boolean),
         blockedWords: $("#distill-blocked").value.split(",").map((s) => s.trim()).filter(Boolean),
+        model: distillModelChoice(),
       }),
     });
     lastDistilledCard = r.card;
@@ -3909,7 +5087,11 @@ async function startLogin(channelPath, qrSel, msgSel, refreshCb) {
         }
       } catch { /* 忽略 */ }
     }, 800);
-  } catch (e) { $(msgSel).textContent = "启动失败：" + e.message; }
+  } catch (e) {
+    // 账号槽位满：后端拒绝生成二维码，把原因原样告诉用户（要先彻底删一个账号）
+    $(msgSel).textContent = e.message || "启动失败";
+    if (/存满/.test(e.message || "")) toast(e.message, false);
+  }
 }
 
 function initChannels() {
@@ -3920,14 +5102,31 @@ function initChannels() {
   $("#btn-qq-refresh").addEventListener("click", () => { refreshQQ(true); refreshConnections(); });
   refreshWechat(); refreshPairing(); refreshQQ(); refreshConnections();
 }
+let connCardsCache = null; // 卡片列表（渲染换卡下拉用，变动少，缓存一份省一次请求
+const connBusy = new Set(); // 正在换卡中的 bot id：该行渲染成「更换中…」转圈，防止后台静默重绘把它跳回老卡
+
 async function refreshConnections() {
+  const box = $("#conn-list");
+  if (!box) return;
+  // 先用快路径渲染（纯文件读，毫秒级），再后台跑自愈刷新一次——
+  // 以前默认就跑 openclaw CLI 自愈，进页面/换卡后都要干等 5-15s 才看到结果
+  const conn = await fetchConnections({ force: true });
+  await renderConnections(conn);
+  fetchConnections({ repair: true }).then((fresh) => {
+    if (fresh && $("#conn-list")) renderConnections(fresh);
+  }).catch(() => {});
+}
+
+async function renderConnections(connData) {
   const box = $("#conn-list");
   if (!box) return;
   try {
     const [conn, cards] = await Promise.all([
-      api.get("/api/channels/connections"),
-      api.get("/api/cards").catch(() => ({ cards: [] })),
+      connData ? Promise.resolve(connData) : fetchConnections({ force: true }),
+      connCardsCache ? Promise.resolve(connCardsCache) : api.get("/api/cards").catch(() => ({ cards: [] })),
     ]);
+    connCardsCache = cards;
+    if (!conn) throw new Error("读取连接状态失败");
     const bots = conn.bots ?? [];
     const accounts = conn.accounts ?? [];
     const cardOpts = (cards.cards ?? []).map((c) => `<option value="${escapeHtml(c.slug)}">${escapeHtml(c.name)}</option>`).join("");
@@ -3935,6 +5134,8 @@ async function refreshConnections() {
     let html = "";
     const maxQq = conn.limits?.maxQq ?? 5;
     const maxWx = conn.limits?.maxWeixin ?? 1;
+    const maxQqAcc = conn.limits?.maxQqAccounts ?? 5;
+    const maxWxAcc = conn.limits?.maxWeixinAccounts ?? 2;
     const qqCnt = bots.filter((b) => b.channel === "qqbot").length;
     const wxCnt = bots.filter((b) => b.channel === "openclaw-weixin").length;
     if (bots.length) {
@@ -3945,11 +5146,17 @@ async function refreshConnections() {
         const opts = (cards.cards ?? [])
           .map((c) => `<option value="${escapeHtml(c.slug)}" ${c.slug === b.cardSlug ? "selected" : ""}>${escapeHtml(c.name)}${c.slug === b.cardSlug ? "（当前）" : ""}</option>`)
           .join("");
+        const accName = b.accountLabel || b.accountId;
+        // 换卡进行中：整行换成转圈状态，任何后台重绘都不会让它跳回老卡，成功后才一次到位
+        if (connBusy.has(b.id) || connBusy.has(connBusyKey(b.channel, b.accountId))) {
+          html += connBusyRow(b.channel, b.accountId, accName);
+          continue;
+        }
         html += `<div class="conn-row">
-          <span class="chip">${b.channel === "qqbot" ? "QQ" : "微信"} · ${escapeHtml(b.accountId)}</span>
-          <span class="conn-arrow">→</span>
-          <select class="conn-target" data-bot="${b.id}" data-cur="${escapeHtml(b.cardSlug)}" title="当前连接：${escapeHtml(cardName)}（可换卡）" style="max-width:190px">${opts}</select>
+          <span class="chip" title="${escapeHtml(b.accountId)}">${connChannelTag(b.channel)} · ${escapeHtml(accName)}</span>
+          <button class="ghost small-btn" data-acc-rename="${b.channel}|${escapeHtml(b.accountId)}" title="给这个账号起个昵称">✏️</button>
           <button class="danger small-btn" data-conn-del="${b.id}">解绑</button>
+          <select class="conn-target" data-bot="${b.id}" data-cur="${escapeHtml(b.cardSlug)}" title="当前连接：${escapeHtml(cardName)}（可换卡）">${opts}</select>
         </div>`;
       }
     } else {
@@ -3960,23 +5167,71 @@ async function refreshConnections() {
     if (freeAccounts.length) {
       html += `<div class="conn-sub">未绑卡的账号（凭证已认证，选一张卡即可用，免扫码）</div>`;
       for (const a of freeAccounts) {
+        const accName = accountText(a);
+        if (connBusy.has(connBusyKey(a.channel, a.accountId))) {
+          html += connBusyRow(a.channel, a.accountId, accName);
+          continue;
+        }
         html += `<div class="conn-row">
-          <span class="chip">${a.channel === "qqbot" ? "QQ" : "微信"} · ${escapeHtml(a.accountId)}</span>
-          <span class="warn-badge">未绑卡</span>
-          <span class="conn-arrow">→</span>
-          <select class="conn-cardpick" data-acc="${a.channel}|${a.accountId}" style="max-width:190px"><option value="">选一张卡绑定…</option>${cardOpts}</select>
+          <span class="chip" title="${escapeHtml(a.accountId)}">${connChannelTag(a.channel)} · ${escapeHtml(accName)}</span>
+          <button class="ghost small-btn" data-acc-rename="${a.channel}|${escapeHtml(a.accountId)}" title="给这个账号起个昵称">✏️</button>
+          <button class="danger small-btn" data-acc-del="${a.channel}|${escapeHtml(a.accountId)}" title="删除这个账号（连凭证一起删，释放槽位）">删除</button>
+          <select class="conn-cardpick" data-acc="${a.channel}|${escapeHtml(a.accountId)}"><option value="">选一张卡绑定…</option>${cardOpts}</select>
         </div>`;
       }
     }
-    html += `<p class="hint" style="margin-top:8px">上限：QQ ${maxQq} 个机器人（平台，每号 5 个 AppID）、微信 ${maxWx} 个（一个微信号一个）。换卡/绑卡都复用已有凭证，无需重新扫码。</p>`;
+    // 账号槽位用量：满了扫码按钮会被禁用，必须先彻底删一个
+    const qqSlot = conn.slots?.qqbot ?? { used: 0, max: maxQqAcc };
+    const wxSlot = conn.slots?.["openclaw-weixin"] ?? { used: 0, max: maxWxAcc };
+    html += `<p class="hint" style="margin-top:8px">账号槽位：QQ ${qqSlot.used}/${qqSlot.max}${qqSlot.used >= qqSlot.max ? "（已存满）" : ""} · 微信 ${wxSlot.used}/${wxSlot.max}${wxSlot.used >= wxSlot.max ? "（已存满）" : ""}。存满后需先删除一个账号才能扫新码。QQ 可同时绑 ${maxQq} 张卡；微信同时只能绑 1 张，绑新卡时旧卡自动掉落。</p>`;
     box.innerHTML = html;
     // 事件
     box.querySelectorAll("[data-conn-del]").forEach((b) =>
       b.addEventListener("click", async () => {
         if (!confirm("解绑这个机器人实例？（账号凭证保留，可复用）")) return;
         const r = await api.send(`/api/bots/${b.dataset.connDel}`, { method: "DELETE" });
-        toast(r.ok ? "已解绑" : "解绑失败：" + (r.error ?? ""), r.ok);
-        refreshConnections();
+        toast("已解绑");
+        await syncAfterBotChange();
+      })
+    );
+    // 昵称：给账号起个自己认得的名字（底层仍按 accountId 路由）
+    box.querySelectorAll("[data-acc-rename]").forEach((b) =>
+      b.addEventListener("click", async () => {
+        const [channel, accountId] = b.dataset.accRename.split("|");
+        const cur = (conn.accounts ?? []).find((a) => a.channel === channel && a.accountId === accountId);
+        const now = cur?.hasLabel ? cur.label : "";
+        const next = prompt(`给账号起个昵称（留空恢复显示原编号）\n原编号：${accountId}`, now);
+        if (next === null) return;
+        try {
+          await api.send("/api/channels/accounts/label", {
+            method: "POST",
+            body: JSON.stringify({ channel, accountId, label: next }),
+          });
+          toast(next.trim() ? "✓ 昵称已保存" : "已恢复显示原编号");
+          await syncAfterBotChange();
+        } catch (e) { toast("保存昵称失败：" + e.message, false); }
+      })
+    );
+    // 彻底删除账号：连凭证一起删，腾出槽位（账号存满后加新号的唯一途径）
+    box.querySelectorAll("[data-acc-del]").forEach((b) =>
+      b.addEventListener("click", async () => {
+        const [channel, accountId] = b.dataset.accDel.split("|");
+        const cur = (conn.accounts ?? []).find((a) => a.channel === channel && a.accountId === accountId);
+        const nm = accountText(cur) || accountId;
+        if (!confirm(`彻底删除账号「${nm}」？\n\n会删掉它的登录凭证和会话数据（不可恢复，要再用必须重新扫码），并释放一个账号槽位。\n平台侧（QQ 开放平台 / 微信）的机器人本身不受影响。`)) return;
+        b.disabled = true; b.textContent = "删除中…";
+        try {
+          const r = await api.send("/api/channels/accounts/delete", {
+            method: "POST",
+            body: JSON.stringify({ channel, accountId }),
+          });
+          toast("✓ 账号已删除，槽位已释放");
+          await syncAfterBotChange();
+          refreshQQ(true); refreshWechat(true);
+        } catch (e) {
+          toast("删除失败：" + e.message, false);
+          b.disabled = false; b.textContent = "删除";
+        }
       })
     );
     box.querySelectorAll(".conn-target").forEach((sel) =>
@@ -3988,30 +5243,64 @@ async function refreshConnections() {
           sel.value = sel.dataset.cur; // 取消就还原选中项
           return;
         }
+        // 立即进入「更换中…」转圈态：这行不再响应任何重绘（后台静默刷新也跳不回老卡），
+        // 请求成功才由 syncAfterBotChange 一次性渲染成最终态，失败则还原
+        const botId = sel.dataset.bot;
+        connBusy.add(botId);
+        renderConnections(conn); // 用当前快照重绘，busy 行会走转圈分支
         try {
-          const r = await api.send("/api/bots/transfer", { method: "POST", body: JSON.stringify({ botId: sel.dataset.bot, toCardSlug: sel.value }) });
-          toast(r.ok ? "✓ 已换卡" : "换卡失败：" + (r.error ?? ""), r.ok);
-        } catch (e) { toast("换卡失败：" + e.message, false); }
-        refreshConnections();
+          await api.send("/api/bots/transfer", { method: "POST", body: JSON.stringify({ botId, toCardSlug: sel.value }) });
+          connBusy.delete(botId);
+          toast("✓ 已换卡");
+          await syncAfterBotChange(); // 一次到位：新卡 + 当前标志
+        } catch (e) {
+          connBusy.delete(botId);
+          toast("换卡失败：" + e.message, false);
+          // 还原列表（下拉回到老卡）
+          const fresh = await fetchConnections({ force: true }).catch(() => null);
+          if (fresh && $("#conn-list")) renderConnections(fresh);
+        }
       })
     );
     box.querySelectorAll(".conn-cardpick").forEach((sel) =>
       sel.addEventListener("change", async () => {
         if (!sel.value) return;
         const [channel, accountId] = sel.dataset.acc.split("|");
-        try {
-          const r = await api.send("/api/bots", { method: "POST", body: JSON.stringify({ cardSlug: sel.value, channel, accountId }) });
-          if (r.conflict) {
-            toast(`账号已被「${r.occupiedBy?.cardName ?? r.occupiedBy?.cardSlug}」占用，先去那边换卡或解绑`, false);
-          } else {
-            toast("✓ 已绑定（账号凭证复用，网关重启后生效）");
+        const accName = accountText((conn.accounts ?? []).find((a) => a.channel === channel && a.accountId === accountId)) || accountId;
+        const occ = (conn.bots ?? []).find((b) => b.cardSlug === sel.value);
+        const targetName = sel.options[sel.selectedIndex]?.textContent ?? sel.value;
+        if (occ) {
+          if (!confirm(`「${targetName}」已绑定「${occ.accountLabel || occ.accountId}」。\n\n确定换成账号「${accName}」吗？原绑定会解除（凭证保留）。`)) {
+            sel.value = "";
+            return;
           }
-        } catch (e) {
-          const msg = e.message || "";
-          if (msg.includes("占用")) toast("账号已被占用，可先在旧卡上「换卡」", false);
-          else toast("绑定失败：" + msg, false);
         }
-        refreshConnections();
+        const busyKey = connBusyKey(channel, accountId);
+        connBusy.add(busyKey);
+        renderConnections(conn);
+        try {
+          if (occ) {
+            // 同卡换账号：agent 还是这张卡的，只换绑账号，别删再建（慢而且同 slug 会打架）
+            await api.send(`/api/bots/${occ.id}/bind`, { method: "POST", body: JSON.stringify({ channel, accountId }) });
+            toast("✓ 已换成「" + accName + "」");
+          } else {
+            const r = await api.send("/api/bots", { method: "POST", body: JSON.stringify({ cardSlug: sel.value, channel, accountId }) });
+            if (r.evicted?.length) toast(`✓ 已绑定，已卸下「${r.evicted.join("、")}」`);
+            else toast("✓ 已绑定");
+          }
+          connBusy.delete(busyKey);
+          await syncAfterBotChange();
+        } catch (e) {
+          connBusy.delete(busyKey);
+          const msg = e.message || "";
+          if (msg.includes("占用")) {
+            toast("账号已被占用，可先在旧卡上换卡", false);
+          } else {
+            toast("绑定失败：" + msg, false);
+          }
+          const fresh = await fetchConnections({ force: true }).catch(() => null);
+          if (fresh && $("#conn-list")) renderConnections(fresh);
+        }
       })
     );
   } catch (e) {
@@ -4172,8 +5461,16 @@ async function wsLoadOverview() {
 let presetStoreData = { tiers: [], styles: [] };
 let presetView = null; // null=首页；{kind:'tier'|'style', groupId}=组内
 
-async function loadPresetStore() {
-  presetStoreData = await api.get("/api/presets").catch(() => ({ tiers: [], styles: [] }));
+/**
+ * 读预设库。走缓存先渲染；**失败不再静默变空**（原来 catch 成空数组 →
+ * 预设页只剩「新增档位/恢复内置」两个按钮，高级配置的档位/风格下拉也空白），
+ * 失败时抛出让调用方显示错误 + 重试。
+ */
+async function loadPresetStore(onFresh) {
+  presetStoreData = await cachedGet("/api/presets", (fresh) => {
+    presetStoreData = fresh;
+    if (onFresh) onFresh(fresh);
+  });
   return presetStoreData;
 }
 
@@ -4195,7 +5492,7 @@ function renderPresets() {
         ${groups.length ? groups.map((g) => groupCard(kind, g)).join("") : '<div class="muted">还没有组，点下方「新增」创建</div>'}
       </div>
       <div class="row" style="margin-top:10px">
-        <button class="ghost small-btn preset-group-add" data-kind="${kind}">${icon("plus")} 新增${kind === "tier" ? "档位" : "风格"}</button>
+        <button class="ghost small-btn preset-group-add" data-kind="${kind}">${icon("plus")} 新增${kind === "tier" ? "档位" : kind === "guard" ? "全局规则组" : "风格"}</button>
         <button class="ghost small-btn preset-reset-all" data-kind="${kind}" style="margin-left:8px">恢复内置</button>
       </div>
     </div>`;
@@ -4203,21 +5500,11 @@ function renderPresets() {
   <div class="view">
     <div class="page-head">
       <h2>${icon("sliders")} 角色扮演预设</h2>
-      <p class="hint">档位/风格是「预设组」：点进组看里面的条目（如 破甲组里有 破甲/防神化/防抢话/防跑偏），点条目单独编辑。预设页不显示内容。</p>
+      
     </div>
-    ${section("tier", "档位", "档位决定扮演模式与内容尺度（当前：破甲）。点进「破甲」可分别编辑破甲、防神化、防抢话、防跑偏等条目。", presetStoreData.tiers)}
+    ${section("tier", "档位", "", presetStoreData.tiers)}
     <div style="height:12px"></div>
-    ${section("style", "风格", "风格决定输出形式：纯对话（≤2 逗号）/ 重描写（心理（）动作 {}）。点进风格可编辑文风规则与示范对话条目。", presetStoreData.styles)}
-    <div class="card-box" style="margin-top:12px">
-      <h3>${icon("info")} 说明</h3>
-      <ul class="guide">
-        <li>点任意组（如「破甲」）进入组内条目列表；点某条（如「防神化」）单独编辑内容与插入位置（系统提示词 / 用户消息 / AI 消息）。</li>
-        <li>档位只保留「破甲（最高）」，组内含 破甲/防神化/防抢话/防跑偏 四条；风格组内含 文风规则 + 示范对话（AI/用户）。</li>
-        <li>示范对话条目（AI 消息/用户消息）会注入真实对话开头，让 AI 模仿语气（few-shot）。</li>
-        <li>全局「输出铁律」护栏所有档位/风格生效：剥离思维链、禁止跳出角色、末句不加句号。</li>
-        <li>改完预设文本后，网页试聊立即生效；QQ/微信 机器人需在卡片 🤖 机器人里点「重编译」。</li>
-      </ul>
-    </div>
+    ${section("style", "风格", "", presetStoreData.styles)}
   </div>`;
 }
 
@@ -4257,16 +5544,34 @@ function renderPresetGroupView(kind, groupId) {
 
 async function initPresets() {
   presetView = null;
-  await loadPresetStore();
+  // 有缓存时 loadPresetStore 立即返回旧数据（公网上省掉一次 0.5-1.7s 往返），
+  // 后台刷新到新数据再重绘；失败显示错误 + 重试，不再静默只剩两个按钮
+  try {
+    await loadPresetStore(() => {
+      if (!$("#view")) return;
+      $("#view").innerHTML = renderPresets();
+      bindPresets();
+    });
+  } catch (e) {
+    $("#view").innerHTML = `<div class="view"><div class="page-head"><h2>${icon("sliders")} 角色扮演预设</h2></div>
+      <div class="card-box"><div class="muted">读取预设失败：${escapeHtml(e.message)}</div>
+      <div class="row" style="margin-top:10px"><button class="primary small-btn" id="presets-retry">重试</button></div></div></div>`;
+    $("#presets-retry")?.addEventListener("click", initPresets);
+    return;
+  }
   $("#view").innerHTML = renderPresets();
   bindPresets();
 }
 
 function refreshPresetView() {
-  loadPresetStore().then(() => {
-    $("#view").innerHTML = renderPresets();
-    bindPresets();
-  });
+  // 预设改动后必须拿最新数据（不能吃缓存）
+  cacheInvalidate("/api/presets");
+  loadPresetStore()
+    .then(() => {
+      $("#view").innerHTML = renderPresets();
+      bindPresets();
+    })
+    .catch((e) => toast("刷新预设失败：" + e.message, false));
 }
 
 function bindPresets() {
@@ -4445,12 +5750,11 @@ function renderSettings() {
     </a>`;
   return `
   <div class="view">
-    <div class="page-head"><h2>设置</h2><p class="hint">日志、插件、公告与数据备份——点开对应项进入页面</p></div>
+    <div class="page-head"><h2>设置</h2></div>
     <div class="setting-rows">
       ${row("logs", "clipboard", "运行日志", "聊天 / 通道 / 生图 / 语音 / 记忆的报错记录，出问题先看这里（留最近 500 条）")}
       ${row("plugins", "store", "插件", "已安装插件只读列表", "暂未开放")}
       ${row("data", "package", "数据备份与记忆", "全部卡片 + 记忆 + 配置导出为 JSON；查看全部记忆")}
-      ${row("notice", "message", "首页公告", "编辑展示在首页的公告内容")}
     </div>
   </div>`;
 }
@@ -4605,7 +5909,6 @@ function renderEmojis() {
   <div class="view">
     <div class="page-head">
       <h2>表情包库</h2>
-      <p class="hint">全部角色卡共用。按分组组织：在卡片「高级配置」里选一个分组，AI 就只从这个分组里挑表情发。名字和解释会告诉 AI，解释要写清楚什么场合用</p>
     </div>
     <div class="card-box">
       <h3>分组</h3>
@@ -4615,8 +5918,8 @@ function renderEmojis() {
       <h3>添加表情 <span class="hint" id="em-cur-group-hint"></span></h3>
       <div class="form">
         <div class="cf-grid2">
-          <div><label>表情名（AI 用它引用，唯一）</label><input id="em-name" placeholder="如：得意、无语、抱抱"></div>
-          <div><label>什么场合用（给 AI 看）</label><input id="em-exp" placeholder="如：调皮得意，占了上风的时候"></div>
+          <div><label>表情名</label><input id="em-name" placeholder="如：得意、无语、抱抱"></div>
+          <div><label>什么场合用</label><input id="em-exp" placeholder="如：调皮得意，占了上风的时候"></div>
         </div>
         <label>图片（png / jpg / gif / webp）</label>
         <input type="file" id="em-file" accept=".png,.jpg,.jpeg,.gif,.webp">
@@ -4627,7 +5930,10 @@ function renderEmojis() {
       </div>
     </div>
     <div class="card-box">
-      <h3>「<span id="em-group-title">默认</span>」里的表情 <span id="em-count" class="hint"></span></h3>
+      <div class="row" style="justify-content:space-between;align-items:center">
+        <h3 style="margin:0">「<span id="em-group-title">默认</span>」里的表情 <span id="em-count" class="hint"></span></h3>
+        <button id="em-import" class="ghost small-btn" title="把其他分组的表情复制到当前分组（共用同一张图，不重复存文件）">${icon("download")} 从其他分组导入</button>
+      </div>
       <div id="em-list" class="emoji-grid"></div>
     </div>
   </div>`;
@@ -4638,7 +5944,71 @@ let emojiCurGroup = "default"; // 当前选中分组
 
 function initEmojis() {
   $("#em-add").addEventListener("click", addEmojiToLib);
+  $("#em-import").addEventListener("click", openEmojiImport);
   loadEmojiList();
+}
+
+/** 从其他分组导入：选来源分组 → 勾选表情 → 路径复用导入当前分组（不复制图片文件） */
+function openEmojiImport() {
+  const others = emojiGroups.filter((g) => g.id !== emojiCurGroup);
+  if (!others.length) return toast("没有其他分组可导入", false);
+  const ov = document.createElement("div");
+  ov.className = "bot-overlay";
+  ov.id = "emoji-import-overlay";
+  ov.innerHTML = `<div class="bot-dialog" style="max-width:460px">
+    <div class="bot-dialog-head">
+      <h3>从其他分组导入</h3>
+      <button class="ghost small-btn" id="emoji-import-close">${icon("x")}</button>
+    </div>
+    <label>来源分组</label>
+    <select id="emoji-import-src" style="width:100%">
+      ${others.map((g) => `<option value="${escapeHtml(g.id)}">${escapeHtml(g.name)}</option>`).join("")}
+    </select>
+    <div id="emoji-import-pool" class="emoji-grid" style="margin-top:10px;max-height:300px;overflow-y:auto"></div>
+    <p class="hint" id="emoji-import-tip" style="margin-top:6px">点击图片勾选；导入共用原图不重复存文件，重名会自动加序号</p>
+    <div class="row" style="justify-content:flex-end;margin-top:6px">
+      <span class="muted" id="emoji-import-count">已选 0 个</span>
+      <button class="ghost small-btn" id="emoji-import-cancel">取消</button>
+      <button class="primary small-btn" id="emoji-import-ok">导入到当前分组</button>
+    </div>
+  </div>`;
+  document.body.appendChild(ov);
+  const close = () => ov.remove();
+  const picked = new Set();
+  const renderPool = () => {
+    const gid = $("#emoji-import-src").value;
+    const pool = emojiLib.filter((e) => e.group === gid);
+    $("#emoji-import-pool").innerHTML = pool.length
+      ? pool.map((e) => `<div class="emoji-item emoji-pick${picked.has(e.id) ? " picked" : ""}" data-id="${escapeHtml(e.id)}">
+          <img src="${escapeHtml(e.url)}" alt="${escapeHtml(e.name)}" loading="lazy">
+          <div class="emoji-name">${escapeHtml(e.name)}</div>
+        </div>`).join("")
+      : '<div class="muted">这个分组还没有表情</div>';
+    $("#emoji-import-pool").querySelectorAll(".emoji-pick").forEach((el) =>
+      el.addEventListener("click", () => {
+        const id = el.dataset.id;
+        if (picked.has(id)) { picked.delete(id); el.classList.remove("picked"); }
+        else { picked.add(id); el.classList.add("picked"); }
+        const c = $("#emoji-import-count");
+        if (c) c.textContent = `已选 ${picked.size} 个`;
+      })
+    );
+  };
+  renderPool();
+  $("#emoji-import-src").addEventListener("change", renderPool);
+  ov.addEventListener("click", (e) => { if (e.target === ov) close(); });
+  $("#emoji-import-close").addEventListener("click", close);
+  $("#emoji-import-cancel").addEventListener("click", close);
+  $("#emoji-import-ok").addEventListener("click", async () => {
+    if (!picked.size) return toast("先勾选要导入的表情", false);
+    try {
+      const r = await api.send("/api/emojis/import", { method: "POST", body: JSON.stringify({ ids: [...picked], group: emojiCurGroup }) });
+      toast(`✓ 已导入 ${r.imported.length} 个（共用原图）`);
+      close();
+      cacheInvalidate("/api/emojis");
+      await loadEmojiList();
+    } catch (e) { toast("导入失败：" + e.message, false); }
+  });
 }
 
 /** 渲染分组标签栏 */
@@ -4677,6 +6047,7 @@ function renderEmojiGroups() {
       try {
         await api.send(`/api/emojis/groups/${g.id}`, { method: "PUT", body: JSON.stringify({ name }) });
         toast("✓ 已重命名");
+        cacheInvalidate("/api/emojis");
         await loadEmojiList();
       } catch (e) { toast(e.message, false); }
     })
@@ -4690,6 +6061,7 @@ function renderEmojiGroups() {
         await api.send(`/api/emojis/groups/${g.id}`, { method: "DELETE" });
         if (emojiCurGroup === g.id) emojiCurGroup = "default";
         toast("✓ 已删除");
+        cacheInvalidate("/api/emojis");
         await loadEmojiList();
       } catch (e) { toast(e.message, false); }
     })
@@ -4700,6 +6072,7 @@ function renderEmojiGroups() {
     try {
       await api.send("/api/emojis/groups", { method: "POST", body: JSON.stringify({ name }) });
       toast("✓ 已创建");
+      cacheInvalidate("/api/emojis");
       await loadEmojiList();
     } catch (e) { toast(e.message, false); }
   });
@@ -4708,7 +6081,9 @@ function renderEmojiGroups() {
 async function loadEmojiList() {
   const box = $("#em-list");
   try {
-    const r = await api.get("/api/emojis");
+    // 走缓存先渲染（公网上省掉一次往返）；库内 CRUD 都会 cacheInvalidate 后再调本函数，
+    // 所以增删改后拿到的一定是新数据
+    const r = await cachedGet("/api/emojis");
     emojiLib = r.emojis ?? [];
     emojiGroups = r.groups ?? [];
     if ($("#em-count")) {
@@ -4731,67 +6106,110 @@ function renderEmojiList() {
     box.innerHTML = '<div class="muted">这个分组还没有表情，上面添加第一个</div>';
     return;
   }
-  const groupOpts = emojiGroups.filter((g) => g.id !== emojiCurGroup).map((g) => `<option value="${escapeHtml(g.id)}">${escapeHtml(g.name)}</option>`).join("");
+  // 紧凑格子：只显示图 + 名字；点击弹出单个表情的放大详情（含解释与全部操作）
   box.innerHTML = items
     .map(
-      (e) => `<div class="emoji-item" data-id="${escapeHtml(e.id)}">
+      (e) => `<div class="emoji-item" data-id="${escapeHtml(e.id)}" title="点击查看大图与操作">
         <img src="${escapeHtml(e.url)}" alt="${escapeHtml(e.name)}" loading="lazy">
         <div class="emoji-name">${escapeHtml(e.name)}</div>
-        <div class="emoji-exp">${escapeHtml(e.explanation || "（未写用法）")}</div>
-        <div class="row">
-          <button class="ghost small-btn" data-act="edit">编辑</button>
-          <button class="danger small-btn" data-act="del">删除</button>
-        </div>
-        <div class="row" style="gap:4px">
-          <select class="em-move" data-mid="${escapeHtml(e.id)}" title="复制/移动到其他分组">
-            <option value="">移动到…</option>
-            ${groupOpts}
-          </select>
-          <button class="ghost small-btn" data-act="copy" title="复制一份到其他分组">复制</button>
-        </div>
       </div>`
     )
     .join("");
-  box.querySelectorAll("button[data-act]").forEach((b) =>
-    b.addEventListener("click", () => {
-      const id = b.closest(".emoji-item").dataset.id;
-      const item = emojiLib.find((x) => x.id === id);
-      if (!item) return;
-      if (b.dataset.act === "del") return delEmoji(item);
-      if (b.dataset.act === "copy") return copyEmojiToGroup(item);
-      editEmoji(item);
-    })
-  );
-  box.querySelectorAll("select.em-move").forEach((sel) =>
-    sel.addEventListener("change", async () => {
-      const target = sel.value;
-      if (!target) return;
-      const id = sel.dataset.mid;
-      const item = emojiLib.find((x) => x.id === id);
-      if (!item) return;
-      const destName = emojiGroups.find((g) => g.id === target)?.name;
-      try {
-        await api.send(`/api/emojis/${id}/move`, { method: "POST", body: JSON.stringify({ group: target, copy: false }) });
-        toast("✓ 已移动到「" + destName + "」");
-        await loadEmojiList();
-      } catch (e) { toast(e.message, false); }
+  box.querySelectorAll(".emoji-item").forEach((el) =>
+    el.addEventListener("click", () => {
+      const item = emojiLib.find((x) => x.id === el.dataset.id);
+      if (item) openEmojiDetail(item);
     })
   );
 }
 
-/** 复制表情到其他分组（选目标分组） */
-async function copyEmojiToGroup(item) {
+/** 单个表情的放大详情：大图 + 解释 + 全部操作（编辑/删除/移动/复制） */
+function openEmojiDetail(item) {
   const others = emojiGroups.filter((g) => g.id !== emojiCurGroup);
-  if (!others.length) return toast("没有其他分组可复制", false);
-  const name = prompt("复制「" + item.name + "」到哪个分组？（填分组名）\n可选：" + others.map((g) => g.name).join("、"));
-  if (!name) return;
-  const dest = others.find((x) => x.name === name.trim());
-  if (!dest) return toast("没找到分组「" + name + "」", false);
-  try {
-    await api.send(`/api/emojis/${item.id}/move`, { method: "POST", body: JSON.stringify({ group: dest.id, copy: true }) });
-    toast("✓ 已复制到「" + dest.name + "」");
-    await loadEmojiList();
-  } catch (e) { toast(e.message, false); }
+  const ov = document.createElement("div");
+  ov.className = "bot-overlay";
+  ov.id = "emoji-detail-overlay";
+  ov.innerHTML = `<div class="bot-dialog emoji-detail">
+    <div class="bot-dialog-head">
+      <h3>${escapeHtml(item.name)}</h3>
+      <button class="ghost small-btn" id="emoji-detail-close">${icon("x")}</button>
+    </div>
+    <img class="emoji-detail-img" src="${escapeHtml(item.url)}" alt="${escapeHtml(item.name)}">
+    <p class="emoji-detail-exp">${escapeHtml(item.explanation || "（未写用法）")}</p>
+    <div class="row" style="justify-content:center">
+      <button class="ghost small-btn" data-act="edit">编辑</button>
+      <button class="danger small-btn" data-act="del">删除</button>
+    </div>
+    ${others.length ? `<div class="row" style="justify-content:center;margin-top:6px">
+      <select class="em-detail-move">
+        <option value="">移动/复制到其他分组…</option>
+        ${others.map((g) => `<option value="${escapeHtml(g.id)}">${escapeHtml(g.name)}</option>`).join("")}
+      </select>
+      <button class="ghost small-btn" data-act="move">移动</button>
+      <button class="ghost small-btn" data-act="copy">复制</button>
+    </div>` : ""}
+  </div>`;
+  document.body.appendChild(ov);
+  const close = () => ov.remove();
+  ov.addEventListener("click", (e) => { if (e.target === ov) close(); });
+  $("#emoji-detail-close").addEventListener("click", close);
+  ov.querySelectorAll("button[data-act]").forEach((b) =>
+    b.addEventListener("click", async () => {
+      const act = b.dataset.act;
+      if (act === "edit") { close(); editEmoji(item); return; }
+      if (act === "del") { close(); delEmoji(item); return; }
+      if (act === "move" || act === "copy") {
+        const target = ov.querySelector(".em-detail-move").value;
+        if (!target) return toast("先选一个目标分组", false);
+        try {
+          await api.send(`/api/emojis/${item.id}/move`, { method: "POST", body: JSON.stringify({ group: target, copy: act === "copy" }) });
+          toast(act === "copy" ? "✓ 已复制" : "✓ 已移动");
+          close();
+          cacheInvalidate("/api/emojis");
+          await loadEmojiList();
+        } catch (e) { toast(e.message, false); }
+      }
+    })
+  );
+}
+
+/** 编辑表情：名称 + 适用场合同一个弹窗一起改（原来连弹两个 prompt，第二个会被浏览器拦掉） */
+function editEmoji(item) {
+  const ov = document.createElement("div");
+  ov.className = "bot-overlay";
+  ov.id = "emoji-edit-overlay";
+  ov.innerHTML = `<div class="bot-dialog" style="max-width:420px">
+    <div class="bot-dialog-head">
+      <h3>编辑表情</h3>
+      <button class="ghost small-btn" id="emoji-edit-close">${icon("x")}</button>
+    </div>
+    <div class="form">
+      <label>表情名</label>
+      <input id="emoji-edit-name" value="${escapeHtml(item.name)}">
+      <label>什么场合用（给 AI 看）</label>
+      <input id="emoji-edit-exp" value="${escapeHtml(item.explanation || "")}">
+      <div class="row" style="justify-content:flex-end;margin-top:6px">
+        <button class="ghost small-btn" id="emoji-edit-cancel">取消</button>
+        <button class="primary small-btn" id="emoji-edit-save">保存</button>
+      </div>
+    </div>
+  </div>`;
+  document.body.appendChild(ov);
+  const close = () => ov.remove();
+  ov.addEventListener("click", (e) => { if (e.target === ov) close(); });
+  $("#emoji-edit-close").addEventListener("click", close);
+  $("#emoji-edit-cancel").addEventListener("click", close);
+  $("#emoji-edit-save").addEventListener("click", async () => {
+    const name = $("#emoji-edit-name").value.trim();
+    if (!name) return toast("表情名不能为空", false);
+    try {
+      await api.send(`/api/emojis/${item.id}`, { method: "POST", body: JSON.stringify({ name, explanation: $("#emoji-edit-exp").value.trim() }) });
+      toast("✓ 已保存");
+      close();
+      cacheInvalidate("/api/emojis");
+      await loadEmojiList();
+    } catch (e) { toast("保存失败：" + e.message, false); }
+  });
 }
 
 async function addEmojiToLib() {
@@ -4816,24 +6234,12 @@ async function addEmojiToLib() {
     $("#em-exp").value = "";
     $("#em-file").value = "";
     toast("✓ 已添加");
+    cacheInvalidate("/api/emojis");
     await loadEmojiList();
   } catch (e) {
     toast("添加失败：" + e.message, false);
-  }
-  btn.disabled = false;
-}
-
-async function editEmoji(item) {
-  const name = prompt("表情名（AI 用它引用）", item.name);
-  if (name === null) return;
-  const explanation = prompt("什么场合用（给 AI 看）", item.explanation || "");
-  if (explanation === null) return;
-  try {
-    await api.send(`/api/emojis/${item.id}`, { method: "POST", body: JSON.stringify({ name, explanation }) });
-    toast("✓ 已保存");
-    await loadEmojiList();
-  } catch (e) {
-    toast("保存失败：" + e.message, false);
+  } finally {
+    btn.disabled = false;
   }
 }
 
@@ -4842,6 +6248,7 @@ async function delEmoji(item) {
   try {
     await api.send(`/api/emojis/${item.id}`, { method: "DELETE" });
     toast("✓ 已删除");
+    cacheInvalidate("/api/emojis");
     await loadEmojiList();
   } catch (e) {
     toast("删除失败：" + e.message, false);
@@ -4881,9 +6288,10 @@ document.querySelectorAll(".drawer-nav a").forEach((a) => a.addEventListener("cl
 document.querySelectorAll(".drawer-nav a").forEach((a) => {
   a.insertAdjacentHTML("afterbegin", icon(a.dataset.icon));
 });
-// 先拿用户资料再渲染首页（横幅昵称/头像一次到位），失败不阻塞
-// 同时预载共享表情库：聊天气泡渲染 [表情:名字] 要靠它查图
-loadProfile().finally(() => {
-  void loadEmojiLib();
-  router();
-});
+// 立刻渲染首屏，不等任何网络请求。
+// 原来是 `loadProfile().finally(() => router())`——必须等 /api/profile 回来才画第一屏，
+// 公网上这一等就是 1-2s，期间页面只有顶栏 + 背景色（用户看到的「只有 SoulBox 加黄页」）。
+// 资料与表情库改为后台加载，回来后 loadProfile 内部会补昵称头像并刷新首页。
+router();
+void loadProfile();
+void loadEmojiLib();
