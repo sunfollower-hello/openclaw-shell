@@ -17,6 +17,16 @@ export async function userName(): Promise<string> {
   return "你";
 }
 
+/** 用户自我简介：读 data/user-profile.json 的 bio（通道端编译时注入，原来只有网页侧能读到） */
+export async function userBio(): Promise<string> {
+  try {
+    const p = JSON.parse(await fs.readFile(path.join(dataDir(), "user-profile.json"), "utf8"));
+    return String(p?.bio ?? "").trim();
+  } catch {
+    return "";
+  }
+}
+
 export interface MacroValues {
   user: string;
   char: string;

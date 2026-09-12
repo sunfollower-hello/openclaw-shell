@@ -72,10 +72,16 @@ export async function recordConfigChange(card: PersonaCard): Promise<void> {
   await writeConfigState(slug, { ...cur, ts: new Date().toISOString(), lastChange });
 }
 
-/** 生成强提醒文案（无变更返回空串） */
+/** 生成强提醒文案（无变更或已过期返回空串，24 小时后自动过期） */
 export function buildConfigChangeReminder(state: ConfigState): string {
   const changes = state?.lastChange?.changes;
   if (!changes || changes.length === 0) return "";
+  // 24 小时过期检查（缓存友好：过期后不再注入动态块）
+  const changeAt = state.lastChange?.at;
+  if (changeAt) {
+    const elapsed = Date.now() - new Date(changeAt).getTime();
+    if (elapsed > 24 * 3600 * 1000) return ""; // 超过 24 小时静默过期
+  }
   const lines = changes.map((c) => `- ${c.what}：${c.from} → ${c.to}`);
   return (
     `【⚠️ 扮演配置变更提醒（必须立即执行，覆盖你之前的表达习惯）】\n` +

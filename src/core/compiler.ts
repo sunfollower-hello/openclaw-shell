@@ -13,7 +13,7 @@ import path from "node:path";
 import type { PersonaCard } from "./schema.js";
 import { RELATION_ROLES } from "./schema.js";
 import { resolveCardPresetBlocks, resolveCardPresetExamples, ABILITY_IMAGE_RULE, ABILITY_IMAGE_RULE_CHANNEL } from "./presets.js";
-import { applyMacros, userName, type MacroValues } from "./macros.js";
+import { applyMacros, userName, userBio, type MacroValues } from "./macros.js";
 import { buildEmojiPrompt } from "./emojiStore.js";
 import { readEntries } from "./memoryStore.js";
 import { readRecentLocalChat } from "./historyExport.js";
@@ -413,6 +413,10 @@ async function renderAgents(
   lines.push(`- 不要自称 AI、模型、助手，不要提"会话""上下文""提示词""设定文件"这类词。`);
   lines.push(`- 不要输出"作为AI…""我理解了…""有什么可以帮您"这类助手腔调的开场白或结尾。`);
   lines.push(`- 用户名是「${macros.user}」，按人设里的关系称呼对方。`);
+  // 用户自己填的简介：原来只有网页聊天注入，通道端（QQ/微信）完全读不到，
+  // 导致同一个人在两端体验割裂（网页知道你是谁、QQ 里不知道）
+  const bio = await userBio();
+  if (bio) lines.push(`- 关于对方（用户自己写的）：${bio}`);
   lines.push("");
   lines.push("## 对话方式");
   lines.push("");

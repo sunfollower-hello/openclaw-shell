@@ -1609,3 +1609,230 @@ body.lc-fullscreen .lc-root { height: 100dvh; }
   border-radius: 8px;
   padding: 6px 10px;
 }
+
+/* ================= 本地聊天：QQ / 微信 式灰白配色 =================
+   只在 .lc-root 作用域内覆盖调色变量，其余页面仍是暖纸风。
+   对齐微信：会话底 #ededed 灰、角色（对方）气泡纯白、自己的气泡绿色。 */
+.lc-root {
+  --lc-chat-bg: #ededed;      /* 会话背景灰（微信同款） */
+  --lc-bubble-bot: #ffffff;   /* 角色气泡：纯白（用户点名要求） */
+  --lc-bubble-me: #95ec69;    /* 自己的气泡：微信绿 */
+  --lc-bubble-me-text: #10130f;
+  --lc-bar: #f7f7f7;          /* 顶栏 / 输入区浅灰白 */
+  --lc-line: #dedede;         /* 分隔线 */
+  --lc-field: #ffffff;        /* 输入框白底 */
+}
+/* 顶栏与消息区：灰白分层 */
+.lc-root .lc-top { background: var(--lc-bar); border-bottom-color: var(--lc-line); }
+.lc-root .lc-log { background: var(--lc-chat-bg); }
+/* 气泡：角色纯白 + 极淡描边；自己绿色。圆角比原来收一点，更接近 IM 观感 */
+.lc-root .bubble { border-radius: 8px; padding: 9px 12px; box-shadow: none; }
+.lc-root .bubble.bot {
+  background: var(--lc-bubble-bot);
+  border: 1px solid rgba(0, 0, 0, 0.06);
+  color: #1a1a1a;
+}
+.lc-root .bubble.me {
+  background: var(--lc-bubble-me);
+  border: 1px solid rgba(0, 0, 0, 0.04);
+  color: var(--lc-bubble-me-text);
+}
+/* 气泡小尖角（指向头像一侧），QQ/微信 观感的关键细节 */
+.lc-root .bubble-row .bubble { position: relative; }
+.lc-root .bubble-row.bot .bubble::before,
+.lc-root .bubble-row.me .bubble::before {
+  content: ""; position: absolute; top: 12px;
+  border: 5px solid transparent;
+}
+.lc-root .bubble-row.bot .bubble::before {
+  left: -10px; border-right-color: var(--lc-bubble-bot);
+}
+.lc-root .bubble-row.me .bubble::before {
+  right: -10px; border-left-color: var(--lc-bubble-me);
+}
+/* 头像：IM 里是小圆角方形，不是圆形 */
+.lc-root .bubble-avatar { border-radius: 6px; border-color: rgba(0, 0, 0, 0.06); }
+/* 输入区：浅灰白底 + 白输入框（微信输入条观感） */
+.lc-root .lc-dock { background: var(--lc-bar); border-top: 1px solid var(--lc-line); padding-top: 8px; }
+.lc-root .lc-island { background: transparent; border: none; box-shadow: none; border-radius: 0; padding: 0 4px 4px; }
+.lc-root .lc-input-row textarea {
+  background: var(--lc-field);
+  border: 1px solid var(--lc-line);
+  color: #1a1a1a;
+}
+.lc-root .lc-input-row textarea:focus { background: var(--lc-field); border-color: #c8c8c8; }
+/* 上排按键（模型商/模型/思考深度）跟着灰白走 */
+.lc-root .lc-pill { background: var(--lc-field); border-color: var(--lc-line); }
+/* 朗读按钮在白气泡上要有对比 */
+.lc-root .tts-speak-btn { background: var(--lc-bubble-bot); border-color: var(--lc-line); }
+/* 纯表情气泡：QQ/微信 里表情是裸图、没有气泡底和尖角 */
+.lc-root .bubble:has(> img.chat-emoji:only-child) {
+  background: transparent; border: none; padding: 0;
+}
+.lc-root .bubble:has(> img.chat-emoji:only-child)::before { display: none; }
+
+/* 顶栏「更多」：三个点（对齐微信聊天页右上角） */
+.lc-more-btn {
+  width: 32px; height: 32px; padding: 0;
+  border: 1px solid var(--lc-line, var(--border));
+  background: var(--lc-field, var(--card));
+  color: #444; border-radius: 9px;
+  font-size: 19px; line-height: 1; cursor: pointer;
+  display: inline-flex; align-items: center; justify-content: center;
+  flex-shrink: 0;
+}
+.lc-more-btn:hover { background: #ececec; color: #111; }
+
+/* 搜索命中定位：短暂高亮那一条消息 */
+.bubble-row.hit-flash .bubble {
+  outline: 2px solid var(--accent);
+  animation: hitFlash 2.2s ease-out;
+}
+@keyframes hitFlash {
+  0%, 30% { background: #fff6b8; }
+  100% { background: inherit; }
+}
+
+/* ================= 通讯录（微信式会话列表） =================
+   一条 = 一个人：头像靠左固定尺寸，右侧上行名字+时间、下行最后一句预览。 */
+.chat-search-wrap { padding: 0 0 10px; }
+.chat-search-wrap input {
+  width: 100%; padding: 8px 12px; border-radius: 10px;
+  border: 1px solid var(--border); background: var(--card);
+}
+.chat-list {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  overflow: hidden;
+}
+.chat-item {
+  display: flex; align-items: center; gap: 12px;
+  padding: 11px 13px;
+  border-bottom: 1px solid var(--border);
+  cursor: pointer; min-width: 0;
+  transition: background 0.12s;
+}
+.chat-item:last-child { border-bottom: none; }
+.chat-item:hover { background: var(--panel); }
+.chat-item.pinned { background: #f7f5f0; }
+.chat-item.pinned:hover { background: var(--panel); }
+/* 头像：只在最左边占一个合适的大小（微信是 48px 小圆角方形） */
+.chat-av {
+  width: 46px; height: 46px; flex-shrink: 0;
+  border-radius: 8px; overflow: hidden;
+  background: var(--accent-soft); color: var(--accent);
+  display: flex; align-items: center; justify-content: center;
+  font-size: 19px; font-weight: 700;
+}
+.chat-av img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.chat-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 4px; }
+.chat-line1 { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
+.chat-name {
+  font-size: 15px; font-weight: 600; color: var(--text);
+  flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.chat-time { font-size: 11.5px; color: var(--faint); flex-shrink: 0; }
+.chat-line2 { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.chat-preview {
+  flex: 1; min-width: 0; font-size: 12.5px; color: var(--muted);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.chat-pin-flag {
+  font-size: 10.5px; color: var(--accent); background: var(--accent-soft);
+  padding: 1px 6px; border-radius: 20px; flex-shrink: 0;
+}
+@media (max-width: 600px) {
+  .chat-av { width: 42px; height: 42px; }
+  .chat-name { font-size: 14.5px; }
+}
+
+/* ================= 单卡聊天设置页 ================= */
+.ci-head { display: flex; align-items: center; gap: 10px; }
+.ci-head h2 { margin: 0; }
+.ci-who { display: flex; align-items: center; gap: 12px; }
+.ci-av {
+  width: 54px; height: 54px; border-radius: 10px; overflow: hidden; flex-shrink: 0;
+  background: var(--accent-soft); color: var(--accent);
+  display: flex; align-items: center; justify-content: center;
+  font-size: 22px; font-weight: 700;
+}
+.ci-av img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.ci-who-text { flex: 1; min-width: 0; }
+.ci-name { font-size: 16px; font-weight: 700; }
+.ci-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.ci-row-label { font-size: 14px; font-weight: 600; }
+.ci-danger { border-color: var(--danger); }
+.ci-search-out { margin-top: 8px; display: flex; flex-direction: column; gap: 4px; max-height: 300px; overflow-y: auto; }
+.ci-hit {
+  display: flex; align-items: baseline; gap: 8px;
+  padding: 7px 9px; border-radius: 8px; background: var(--panel);
+  cursor: pointer; font-size: 12.5px;
+}
+.ci-hit:hover { background: var(--accent-soft); }
+.ci-hit-who { flex-shrink: 0; color: var(--muted); font-weight: 600; }
+.ci-hit-text { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ci-hit-text mark { background: #ffe9a8; padding: 0 1px; border-radius: 2px; }
+.ci-hit-time { flex-shrink: 0; color: var(--faint); font-size: 11px; }
+
+/* ===== 表情面板：输入框「下方」展开（QQ 式），输入岛随之上移 =====
+   面板在 .lc-dock 内、紧跟 .lc-island 之后。消息区 .lc-log 是 flex:1，
+   面板一出现 dock 变高、log 被压缩 → 视觉上就是「输入框上移、下方让出表情区」。 */
+.lc-root .lc-dock { display: flex; flex-direction: column; }
+.lc-emoji-panel {
+  flex-shrink: 0;
+  height: 40vh; max-height: 320px; min-height: 180px;
+  background: var(--lc-bar);
+  border-top: 1px solid var(--lc-line);
+  /* 抵掉 lc-dock 的左右/底部内边距（8px 14px 14px + safe-area），让面板铺满宽度贴到底 */
+  margin: 8px -14px calc(-14px - env(safe-area-inset-bottom));
+  padding-bottom: env(safe-area-inset-bottom);
+  overflow: hidden;
+  display: flex; flex-direction: column;
+}
+.lc-emoji-panel[hidden] { display: none; }
+.lc-emoji-scroll {
+  flex: 1; min-height: 0; overflow-y: auto;
+  padding: 12px 12px 14px;
+  display: grid;
+  /* 桌面自适应列数；手机固定 4 列（下方媒体查询） */
+  grid-template-columns: repeat(auto-fill, minmax(74px, 1fr));
+  gap: 10px 8px;
+  align-content: start;
+}
+.lc-emoji-item {
+  display: flex; flex-direction: column; align-items: center; gap: 4px;
+  padding: 6px 2px;
+  background: transparent; border: 1px solid transparent; border-radius: 10px;
+  cursor: pointer; min-width: 0;
+}
+.lc-emoji-item:hover { background: #fff; border-color: var(--lc-line); }
+.lc-emoji-item img {
+  width: 52px; height: 52px; object-fit: contain; display: block;
+}
+.lc-emoji-label {
+  font-size: 11px; color: #5a5a5a; line-height: 1.2;
+  max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.lc-emoji-empty { grid-column: 1 / -1; text-align: center; color: var(--muted); font-size: 12.5px; padding: 18px 0; }
+/* 表情按钮激活态（面板展开中）：灰白主题下用淡底 + 深色图标。
+   注意别只改 color——基础态 .lc-icon-btn.on 是「陶土底 + 白图标」，
+   单独改 color 会变成底色与图标同色的实心圆点（看不见图标）。 */
+.lc-root .lc-input-row .lc-icon-btn.on {
+  background: #e4e4e4;
+  border-color: #cfcfcf;
+  color: #333;
+}
+.lc-root .lc-input-row .lc-icon-btn.on:hover { background: #dcdcdc; color: #111; }
+/* 灰白主题下未激活态也跟着走（默认的暖色 panel 底在灰白页里发黄） */
+.lc-root .lc-input-row .lc-icon-btn { background: var(--lc-field); border-color: var(--lc-line); color: #6b6b6b; }
+/* 手机：每行固定 4 个，格子再小一点（用户点名要求） */
+@media (max-width: 600px) {
+  .lc-emoji-scroll {
+    grid-template-columns: repeat(4, 1fr);
+    gap: 10px 6px; padding: 10px 8px 12px;
+  }
+  .lc-emoji-item img { width: 46px; height: 46px; }
+  .lc-emoji-label { font-size: 10.5px; }
+  .lc-emoji-panel { height: 42vh; min-height: 170px; }
+}

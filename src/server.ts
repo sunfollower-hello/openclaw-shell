@@ -5,7 +5,7 @@ import path from "node:path";
 import os from "node:os";
 import crypto from "node:crypto";
 import { promises as fs, existsSync } from "node:fs";
-import { CardStore, dataDir, newCardId, nowIso } from "./core/cardStore.js";
+import { CardStore, dataDir, newCardId, nowIso, isValidSlug } from "./core/cardStore.js";
 import { defaultCard, SCHEMA_VERSION, personaCardSchema, type PersonaCard } from "./core/schema.js";
 import { validateCard } from "./core/validator.js";
 import { compileCard } from "./core/compiler.js";
@@ -27,7 +27,7 @@ import {
 import { runDistill } from "./distiller/pipeline.js";
 import { parsePlainText } from "./distiller/parser.js";
 import { RELATION_ROLES } from "./core/schema.js";
-import { buildChatSystemAsync } from "./core/chatPrompt.js";
+import { buildChatSystemAsync, selectTriggeredWorldbook } from "./core/chatPrompt.js";
 import { splitReply, describeSplit, type SplitStyle } from "./core/splitter.js";
 import {
   listPresets,
@@ -58,6 +58,7 @@ import { TOOL_REGISTRY, toolsToOpenAI, resolveInSandbox, type ToolDef, type Tool
 import { FEATURES, filterDisabledTools } from "./core/features.js";
 import { toUserError } from "./core/errors.js";
 import { queryLogs, clearLogs, logInfo, logWarn, logError } from "./core/logger.js";
+import { parseUsage, recordLlmUsage, summarizeLlmUsage } from "./core/llmUsage.js";
 import { cardToCCv2, ccv2ToCard } from "./core/cardConvert.js";
 import { solidPng, pngWithTexts, extractCardJson, pngStripCardMeta, isPng } from "./core/png.js";
 import { getImageConfig, saveImageConfig, maskKey, testNovelaiKey, testOpenAIImageKey } from "./core/imageConfig.js";
@@ -127,7 +128,7 @@ import {
   displayName as accountDisplayName,
 } from "./core/accountLabels.js";
 import {
-  recall,
+  readEntries,
   appendEntry,
   deleteEntry,
   updateEntry,
@@ -143,6 +144,7 @@ import {
   roundKeyOf,
 } from "./core/memoryStore.js";
 import { appendConv, readConv, readConvSrcIds, deleteConvByIds, clearConv, type ConvSurface } from "./core/conversationStore.js";
+import { readChatListState, setPinned, forgetChatListEntry } from "./core/chatListStore.js";
 import {
   listGroupsForCard,
   getGroupDetail,
@@ -302,6 +304,17 @@ app.get("/api/logs", (req, res) => {
 app.post("/api/logs/clear", (_req, res) => {
   clearLogs();
   res.json({ ok: true });
+});
+
+// ---------- 模型用量与缓存命中统计（角色扮演成本优化的实测依据） ----------
+// DeepSeek 等上游对「缓存命中的输入」按 1/50 计价，但命中要求前缀逐字节稳定。
+// 这里给出真实命中率，用来验证 prompt 结构改动是否生效。
+app.get("/api/llm-usage", async (_req, res) => {
+  try {
+    res.json(await summarizeLlmUsage(30));
+  } catch (e) {
+    res.status(500).json({ error: toUserError(e) });
+  }
 });
 
 // ---------- 用户资料（抽屉头像/昵称，可编辑） ----------
@@ -637,6 +650,7 @@ app.delete("/api/cards/:slug", async (req, res) => {
     const slug = req.params.slug;
     await store.remove(slug);
     // 清理该卡的关联数据（卡删了这些失去归属，避免重建同名卡时出现"幽灵记忆/表情"）
+    await forgetChatListEntry(slug).catch(() => {}); // 通讯录置顶记录
     const root = dataDir();
     await fs.rm(path.join(root, "memory", `${slug}.mem`), { force: true }).catch(() => {});
     await fs.rm(path.join(root, "memory", `${slug}.mem.count`), { force: true }).catch(() => {});
@@ -1693,6 +1707,14 @@ keys 必须包含 "<重描写>"（可另加场景词）。constant=false。
 - 例外：她在**用文字描述自己想对 {{user}} 做什么**（那属于台词内容，写在第二块），不是这一块的动作
 
 按情绪/情景写细：高兴、生气、紧张、害羞、难过、吃醋、被冷落、示弱、心软、想靠近又怕被拒绝、深夜发消息……每种都要写：手机/打字的具体动作 + 她当时的身体反应 + 心里真实想法，以及「发出去的字」和「心里想的」怎么不一致。
+
+【动作和心理要分清，分两栏写，别混在一起】
+- 动作 = 这一瞬间能被摄像头拍到的身体行为（手指停在屏幕上、删了又重打、眼睛一下热了、抱着手机打滚、指甲掐进掌心）
+- 心理 = 只在脑子里的念头（他是不是讨厌我了、这次真的过分了、不想让他知道我在等）
+- 【禁止旁白】不要写时间跨度（"过了一会儿""沉默了很久""十分钟后"）、不要写语气说明（"语气慢悠悠""声音压低""冷冷地"）、不要写场面调度。聊天是瞬时的，语气要靠台词本身传达。
+  允许的极短迟疑必须带情绪或动作，如"迟疑了一下还是点了发送"。
+- 情绪不要直接命名，要落到身体上：不写"有点委屈"，写"眼睛一下就热了"；不写"很生气"，写"手指用力戳着屏幕"。
+每个情景都按「动作：…… / 心理：……」两行写清楚，方便模型区分。
 不要写括号、不要写排版格式（（）和 {} 由系统按风格自动加）。
 
 （可选）「世界观」：仅异世界/末世/特定作品才加。现代日常不要加。
@@ -2190,17 +2212,20 @@ app.post("/api/distill/weflow", async (req, res) => {
 
 // ---------- 聊天测试（人设 + 工具 + 记忆 + 思考深度 + ask 审批） ----------
 async function chatCompletions(
-  llm: { baseUrl: string; apiKey: string; model: string },
+  llm: { baseUrl: string; apiKey: string; model: string; provider?: string },
   messages: unknown[],
   tools?: unknown[],
   reasoning?: string,
-  externalSignal?: AbortSignal // 客户端断开/截断时中止模型请求（省 API）
-): Promise<{ choices?: { message?: { content?: string; tool_calls?: unknown[] } }[] }> {
+  externalSignal?: AbortSignal, // 客户端断开/截断时中止模型请求（省 API）
+  /** 记账用：调用来源（web/memory/distill…）与卡 slug，便于按场景看缓存命中率 */
+  meta?: { kind?: string; slug?: string }
+): Promise<{ choices?: { message?: { content?: string; tool_calls?: unknown[] } }[]; usage?: unknown }> {
   const doCall = async (effort?: string) => {
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), 90000);
     const onExternal = () => ctrl.abort();
     externalSignal?.addEventListener("abort", onExternal, { once: true });
+    const t0 = Date.now();
     try {
       const r = await fetch(`${llm.baseUrl.replace(/\/+$/, "")}/chat/completions`, {
         method: "POST",
@@ -2219,7 +2244,10 @@ async function chatCompletions(
         const body = await r.text().catch(() => "");
         throw new Error(`模型调用失败 ${r.status}: ${body.slice(0, 200)}`);
       }
-      return await r.json();
+      const data = await r.json();
+      // 用量与缓存命中记账（DeepSeek 命中的输入按 1/50 计价，没有实测就无法判断优化是否生效）
+      void logAndRecordUsage(data?.usage, llm, Date.now() - t0, meta);
+      return data;
     } finally {
       clearTimeout(timer);
       externalSignal?.removeEventListener("abort", onExternal);
@@ -2234,6 +2262,44 @@ async function chatCompletions(
     }
     throw e;
   }
+}
+
+/**
+ * 把一次模型调用的 usage 写进运行日志 + 落盘记账。
+ * 日志一行看清四件事：输入多少、其中命中多少（省钱的部分）、输出多少、耗时。
+ * 上游没报告缓存字段时明确写「上游未报告缓存」——那说明中转没透传，不能当成没命中。
+ */
+async function logAndRecordUsage(
+  rawUsage: unknown,
+  llm: { model: string; provider?: string },
+  ms: number,
+  meta?: { kind?: string; slug?: string }
+): Promise<void> {
+  if (!rawUsage) return;
+  const u = parseUsage(rawUsage);
+  const provider = llm.provider ?? "unknown";
+  const kind = meta?.kind ?? "other";
+  const hitPct = u.promptTokens > 0 ? Math.round((u.cacheHitTokens / u.promptTokens) * 100) : 0;
+  const cacheText = u.cacheReported
+    ? `缓存命中 ${u.cacheHitTokens}/${u.promptTokens}（${hitPct}%）· 未命中 ${u.cacheMissTokens}`
+    : "上游未报告缓存字段（中转可能没透传）";
+  logInfo(
+    "用量",
+    `${kind}${meta?.slug ? `·${meta.slug}` : ""} ${provider}/${llm.model} 输入 ${u.promptTokens} · 输出 ${u.completionTokens} · ${cacheText} · ${ms}ms`,
+    JSON.stringify(rawUsage)
+  );
+  await recordLlmUsage({
+    ts: new Date().toISOString(),
+    provider,
+    model: llm.model,
+    kind,
+    slug: meta?.slug,
+    promptTokens: u.promptTokens,
+    completionTokens: u.completionTokens,
+    cacheHitTokens: u.cacheHitTokens,
+    cacheMissTokens: u.cacheMissTokens,
+    ms,
+  });
 }
 
 interface ToolCallMsg {
@@ -2318,18 +2384,19 @@ type LoopResult =
   | { type: "pending"; pending: { id: string; name: string; args: string }[]; messages: unknown[] };
 
 async function runToolLoop(
-  llm: { baseUrl: string; apiKey: string; model: string },
+  llm: { baseUrl: string; apiKey: string; model: string; provider?: string },
   messages: unknown[],
   tools: ToolDef[],
   ctx: ToolCtx,
   askAll: boolean,
   reasoning?: string,
-  externalSignal?: AbortSignal // 客户端断开/截断时中止模型请求
+  externalSignal?: AbortSignal, // 客户端断开/截断时中止模型请求
+  meta?: { kind?: string; slug?: string }
 ): Promise<LoopResult> {
   const toolImages: string[] = [];
   for (let i = 0; i < 4; i++) {
     if (externalSignal?.aborted) return { type: "reply", reply: "（已截断）" };
-    const data = await chatCompletions(llm, messages, tools.length ? toolsToOpenAI(tools) : undefined, reasoning, externalSignal);
+    const data = await chatCompletions(llm, messages, tools.length ? toolsToOpenAI(tools) : undefined, reasoning, externalSignal, meta);
     const msg = data.choices?.[0]?.message;
     const toolCalls = ((msg?.tool_calls ?? []) as ToolCallMsg[]).filter((tc) => tc.function?.name);
     if (toolCalls.length === 0) {
@@ -2404,13 +2471,16 @@ app.post("/api/chat", async (req, res) => {
     const enabledTools = Array.isArray(tools) ? (tools as string[]) : [];
     const { defs: toolDefs } = await resolveChatTools(enabledTools);
 
-    // 相关召回：按关键词重合 + 新鲜度取与当前话题最相关的记忆（最多 30 条）。
-    // 【关键】记忆恒置顶（稳定排序，组内仍按相关度），不被高分普通记忆挤掉。
-    const memories = (await recall(slug, message, 30, ns).catch(() => [])).slice().sort(
+    // 【上下文缓存优化（2026-09-11）】system prompt 必须是**逐字节稳定的前缀**。
+    // 长期记忆改为全量注入（不再按当前消息检索），这样同一张卡的 system 在记忆没新增时
+    // 完全不变；世界书只注入常驻条目（关键词触发条目后置到动态块，避免每轮集合变化）。
+    // 记忆检索结果如果每轮按当前消息变，system 前缀就整段失效——实测基线每轮 170-380 token
+    // 未命中就是这块在作祟。
+    const allMems = (await readEntries(slug).catch(() => [])).slice().sort(
       (a, b) => (b.important ? 1 : 0) - (a.important ? 1 : 0)
     );
-    const memoryBlock = memories.length
-      ? `\n\n【长期记忆（关于你的事实，仅在相关时使用；【关键】为必须遵守的长期约定；要新增事实时调用 memory_save 工具）】\n- ${memories
+    const memoryBlock = allMems.length
+      ? `\n\n【长期记忆（关于你的事实，仅在相关时使用；【关键】为必须遵守的长期约定；要新增事实时调用 memory_save 工具）】\n- ${allMems
           .map((m) => `${m.important ? "【关键】" : ""}${m.fact}`)
           .join("\n- ")}`
       : "";
@@ -2431,33 +2501,45 @@ app.post("/api/chat", async (req, res) => {
             : level === "extreme"
               ? "xhigh"
               : undefined;
-    // 世界书关键词触发的检索文本：当前消息 + 最近几轮对话内容
-    const recentText = [
-      ...(Array.isArray(history) ? history.slice(-6) : []).map((m) => String((m as { content?: string })?.content ?? "")),
-      String(message),
-    ].join("\n");
     // 用户身份：让 AI 知道"对面是谁"（设置里的昵称/简介，留空则不注入）
     const me = await readUserProfile();
     const userBlock =
       me.name || me.bio
         ? `\n\n【和你说话的人】${me.name ? `称呼：${me.name}。` : ""}${me.bio ? `\n${me.bio}` : ""}`
         : "";
+    // 【上下文缓存优化（2026-09-11）】system prompt 必须是**逐字节稳定的前缀**，
+    // 上游（DeepSeek 等）才会命中上下文缓存——命中的输入按 1/50 计价，省 ~98%。
+    // 所以这里只放静态内容（人设/预设/常驻世界书/工具说明/表情清单），
+    // 每轮都会变的东西（长期记忆检索结果、关键词触发的世界书条目）一律后置到
+    // 聊天历史之后作为独立 system 消息注入——既不破坏前缀，又因为贴着生成点而更有效。
+    // recentText 传空 = 只注入常驻（constant）世界书条目，保证 system 稳定。
     let system =
-      (await buildChatSystemAsync(card, await resolveCardPresetBlocks(card), recentText)) +
+      (await buildChatSystemAsync(card, await resolveCardPresetBlocks(card), "")) +
       userBlock +
       (toolDefs.length
         ? `\n\n你可以使用以下工具完成任务：${toolDefs.map((t) => t.name).join("、")}。用户请求适合用工具完成时，调用工具而不是凭空编造；危险工具会先征得用户同意。${toolDefs.some((t) => t.id === "image_gen") ? "\n【生图强约束】如果角色设定/剧情让你拒绝用户的图片请求，可以直接拒绝（符合人设）；但只要你【同意】生成图片，就必须立即调用 image_gen 工具真实生成——绝不能只口头描述画面、编造图片地址或假装已生成（那样用户什么也收不到）。图片生成后系统会自动附带在回复末尾，你【不要】在回复正文里写图片地址/路径。" : ""}`
         : "") +
-      memoryBlock +
-      rememberRule;
+      rememberRule +
+      // 记忆放 system 末尾（全量、稳定）：新增记忆时才变一次，其余轮次完全命中缓存
+      memoryBlock;
 
-    // 表情包注入：全局共享库（关闭档不注入）
+    // 表情包注入：全局共享库（关闭档不注入）。清单是静态的，留在 system 里。
     system += await buildEmojiPrompt(card.voice?.message_style?.emoji ?? "克制", "inline", card.emojiGroups);
 
-    // 配置变更强提醒：风格/条数/预设档位最近改过 → system 最顶部注入（覆盖上下文惯性）
+    // ---- 动态块（每轮可能变化，放在聊天历史之后，不进 system 前缀）----
+    // 世界书关键词触发：只挑「非常驻且命中当前话题关键词」的条目（常驻的已在 system 里）
+    const recentText = [
+      ...(Array.isArray(history) ? history.slice(-6) : []).map((m) => String((m as { content?: string })?.content ?? "")),
+      String(message),
+    ].join("\n");
+    const triggeredWb = selectTriggeredWorldbook(card, recentText);
+
+    // 配置变更强提醒：风格/条数/预设档位最近改过。
+    // 【位置很关键】不能只放 system 顶部——那里离生成点最远，会被末尾 20 条旧风格聊天记录
+    // 的近因效应压过去（实测：轻描写切重描写后模型仍按旧风格输出）。改为放在
+    // 聊天记录之后、用户消息之前作为独立 system 消息注入，贴着生成点提醒。
     const cfgState = await readConfigState(card.slug).catch(() => ({}));
     const cfgReminder = buildConfigChangeReminder(cfgState);
-    if (cfgReminder) system = cfgReminder + "\n\n" + system;
 
     // 破甲示范对话（few-shot 锚定）：从所选档位预设的 <example> 块解析，注入在真实对话开头。
     // 对齐 RP-Hub 的「system 破限 + user/AI 消息注入」三重结构，弱模型靠模仿比靠指令更稳。
@@ -2469,6 +2551,15 @@ app.post("/api/chat", async (req, res) => {
     const firstMes = card.sillytavern_v2?.first_mes?.trim() ?? "";
     const openedWithGreeting = isFreshChat && firstMes ? firstMes : "";
 
+    // 动态块：只放「必须贴近生成点才生效」的内容——配置变更强提醒（靠近因效应压过旧风格惯性）
+    // 与关键词触发的世界书条目。记忆已全量进 system（稳定前缀），不在这里重复。
+    // 稳定态下这里应为空 → 整轮请求前缀完全一致 → 缓存命中率最高（实测 93-96%）。
+    const dynamicBlock = [triggeredWb, cfgReminder].filter(Boolean).join("\n\n");
+    if (dynamicBlock) {
+      // 有动态内容才会破坏本轮缓存，记一行便于回溯（正常情况下不该频繁出现）
+      logInfo("缓存", `动态块 ${dynamicBlock.length} 字符（世界书触发 ${triggeredWb ? "是" : "否"} / 配置提醒 ${cfgReminder ? "是" : "否"}）`);
+    }
+
     const messages: unknown[] = [
       { role: "system", content: system },
       ...(presetExamples.length
@@ -2476,6 +2567,9 @@ app.post("/api/chat", async (req, res) => {
         : []),
       ...(openedWithGreeting ? [{ role: "assistant", content: openedWithGreeting }] : []),
       ...(Array.isArray(history) ? history.slice(-20) : []),
+      // 动态块贴着生成点：记忆/相关设定/配置提醒放这里，既不破坏前缀缓存，
+      // 又靠近因效应压过旧聊天记录的惯性（配置变更提醒原本就必须放这个位置才生效）
+      ...(dynamicBlock ? [{ role: "system", content: dynamicBlock }] : []),
       { role: "user", content: message },
     ];
     logInfo("聊天", `${card.name} 用 ${llm.provider}/${llm.model}` + (toolDefs.length ? ` · 工具 ${toolDefs.length} 个` : "") + (presetExamples.length ? " · 破甲示范注入" : ""));
@@ -2486,7 +2580,7 @@ app.post("/api/chat", async (req, res) => {
     // 客户端断开（截断）→ 中止模型请求，省 API
     const chatCtrl = new AbortController();
     req.on("close", () => { if (!res.writableEnded) chatCtrl.abort(); });
-    const result = await runToolLoop(llm, messages, toolDefs, chatCtx(slug, ns), card.tools?.policy === "ask", reasoning, chatCtrl.signal);
+    const result = await runToolLoop(llm, messages, toolDefs, chatCtx(slug, ns), card.tools?.policy === "ask", reasoning, chatCtrl.signal, { kind: "web", slug });
     // 出站清理：剥离低级模型泄漏的纯文本思维链（「分析：」「（思考）」等前缀行）
     if (result.type === "reply" && typeof result.reply === "string") {
       const cleaned = sanitizeChatReply(card, result.reply);
@@ -2598,6 +2692,8 @@ async function autoMemorize(
       return;
     }
     const data = await r.json();
+    // 记忆总结也在花钱（每 N 轮一次），一并记账便于看整体成本构成
+    void logAndRecordUsage(data?.usage, llm, 0, { kind: "memory", slug });
     const text = String(data.choices?.[0]?.message?.content ?? "").replace(/```json|```/g, "").trim();
     const start = text.indexOf("{");
     const end = text.lastIndexOf("}");
@@ -2657,7 +2753,7 @@ app.post("/api/chat/approve", async (req, res) => {
     // 客户端断开（截断）→ 中止模型请求，省 API
     const chatCtrl = new AbortController();
     req.on("close", () => { if (!res.writableEnded) chatCtrl.abort(); });
-    const result = await runToolLoop(llm, messages, toolDefs, chatCtx(slug, ns), card.tools?.policy === "ask", undefined, chatCtrl.signal);
+    const result = await runToolLoop(llm, messages, toolDefs, chatCtx(slug, ns), card.tools?.policy === "ask", undefined, chatCtrl.signal, { kind: "approve", slug });
     if (result.type === "reply") {
       // 与 /api/chat 一致：审批续聊后的回复同样计入自动记忆（用户消息取 messages 里最后一条 user）
       const lastUser = [...messages].reverse().find((m) => (m as { role?: string }).role === "user");
@@ -3290,6 +3386,103 @@ app.get("/api/cards/:slug/conversation", async (req, res) => {
   }
 });
 
+/**
+ * 通讯录（会话列表）：只列出**真的聊过**的卡——像微信一样，没聊过的人不出现在聊天列表里。
+ * 每条给出微信式长条需要的字段：头像、名字、最后一句预览、时间、置顶。
+ * 排序：置顶优先（按置顶时间倒序），其余按最后一条消息时间倒序。
+ */
+app.get("/api/conversations", async (_req, res) => {
+  try {
+    const [metas, state] = await Promise.all([store.list(), readChatListState()]);
+    const items: {
+      slug: string;
+      name: string;
+      avatar?: string;
+      role: string;
+      last: string;
+      lastRole: "user" | "assistant" | "";
+      lastAt: string;
+      count: number;
+      pinned: boolean;
+      pinnedAt: string;
+    }[] = [];
+    for (const m of metas) {
+      const entries = await readConv(m.slug).catch(() => []);
+      if (!entries.length) continue; // 没有聊天记录的卡不进通讯录（用户明确要求）
+      const last = entries[entries.length - 1];
+      items.push({
+        slug: m.slug,
+        name: m.name,
+        avatar: m.avatar,
+        role: m.role,
+        // 预览去掉换行与表情标签，只留一行文字（列表里一行显示）
+        last: String(last?.content ?? "")
+          .replace(/\[表情:([^\]]+)\]/g, "[$1]")
+          .replace(/\s+/g, " ")
+          .trim()
+          .slice(0, 60),
+        lastRole: last?.role === "assistant" ? "assistant" : last?.role === "user" ? "user" : "",
+        lastAt: last?.t ?? "",
+        count: entries.length,
+        pinned: !!state.pinned[m.slug],
+        pinnedAt: state.pinned[m.slug] ?? "",
+      });
+    }
+    items.sort((a, b) => {
+      if (a.pinned !== b.pinned) return a.pinned ? -1 : 1;
+      if (a.pinned && b.pinned) return b.pinnedAt.localeCompare(a.pinnedAt);
+      return String(b.lastAt).localeCompare(String(a.lastAt));
+    });
+    res.json({ items });
+  } catch (e) {
+    res.status(500).json({ error: toUserError(e) });
+  }
+});
+
+/** 置顶 / 取消置顶某个会话（通讯录与单卡设置页共用） */
+app.post("/api/cards/:slug/pin", async (req, res) => {
+  try {
+    const slug = req.params.slug;
+    if (!isValidSlug(slug)) return res.status(400).json({ error: "slug 不合法" });
+    const pinned = req.body?.pinned !== false;
+    await setPinned(slug, pinned);
+    res.json({ ok: true, pinned });
+  } catch (e) {
+    res.status(500).json({ error: toUserError(e) });
+  }
+});
+
+/**
+ * 聊天记录查找：在某张卡的会话日志里按关键词搜。
+ * 返回命中条目 + 它在整份记录里的位置（前端可据此跳转定位）。
+ */
+app.get("/api/cards/:slug/conversation/search", async (req, res) => {
+  try {
+    const slug = req.params.slug;
+    const q = String(req.query.q ?? "").trim();
+    if (!q) return res.json({ hits: [], total: 0 });
+    const bot = await getBotByCard(slug);
+    const all = await readConv(slug);
+    const entries = bot ? all : all.filter((e) => e.surface === "web");
+    const needle = q.toLowerCase();
+    const hits = entries
+      .map((e, idx) => ({ e, idx }))
+      .filter(({ e }) => e.content.toLowerCase().includes(needle))
+      .slice(-200) // 命中太多时只回最近 200 条，避免公网传输过大
+      .map(({ e, idx }) => ({
+        id: e.id,
+        role: e.role,
+        content: e.content.slice(0, 300),
+        t: e.t,
+        surface: e.surface,
+        index: idx,
+      }));
+    res.json({ hits: hits.reverse(), total: hits.length }); // 最近的排前面
+  } catch (e) {
+    res.status(500).json({ error: toUserError(e) });
+  }
+});
+
 // 删除指定消息（网页长按多选删除用），并做记忆修复：
 // ① 对话日志里同内容的未总结轮次一并移除（不再被总结）；
 // ② 删掉的轮数 ≥ N/2（或一次删掉大量已总结消息）→ 最新一条记忆按「解散」处理，由后续总结自然重算
@@ -3350,7 +3543,17 @@ app.post("/api/cards/:slug/conversation/delete", async (req, res) => {
       void exportMemoryToMarkdown(slug).catch(() => {});
       void syncAgentUserMemory(slug).catch(() => {});
     }
-    res.json({ ok: true, removed: removed.length, rounds, dissolved, memGone, channelTrimmed, channelNote });
+    // removedIds 同 undo：前端据此局部移除气泡，不整页重载
+    res.json({
+      ok: true,
+      removed: removed.length,
+      removedIds: removed.map((e) => e.id),
+      rounds,
+      dissolved,
+      memGone,
+      channelTrimmed,
+      channelNote,
+    });
   } catch (e) {
     res.status(500).json({ error: toUserError(e) });
   }
@@ -3407,7 +3610,17 @@ app.post("/api/cards/:slug/conversation/undo", async (req, res) => {
         void syncAgentUserMemory(slug).catch(() => {});
       }
     }
-    res.json({ ok: true, removed: removed.length, rounds: got, channelTrimmed, channelNote, dissolved, memGone });
+    // removedIds：前端据此只摘掉这几个气泡（不再整页重载历史，避免"消息全消失又出现"的闪动）
+    res.json({
+      ok: true,
+      removed: removed.length,
+      removedIds: removed.map((e) => e.id),
+      rounds: got,
+      channelTrimmed,
+      channelNote,
+      dissolved,
+      memGone,
+    });
   } catch (e) {
     res.status(500).json({ error: toUserError(e) });
   }
@@ -4152,6 +4365,15 @@ app.get("/api/tts/usage", async (_req, res) => {
   }
 });
 
+// ---------- LLM 用量与缓存统计 ----------
+app.get("/api/llm/usage", async (_req, res) => {
+  try {
+    res.json(await summarizeLlmUsage());
+  } catch (e) {
+    res.status(500).json({ error: toUserError(e) });
+  }
+});
+
 // ---------- 插件商店：ClawHub 实时搜索 + 精选/分享/付费目录 + 安装管理 ----------
 import AdmZip from "adm-zip";
 import {
@@ -4454,10 +4676,12 @@ async function syncAgentUserMemory(slug: string): Promise<void> {
   // 剥离旧的记忆段（若存在），保留原档案
   const existing = await fs.readFile(userMd, "utf8").catch(() => "");
   const base = existing.replace(new RegExp(`${USER_MEMORY_START}[\\s\\S]*?${USER_MEMORY_END}\\s*`, "g"), "").trimEnd();
-  // 当前扮演配置 + 变更提醒（每轮注入，对抗上下文惯性）
+  // 当前扮演配置 + 变更提醒（每轮注入，对抗上下文惯性）。
+  // 【位置】放在段尾（长期记忆与近期聊天之后）：旧聊天记录里全是旧风格的句式，
+  // 配置提醒必须排在它们后面才压得住近因效应，否则换风格后模型照旧风格输出。
   const cfgSection = buildConfigSectionForUserMd(await readConfigState(slug).catch(() => ({})));
   const memSection = (content.trim() || chatSection || cfgSection)
-    ? `\n\n${USER_MEMORY_START}\n${cfgSection.trim()}\n${content.trim() || "\n### 长期记忆\n- （暂无自动总结的记忆，靠对话自然积累）"}\n${chatSection.trim()}\n${USER_MEMORY_END}`
+    ? `\n\n${USER_MEMORY_START}\n${content.trim() || "\n### 长期记忆\n- （暂无自动总结的记忆，靠对话自然积累）"}\n${chatSection.trim()}\n${cfgSection.trim()}\n${USER_MEMORY_END}`
     : "";
   await fs.writeFile(userMd, base + memSection + "\n", "utf8");
 }

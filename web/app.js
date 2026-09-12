@@ -90,6 +90,11 @@ function cacheInvalidate(...prefixes) {
       if (key === p || key.startsWith(p)) apiCache.delete(key);
     }
   }
+  // 卡片数据变了：聊天页快照里的卡对象（模型/能力/表情分组等）也过期了。
+  // 只丢卡对象、保留聊天 DOM——改配置不该让已渲染的聊天记录重新加载一遍。
+  if (prefixes.some((p) => String(p).startsWith("/api/cards"))) {
+    try { lcSnap.cardObj = null; } catch { /* 首次 router 时 lcSnap 还在 TDZ */ }
+  }
 }
 
 /** 失败自动重试一次（公网抖动时避免直接静默失败），仍失败则抛出让调用方显示错误 */
@@ -378,6 +383,13 @@ function cleanupBeforeRoute() {
   try {
     if (lcEnterTimer) { clearTimeout(lcEnterTimer); lcEnterTimer = null; }
   } catch { /* 同上 */ }
+  // 离开本地聊天页：把聊天区 DOM + 上下文存成快照，回来时秒开（不重新加载聊天记录）。
+  // 注意这里**绝不** abort 正在跑的 /api/chat：用户可以在等回复期间去看配置，
+  // 请求继续在后台跑，回复到了由 wbDoSend 直接写进快照（见那里的 lcSnap 同步）。
+  try {
+    if (document.querySelector(".lc-root")) saveLcSnapshot();
+    if (wbMirrorTimer) { clearInterval(wbMirrorTimer); wbMirrorTimer = null; }
+  } catch { /* 同上 */ }
   document.getElementById("bot-overlay")?.remove();
   document.getElementById("adv-overlay")?.remove();
   try {
@@ -386,7 +398,9 @@ function cleanupBeforeRoute() {
 }
 
 function router() {
-  const hash = (location.hash || "").replace(/^#\/?/, "") || "home";
+  // 路由 key 只取路径段：#/chatinfo?slug=xxx 这类带查询串的地址要剥掉 ? 后面的部分，
+  // 否则整串当 key 匹配不到任何路由，会静默回落到首页。
+  const hash = (location.hash || "").replace(/^#\/?/, "").split("?")[0] || "home";
   const route = routes[hash] || routes.home;
   cleanupBeforeRoute();
   $("#view").innerHTML = route.render();
@@ -912,6 +926,105 @@ let wbMirror = null;        // 跨端会话状态（绑定=联通；null=本地�
 let wbMirrorTimer = null;   // 通道消息轮询定时器
 let wbRenderedIds = new Set(); // 已渲染的会话条目 id（增量渲染防重复）
 
+// ---------- 聊天页 DOM 快照缓存（切页不重载） ----------
+// 问题：router() 每次都重建 #view.innerHTML，initWorkbench 又无条件 wbPickCard，
+// 于是「点三个点看设置」「打开侧边栏看配置」回来都要清空聊天区 + 串行 4 个请求 +
+// 逐条重画几十上百条气泡 —— 表现就是每次都在重新加载聊天记录。
+// 方案：离开聊天页时把聊天区 DOM 与上下文整体存下来，回来只要卡没换就原样贴回。
+const lcSnap = {
+  slug: "",          // 快照属于哪张卡（换卡则作废）
+  logHtml: "",       // #chat-log 的 innerHTML
+  scrollTop: 0,
+  history: null,     // wbChatHistory 副本
+  renderedIds: null, // wbRenderedIds 副本
+  cardObj: null,     // 卡对象（省一次 /api/cards/<slug>）
+  mirror: null,      // 联通状态（省一次 mirror/status）
+  dot: { cls: "", title: "" },
+  greeted: false,    // 已领过开场白（回来不再重复领）
+};
+
+/** 离开聊天页前：把当前聊天区整体存进快照 */
+function saveLcSnapshot() {
+  const log = $("#chat-log");
+  if (!log || !wbSlug) return;
+  lcSnap.slug = wbSlug;
+  lcSnap.logHtml = log.innerHTML;
+  lcSnap.scrollTop = log.scrollTop;
+  lcSnap.history = wbChatHistory.slice();
+  lcSnap.renderedIds = new Set(wbRenderedIds);
+  lcSnap.cardObj = wbCardObj;
+  lcSnap.mirror = wbMirror;
+  const dot = $("#lc-dot");
+  lcSnap.dot = { cls: dot?.className?.replace("lc-dot", "").trim() ?? "", title: dot?.title ?? "" };
+}
+
+/** 快照对这张卡还有效吗（有内容且是同一张卡） */
+function lcSnapshotUsable(slug) {
+  return !!slug && lcSnap.slug === slug && !!lcSnap.logHtml;
+}
+
+/**
+ * 卡配置改过（cacheInvalidate 把 lcSnap.cardObj 清成 null）后补取卡对象。
+ * 只补这一份数据，聊天 DOM 不动 —— 改个配置不该让聊天记录重新加载。
+ */
+async function refreshLcCardObj(slug) {
+  if (!slug || lcSnap.slug !== slug) return;
+  const c = await cachedGet(`/api/cards/${slug}`).catch(() => null);
+  if (!c || lcSnap.slug !== slug) return;
+  lcSnap.cardObj = c;
+  if (wbSlug === slug) wbCardObj = c;
+  // 头像/名字可能改了，顺手刷新页头
+  const avEl = $("#lc-avatar");
+  const nameEl = $("#lc-name");
+  if (avEl) {
+    avEl.innerHTML = c.identity?.avatar
+      ? `<img src="${escapeHtml(c.identity.avatar)}" alt="">`
+      : `<span>${escapeHtml(String(c.name ?? "?").slice(0, 1))}</span>`;
+  }
+  if (nameEl) nameEl.textContent = middleEllipsis(c.name ?? slug, 16);
+}
+
+/** 用快照秒开聊天页：贴回 DOM 与上下文，不发任何请求 */
+function restoreLcSnapshot() {
+  const log = $("#chat-log");
+  if (!log) return false;
+  wbSlug = lcSnap.slug;
+  wbCardObj = lcSnap.cardObj;
+  wbChatHistory = (lcSnap.history ?? []).slice();
+  wbRenderedIds = new Set(lcSnap.renderedIds ?? []);
+  wbMirror = lcSnap.mirror;
+  log.innerHTML = lcSnap.logHtml;
+  // 头像与名字（快照里有卡对象，不用再请求）
+  const c = wbCardObj;
+  const avEl = $("#lc-avatar");
+  const nameEl = $("#lc-name");
+  if (avEl) {
+    avEl.innerHTML = c?.identity?.avatar
+      ? `<img src="${escapeHtml(c.identity.avatar)}" alt="">`
+      : `<span>${escapeHtml(String(c?.name ?? "?").slice(0, 1))}</span>`;
+  }
+  if (nameEl) nameEl.textContent = middleEllipsis(c?.name ?? wbSlug, 16);
+  setLcDot(lcSnap.dot.cls, lcSnap.dot.title);
+  // 滚动位置还原（instant：容器 CSS 是 smooth，平滑动画会被后续渲染打断）
+  log.scrollTo({ top: lcSnap.scrollTop, behavior: "instant" });
+  // 正在生成中就把占位气泡接回来（切页期间请求没断，见 wbDoSend）
+  if (wbAbort && !$("#chat-log .lc-pending-row")) {
+    wbThinkingBubble = addChatBubble("bot", "（正在输出… 发新消息可截断重来）");
+    wbThinkingBubble?.classList.add("lc-pending-row");
+  }
+  // 联通模式：重新挂上轮询（定时器在离开时被 cleanup 清掉了）
+  if (wbMirror?.slug === wbSlug && !wbMirrorTimer) {
+    wbMirrorTimer = setInterval(() => wbMirrorSync(wbSlug), 3000);
+  }
+  // 卡对象被配置变更清掉了 → 后台补取一份（不阻塞、不重画聊天）
+  if (!wbCardObj) void refreshLcCardObj(wbSlug);
+  // 模型商/模型/思考深度的按键标签：秒开路径不走 wbPickCard，必须在这里补上，
+  // 否则按键会一直显示「模型商」「模型」占位文字（lcModelState 是空的）。
+  // /api/providers 已走缓存，正常是命中缓存、不发请求。
+  void loadLcModelDefaults();
+  return true;
+}
+
 /** 联通状态圆点：on=绿（已联通） err=红（同步异常） 默认=白（本地） */
 function setLcDot(cls, title) {
   const dotEl = $("#lc-dot");
@@ -933,8 +1046,8 @@ function renderWorkbench() {
       </div>
       <div class="lc-top-actions">
         <button id="wb-undo-round" class="ghost small-btn" title="撤掉最近一问一答（网页与 QQ/微信 上下文一起摘，破甲被拒时用）">撤掉上一轮</button>
-        <button id="wb-chat-clear" class="ghost small-btn" title="一键删除：清空聊天记录与全部记忆（不可恢复）">一键删除</button>
-        <button id="wb-exit" class="ghost small-btn" title="退出本地聊天">退出</button>
+        <!-- 三个点=更多：进这张卡的聊天设置页（记忆/查找/置顶/一键删除都在里面） -->
+        <button id="wb-more" class="lc-more-btn" title="更多（聊天设置）" aria-label="更多">⋯</button>
       </div>
     </div>
 
@@ -965,13 +1078,18 @@ function renderWorkbench() {
           <button id="wb-send" class="lc-send" title="发送">${icon("send")}</button>
         </div>
       </div>
+      <!-- 表情面板（QQ 式）：在输入框「下方」展开，输入框整体上移，这里占住下半屏 -->
+      <div class="lc-emoji-panel" id="lc-emoji-panel" hidden>
+        <div class="lc-emoji-scroll" id="lc-emoji-scroll"></div>
+      </div>
     </div>
   </div>`;
 }
 
 async function initWorkbench() {
-  const cards = await api.get("/api/cards").catch(() => ({ cards: [] }));
-  wbCards = cards.cards ?? [];
+  // 卡列表走缓存且不阻塞首屏：本地聊天页用不到它（模型固定跟卡片配置），
+  // 原来 await 它会让整个聊天页等一个网络往返才开始渲染。
+  void cachedGet("/api/cards").then((r) => { wbCards = r.cards ?? []; }).catch(() => {});
   $("#wb-send").addEventListener("click", wbSend);
   // 三条横线：打开左侧抽屉（本地聊天接管整页后，菜单入口挪到这里）
   $("#lc-menu").addEventListener("click", openDrawer);
@@ -979,61 +1097,15 @@ async function initWorkbench() {
   const input = $("#wb-input");
   input.addEventListener("keydown", wbInputEnter);
   input.addEventListener("input", () => wbAutoGrow(input));
-  // 一键删除：清空聊天记录 + 全部记忆 + 开场状态（原「清空对话/重置」两键合一）
   $("#wb-undo-round").addEventListener("click", () => {
     if (!wbSlug) return toast("先选一张卡", false);
     void wbUndoLastRound();
   });
-  $("#wb-chat-clear").addEventListener("click", async () => {
-    if (!wbSlug) return;
-    const name = wbCardObj?.name ?? wbSlug;
-    const ok = await wbConfirm({
-      title: `一键删除「${name}」`,
-      lead: "清空这张卡的全部聊天记录与记忆，AI 会忘掉之前的一切。",
-      points: [
-        "网页聊天记录全部清空",
-        "长期记忆全部删除（包括通道里记住的事）",
-        "QQ / 微信 的对话上下文一并重置",
-        "开场白状态复位，下次见面重新开场",
-      ],
-      note: "此操作不可恢复。",
-      okText: "全部删除",
-    });
-    if (!ok) return;
-    try {
-      await api.send(`/api/cards/${encodeURIComponent(wbSlug)}/reset`, { method: "POST", body: "{}" });
-      wbChatHistory = []; wbPending = null; $("#chat-log").innerHTML = "";
-      wbRenderedIds = new Set();
-      // 清空后只保留一条开场白：本地重新领取显示；绑了通道则主动补发（QQ/微信私聊用户）
-      const cardObj = wbCardObj ?? (await api.get(`/api/cards/${encodeURIComponent(wbSlug)}`).catch(() => null));
-      const first = cardObj?.sillytavern_v2?.first_mes?.trim();
-      if (first) {
-        try {
-          const g = await api.send(`/api/cards/${encodeURIComponent(wbSlug)}/greeting/claim`, {
-            method: "POST",
-            body: JSON.stringify({ userKey: "local" }),
-          });
-          if (g.greeted && g.text) addChatBubble("bot", g.text);
-        } catch { /* 忽略 */ }
-      }
-      void api.send(`/api/cards/${encodeURIComponent(wbSlug)}/greeting/push`, { method: "POST" }).catch(() => {});
-      toast(`✓ 「${name}」已全部删除，开场白已重新放上`);
-    } catch (e) { toast("删除失败：" + e.message, false); }
-  });
-  // 退出：回到刚才聊的那张卡的编辑页（而不是甩回首页，用户容易失去上下文）。
-  // 走 SPA 内部切换，不整页重载（重载会重新拉 266KB 脚本，明显卡顿）。
-  $("#wb-exit").addEventListener("click", () => {
-    const back = wbSlug;
-    setWorkbenchOn(false);
-    if (!back) { router(); return; }
-    if ((location.hash || "").replace(/^#\/?/, "") === "cards") {
-      router();
-      void loadCardIntoEditor(back);
-    } else {
-      // hashchange 会触发 router()，卡库渲染完再打开这张卡的编辑页
-      pendingOpenCardSlug = back;
-      location.hash = "#/cards";
-    }
+  // 三个点「更多」→ 这张卡的聊天设置页（记忆 / 查找 / 置顶 / 一键删除都在里面，
+  // 对齐微信：聊天页右上角进去就是这个会话的设置）
+  $("#wb-more").addEventListener("click", () => {
+    if (!wbSlug) return toast("先选一张卡", false);
+    openChatSettings(wbSlug);
   });
   // 头像/名字点击 → 直接改这张卡的配置（不用回卡库）
   $("#lc-who").addEventListener("click", () => {
@@ -1089,14 +1161,39 @@ async function initWorkbench() {
     wbLoadFiles(); // 工作区共享，不等选卡
   }
   const last = localStorage.getItem("ocs_workbench_slug");
-  if (last) await wbPickCard(last);
+  if (!last) return;
+  // 卡没换 → 用 DOM 快照秒开（0 请求、不重画气泡）；否则才真正加载这张卡
+  if (lcSnapshotUsable(last)) {
+    restoreLcSnapshot();
+    // 通道消息同步交给 3 秒一次的定时器，秒开这一刻不发请求（免得刚进页面又卡一下）。
+    // 它本身是增量渲染（wbRenderedIds 去重），漏不了消息，只是最多晚 3 秒。
+    return;
+  }
+  await wbPickCard(last);
 }
 
 async function wbPickCard(slug) {
+  // 同一张卡且已有快照（例如从通讯录点当前正在聊的卡）→ 秒开，不重载
+  if (lcSnapshotUsable(slug) && $("#chat-log")) {
+    restoreLcSnapshot();
+    if (wbMirror?.slug === slug) void wbMirrorSync(slug);
+    return;
+  }
+  // 换卡：旧快照作废
+  if (lcSnap.slug && lcSnap.slug !== slug) {
+    lcSnap.slug = "";
+    lcSnap.logHtml = "";
+    lcSnap.history = null;
+  }
   wbSlug = slug;
   wbCardObj = null;
   wbChatHistory = [];
   wbPending = null;
+  // 换卡后表情分组不同 → 面板收起并丢弃已渲染的表情，下次打开按新卡重建
+  closeWbEmojiPanel();
+  lcEmojiLoaded = false;
+  const emojiBox = $("#lc-emoji-scroll");
+  if (emojiBox) emojiBox.innerHTML = "";
   wbDir = "";
   bubbleCardAvatarUrl = null; // 换卡后头像缓存失效（旧 Blob 留着给已渲染气泡用，不回收）
   $("#chat-log").innerHTML = "";
@@ -1104,7 +1201,13 @@ async function wbPickCard(slug) {
   const nameEl = $("#lc-name");
   const avEl = $("#lc-avatar");
   if (slug) {
-    wbCardObj = await api.get(`/api/cards/${slug}`).catch(() => null);
+    // 卡片与联通状态并行取（原来是串行，公网上每个请求 0.5-1.7s，串起来就是等待感的主要来源）；
+    // 卡片走缓存层：卡片内容变化时相关写操作已 cacheInvalidate，不会读到旧数据
+    const [cardRes, mirRes] = await Promise.all([
+      cachedGet(`/api/cards/${slug}`).catch(() => null),
+      api.get(`/api/cards/${encodeURIComponent(slug)}/mirror/status`).catch(() => ({ bound: false })),
+    ]);
+    wbCardObj = cardRes;
     const c = wbCardObj;
     if (avEl) {
       avEl.innerHTML = c?.identity?.avatar
@@ -1117,17 +1220,15 @@ async function wbPickCard(slug) {
     wbMirror = null;
     if (wbMirrorTimer) { clearInterval(wbMirrorTimer); wbMirrorTimer = null; }
     wbRenderedIds = new Set();
-    const mir = await api.get(`/api/cards/${encodeURIComponent(slug)}/mirror/status`).catch(() => ({ bound: false }));
+    const mir = mirRes;
     if (mir?.bound) {
       wbMirror = { ...mir, slug };
       setLcDot("on", "已联通" + (mir.channel === "qqbot" ? "QQ" : "微信") + "，通道消息同步中");
       // 单向同步：通道消息实时显示到本地，本地聊天不发送到通道（清空只清本地记录）
-      $("#wb-chat-clear").disabled = false;
       wbMirrorTimer = setInterval(() => wbMirrorSync(slug), 3000);
       void wbMirrorSync(slug); // 立即同步一次
     } else {
       setLcDot("", "本地聊天（未联通通道）");
-      $("#wb-chat-clear").disabled = false;
     }
     // 开场白（网页版默认直接放上去）：本地没开场过就领取并显示（联通与否都显示）
     const first = c?.sillytavern_v2?.first_mes?.trim();
@@ -1179,6 +1280,37 @@ async function wbReloadHistory() {
       wbRenderedIds.add(e.id);
       addChatBubble(e.role === "assistant" ? "bot" : "user", e.content, e.id);
     }
+  }
+  // 从「聊天设置 → 查找聊天记录」点某条命中过来的：滚到那条并高亮。
+  // 反复重试而不是只延时一次：气泡里的头像/表情图片加载完会改变布局高度，
+  // 而且本函数返回后调用方（wbPickCard）可能还在补渲染，单次延时经常扑空。
+  if (pendingChatFocusId) {
+    const target = pendingChatFocusId;
+    pendingChatFocusId = "";
+    let tries = 0;
+    // 必须显式 behavior:"instant"：.lc-log 设了 CSS scroll-behavior:smooth，
+    // 而 scrollTop 赋值 / scrollIntoView / scrollTo({behavior:"auto"}) 都会沿用这个 CSS 值
+    // 变成平滑动画（"auto" 按规范就是"用元素的 scroll-behavior"，不是"瞬时"），
+    // 动画又被随后的图片加载与渲染打断 → 实测 scrollTop 同步读回一直是 0。
+    const scrollToRow = (log, row) => {
+      const top = Math.max(0, row.offsetTop - log.clientHeight / 2 + row.offsetHeight / 2);
+      log.scrollTo({ top, behavior: "instant" });
+    };
+    const focus = () => {
+      tries++;
+      const log = $("#chat-log");
+      const row = log?.querySelector(`.bubble-row[data-conv-id="${CSS.escape(target)}"]`);
+      if (log && row) {
+        scrollToRow(log, row);
+        row.classList.add("hit-flash");
+        setTimeout(() => row.classList.remove("hit-flash"), 4000);
+        // 图片加载完布局高度会变，再校正一次位置（不重复加高亮类）
+        setTimeout(() => scrollToRow(log, row), 400);
+        return;
+      }
+      if (tries < 12) setTimeout(focus, 120); // 最多等约 1.4s
+    };
+    setTimeout(focus, 50);
   }
 }
 
@@ -1254,7 +1386,8 @@ async function wbDeleteSelected() {
       body: JSON.stringify({ ids, trimChannel: true }),
     });
     wbExitSelectMode();
-    await wbReloadHistory();
+    // 局部移除（不整页重载）：后端回 removedIds，只摘这些气泡，其余不动
+    await wbRemoveRowsByIds(r.removedIds ?? ids);
     const parts = [`✓ 已删除 ${r.removed ?? ids.length} 条`];
     if (r.channelTrimmed) parts.push(`通道上下文截断 ${r.channelTrimmed} 轮`);
     if (r.channelNote) parts.push(r.channelNote);
@@ -1262,6 +1395,33 @@ async function wbDeleteSelected() {
     if (r.dissolved) parts.push("最新记忆已解散");
     toast(parts.join("，"));
   } catch (e) { toast("删除失败：" + e.message, false); }
+}
+
+/**
+ * 局部移除已删消息的气泡（不重载整页历史）。
+ * 为什么不用 wbReloadHistory：那会清空 #chat-log 再逐条重画，视觉上是「记录全消失又冒出来」；
+ * 这里只摘掉被删的行，其余气泡的 DOM 一动不动，观感与 QQ 撤回一致（下方内容自然上移）。
+ * 一个 convId 可能对应多个气泡（拆条回复每条一个气泡都挂同一个 id），所以按 id 全量匹配。
+ * 兜底：后端没给 removedIds（老版本）时才回退整页重载。
+ */
+async function wbRemoveRowsByIds(removedIds) {
+  const ids = (Array.isArray(removedIds) ? removedIds : []).map(String).filter(Boolean);
+  if (!ids.length) { await wbReloadHistory(); return; }
+  const idSet = new Set(ids);
+  const log = $("#chat-log");
+  if (!log) return;
+  const rows = [...log.querySelectorAll(".bubble-row[data-conv-id]")].filter((r) => idSet.has(r.dataset.convId));
+  // 上下文条数按「不同 convId 个数」算，不能按气泡数：一条拆条回复是多个气泡但只占一条历史
+  const goneIds = new Set(rows.map((r) => r.dataset.convId));
+  rows.forEach((r) => {
+    // 审批按钮行（.approve-row）是气泡的兄弟节点，一并清掉避免留下孤立按钮
+    const sib = r.nextElementSibling;
+    if (sib?.classList?.contains("approve-row")) sib.remove();
+    r.remove();
+  });
+  for (const id of idSet) wbRenderedIds.delete(id);
+  // 删掉的轮次同时从本地上下文尾部摘掉（本地删除一律是「从某条删到底」，所以截尾准确）
+  if (goneIds.size) wbChatHistory = wbChatHistory.slice(0, Math.max(0, wbChatHistory.length - goneIds.size));
 }
 
 /** 撤掉上一轮（破甲被拒时最常用）：一问一答从网页与通道两边一起摘掉 */
@@ -1283,7 +1443,8 @@ async function wbUndoLastRound() {
       method: "POST",
       body: JSON.stringify({ rounds: 1 }),
     });
-    await wbReloadHistory();
+    // 局部移除这一轮的气泡（不整页重载，观感同 QQ 撤回：下面的内容直接上移）
+    await wbRemoveRowsByIds(r.removedIds);
     const parts = [`✓ 已撤掉 ${r.rounds || 1} 轮`];
     if (r.channelTrimmed) parts.push("通道上下文已同步");
     if (r.channelNote) parts.push(r.channelNote);
@@ -1302,7 +1463,6 @@ async function wbMirrorSync(slug) {
     if (!st.bound) {
       if (wbMirrorTimer) { clearInterval(wbMirrorTimer); wbMirrorTimer = null; }
       wbMirror = null;
-      $("#wb-chat-clear").disabled = false;
       setLcDot("", "本地聊天（未联通通道）");
       toast("已解除绑定，聊天切回本地模式");
       return;
@@ -1469,7 +1629,8 @@ function bindLcPopovers() {
 async function loadLcModelDefaults() {
   let provs = [];
   try {
-    const r = await api.get("/api/providers");
+    // 走缓存：提供商列表极少变，写操作处已 cacheInvalidate("/api/providers")
+    const r = await cachedGet("/api/providers");
     provs = (r.chat ?? []).filter((p) => p.enabled !== false);
   } catch { provs = []; }
   const cm = wbCardObj?.model;
@@ -1484,47 +1645,78 @@ async function loadLcModelDefaults() {
   refreshLcPills();
 }
 
-/** 表情包按钮：弹出当前卡配置分组的表情，点击插入 [表情:名] 到输入框 */
+/**
+ * 表情面板（QQ 式）：不再弹居中弹窗，而是在**输入框下方**展开一块面板——
+ * 输入岛整体上移、下方腾出的空间就是表情区，可上下滑动看更多。
+ * 点一个表情 = 直接把 [表情:名] 发出去（对齐 QQ：点了就发，不用再按发送）。
+ * 手机每行 4 个（CSS grid 固定 4 列），格子下方显示表情名字。
+ */
+let lcEmojiLoaded = false;
+
 async function openWbEmojiPicker() {
+  const panel = $("#lc-emoji-panel");
+  if (!panel) return;
+  // 再点一次收起（QQ 式开关）
+  if (!panel.hidden) { closeWbEmojiPanel(); return; }
   const groups = wbCardObj?.emojiGroups ?? [];
   if (!groups.length) return toast("这张卡还没配表情包分组（卡片高级配置里选）", false);
-  let lib = [];
-  try {
-    const r = await cachedGet("/api/emojis");
-    lib = r.emojis ?? [];
-  } catch { return toast("表情库读取失败", false); }
-  const pool = lib.filter((e) => groups.includes(e.group));
-  if (!pool.length) return toast("配置的表情分组里还没有表情", false);
-  const ov = document.createElement("div");
-  ov.className = "bot-overlay";
-  ov.id = "wb-emoji-overlay";
-  ov.innerHTML = `<div class="bot-dialog" style="max-width:400px">
-    <div class="bot-dialog-head">
-      <h3>插入表情</h3>
-      <button class="ghost small-btn" id="wb-emoji-close">${icon("x")}</button>
-    </div>
-    <div class="emoji-grid" style="max-height:320px;overflow-y:auto">
-      ${pool.map((e) => `<div class="emoji-item emoji-pick" data-name="${escapeHtml(e.name)}" data-exp="${escapeHtml(e.explanation || "")}" title="${escapeHtml(e.explanation || e.name)}">
+  const box = $("#lc-emoji-scroll");
+  if (!lcEmojiLoaded) {
+    box.innerHTML = '<div class="lc-emoji-empty">加载中…</div>';
+    panel.hidden = false;
+    $("#wb-emoji")?.classList.add("on");
+    let lib = [];
+    try {
+      const r = await cachedGet("/api/emojis");
+      lib = r.emojis ?? [];
+    } catch {
+      box.innerHTML = '<div class="lc-emoji-empty">表情库读取失败</div>';
+      return;
+    }
+    const pool = lib.filter((e) => groups.includes(e.group));
+    if (!pool.length) {
+      box.innerHTML = '<div class="lc-emoji-empty">配置的表情分组里还没有表情</div>';
+      return;
+    }
+    box.innerHTML = pool
+      .map(
+        (e) => `<button type="button" class="lc-emoji-item" data-name="${escapeHtml(e.name)}" title="${escapeHtml(e.explanation || e.name)}">
         <img src="${escapeHtml(e.url)}" alt="${escapeHtml(e.name)}" loading="lazy">
-        <div class="emoji-name">${escapeHtml(e.name)}</div>
-      </div>`).join("")}
-    </div>
-  </div>`;
-  document.body.appendChild(ov);
-  const close = () => ov.remove();
-  ov.addEventListener("click", (e) => { if (e.target === ov) close(); });
-  $("#wb-emoji-close").addEventListener("click", close);
-  ov.querySelectorAll(".emoji-pick").forEach((el) =>
-    el.addEventListener("click", () => {
-      const input = $("#wb-input");
-      const tag = `[表情:${el.dataset.name}]`;
-      const at = input.selectionStart ?? input.value.length;
-      input.value = input.value.slice(0, at) + tag + input.value.slice(input.selectionEnd ?? at);
-      input.selectionStart = input.selectionEnd = at + tag.length;
-      input.focus();
-      close();
-    })
-  );
+        <span class="lc-emoji-label">${escapeHtml(e.name)}</span>
+      </button>`
+      )
+      .join("");
+    lcEmojiLoaded = true;
+    // 点一个 = 直接发送这个表情
+    box.addEventListener("click", (ev) => {
+      const el = ev.target.closest(".lc-emoji-item");
+      if (!el) return;
+      sendEmojiFromPanel(el.dataset.name);
+    });
+  } else {
+    panel.hidden = false;
+    $("#wb-emoji")?.classList.add("on");
+  }
+  // 展开后把消息区滚到底（输入岛上移，别让最后一条被挡住）
+  const log = $("#chat-log");
+  if (log) log.scrollTop = log.scrollHeight;
+}
+
+function closeWbEmojiPanel() {
+  const panel = $("#lc-emoji-panel");
+  if (panel) panel.hidden = true;
+  $("#wb-emoji")?.classList.remove("on");
+}
+
+/** 面板里点表情 → 直接发送（输入框已有文字时，表情跟在文字后面一起发） */
+function sendEmojiFromPanel(name) {
+  if (!name) return;
+  const input = $("#wb-input");
+  if (!input) return;
+  const tag = `[表情:${name}]`;
+  input.value = input.value.trim() ? `${input.value.trim()}${tag}` : tag;
+  closeWbEmojiPanel();
+  void wbSend();
 }
 
 
@@ -1566,7 +1758,8 @@ async function wbSend() {
 
 async function wbDoSend(msgs) {
   const btn = $("#wb-send");
-  btn.disabled = true;
+  if (btn) btn.disabled = true;
+  const sendSlug = wbSlug; // 记住这轮是哪张卡（用户可能中途去别处，回来要对得上）
   // 能力跟随这张卡的「高级配置」；联网搜索由输入框旁的按钮临时叠加
   const cardTools = Array.isArray(wbCardObj?.tools?.enabled) ? [...wbCardObj.tools.enabled] : [];
   // 联网搜索等能力跟随卡片高级配置（输入岛不再放开关）
@@ -1579,6 +1772,8 @@ async function wbDoSend(msgs) {
   const ctrl = new AbortController();
   wbAbort = ctrl;
   wbThinkingBubble = addChatBubble("bot", "（正在输出… 发新消息可截断重来）");
+  // 打标记：切页存快照时要能认出这条占位并在回复到达时替换掉它
+  wbThinkingBubble?.classList.add("lc-pending-row");
   try {
     const r = await api.send("/api/chat", {
       method: "POST",
@@ -1586,24 +1781,78 @@ async function wbDoSend(msgs) {
       body: JSON.stringify({ slug: wbSlug, message: msgs.join("\n"), history: wbChatHistory.slice(0, -msgs.length), userKey: "local", ...wbLastOpts }),
     });
     if (ctrl.signal.aborted) return;
+    // 用户可能在等回复期间去看配置了 → 聊天页 DOM 不在，回复要落到快照里而不是丢掉
+    if (!$("#chat-log")) { stashReplyToSnapshot(sendSlug, r); return; }
     if (wbThinkingBubble) { wbThinkingBubble.closest(".bubble-row")?.remove(); wbThinkingBubble = null; }
     await wbFinishTurn(r);
     // 给这一轮的气泡挂上统一日志 id（长按删除要用）
     const ids = Array.isArray(r.convIds) ? r.convIds : [];
     const rows = wbPendingUserRows.splice(0);
-    if (ids[0] && rows.length) rows[rows.length - 1].dataset.convId = ids[0];
+    const lastUserRow = rows[rows.length - 1];
+    if (ids[0] && lastUserRow) lastUserRow.dataset.convId = ids[0];
     if (ids[1]) {
-      const bots = document.querySelectorAll("#chat-log .bubble-row.bot:not([data-conv-id])");
-      if (bots.length) bots[bots.length - 1].dataset.convId = ids[1];
+      // 拆条回复是多个气泡但只有一条日志记录 → 本轮所有还没挂 id 的 bot 气泡都挂上同一个 id，
+      // 这样「撤掉上一轮/删除」按 id 局部移除时能把整轮的气泡一起摘干净（以前只挂最后一个，会残留）
+      document.querySelectorAll("#chat-log .bubble-row.bot:not([data-conv-id])").forEach((row) => {
+        row.dataset.convId = ids[1];
+      });
     }
   } catch (e) {
     if (ctrl.signal.aborted) return; // 截断不算错误
     wbChatHistory.pop();
+    if (!$("#chat-log")) {
+      // 同上：人不在聊天页，错误也记进快照，回来能看到
+      stashReplyToSnapshot(sendSlug, { type: "error", message: e.message });
+      return;
+    }
     if (wbThinkingBubble) { wbThinkingBubble.closest(".bubble-row")?.remove(); wbThinkingBubble = null; }
     addChatBubble("bot", "⚠ " + e.message);
   } finally {
     if (wbAbort === ctrl) wbAbort = null;
-    btn.disabled = false;
+    const b = $("#wb-send");
+    if (b) b.disabled = false;
+  }
+}
+
+/**
+ * 回复到达时用户已经离开聊天页 → 把这轮结果直接写进 DOM 快照，
+ * 这样他回到聊天页就能看到回复（既不打断生成，也不用重新拉历史）。
+ * 做法：用一个离屏容器复用同一套气泡渲染，再把 HTML 追加到快照。
+ */
+function stashReplyToSnapshot(slug, r) {
+  if (lcSnap.slug !== slug) return; // 期间换了卡：这轮结果留在服务端日志里，下次进那张卡自然会读到
+  const text = r?.type === "reply" ? String(r.reply ?? "") : `⚠ ${r?.message ?? "生成失败"}`;
+  const convId = Array.isArray(r?.convIds) ? r.convIds[1] : "";
+  // 离屏渲染：临时挂一个 id=chat-log 的容器，让 addChatBubble 照常工作
+  const holder = document.createElement("div");
+  holder.id = "chat-log";
+  holder.style.display = "none";
+  document.body.appendChild(holder);
+  try {
+    if (r?.type === "reply") {
+      // 快照里不做逐条延时动画（人不在场），按 parts 一次性渲染
+      const parts = Array.isArray(r.parts) && r.parts.length ? r.parts : [text];
+      for (const p of parts) {
+        const s = String(p ?? "").trim();
+        if (s) addChatBubble("bot", applyRegexScripts(s), convId || undefined);
+      }
+    } else {
+      addChatBubble("bot", text);
+    }
+    // 去掉快照里的「正在输出」占位，再把新气泡接上去。
+    // 用 DOM 解析而不是正则替换：气泡是嵌套 div，正则匹配 </div></div> 很容易咬错边界。
+    const tmp = document.createElement("div");
+    tmp.innerHTML = lcSnap.logHtml;
+    tmp.querySelectorAll(".lc-pending-row").forEach((el) => el.remove());
+    lcSnap.logHtml = tmp.innerHTML + holder.innerHTML;
+    if (r?.type === "reply") {
+      if (!Array.isArray(lcSnap.history)) lcSnap.history = [];
+      lcSnap.history.push({ role: "assistant", content: text });
+    }
+    lcSnap.scrollTop = 10_000_000; // 回来时滚到底（会被 clamp 到最大值）
+    toast("✓ 回复已生成，回聊天页查看");
+  } finally {
+    holder.remove();
   }
 }
 
@@ -4265,6 +4514,376 @@ async function provDone() {
 }
 
 // ============================================================
+//  视图：通讯录（微信式会话列表）
+//  只列「真的聊过」的卡（后端 /api/conversations 已按有无聊天记录过滤），
+//  一个长条 = 一个人：头像靠左固定尺寸，右边上行名字+时间、下行最后一句预览。
+//  点条目 = 进入该卡的本地聊天；长按/右键 = 置顶或取消置顶。
+// ============================================================
+function renderChats() {
+  return `
+  <div class="view">
+    <div class="page-head"><h2>通讯录</h2></div>
+    <div class="chat-search-wrap">
+      <input id="chats-filter" type="text" placeholder="搜索聊天…">
+    </div>
+    <div id="chats-list" class="chat-list"></div>
+  </div>`;
+}
+
+let chatsCache = [];
+
+function initChats() {
+  const box = $("#chats-list");
+  box.innerHTML = '<div class="muted" style="padding:14px">加载中…</div>';
+  const draw = (items) => {
+    chatsCache = items ?? [];
+    paintChatList();
+  };
+  (async () => {
+    try {
+      const r = await cachedGet("/api/conversations", (fresh) => draw(fresh.items));
+      draw(r.items);
+    } catch (e) {
+      box.innerHTML = `<div class="muted" style="padding:14px">读取失败：${escapeHtml(e.message)}</div>`;
+    }
+  })();
+  $("#chats-filter").addEventListener("input", paintChatList);
+  // 点条目进聊天；长按（触屏 500ms）/ 右键 = 置顶开关
+  let pressTimer = null;
+  const startPress = (e) => {
+    const row = e.target.closest?.(".chat-item");
+    if (!row) return;
+    pressTimer = setTimeout(() => { pressTimer = null; void toggleChatPin(row.dataset.slug); }, 500);
+  };
+  const cancelPress = () => { if (pressTimer) { clearTimeout(pressTimer); pressTimer = null; } };
+  box.addEventListener("touchstart", startPress, { passive: true });
+  box.addEventListener("touchend", cancelPress);
+  box.addEventListener("touchmove", cancelPress);
+  box.addEventListener("contextmenu", (e) => {
+    const row = e.target.closest(".chat-item");
+    if (!row) return;
+    e.preventDefault();
+    void toggleChatPin(row.dataset.slug);
+  });
+  box.addEventListener("click", (e) => {
+    const pin = e.target.closest(".chat-pin-btn");
+    if (pin) { e.stopPropagation(); void toggleChatPin(pin.closest(".chat-item")?.dataset.slug); return; }
+    const row = e.target.closest(".chat-item");
+    if (row?.dataset.slug) openChatFromList(row.dataset.slug);
+  });
+}
+
+function paintChatList() {
+  const box = $("#chats-list");
+  if (!box) return;
+  const q = ($("#chats-filter")?.value ?? "").trim().toLowerCase();
+  const items = q
+    ? chatsCache.filter((c) => c.name.toLowerCase().includes(q) || String(c.last).toLowerCase().includes(q))
+    : chatsCache;
+  if (!items.length) {
+    box.innerHTML = `<div class="muted" style="padding:16px">${
+      q ? "没有匹配的聊天" : "还没有聊过天。去卡库选一张卡开始聊，这里就会出现它。"
+    }</div>`;
+    return;
+  }
+  box.innerHTML = items
+    .map((c) => {
+      const initial = escapeHtml(String(c.name || "?").slice(0, 1));
+      const av = c.avatar
+        ? `<img src="${escapeHtml(c.avatar)}" alt="" loading="lazy">`
+        : `<span class="chat-av-txt">${initial}</span>`;
+      const who = c.lastRole === "user" ? "我：" : "";
+      return `<div class="chat-item${c.pinned ? " pinned" : ""}" data-slug="${escapeHtml(c.slug)}">
+        <div class="chat-av">${av}</div>
+        <div class="chat-main">
+          <div class="chat-line1">
+            <span class="chat-name">${escapeHtml(c.name)}</span>
+            <span class="chat-time">${escapeHtml(fmtChatTime(c.lastAt))}</span>
+          </div>
+          <div class="chat-line2">
+            <span class="chat-preview">${escapeHtml(who + (c.last || "（无内容）"))}</span>
+            ${c.pinned ? '<span class="chat-pin-flag" title="已置顶">置顶</span>' : ""}
+          </div>
+        </div>
+      </div>`;
+    })
+    .join("");
+}
+
+/** 会话列表时间：今天只显时分、昨天显“昨天”、更早显日期（微信口径） */
+function fmtChatTime(iso) {
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return "";
+  const now = new Date();
+  const sameDay = d.toDateString() === now.toDateString();
+  if (sameDay) return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+  const yest = new Date(now);
+  yest.setDate(now.getDate() - 1);
+  if (d.toDateString() === yest.toDateString()) return "昨天";
+  if (d.getFullYear() === now.getFullYear()) return `${d.getMonth() + 1}月${d.getDate()}日`;
+  return `${d.getFullYear()}/${d.getMonth() + 1}/${d.getDate()}`;
+}
+
+async function toggleChatPin(slug) {
+  if (!slug) return;
+  const cur = chatsCache.find((c) => c.slug === slug);
+  const next = !cur?.pinned;
+  try {
+    await api.send(`/api/cards/${encodeURIComponent(slug)}/pin`, {
+      method: "POST",
+      body: JSON.stringify({ pinned: next }),
+    });
+    cacheInvalidate("/api/conversations");
+    const r = await api.get("/api/conversations");
+    chatsCache = r.items ?? [];
+    paintChatList();
+    toast(next ? "✓ 已置顶" : "已取消置顶");
+  } catch (e) { toast("操作失败：" + e.message, false); }
+}
+
+/** 从通讯录进入某张卡的本地聊天 */
+function openChatFromList(slug) {
+  localStorage.setItem("ocs_workbench_slug", slug);
+  setWorkbenchOn(true);
+  if ((location.hash || "").replace(/^#\/?/, "") === "home") router();
+  else location.hash = "#/home";
+}
+
+// ============================================================
+//  视图：单卡聊天设置（微信「聊天信息」式）
+//  从本地聊天页右上角三个点进来，是**这一个会话**的设置面板：
+//  置顶 / 聊天记录查找 / 记忆（跟随这张卡，不再走侧边栏的全局记忆页）/ 一键删除。
+//  记忆区复用记忆页那套 DOM id 与函数（loadMemEntries / onMemRowClick 等），
+//  所以这里的容器 id 必须与 renderMemory 保持一致。
+// ============================================================
+let chatSettingsSlug = "";
+
+/** 打开某张卡的聊天设置页（SPA 内跳转，hash 带 slug 便于刷新后仍在这一页） */
+function openChatSettings(slug) {
+  chatSettingsSlug = slug;
+  location.hash = `#/chatinfo?slug=${encodeURIComponent(slug)}`;
+}
+
+function renderChatInfo() {
+  return `
+  <div class="view">
+    <div class="page-head ci-head">
+      <button id="ci-back" class="ghost small-btn" title="返回聊天">← 返回聊天</button>
+      <h2>聊天设置</h2>
+    </div>
+
+    <div class="card-box ci-who">
+      <div class="ci-av" id="ci-av"></div>
+      <div class="ci-who-text">
+        <div class="ci-name" id="ci-name">—</div>
+        <div class="hint" id="ci-meta"></div>
+      </div>
+      <button id="ci-open-card" class="ghost small-btn" title="打开这张卡的高级配置">卡片配置</button>
+    </div>
+
+    <div class="card-box">
+      <div class="ci-row">
+        <span class="ci-row-label">置顶聊天</span>
+        <label class="switch"><input type="checkbox" id="ci-pin"><span class="slider"></span></label>
+      </div>
+      <p class="hint">置顶后这个会话会排在通讯录最上面。</p>
+    </div>
+
+    <div class="card-box">
+      <h3>${icon("search")} 查找聊天记录</h3>
+      <div class="row">
+        <input id="ci-search" type="text" placeholder="输入关键词搜这张卡的聊天记录…" style="flex:1">
+        <button id="ci-search-btn" class="primary small-btn">查找</button>
+      </div>
+      <div id="ci-search-out" class="ci-search-out"></div>
+    </div>
+
+    <div class="card-box">
+      <h3>${icon("database")} 记忆</h3>
+      <div class="row" style="align-items:center">
+        <label>每 <input id="mem-rounds" type="number" min="1" max="20" style="width:64px;text-align:center"> 轮自动总结</label>
+        <button id="mem-save-rounds" class="primary small-btn">保存</button>
+      </div>
+      <input id="mem-search" type="text" placeholder="搜索记忆…" style="width:100%">
+      <div id="mem-key-section" class="mem-key-section" style="display:none">
+        <div class="mem-sec-head"><span class="mem-sec-icon">${icon("shield")}</span> 关键记忆（必须遵守）</div>
+        <div id="mem-key-entries" class="small-out" style="padding:4px 10px"></div>
+      </div>
+      <div id="mem-entries" class="small-out tall" style="max-height:420px;padding:4px 10px"></div>
+    </div>
+
+    <div class="card-box">
+      <div class="row">
+        <button id="ci-to-list" class="ghost">回通讯录</button>
+        <button id="ci-exit-chat" class="ghost">退出聊天（回卡库）</button>
+      </div>
+      <p class="hint">「退出聊天」会关掉聊天页形态，回到卡库编辑这张卡。</p>
+    </div>
+
+    <div class="card-box ci-danger">
+      <h3>${icon("trash")} 一键删除</h3>
+      <p class="hint">清空这张卡的全部聊天记录与记忆，AI 会忘掉之前的一切。删除前会再确认一次。</p>
+      <button id="ci-wipe" class="danger">清空聊天记录与记忆</button>
+    </div>
+  </div>`;
+}
+
+function initChatInfo() {
+  // slug 来源：hash 参数优先（刷新后仍在这一页），否则用刚才聊天的那张卡
+  const m = (location.hash || "").match(/[?&]slug=([^&]+)/);
+  const slug = m ? decodeURIComponent(m[1]) : chatSettingsSlug || localStorage.getItem("ocs_workbench_slug") || "";
+  chatSettingsSlug = slug;
+  if (!slug) {
+    $("#ci-name").textContent = "没有选中的聊天";
+    return;
+  }
+  // 返回聊天：回到这张卡的本地聊天页
+  $("#ci-back").addEventListener("click", () => openChatFromList(slug));
+  $("#ci-open-card").addEventListener("click", async () => {
+    const card = await api.get(`/api/cards/${encodeURIComponent(slug)}`).catch(() => null);
+    if (!card) return toast("读取卡片失败", false);
+    editingCard = card;
+    openAdvConfig();
+  });
+  // 记忆区复用记忆页的函数（它们依赖全局 memCard 与这些 DOM id）
+  $("#mem-save-rounds").addEventListener("click", saveMemRounds);
+  $("#mem-search").addEventListener("input", loadMemEntries);
+  $("#mem-entries").addEventListener("click", onMemRowClick);
+  $("#mem-key-entries").addEventListener("click", onMemRowClick);
+  // 查找聊天记录
+  const doSearch = () => void ciSearchChat(slug);
+  $("#ci-search-btn").addEventListener("click", doSearch);
+  $("#ci-search").addEventListener("keydown", (e) => { if (e.key === "Enter") doSearch(); });
+  // 置顶开关
+  $("#ci-pin").addEventListener("change", async (e) => {
+    const pinned = e.target.checked;
+    try {
+      await api.send(`/api/cards/${encodeURIComponent(slug)}/pin`, { method: "POST", body: JSON.stringify({ pinned }) });
+      cacheInvalidate("/api/conversations");
+      toast(pinned ? "✓ 已置顶" : "已取消置顶");
+    } catch (err) {
+      e.target.checked = !pinned; // 失败回滚开关
+      toast("操作失败：" + err.message, false);
+    }
+  });
+  // 出口：回通讯录 / 退出聊天形态回卡库（聊天页删了「退出」键，出口移到这里）
+  $("#ci-to-list").addEventListener("click", () => { location.hash = "#/chats"; });
+  $("#ci-exit-chat").addEventListener("click", () => {
+    setWorkbenchOn(false);
+    pendingOpenCardSlug = slug; // 卡库渲染完自动打开这张卡的编辑页
+    location.hash = "#/cards";
+  });
+  // 一键删除（二次确认）
+  $("#ci-wipe").addEventListener("click", () => void ciWipeAll(slug));
+  // 填充数据
+  (async () => {
+    const card = await api.get(`/api/cards/${encodeURIComponent(slug)}`).catch(() => null);
+    if (!card) { $("#ci-name").textContent = "卡片不存在"; return; }
+    memCard = card; // 记忆区函数用它
+    $("#ci-name").textContent = card.name;
+    $("#ci-meta").textContent = roleLabel(card.role) || "";
+    const av = $("#ci-av");
+    const url = card.identity?.avatar || "";
+    av.innerHTML = url
+      ? `<img src="${escapeHtml(url)}" alt="">`
+      : `<span>${escapeHtml(String(card.name || "?").slice(0, 1))}</span>`;
+    $("#mem-rounds").value = card.memoryConfig?.auto_rounds ?? 5;
+    await loadMemEntries();
+    // 置顶状态从会话列表读（那里是置顶的唯一来源）
+    const conv = await cachedGet("/api/conversations").catch(() => ({ items: [] }));
+    const hit = (conv.items ?? []).find((c) => c.slug === slug);
+    $("#ci-pin").checked = !!hit?.pinned;
+  })();
+}
+
+/** 聊天记录查找：命中列表点一条 → 回聊天页并定位高亮那条消息 */
+async function ciSearchChat(slug) {
+  const q = ($("#ci-search")?.value ?? "").trim();
+  const out = $("#ci-search-out");
+  if (!q) { out.innerHTML = '<div class="muted">输入关键词再查找</div>'; return; }
+  out.innerHTML = '<div class="muted">查找中…</div>';
+  try {
+    const r = await api.get(`/api/cards/${encodeURIComponent(slug)}/conversation/search?q=${encodeURIComponent(q)}`);
+    const hits = r.hits ?? [];
+    if (!hits.length) { out.innerHTML = '<div class="muted">没有找到包含这个词的消息</div>'; return; }
+    out.innerHTML =
+      `<div class="hint">找到 ${hits.length} 条（点一条跳到聊天里）</div>` +
+      hits
+        .map(
+          (h) => `<div class="ci-hit" data-id="${escapeHtml(h.id)}">
+        <span class="ci-hit-who">${h.role === "user" ? "我" : "TA"}</span>
+        <span class="ci-hit-text">${highlightHit(h.content, q)}</span>
+        <span class="ci-hit-time">${escapeHtml(fmtChatTime(h.t))}</span>
+      </div>`
+        )
+        .join("");
+    out.querySelectorAll(".ci-hit").forEach((el) =>
+      el.addEventListener("click", () => {
+        pendingChatFocusId = el.dataset.id; // 回聊天页后滚动并高亮这条
+        openChatFromList(slug);
+      })
+    );
+  } catch (e) {
+    out.innerHTML = `<div class="muted">查找失败：${escapeHtml(e.message)}</div>`;
+  }
+}
+
+/** 关键词高亮（先转义再插标签，避免把用户输入当 HTML） */
+function highlightHit(text, q) {
+  const safe = escapeHtml(String(text));
+  const needle = escapeHtml(q);
+  if (!needle) return safe;
+  // 简单不区分大小写替换（关键词已转义，正则里的特殊字符要再escape一次）
+  const re = new RegExp(needle.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "gi");
+  return safe.replace(re, (mm) => `<mark>${mm}</mark>`);
+}
+
+/** 从设置页跳回聊天时要定位的消息 id（wbReloadHistory 渲染完消费） */
+let pendingChatFocusId = "";
+
+/** 一键删除：清空聊天记录 + 记忆 + 开场状态（二次确认） */
+async function ciWipeAll(slug) {
+  const name = memCard?.name ?? slug;
+  const ok = await wbConfirm({
+    title: `清空「${name}」的聊天与记忆`,
+    lead: "这张卡的聊天记录与长期记忆会被全部删除，AI 会忘掉之前的一切。",
+    points: [
+      "网页聊天记录全部清空",
+      "长期记忆全部删除（包括通道里记住的事）",
+      "QQ / 微信 的对话上下文一并重置",
+      "开场白状态复位，下次见面重新开场",
+    ],
+    note: "此操作不可恢复。",
+    okText: "全部删除",
+  });
+  if (!ok) return;
+  // 第二次确认（用户点名要求二次确认）
+  const again = await wbConfirm({
+    title: "再确认一次",
+    lead: `真的要清空「${name}」的全部聊天记录与记忆吗？删除后无法恢复。`,
+    points: [],
+    note: "",
+    okText: "确认清空",
+  });
+  if (!again) return;
+  try {
+    await api.send(`/api/cards/${encodeURIComponent(slug)}/reset`, { method: "POST", body: "{}" });
+    // 本地聊天页的状态一起清掉（否则回聊天页还会看到旧气泡）
+    if (wbSlug === slug) {
+      wbChatHistory = [];
+      wbPending = null;
+      wbRenderedIds = new Set();
+      const log = $("#chat-log");
+      if (log) log.innerHTML = "";
+    }
+    void api.send(`/api/cards/${encodeURIComponent(slug)}/greeting/push`, { method: "POST" }).catch(() => {});
+    cacheInvalidate("/api/conversations");
+    await loadMemEntries();
+    toast(`✓ 「${name}」的聊天与记忆已清空`);
+  } catch (e) { toast("删除失败：" + e.message, false); }
+}
+
+// ============================================================
 //  视图：记忆（每卡配置 + 查看 + 单条管理）
 // ============================================================
 const MEM_SRC_LABEL = { manual: "手动", auto: "自动总结", tool: "工具", legacy: "旧数据" };
@@ -4671,19 +5290,24 @@ function appendChatContent(div, text) {
   }
 }
 
+/** 渲染气泡并返回**外层 .bubble-row 元素**（调用方依赖它挂 id / 移除 / 追加按钮） */
 function addChatBubble(role, text, convId) {
   // bot 消息里含 [表情:名] 标签时，表情独立成气泡（文本一个、每个表情一个），
   // 不再让图片挤在文本气泡里；未命中的表情名按原文显示（appendChatContent 兜底）
   if (role === "bot" && /\[表情:/.test(String(text ?? ""))) {
     const segs = String(text).split(CHAT_EMOJI_RE);
+    let last = null;
     for (let i = 0; i < segs.length; i++) {
       const seg = segs[i];
       if (!seg) continue;
-      renderBubbleRow(role, i % 2 === 1 ? `[表情:${seg}]` : seg, i > 0 ? undefined : convId);
+      // 同一轮拆出来的每个气泡都挂同一个 convId：删除时按 id 能把这轮的所有气泡一起摘掉
+      // （以前只给第一条挂 id，局部删除会漏掉后面的表情气泡）
+      const r = renderBubbleRow(role, i % 2 === 1 ? `[表情:${seg}]` : seg, convId);
+      if (r) last = r;
     }
-    return;
+    return last; // 表情拆分时返回最后一条（"正在输出"占位等场景不会走这里）
   }
-  renderBubbleRow(role, text, convId);
+  return renderBubbleRow(role, text, convId);
 }
 
 /** 渲染单个气泡行（addChatBubble 的底层实现；bot 表情拆分时逐条调用） */
@@ -4723,8 +5347,14 @@ function renderBubbleRow(role, text, convId) {
   }
   row.appendChild(div);
   log.appendChild(row);
-  log.scrollTop = log.scrollHeight;
-  return div;
+  // 滚到底必须显式 behavior:"instant"：.lc-log 的 CSS scroll-behavior:smooth 会把
+  // scrollTop 赋值变成平滑动画，逐条渲染时后一条又把前一条的动画打断 → 实测滚不动。
+  log.scrollTo({ top: log.scrollHeight, behavior: "instant" });
+  // 返回**外层 .bubble-row**（不是内层 .bubble）：调用方要用它挂 data-conv-id、
+  // 用 closest(".bubble-row") 移除、用 parentNode 追加审批按钮——都依赖外层这一层。
+  // 2026-09-10 重构抽出本函数时这里误留了旧代码的 `return div`（那时 div 就是外层），
+  // 导致 addChatBubble 的返回值不可用 → 「正在输出」气泡删不掉 + dataset 报错。
+  return row;
 }
 
 // 会话级头像缓存：dataURL 只转一次 Blob URL，所有气泡复用同一个短字符串
@@ -5777,6 +6407,10 @@ function renderLogsPage() {
   <div class="view">
     <div class="page-head"><h2>${icon("clipboard")} 运行日志</h2><p class="hint">出问题先看这里：聊天、通道、生图、语音、记忆的报错都会记下来。只留最近 500 条。</p>${settingsBack()}</div>
     <div class="card-box">
+      <h3>${icon("zap")} 模型缓存统计 <button id="cache-refresh" class="ghost small-btn">刷新</button></h3>
+      <div id="cache-stats" class="small-out" style="max-height:200px;overflow-y:auto;margin-bottom:1rem">加载中…</div>
+    </div>
+    <div class="card-box">
       <div class="row log-toolbar">
         <select id="log-level" style="width:auto">
           <option value="all">全部级别</option>
@@ -5794,6 +6428,8 @@ function renderLogsPage() {
   </div>`;
 }
 function initLogsPage() {
+  loadCacheStats();
+  $("#cache-refresh").addEventListener("click", loadCacheStats);
   $("#log-refresh").addEventListener("click", loadLogs);
   $("#log-level").addEventListener("change", loadLogs);
   $("#log-tag").addEventListener("change", loadLogs);
@@ -5811,6 +6447,34 @@ function initLogsPage() {
     } catch (e) { toast("清空失败：" + e.message, false); }
   });
   loadLogs();
+}
+
+async function loadCacheStats() {
+  const box = $("#cache-stats");
+  if (!box) return;
+  try {
+    const data = await api.get("/api/llm/usage");
+    const rows = data?.byModel ?? [];
+    if (!rows.length) {
+      box.innerHTML = '<div class="muted">暂无统计数据（发起聊天后会记录）</div>';
+      return;
+    }
+    const pct = (r) => Math.round((r.hitRate ?? 0) * 100);
+    let html =
+      `<div style="margin-bottom:0.6rem"><strong>合计</strong>：输入 ${data.promptTokens.toLocaleString()} · ` +
+      `输出 ${data.completionTokens.toLocaleString()} · 缓存命中 ${data.cacheHitTokens.toLocaleString()}` +
+      `（<strong>${pct(data)}%</strong>）· 调用 ${data.calls} 次 · 近 24h ${data.last24h} 次</div>`;
+    html += '<table style="width:100%;border-collapse:collapse;font-size:0.85em">';
+    html += '<tr style="text-align:left;opacity:0.7"><th>模型</th><th>命中率</th><th>输入</th><th>输出</th><th>调用</th></tr>';
+    for (const m of rows) {
+      html += `<tr><td>${escapeHtml(m.id)}</td><td><strong>${pct(m)}%</strong></td>` +
+        `<td>${m.promptTokens.toLocaleString()}</td><td>${m.completionTokens.toLocaleString()}</td><td>${m.calls}</td></tr>`;
+    }
+    html += "</table>";
+    box.innerHTML = html;
+  } catch (e) {
+    box.innerHTML = `<div class="muted">读取失败：${escapeHtml(e.message)}</div>`;
+  }
 }
 
 // ---- 设置子页：插件（只读） ----
@@ -6260,6 +6924,8 @@ async function delEmoji(item) {
 // ============================================================
 const routes = {
   home: { render: renderHome, init: initHome },
+  chats: { render: renderChats, init: initChats },          // 通讯录（微信式会话列表）
+  chatinfo: { render: renderChatInfo, init: initChatInfo }, // 单卡聊天设置（三个点进来）
   cards: { render: renderCards, init: initCards },
   presets: { render: renderPresets, init: initPresets },
   create: { render: renderCreate, init: initCreate },

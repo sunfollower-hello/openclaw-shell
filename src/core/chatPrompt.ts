@@ -34,8 +34,22 @@ export function selectWorldbookEntries(entries: WorldbookEntry[], recentText = "
       const hit = keys.some((k) => haystack.includes(String(k).toLowerCase()));
       if (!hit) return false;
     }
+    // probability 抽样改为「按条目内容做确定性哈希」而不是 Math.random()。
+    // 原因：随机抽样会让同一张卡每轮注入的世界书集合都不同 → system prompt 前缀逐轮变化
+    // → 上游的上下文缓存（命中的输入按 1/50 计价）整段失效，钱白花。
+    // 确定性哈希保留「按概率决定要不要这条」的语义（不同条目按其 prob 稳定地在/不在），
+    // 同时保证同一张卡的注入集合稳定可缓存。
     const prob = typeof e.probability === "number" ? e.probability : 100;
-    if (prob < 100 && Math.random() * 100 >= prob) return false;
+    if (prob <= 0) return false;
+    if (prob < 100) {
+      const seed = `${e.name ?? ""}|${e.comment ?? ""}|${String(e.content ?? "").slice(0, 64)}`;
+      let h = 2166136261;
+      for (let i = 0; i < seed.length; i++) {
+        h ^= seed.charCodeAt(i);
+        h = Math.imul(h, 16777619);
+      }
+      if ((h >>> 0) % 100 >= prob) return false;
+    }
     return true;
   });
   return picked.sort((a, b) => {
@@ -43,6 +57,23 @@ export function selectWorldbookEntries(entries: WorldbookEntry[], recentText = "
     const bo = typeof b.insertion_order === "number" ? b.insertion_order : 100;
     return ao - bo;
   });
+}
+
+/**
+ * 只挑「关键词触发」的世界书条目（非常驻、有 keys 且命中当前话题）。
+ * 用途：上下文缓存优化——常驻条目留在稳定的 system prompt 里，
+ * 这些每轮可能变化的触发条目改为放到聊天历史之后注入，避免破坏 system 前缀。
+ * 返回已渲染好的文本块（无命中返回空串）。
+ */
+export function selectTriggeredWorldbook(card: PersonaCard, recentText: string): string {
+  const entries = card.sillytavern_v2?.character_book?.entries ?? [];
+  const picked = selectWorldbookEntries(entries, recentText).filter((e) => !e.constant);
+  if (!picked.length) return "";
+  const lines = picked.map((e) => {
+    const title = e.comment || e.name || "世界书条目";
+    return `【${title}】${String(e.content ?? "").trim()}`;
+  });
+  return `【与当前话题相关的设定（仅在相关时参考）】\n${lines.join("\n")}`;
 }
 
 /**
