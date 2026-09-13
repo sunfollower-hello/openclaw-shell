@@ -14,9 +14,9 @@
   --text: #1a1a1a;        /* 中性近黑 */
   --muted: #8a8a8a;       /* 中性灰 */
   --faint: #b8b8b8;       /* 极浅元信息 */
-  --accent: #07c160;      /* 微信绿（唯一强调色） */
-  --accent-dark: #06ad56;
-  --accent-soft: #e8f7ee; /* 绿淡染 */
+  --accent: #1677ff;      /* 清爽蓝（唯一强调色） */
+  --accent-dark: #0958d9;
+  --accent-soft: #e8f1ff; /* 蓝淡染 */
   --ink: #1f1f1f;         /* 深色面板/深色按钮 */
   --danger: #e64340;      /* 微信红 */
   --danger-soft: #fdecec;
@@ -1838,7 +1838,7 @@ body.lc-fullscreen .lc-root { height: 100dvh; }
   border: 1px solid var(--border); background: var(--panel); color: var(--muted);
   font-size: 11px; cursor: pointer; white-space: nowrap;
 }
-.cw-state.on { background: var(--ok-soft); border-color: var(--ok); color: var(--ok); font-weight: 600; }
+.cw-state.on { background: var(--accent-soft); border-color: var(--accent); color: var(--accent); font-weight: 600; }
 /* 编辑/删除 符号小键 */
 .cw-icon-btn {
   flex-shrink: 0; width: 28px; height: 28px; padding: 0;
@@ -1857,7 +1857,7 @@ body.lc-fullscreen .lc-root { height: 100dvh; }
   border: 1px solid var(--border); background: var(--panel); color: var(--muted);
   font-size: 13px; cursor: pointer;
 }
-.cw-constant.on { background: var(--ok-soft); border-color: var(--ok); color: var(--ok); font-weight: 700; }
+.cw-constant.on { background: var(--accent-soft); border-color: var(--accent); color: var(--accent); font-weight: 700; }
 .cw-order-label { display: inline-flex; align-items: center; gap: 6px; font-size: 12.5px; color: var(--muted); }
 .cw-order-label input { width: 64px; text-align: center; }
 .cw-detail { margin-top: 10px; }

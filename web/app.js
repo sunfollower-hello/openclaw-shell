@@ -469,54 +469,7 @@ const WB_TEMPLATES = {
 
 const WB_DEFAULT_PH = "角色设定：外貌、性格、语言风格、背景、喜好、雷区……";
 
-// 世界书条目：表面只显示一行（名称 + 启用 + 编辑 + 删除），点「编辑」展开全部字段
-// idx：对应原 entries 下标，保存时用它取回表单没暴露的字段（secondary_keys/extensions/selective 等），避免编辑一次就削掉酒馆卡数据
-function wbRowHTML(e, expand, idx, phOverride) {
-  const keys = Array.isArray(e?.keys) ? e.keys.join("、") : (e?.keys ?? "");
-  const title = e?.comment || e?.name || "未命名条目";
-  const pos = String(e?.position || "before_char");
-  const keyList = keys.split("、").filter(Boolean);
-  const richOnly = isRichOnlyKeys(e?.keys ?? keys);
-  const summaryMeta = richOnly
-    ? "重描写专属"
-    : e?.constant
-      ? "常驻"
-      : keyList.length
-        ? "触发：" + keyList.slice(0, 2).join("、") + (keyList.length > 2 ? "…" : "")
-        : "";
-  return `<div class="wb-entry${expand ? " open" : ""}"${Number.isInteger(idx) ? ` data-idx="${idx}"` : ""}>
-    <div class="wb-summary">
-      <span class="wb-title">${escapeHtml(title)}</span>
-      ${summaryMeta ? `<span class="wb-summary-meta${richOnly ? " rich-only" : ""}">${escapeHtml(summaryMeta)}</span>` : ""}
-      <span class="wb-spacer-flex"></span>
-      <label class="wb-enable" title="启用 / 停用此条目"><input type="checkbox" class="wb-enabled" ${e?.enabled !== false ? "checked" : ""}> 启用</label>
-      <button class="wb-edit ghost small-btn" type="button" title="编辑条目">${icon("pen")} 编辑</button>
-      <button class="wb-del danger small-btn" type="button" title="删除条目">${icon("trash")}</button>
-    </div>
-    <div class="wb-detail" ${expand ? "" : "hidden"}>
-      <div class="wb-grid">
-        <div class="wb-field"><label>条目名称</label><input class="wb-comment" placeholder="如：人物形象 / 世界观 / 人物关系" value="${escapeHtml(title)}"></div>
-        <div class="wb-field"><label>触发关键词（逗号分隔，常驻条目可留空）</label><input class="wb-keys" placeholder="关键词1, 关键词2" value="${escapeHtml(keys)}"></div>
-      </div>
-      <div class="wb-field"><label>条目内容</label><textarea class="wb-content" rows="6" placeholder="${escapeHtml(phOverride || WB_DEFAULT_PH)}">${escapeHtml(e?.content ?? "")}</textarea></div>
-      <div class="wb-grid wb-grid3">
-        <div class="wb-field"><label>插入位置</label>
-          <select class="wb-pos">${WB_POSITIONS.map(([v, l]) => `<option value="${v}" ${pos === v ? "selected" : ""}>${l}</option>`).join("")}</select>
-        </div>
-        <div class="wb-field"><label>触发概率 %</label><input type="number" class="wb-prob" min="0" max="100" value="${e?.probability ?? 100}"></div>
-        <div class="wb-field"><label>深度</label><input type="number" class="wb-depth" min="0" value="${e?.depth ?? 4}"></div>
-      </div>
-      <div class="wb-adv-row">
-        <label title="常驻条目始终生效，不靠关键词触发"><input type="checkbox" class="wb-constant" ${e?.constant ? "checked" : ""}> 常驻（始终生效）</label>
-        <label title="多条条目同时触发时的排序">顺序 <input type="number" class="wb-order" min="0" value="${e?.insertion_order ?? 100}" style="width:56px"></label>
-      </div>
-      <div class="wb-foot">
-        <button class="wb-cancel ghost small-btn" type="button">取消</button>
-        <button class="wb-save primary small-btn" type="button">${icon("check")} 保存条目</button>
-      </div>
-    </div>
-  </div>`;
-}
+// 旧版卡库世界书行模板已删：与通讯录世界书页共用 cwRowHTML（见文件后部，withActions=false）
 
 /** 读取一个条目/正则行里所有输入控件的当前值（用于「取消」回退） */
 function snapshotFields(root) {
@@ -550,75 +503,33 @@ function closeFoldRow(row) {
 }
 
 // 世界书/正则折叠：编辑展开，保存收起并刷新摘要，取消回退原值
+/**
+ * 卡库编辑器的世界书/正则行交互（与通讯录世界书/正则页同一套行模板 cwRowHTML/crRowHTML）。
+ * 区别：卡库是整卡保存——行上没有「保存/取消」，改动都暂存在 DOM，点右上「保存」时
+ * collectCardForm 统一读取。所以这里只处理：展开编辑、启用/停用 chip、常驻按键高亮。
+ * 只在 #cf-book / #cf-regex 容器内生效（通讯录那两个页面有自己的容器级处理，别互相干扰）。
+ */
 function cardFormEditHandler(e) {
-  const row = e.target.closest(".wb-entry, .rx-row");
+  const container = e.target.closest('#cf-book, #cf-regex');
+  if (!container) return;
+  const row = e.target.closest('.cw-item');
   if (!row) return;
-  if (e.target.closest(".wb-edit, .rx-edit")) {
-    if (row.classList.contains("open")) closeFoldRow(row);
-    else openFoldRow(row);
+  // 常驻按键：点击切换高亮（高亮 = 开启，保存时按高亮读取）
+  if (e.target.closest('.cw-constant')) {
+    e.target.closest('.cw-constant').classList.toggle('on');
     return;
   }
-  if (e.target.closest(".wb-save, .rx-save")) {
-    refreshFoldSummary(row);
-    closeFoldRow(row);
-    toast("条目已更新，记得点右上「保存」写入卡片");
-    return;
+  const act = e.target.closest('[data-act]')?.dataset.act;
+  if (act === 'edit') {
+    const d = row.querySelector('.cw-detail');
+    if (d) d.hidden = !d.hidden;
+  } else if (act === 'state') {
+    const chip = e.target.closest('.cw-state');
+    chip.classList.toggle('on');
+    const on = chip.classList.contains('on');
+    chip.textContent = on ? '启用中' : '已停用';
+    row.classList.toggle('disabled', !on);
   }
-  if (e.target.closest(".wb-cancel, .rx-cancel")) {
-    const snap = foldSnapshots.get(row);
-    const detail = row.querySelector(".wb-detail, .rx-detail");
-    if (snap && detail) restoreFields(detail, snap);
-    closeFoldRow(row);
-    return;
-  }
-}
-
-/** 保存条目后刷新折叠行上的摘要文字（名称 / 常驻或触发词） */
-function refreshFoldSummary(row) {
-  if (row.classList.contains("wb-entry")) {
-    const name = row.querySelector(".wb-comment")?.value.trim() || "未命名条目";
-    const keys = (row.querySelector(".wb-keys")?.value ?? "").split(/[,，、]/).map((s) => s.trim()).filter(Boolean);
-    const constant = row.querySelector(".wb-constant")?.checked;
-    row.querySelector(".wb-title").textContent = name;
-    const meta = row.querySelector(".wb-summary-meta");
-    const metaText = constant ? "常驻" : keys.length ? "触发：" + keys.slice(0, 2).join("、") + (keys.length > 2 ? "…" : "") : "";
-    if (meta) {
-      meta.textContent = metaText;
-      meta.style.display = metaText ? "" : "none";
-    } else if (metaText) {
-      row.querySelector(".wb-title").insertAdjacentHTML("afterend", `<span class="wb-summary-meta">${escapeHtml(metaText)}</span>`);
-    }
-  } else {
-    const name = row.querySelector(".rx-name")?.value.trim() || "未命名正则";
-    const find = row.querySelector(".rx-find")?.value.trim() || "";
-    row.querySelector(".rx-title").textContent = name;
-    const meta = row.querySelector(".rx-summary-meta");
-    if (meta) meta.textContent = find ? find.slice(0, 24) : "";
-  }
-}
-
-// 正则替换行（可留空；导入的酒馆卡自带正则也会显示在这里）
-function rxRowHTML(s, expand) {
-  const name = s?.scriptName || "未命名正则";
-  const find = s?.findRegex ?? "";
-  return `<div class="rx-row${expand ? " open" : ""}">
-    <div class="rx-summary">
-      <span class="rx-title">${escapeHtml(name)}</span>
-      <span class="rx-summary-meta">${escapeHtml(find.slice(0, 24))}</span>
-      <span class="wb-spacer-flex"></span>
-      <button class="rx-edit ghost small-btn" type="button" title="编辑正则">${icon("pen")} 编辑</button>
-      <button class="rx-del danger small-btn" type="button" title="删除此正则">${icon("trash")}</button>
-    </div>
-    <div class="rx-detail" ${expand ? "" : "hidden"}>
-      <div class="wb-field"><label>名称</label><input class="rx-name" placeholder="如：去星号" value="${escapeHtml(s?.scriptName ?? "")}"></div>
-      <div class="wb-field"><label>查找（正则表达式）</label><input class="rx-find" placeholder="/\\*.*?\\*/g" value="${escapeHtml(find)}"></div>
-      <div class="wb-field"><label>替换为</label><input class="rx-rep" placeholder="留空 = 删除匹配内容" value="${escapeHtml(s?.replaceString ?? "")}"></div>
-      <div class="wb-foot">
-        <button class="rx-cancel ghost small-btn" type="button">取消</button>
-        <button class="rx-save primary small-btn" type="button">${icon("check")} 保存条目</button>
-      </div>
-    </div>
-  </div>`;
 }
 
 function cardFormHTML(mode) {
@@ -641,9 +552,6 @@ function cardFormHTML(mode) {
     <p class="hint" id="cf-book-hint">世界书分三块写：人物档案约一千字、对话与性格约两千字（情景+台词+缘由）、动作心理约一千二百字（重描写专属）。可以一条写满，也可以按关键词拆条。</p>
     <div id="cf-book"></div>
     <div class="wb-add-row">
-      <select id="cf-book-tpl">
-        ${Object.entries(WB_TEMPLATES).map(([k, v]) => `<option value="${k}">${escapeHtml(v.label)}</option>`).join("")}
-      </select>
       <button id="cf-book-add" class="ghost small-btn" type="button">＋ 添加条目</button>
     </div>
   </div>
@@ -667,21 +575,18 @@ function autoGrow(el) {
 
 function bindCardForm(card, mode) {
   fillFormFromCard(card, mode);
+  // 添加条目一律空白（不再选模板）；添加正则同理
   $("#cf-book-add").addEventListener("click", () => {
-    // 按所选模板预填名称/关键词/常驻，内容框给出「这条该怎么写」的示例提示
-    const tpl = WB_TEMPLATES[$("#cf-book-tpl")?.value] ?? WB_TEMPLATES.blank;
-    const seed = {
-      name: tpl.name, comment: tpl.name,
-      keys: tpl.keys ? tpl.keys.split(/[,，、]/).map((s) => s.trim()).filter(Boolean) : [],
-      constant: tpl.constant, enabled: true, content: "",
-      insertion_order: tpl.constant ? 0 : 100, position: "before_char", probability: 100, depth: 4,
-    };
-    $("#cf-book").insertAdjacentHTML("beforeend", wbRowHTML(seed, true, undefined, tpl.ph));
+    $("#cf-book").insertAdjacentHTML("beforeend", cwRowHTML(blankEntry(), undefined, false));
     const last = $("#cf-book").lastElementChild;
-    last?.querySelector(".wb-edit")?.classList.add("open");
+    if (last) { last.querySelector(".cw-detail").hidden = false; last.querySelector(".cw-f-name").focus(); }
     last?.scrollIntoView({ behavior: "smooth", block: "nearest" });
   });
-  $("#cf-regex-add")?.addEventListener("click", () => $("#cf-regex")?.insertAdjacentHTML("beforeend", rxRowHTML({}, true)));
+  $("#cf-regex-add")?.addEventListener("click", () => {
+    $("#cf-regex")?.insertAdjacentHTML("beforeend", crRowHTML({}, undefined, false));
+    const last = $("#cf-regex").lastElementChild;
+    if (last) { last.querySelector(".cw-detail").hidden = false; last.querySelector(".cr-f-name").focus(); }
+  });
   document.addEventListener("click", cardFormDelHandler);
   document.addEventListener("click", cardFormEditHandler);
   // 头像只在「做卡」时可传；卡库里的卡不在这改头像
@@ -697,18 +602,17 @@ function bindCardForm(card, mode) {
 }
 
 function cardFormDelHandler(e) {
-  const del = e.target.closest(".wb-del, .rx-del");
-  if (!del) return;
-  if (del.classList.contains("wb-del")) {
-    const container = del.closest("#cf-book");
-    if (container?.id === "cf-book" && container.querySelectorAll(".wb-entry").length <= 1) {
-      toast("世界书至少保留一条条目", false);
-      return;
-    }
-    del.closest(".wb-entry")?.remove();
-  } else {
-    del.closest(".rx-row")?.remove();
+  const container = e.target.closest('#cf-book, #cf-regex');
+  if (!container) return;
+  if (!e.target.closest('[data-act="del"]')) return;
+  const row = e.target.closest('.cw-item');
+  if (!row) return;
+  if (container.id === 'cf-book' && container.querySelectorAll('.cw-item').length <= 1) {
+    toast('世界书至少保留一条条目', false);
+    return;
   }
+  if (!confirm('删除这条' + (container.id === 'cf-book' ? '条目' : '正则') + '？')) return;
+  row.remove();
 }
 
 function fillFormFromCard(card, mode) {
@@ -729,11 +633,15 @@ function fillFormFromCard(card, mode) {
     }
   }
   const entries = st.character_book?.entries?.length ? st.character_book.entries : [];
-  // 全部折叠：表面只有一行摘要，点「编辑」才展开（参考 RP-Hub）；只有全新空条目才自动展开
+  // 新版行模板（与通讯录世界书/正则页共用）：表面只有一行（状态+名称+编辑/删除），点编辑键展开
   $("#cf-book").innerHTML = entries.length
-    ? entries.map((en, i) => wbRowHTML(en, false, i)).join("")
-    : wbRowHTML({}, true);
-  if ($("#cf-regex")) $("#cf-regex").innerHTML = (st.regex_scripts ?? []).map(rxRowHTML).join("");
+    ? entries.map((en, i) => cwRowHTML(en, i, false)).join("")
+    : cwRowHTML({}, undefined, false);
+  if (!entries.length) {
+    const first = $("#cf-book")?.querySelector(".cw-detail");
+    if (first) first.hidden = false; // 空书自动展开那条空白条目
+  }
+  if ($("#cf-regex")) $("#cf-regex").innerHTML = (st.regex_scripts ?? []).map((sc, i) => crRowHTML(sc, i, false)).join("");
 }
 
 function collectCardForm(card, mode) {
@@ -753,10 +661,10 @@ function collectCardForm(card, mode) {
   };
   const prevEntries = st.character_book?.entries ?? [];
   st.character_book = {
-    entries: [...$("#cf-book").querySelectorAll(".wb-entry")]
+    entries: [...$("#cf-book").querySelectorAll(".cw-item")]
       .map((r) => {
-        const comment = r.querySelector(".wb-comment").value.trim();
-        const keys = r.querySelector(".wb-keys").value.split(/[,，、]/).map((s) => s.trim()).filter(Boolean);
+        const comment = r.querySelector(".cw-f-name").value.trim();
+        const keys = r.querySelector(".cw-f-keys").value.split(/[,，、]/).map((s) => s.trim()).filter(Boolean);
         // 增量覆盖：保住表单没暴露的酒馆字段（secondary_keys / selective / extensions / id / use_regex 等）
         const idx = Number(r.dataset.idx);
         const base = Number.isInteger(idx) && prevEntries[idx] ? prevEntries[idx] : {};
@@ -765,25 +673,26 @@ function collectCardForm(card, mode) {
           name: comment || undefined,
           comment: comment || undefined,
           keys,
-          content: r.querySelector(".wb-content").value,
-          constant: r.querySelector(".wb-constant").checked,
-          enabled: r.querySelector(".wb-enabled").checked,
-          insertion_order: numOr(r.querySelector(".wb-order"), 100, 0, 9999),
+          content: r.querySelector(".cw-f-content").value,
+          constant: r.querySelector(".cw-constant").classList.contains("on"),
+          enabled: r.querySelector(".cw-state").classList.contains("on"),
+          insertion_order: numOr(r.querySelector(".cw-f-order"), 100, 0, 9999),
           priority: Number.isFinite(Number(base.priority)) ? Number(base.priority) : 10,
-          position: r.querySelector(".wb-pos")?.value || "before_char",
-          probability: numOr(r.querySelector(".wb-prob"), 100, 0, 100),
-          depth: numOr(r.querySelector(".wb-depth"), 4, 0, 999),
+          // 插入位置/概率/深度新版行不再暴露：原样保留已有卡的值，新条目走 schema 默认
+          position: base.position || "before_char",
+          probability: Number.isFinite(Number(base.probability)) ? Number(base.probability) : 100,
+          depth: Number.isFinite(Number(base.depth)) ? Number(base.depth) : 4,
         };
       })
       // 名称/关键词/内容全空才算废弃条目（原来只看 content，会静默吞掉填了一半的条目）
       .filter((e) => e.content.trim() || (e.comment ?? "").trim() || e.keys.length),
   };
-  st.regex_scripts = [...$("#cf-regex").querySelectorAll(".rx-row")]
+  st.regex_scripts = [...$("#cf-regex").querySelectorAll(".cw-item")]
     .map((r) => ({
-      scriptName: r.querySelector(".rx-name").value.trim(),
-      findRegex: r.querySelector(".rx-find").value,
-      replaceString: r.querySelector(".rx-rep").value,
-      enabled: true,
+      scriptName: r.querySelector(".cr-f-name").value.trim(),
+      findRegex: r.querySelector(".cr-f-find").value,
+      replaceString: r.querySelector(".cr-f-rep").value,
+      enabled: r.querySelector(".cw-state").classList.contains("on"),
     }))
     .filter((s) => s.findRegex);
   if (card.identity.avatar === undefined) card.identity.avatar = "";
@@ -3486,9 +3395,13 @@ function applyDraftToForm(draft) {
   $("#cf-first").value = draft.sillytavern_v2?.first_mes || "";
   const entries = draft.sillytavern_v2?.character_book?.entries || [];
   $("#cf-book").innerHTML = entries.length
-    ? entries.map((en, i) => wbRowHTML(en, i === 0 && !en.content, i)).join("")
-    : wbRowHTML({}, true);
-  $("#cf-regex").innerHTML = (draft.sillytavern_v2?.regex_scripts || []).map(rxRowHTML).join("");
+    ? entries.map((en, i) => cwRowHTML(en, i, false)).join("")
+    : cwRowHTML({}, undefined, false);
+  if (!entries.length) {
+    const first = $("#cf-book")?.querySelector(".cw-detail");
+    if (first) first.hidden = false;
+  }
+  $("#cf-regex").innerHTML = (draft.sillytavern_v2?.regex_scripts || []).map((sc, i) => crRowHTML(sc, i, false)).join("");
   removeCover(true);
 }
 
@@ -5078,12 +4991,24 @@ function renderChatWb() {
   </div>`;
 }
 
-/** 世界书条目行：状态 + 名称 + 编辑/删除符号键；展开后 名称/关键词各占一行，常驻为按键 + 顺序 */
-function cwRowHTML(e, idx) {
+/** 世界书条目行（通讯录世界书页与卡库编辑器共用）：状态 + 名称 + 编辑/删除符号键；展开后 名称/关键词各占一行，常驻为按键 + 顺序
+ *  withActions：是否带行级「保存/取消」（通讯录页即时保存用 true；卡库整卡保存用 false） */
+/** 空白世界书条目（添加条目一律空白，通讯录世界书页与卡库编辑器共用） */
+function blankEntry() {
+  return {
+    keys: [], secondary_keys: [], content: "", name: "", comment: "",
+    enabled: true, selective: false, constant: false,
+    insertion_order: 100, priority: 10, position: "before_char", probability: 100, depth: 4,
+  };
+}
+
+function cwRowHTML(e, idx, withActions = true) {
   const keys = Array.isArray(e?.keys) ? e.keys.join("、") : (e?.keys ?? "");
   const title = e?.comment || e?.name || "未命名条目";
+  // 完全空白的条目（刚添加）：名称框留空显示 placeholder，不预填「未命名条目」
+  const nameValue = e?.comment || e?.name || "";
   const on = e?.enabled !== false;
-  return `<div class="cw-item${on ? "" : " disabled"}" data-idx="${idx}">
+  return `<div class="cw-item${on ? "" : " disabled"}" data-idx="${Number.isInteger(idx) ? idx : ""}">
     <div class="cw-head">
       <button type="button" class="cw-state${on ? " on" : ""}" data-act="state" title="${on ? "启用中，点击停用" : "已停用，点击启用"}">${on ? "启用中" : "已停用"}</button>
       <span class="cw-name">${escapeHtml(String(title))}</span>
@@ -5092,17 +5017,17 @@ function cwRowHTML(e, idx) {
       <button type="button" class="cw-icon-btn danger" data-act="del" title="删除条目">${icon("trash")}</button>
     </div>
     <div class="cw-detail" hidden>
-      <div class="wb-field"><label>条目名称</label><input class="cw-f-name" placeholder="如：人物形象 / 世界观 / 人物关系" value="${escapeHtml(String(title))}"></div>
+      <div class="wb-field"><label>条目名称</label><input class="cw-f-name" placeholder="如：人物形象 / 世界观 / 人物关系" value="${escapeHtml(String(nameValue))}"></div>
       <div class="wb-field"><label>触发关键词</label><input class="cw-f-keys" placeholder="多个关键词用逗号分隔；常驻条目可留空（始终生效，不靠关键词触发）" value="${escapeHtml(keys)}"></div>
       <div class="cw-row2">
         <button type="button" class="cw-constant${e?.constant ? " on" : ""}" title="常驻条目始终生效，不靠关键词触发">常驻</button>
         <label class="cw-order-label">顺序 <input type="number" class="cw-f-order" min="0" value="${e?.insertion_order ?? 100}" title="多条条目同时触发时的排序"></label>
       </div>
       <div class="wb-field"><label>条目内容</label><textarea class="cw-f-content" rows="14" placeholder="这个世界观里发生了什么、角色是什么样的人…（触发或常驻时注入给 AI 的正文）">${escapeHtml(String(e?.content ?? ""))}</textarea></div>
-      <div class="wb-foot">
+      ${withActions ? `<div class="wb-foot">
         <button class="cw-cancel ghost small-btn" type="button">取消</button>
         <button class="cw-save primary small-btn" type="button">${icon("check")} 保存</button>
-      </div>
+      </div>` : ""}
     </div>
   </div>`;
 }
@@ -5135,12 +5060,6 @@ function initChatWb() {
       return false;
     }
   };
-
-  const blankEntry = () => ({
-    keys: [], secondary_keys: [], content: "", name: "", comment: "",
-    enabled: true, selective: false, constant: false,
-    insertion_order: 100, priority: 10, position: "before_char", probability: 100, depth: 4,
-  });
 
   (async () => {
     card = await api.get(`/api/cards/${encodeURIComponent(slug)}`).catch(() => null);
@@ -5229,12 +5148,12 @@ function renderChatRx() {
   </div>`;
 }
 
-/** 正则行：状态 + 名称 + 查找摘要 + 编辑/删除符号键 */
-function crRowHTML(s, idx) {
+/** 正则行（通讯录正则页与卡库编辑器共用）：状态 + 名称 + 查找摘要 + 编辑/删除符号键 */
+function crRowHTML(s, idx, withActions = true) {
   const name = s?.scriptName || "未命名正则";
   const find = String(s?.findRegex ?? "");
   const on = !(s?.disabled === true || s?.enabled === false);
-  return `<div class="cw-item${on ? "" : " disabled"}" data-idx="${idx}">
+  return `<div class="cw-item${on ? "" : " disabled"}" data-idx="${Number.isInteger(idx) ? idx : ""}">
     <div class="cw-head">
       <button type="button" class="cw-state${on ? " on" : ""}" data-act="state" title="${on ? "启用中，点击停用" : "已停用，点击启用"}">${on ? "启用中" : "已停用"}</button>
       <span class="cw-name">${escapeHtml(String(name))}</span>
@@ -5247,10 +5166,10 @@ function crRowHTML(s, idx) {
       <div class="wb-field"><label>名称</label><input class="cr-f-name" placeholder="如：去星号 / 去旁白" value="${escapeHtml(String(s?.scriptName ?? ""))}"></div>
       <div class="wb-field"><label>查找（正则表达式）</label><input class="cr-f-find" placeholder="/\\*.*?\\*/g 或裸表达式，$1 等分组可用" value="${escapeHtml(find)}"></div>
       <div class="wb-field"><label>替换为</label><input class="cr-f-rep" placeholder="留空 = 删除匹配内容" value="${escapeHtml(String(s?.replaceString ?? ""))}"></div>
-      <div class="wb-foot">
+      ${withActions ? `<div class="wb-foot">
         <button class="cr-cancel ghost small-btn" type="button">取消</button>
         <button class="cr-save primary small-btn" type="button">${icon("check")} 保存</button>
-      </div>
+      </div>` : ""}
     </div>
   </div>`;
 }
