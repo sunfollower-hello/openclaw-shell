@@ -5711,6 +5711,19 @@ function memNsLabel(ns) {
 function renderMemRow(e, inKeySection) {
   const src = MEM_SRC_LABEL[e.src] ?? e.src ?? "";
   const nsBadge = memNsLabel(e.ns) ? `<span class="mem-badge mem-ns">${escapeHtml(memNsLabel(e.ns))}</span>` : "";
+  // 事件时间（聊于 X月X日）：evtFrom 才有 = 新版总结的记忆；旧数据显示记录时间（fmtTime(e.ts)）
+  let evtText = "";
+  if (e.evtFrom) {
+    const d = new Date(e.evtFrom);
+    if (!isNaN(d.getTime())) {
+      const f = (x) => `${x.getMonth() + 1}月${x.getDate()}日`;
+      const from = f(d);
+      const to = e.evtTo ? new Date(e.evtTo) : null;
+      evtText = to && !isNaN(to.getTime()) && to.toDateString() !== d.toDateString()
+        ? `聊于 ${from}~${f(to)}`
+        : `聊于 ${from}`;
+    }
+  }
   // #关键词标签已按用户要求去掉（展示层面用不到；触发词数据本身保留，检索仍生效）
   // 关键记忆单独分区里不再叠整行红色（分区已有红框）；主列表里的关键记忆（搜索命中时）保留高亮
   const rowCls = `mem-row${!inKeySection && e.important ? " mem-key-row" : ""}`;
@@ -5718,7 +5731,7 @@ function renderMemRow(e, inKeySection) {
     ${e.important ? `<span class="mem-badge mem-key">关键</span>` : ""}
     ${nsBadge}
     <span class="mem-fact">${escapeHtml(e.fact)}</span>
-    <span class="mem-meta">${fmtTime(e.ts)}${src ? " · " + src : ""}</span>
+    <span class="mem-meta">${evtText ? evtText + " · " : ""}${fmtTime(e.ts)}${src ? " · " + src : ""}</span>
     <span class="mem-ops">
       <button class="small-btn" data-act="edit" data-id="${escapeHtml(e.id)}">编辑</button>
       <button class="small-btn danger" data-act="del" data-id="${escapeHtml(e.id)}">删除</button>

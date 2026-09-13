@@ -28,6 +28,13 @@ export interface MemEntry {
    * 记忆不该替被删内容留底，删了就按剩余原文重新总结。旧数据无此字段，视为不可溯源（不动）。
    */
   roundKeys?: string[];
+  /**
+   * 事件时间（这段对话实际发生的时刻，ISO）：
+   * ts 是「总结时刻」（攒批总结，可能比事件晚好几轮），evtFrom/evtTo 才是「事情发生的时间」。
+   * SKILL/注入展示与模型做时间推算时用事件时间；旧数据无此字段，回退显示 ts。
+   */
+  evtFrom?: string;
+  evtTo?: string;
 }
 
 /** 轮次指纹：与 repairChatlogAfterDelete 的内容匹配口径一致（各取前 500 字） */
@@ -35,6 +42,25 @@ export function roundKeyOf(round: { u?: string; a?: string }): string {
   const u = String(round.u ?? "").slice(0, 500);
   const a = String(round.a ?? "").slice(0, 500);
   return crypto.createHash("sha1").update(u + "\u0000" + a).digest("hex").slice(0, 16);
+}
+
+/**
+ * 事件时间展示文本：evtFrom/evtTo 优先（同日 → 「9月3日」，跨日 → 「9月1日~5日」）；
+ * 旧数据没有事件时间时回退 ts（总结日期）。空串 = 无可展示时间。
+ * 调用方应区分语义：有 evt 用「聊于」，回退 ts 用「记录于」（总结日期不是事件日期）。
+ */
+export function evtRangeText(e: { evtFrom?: string; evtTo?: string; ts?: string }): string {
+  const fmt = (d: Date) => `${d.getMonth() + 1}月${d.getDate()}日`;
+  const from = e.evtFrom ? new Date(e.evtFrom) : null;
+  const to = e.evtTo ? new Date(e.evtTo) : null;
+  if (from && !isNaN(from.getTime())) {
+    if (to && !isNaN(to.getTime()) && to.getTime() >= from.getTime()) {
+      return from.toDateString() === to.toDateString() ? fmt(from) : `${fmt(from)}~${fmt(to)}`;
+    }
+    return fmt(from);
+  }
+  const ts = e.ts ? new Date(e.ts) : null;
+  return ts && !isNaN(ts.getTime()) ? fmt(ts) : "";
 }
 
 export function memoryFile(slug: string): string {
@@ -121,6 +147,12 @@ function parseLine(line: string): MemEntry | null {
       ...(Array.isArray(o.roundKeys) && o.roundKeys.length
         ? { roundKeys: o.roundKeys.map((k) => String(k)).filter(Boolean) }
         : {}),
+      ...(typeof o.evtFrom === "string" && o.evtFrom && !isNaN(new Date(o.evtFrom).getTime())
+        ? { evtFrom: o.evtFrom }
+        : {}),
+      ...(typeof o.evtTo === "string" && o.evtTo && !isNaN(new Date(o.evtTo).getTime())
+        ? { evtTo: o.evtTo }
+        : {}),
     };
   } catch {
     return null;
@@ -183,7 +215,7 @@ export interface AppendResult {
  *  记忆对整张卡所有入口通用，ns 恒为 shared（保留入参仅为兼容旧调用，不再产生隔离）。 */
 export function appendEntry(
   slug: string,
-  input: { fact: string; keywords?: string[]; important?: boolean; src?: MemorySource; ns?: string; roundKeys?: string[] }
+  input: { fact: string; keywords?: string[]; important?: boolean; src?: MemorySource; ns?: string; roundKeys?: string[]; evtFrom?: string; evtTo?: string }
 ): Promise<AppendResult> {
   return withLock(slug, async () => {
     const fact = String(input.fact ?? "").trim();
@@ -200,9 +232,15 @@ export function appendEntry(
       }
     }
     const roundKeys = Array.isArray(input.roundKeys) ? input.roundKeys.map(String).filter(Boolean) : [];
+    // 事件时间：只在合法 ISO 时记录（旧轮次/手动添加没有就缺省）
+    const iso = (v: unknown) => (typeof v === "string" && v && !isNaN(new Date(v).getTime()) ? v : undefined);
+    const evtFrom = iso(input.evtFrom);
+    const evtTo = iso(input.evtTo);
     const entry: MemEntry = {
       id: newId(), fact, keywords, important, ts: new Date().toISOString(), src, ns: "shared",
       ...(roundKeys.length ? { roundKeys } : {}),
+      ...(evtFrom ? { evtFrom } : {}),
+      ...(evtTo ? { evtTo } : {}),
     };
     await writeEntries(slug, [...entries, entry]);
     return { ok: true, entry };
@@ -434,7 +472,8 @@ export async function exportMemoryToMarkdown(slug: string): Promise<void> {
   if (important.length) {
     lines.push("### 关键记忆（必须遵守）", "");
     for (const e of important) {
-      const when = e.ts ? `（${e.ts.slice(0, 10)}）` : "";
+      const evt = evtRangeText(e);
+      const when = e.evtFrom ? `（聊于 ${evt}）` : e.ts ? `（记录于 ${evt}）` : "";
       const kw = e.keywords?.length ? ` ［关键词：${e.keywords.join("、")}］` : "";
       lines.push(`- ${e.fact}${kw}${when}`);
     }
@@ -443,7 +482,8 @@ export async function exportMemoryToMarkdown(slug: string): Promise<void> {
   if (normal.length) {
     lines.push("### 普通记忆", "");
     for (const e of normal) {
-      const when = e.ts ? `（${e.ts.slice(0, 10)}）` : "";
+      const evt = evtRangeText(e);
+      const when = e.evtFrom ? `（聊于 ${evt}）` : e.ts ? `（记录于 ${evt}）` : "";
       const kw = e.keywords?.length ? ` ［关键词：${e.keywords.join("、")}］` : "";
       lines.push(`- ${e.fact}${kw}${when}`);
     }

@@ -15,7 +15,7 @@ import { RELATION_ROLES } from "./schema.js";
 import { resolveCardPresetBlocks, resolveCardPresetExamples, ABILITY_IMAGE_RULE, ABILITY_IMAGE_RULE_CHANNEL, ABILITY_TTS_RULE, ABILITY_VOICE_RULE_CHANNEL } from "./presets.js";
 import { applyMacros, userName, userBio, type MacroValues } from "./macros.js";
 import { buildEmojiPrompt } from "./emojiStore.js";
-import { readEntries } from "./memoryStore.js";
+import { readEntries, evtRangeText } from "./memoryStore.js";
 import { readRecentLocalChat } from "./historyExport.js";
 
 // ---------- 重描写专属世界书条目 ----------
@@ -338,11 +338,12 @@ async function renderSkill(card: PersonaCard, presetBlocks: string[] = [], emoji
   const memEntries = await readEntries(card.slug).catch(() => []);
   if (memEntries.length > 0) {
     lines.push("");
-    lines.push("### 长期记忆（自动总结，话题相关时引用）");
+    lines.push("### 长期记忆（自动总结，话题相关时引用；括号里的日期是这件事聊到/发生的时间，可用来推算时间线）");
     for (const m of memEntries) {
       const imp = m.important ? "【关键】" : "";
-      const date = m.ts ? m.ts.slice(0, 10) : "";
-      lines.push(`- ${imp}${m.fact}${date ? `（${date}）` : ""}`);
+      const evt = evtRangeText(m);
+      const date = evt ? `（${m.evtFrom ? "聊于 " : "记录于 "}${evt}）` : "";
+      lines.push(`- ${imp}${m.fact}${date}`);
     }
   } else {
     lines.push("");

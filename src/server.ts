@@ -142,9 +142,11 @@ import {
   dissolveNewestMemory,
   deleteMemoriesByRounds,
   roundKeyOf,
+  evtRangeText,
 } from "./core/memoryStore.js";
 import { appendConv, readConv, readConvSrcIds, deleteConvByIds, clearConv, type ConvSurface } from "./core/conversationStore.js";
 import { readChatListState, setPinned, forgetChatListEntry } from "./core/chatListStore.js";
+import { recallChatSnippets } from "./core/chatRecall.js";
 import {
   listGroupsForCard,
   getGroupDetail,
@@ -2479,9 +2481,15 @@ app.post("/api/chat", async (req, res) => {
     const allMems = (await readEntries(slug).catch(() => [])).slice().sort(
       (a, b) => (b.important ? 1 : 0) - (a.important ? 1 : 0)
     );
+    // 事件时间锚点（evtFrom 才有 = 新版总结的记忆；括号日期是事情聊到/发生的时间，非总结时刻）
+    const memLines = allMems.map((m) => {
+      const imp = m.important ? "【关键】" : "";
+      const evt = m.evtFrom ? evtRangeText(m) : "";
+      const when = evt ? `（聊于 ${evt}）` : "";
+      return `${imp}${m.fact}${when}`;
+    });
     const memoryBlock = allMems.length
-      ? `\n\n【长期记忆（关于你的事实，仅在相关时使用；【关键】为必须遵守的长期约定；要新增事实时调用 memory_save 工具）】\n- ${allMems
-          .map((m) => `${m.important ? "【关键】" : ""}${m.fact}`)
+      ? `\n\n【长期记忆（关于你的事实，仅在相关时使用；【关键】为必须遵守的长期约定；要新增事实时调用 memory_save 工具）】\n- ${memLines
           .join("\n- ")}`
       : "";
     // 显式「记住」触发规则：只有启用了 memory_save 工具才注入，避免模型嘴上说记住却没工具可调
@@ -2533,6 +2541,11 @@ app.post("/api/chat", async (req, res) => {
       String(message),
     ].join("\n");
     const triggeredWb = selectTriggeredWorldbook(card, recentText);
+    // 旧聊天原文召回：用户提到「第一次/之前/上次」等往事时，从会话日志按相似度召回
+    // 带精确时间的旧消息片段（滑窗外的部分；稳定态无命中 = 空串，不影响缓存命中）
+    const chatRecallBlock = await recallChatSnippets(slug, String(message ?? ""), {
+      excludeTail: Array.isArray(history) ? Math.min(20, history.length) : 20,
+    }).catch(() => "");
 
     // 配置变更强提醒：风格/条数/预设档位最近改过。
     // 【位置很关键】不能只放 system 顶部——那里离生成点最远，会被末尾 20 条旧风格聊天记录
@@ -2551,13 +2564,13 @@ app.post("/api/chat", async (req, res) => {
     const firstMes = card.sillytavern_v2?.first_mes?.trim() ?? "";
     const openedWithGreeting = isFreshChat && firstMes ? firstMes : "";
 
-    // 动态块：只放「必须贴近生成点才生效」的内容——配置变更强提醒（靠近因效应压过旧风格惯性）
-    // 与关键词触发的世界书条目。记忆已全量进 system（稳定前缀），不在这里重复。
+    // 动态块：只放「必须贴近生成点才生效」的内容——配置变更强提醒（靠近因效应压过旧风格惯性）、
+    // 关键词触发的世界书条目、旧聊天原文召回。记忆已全量进 system（稳定前缀），不在这里重复。
     // 稳定态下这里应为空 → 整轮请求前缀完全一致 → 缓存命中率最高（实测 93-96%）。
-    const dynamicBlock = [triggeredWb, cfgReminder].filter(Boolean).join("\n\n");
+    const dynamicBlock = [triggeredWb, chatRecallBlock, cfgReminder].filter(Boolean).join("\n\n");
     if (dynamicBlock) {
       // 有动态内容才会破坏本轮缓存，记一行便于回溯（正常情况下不该频繁出现）
-      logInfo("缓存", `动态块 ${dynamicBlock.length} 字符（世界书触发 ${triggeredWb ? "是" : "否"} / 配置提醒 ${cfgReminder ? "是" : "否"}）`);
+      logInfo("缓存", `动态块 ${dynamicBlock.length} 字符（世界书触发 ${triggeredWb ? "是" : "否"} / 聊天召回 ${chatRecallBlock ? "是" : "否"} / 配置提醒 ${cfgReminder ? "是" : "否"}）`);
     }
 
     const messages: unknown[] = [
@@ -2656,7 +2669,13 @@ async function autoMemorize(
     .map((e) => `- ${e.important ? "【关键】" : ""}${e.fact}`)
     .join("\n");
   const recent = segment
-    .map((r) => `用户: ${r.u}\n角色: ${r.a}`)
+    .map((r) => {
+      // 每轮带上它真实发生的日期：总结出的记忆才能锚定事件时间
+      // （否则记忆只有"总结时刻"，攒批/巡回后事件时间就丢了）
+      const day = r.t ? new Date(r.t) : null;
+      const dayText = day && !isNaN(day.getTime()) ? `（${day.getFullYear()}年${day.getMonth() + 1}月${day.getDate()}日）` : "";
+      return `${dayText}用户: ${r.u}\n角色: ${r.a}`;
+    })
     .join("\n");
   if (!recent.trim()) return;
   try {
@@ -2675,7 +2694,8 @@ async function autoMemorize(
               " 字；\n" +
               "2. 若对话里用户表达了【长期、绝对的约定或强烈偏好】（出现「总是、以后都、永远、一直、记住、我绝对、我特别喜欢/讨厌、无论如何」等词），把 important 设为 true（关键记忆，必须长期遵守）；否则 false；\n" +
               "3. 提炼 2-5 个关键词放进 keywords（用于之后聊天出现这些词时召回这条记忆）。\n" +
-              "4. 已记住的不要重复。没有值得记的内容就返回 {\"skip\": true}。\n" +
+              "4. 每轮对话前标注了日期。如果记忆内容与时间有关（什么时候说的/打算什么时候做/共同经历发生在何时），在记忆里自然地写上日期（如「9月3日提到周末想去露营」），方便以后回忆时间线。\n" +
+              "5. 已记住的不要重复。没有值得记的内容就返回 {\"skip\": true}。\n" +
               "输出严格 JSON：{\"summary\":\"...\",\"important\":true/false,\"keywords\":[\"...\"]}，不要任何其他文字。",
           },
           { role: "user", content: `已记住的记忆：\n${existing || "（无）"}\n\n最近对话：\n${recent}` },
@@ -2716,7 +2736,11 @@ async function autoMemorize(
     const important = o.important === true;
     // 记下这条记忆总结自哪几轮：用户删掉那些聊天记录时，这条记忆要一并删掉（不给被删内容留底）
     const roundKeys = segment.map((r) => roundKeyOf(r));
-    await appendEntry(slug, { fact, keywords, important, src: "auto", ns, roundKeys }).catch(() => {});
+    // 事件时间 = 这段对话实际发生的区间（轮次各自带 t；与 ts=总结时刻区分开）
+    const times = segment.map((r) => new Date(r.t).getTime()).filter((n) => !isNaN(n));
+    const evtFrom = times.length ? new Date(Math.min(...times)).toISOString() : undefined;
+    const evtTo = times.length ? new Date(Math.max(...times)).toISOString() : undefined;
+    await appendEntry(slug, { fact, keywords, important, src: "auto", ns, roundKeys, evtFrom, evtTo }).catch(() => {});
     logInfo("记忆", `${slug} 自动总结 1 条${important ? "（关键）" : ""}：${fact.slice(0, 40)}`);
     void (async () => {
       await exportMemoryToMarkdown(slug).catch(() => {});
