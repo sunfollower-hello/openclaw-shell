@@ -1086,8 +1086,10 @@ button:disabled { opacity: 0.4; cursor: not-allowed; transform: none; }
 .emoji-group-tab .g-del:hover, .emoji-group-tab .g-rename:hover { opacity: 1; color: var(--danger, #e05); }
 .emoji-group-add { border: 1px dashed var(--border); background: transparent; color: var(--muted); padding: 5px 12px; border-radius: 999px; cursor: pointer; font-size: 13px; }
 .emoji-group-add:hover { border-color: var(--accent); color: var(--accent); }
-/* 聊天气泡里的表情图 */
-.chat-emoji { max-height: 44px; vertical-align: middle; margin: 0 2px; }
+/* 聊天气泡里的表情图：QQ/微信 正常表情大小（此前 44px 太小，用户点名） */
+.chat-emoji { max-width: 110px; max-height: 110px; vertical-align: middle; margin: 0 2px; border-radius: 6px; }
+/* 独立成气泡的表情（一条就是一个表情）再大一档 */
+.lc-root .bubble:has(> img.chat-emoji:only-child) .chat-emoji { max-width: 140px; max-height: 140px; }
 
 /* ============ 通道页：机器人连接区 ============ */
 .conn-sub { font-size: 12.5px; font-weight: 700; color: #6a7186; margin: 10px 0 6px; }
@@ -1515,7 +1517,17 @@ body.lc-fullscreen .lc-root { height: 100dvh; }
 }
 .lc-dot.on { background: var(--ok); border-color: var(--ok); }
 .lc-dot.err { background: var(--danger); border-color: var(--danger); }
-.lc-who { cursor: pointer; }
+/* 头像/名字不可点（卡片配置统一走右上角三个点 → 聊天设置） */
+.lc-back-btn {
+  width: 32px; height: 32px; padding: 0;
+  border: 1px solid var(--lc-line, var(--border));
+  background: var(--lc-field, var(--card));
+  color: #444; border-radius: 9px;
+  cursor: pointer; flex-shrink: 0;
+  display: inline-flex; align-items: center; justify-content: center;
+}
+.lc-back-btn svg { width: 17px; height: 17px; }
+.lc-back-btn:hover { background: #ececec; color: #111; }
 .lc-who-text .lc-sub { display: none; }
 
 /* 单行输入岛：搜索 / 思考深度 / 输入 / 发送（RP-Hub 式） */
@@ -1774,6 +1786,60 @@ body.lc-fullscreen .lc-root { height: 100dvh; }
 .ci-hit-text { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .ci-hit-text mark { background: #ffe9a8; padding: 0 1px; border-radius: 2px; }
 .ci-hit-time { flex-shrink: 0; color: var(--faint); font-size: 11px; }
+/* 聊天记录搜索页的筛选条（微信式：关键词 + 图片 + 日期） */
+.cs-filters { display: flex; align-items: center; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
+.cs-chip {
+  padding: 6px 14px; border-radius: 20px;
+  border: 1px solid var(--border); background: var(--card);
+  font-size: 13px; color: var(--muted); cursor: pointer;
+}
+.cs-chip.on { background: var(--accent-soft); border-color: var(--accent); color: var(--accent-dark); font-weight: 600; }
+.cs-date {
+  padding: 6px 10px; border-radius: 10px;
+  border: 1px solid var(--border); background: var(--card);
+  color: var(--text); font-size: 13px;
+}
+/* 记忆二分按键的选中态（复用 ghost 按钮底子） */
+.row .ghost.on { background: var(--accent-soft); border-color: var(--accent); color: var(--accent-dark); font-weight: 600; }
+
+/* 聊天设置页：记忆/世界书/正则 导航按键（一个框两个键，各占一半） */
+.ci-mem-nav { display: flex; gap: 10px; }
+.ci-mem-nav .ghost { flex: 1; display: flex; align-items: center; justify-content: center; gap: 6px; padding: 11px 8px; font-size: 14px; }
+.ci-mem-nav .ghost .ic { width: 15px; height: 15px; }
+/* 一键删除：裸按钮不套框 */
+.ci-wipe-btn { width: 100%; margin-top: 12px; padding: 10px; font-size: 13px; }
+
+/* 聊天记忆页：关键记忆折叠按键 */
+.cm-key-toggle {
+  width: 100%; padding: 10px 12px; text-align: left;
+  border: 1px solid var(--danger); border-radius: 10px;
+  background: var(--danger-soft); color: #7a2f1d;
+  font-size: 13.5px; font-weight: 700; cursor: pointer;
+}
+.cm-key-toggle.open { border-bottom-left-radius: 0; border-bottom-right-radius: 0; }
+.cm-key-toggle + .mem-key-section { border-top-left-radius: 0; border-top-right-radius: 0; margin-top: -1px; }
+
+/* 世界书 / 正则 查看页条目 */
+.cw-list { display: flex; flex-direction: column; gap: 8px; }
+.cw-item {
+  background: var(--card); border: 1px solid var(--border); border-radius: 12px;
+  padding: 10px 13px; cursor: pointer;
+}
+.cw-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.cw-name { font-weight: 700; font-size: 14px; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cw-tag {
+  font-size: 10.5px; padding: 1px 7px; border-radius: 20px;
+  background: var(--panel); color: var(--muted); flex-shrink: 0;
+}
+.cw-tag.cw-on { background: var(--ok-soft); color: var(--ok); }
+.cw-tag.cw-off { background: var(--danger-soft); color: var(--danger); }
+.cw-keys { margin-top: 6px; font-size: 12px; color: var(--muted); word-break: break-all; }
+.cw-keys code { background: var(--panel); padding: 1px 5px; border-radius: 5px; font-size: 11.5px; }
+.cw-content {
+  margin-top: 8px; padding: 9px 11px; border-radius: 8px;
+  background: var(--panel); font-size: 13px; line-height: 1.6;
+  white-space: pre-wrap; word-break: break-word;
+}
 
 /* ===== 表情面板：输入框「下方」展开（QQ 式），输入岛随之上移 =====
    面板在 .lc-dock 内、紧跟 .lc-island 之后。消息区 .lc-log 是 flex:1，

@@ -3415,8 +3415,11 @@ app.get("/api/conversations", async (_req, res) => {
         name: m.name,
         avatar: m.avatar,
         role: m.role,
-        // 预览去掉换行与表情标签，只留一行文字（列表里一行显示）
+        // 预览去掉换行与表情标签、剥掉 MEDIA: 路径行（通道历史污染），只留一行文字
         last: String(last?.content ?? "")
+          .split(/\r?\n/)
+          .filter((ln) => !/^\s*MEDIA:\s*/i.test(ln))
+          .join(" ")
           .replace(/\[表情:([^\]]+)\]/g, "[$1]")
           .replace(/\s+/g, " ")
           .trim()
@@ -3460,14 +3463,20 @@ app.get("/api/cards/:slug/conversation/search", async (req, res) => {
   try {
     const slug = req.params.slug;
     const q = String(req.query.q ?? "").trim();
-    if (!q) return res.json({ hits: [], total: 0 });
+    const wantImage = req.query.image === "1"; // 只看带图/表情的消息
+    const date = String(req.query.date ?? "").trim(); // YYYY-MM-DD，只看某一天
+    if (!q && !wantImage && !date) return res.json({ hits: [], total: 0 });
     const bot = await getBotByCard(slug);
     const all = await readConv(slug);
     const entries = bot ? all : all.filter((e) => e.surface === "web");
     const needle = q.toLowerCase();
+    const hasMedia = (c: string) =>
+      c.includes("[表情:") || c.includes("/emojis/") || c.includes("/img/") || /MEDIA:/i.test(c);
     const hits = entries
       .map((e, idx) => ({ e, idx }))
-      .filter(({ e }) => e.content.toLowerCase().includes(needle))
+      .filter(({ e }) => (q ? e.content.toLowerCase().includes(needle) : true))
+      .filter(({ e }) => (wantImage ? hasMedia(e.content) : true))
+      .filter(({ e }) => (date ? String(e.t ?? "").slice(0, 10) === date : true))
       .slice(-200) // 命中太多时只回最近 200 条，避免公网传输过大
       .map(({ e, idx }) => ({
         id: e.id,
