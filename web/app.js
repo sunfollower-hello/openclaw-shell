@@ -1533,6 +1533,8 @@ async function wbRemoveRowsByIds(removedIds) {
   const log = $("#chat-log");
   if (!log) return;
   const rows = [...log.querySelectorAll(".bubble-row[data-conv-id]")].filter((r) => idSet.has(r.dataset.convId));
+  // 服务端确认删了、DOM 里却一条都没匹配到（快照/时序异常）→ 整页重载兜底，不留幽灵气泡
+  if (!rows.length) { await wbReloadHistory(); return; }
   // 上下文条数按「不同 convId 个数」算，不能按气泡数：一条拆条回复是多个气泡但只占一条历史
   const goneIds = new Set(rows.map((r) => r.dataset.convId));
   rows.forEach((r) => {
@@ -1544,10 +1546,35 @@ async function wbRemoveRowsByIds(removedIds) {
   for (const id of idSet) wbRenderedIds.delete(id);
   // 删掉的轮次同时从本地上下文尾部摘掉（本地删除一律是「从某条删到底」，所以截尾准确）
   if (goneIds.size) wbChatHistory = wbChatHistory.slice(0, Math.max(0, wbChatHistory.length - goneIds.size));
+  // 懒渲染的完整记录同步剔除（否则快照/上翻补渲染还会把已删的消息带回来）
+  if (wbAllEntries.length) {
+    wbAllEntries = wbAllEntries.filter((e) => !idSet.has(e.id));
+    if (wbRenderedFrom > wbAllEntries.length) wbRenderedFrom = wbAllEntries.length;
+  }
 }
 
 /** 撤掉上一轮（破甲被拒时最常用）：一问一答从网页与通道两边一起摘掉 */
 async function wbUndoLastRound() {
+  // 发送有 2 秒防抖：队列里还没发出的消息不在这轮日志里，撤销时先取消它们
+  // （不然服务端删的是上一轮、排队的气泡却留下来 = 用户看到的"撤了没变化"）
+  if (wbSendTimer) {
+    clearTimeout(wbSendTimer);
+    wbSendTimer = null;
+    const queued = wbSendQueue.splice(0);
+    if (queued.length) {
+      wbPendingUserRows.splice(0).forEach((row) => row?.remove());
+      wbChatHistory.splice(-queued.length);
+    }
+  }
+  // 生成中还点撤销：先截断当前生成（同"发新消息可截断"逻辑——占位移除、本轮气泡摘掉、
+  // 上下文回滚），再撤上一完整轮。否则刚发的那条还挂在屏幕上，看起来就是"撤了没变化"。
+  if (wbAbort) {
+    try { wbAbort.abort(); } catch { /* 已结束 */ }
+    wbAbort = null;
+    if (wbThinkingBubble) { wbThinkingBubble.closest(".bubble-row")?.remove(); wbThinkingBubble = null; }
+    wbPendingUserRows.splice(0).forEach((row) => row?.remove());
+    wbChatHistory.pop(); // 本轮只有用户消息入了上下文（回复还没返回）
+  }
   const ok = await wbConfirm({
     title: "撤掉上一轮对话",
     lead: "把最近的一问一答从上下文里摘掉，常用于回复被模型拒绝、不想让它影响后续。",
@@ -1928,15 +1955,14 @@ async function wbDoSend(msgs) {
     // 用户可能在等回复期间去看配置了 → 聊天页 DOM 不在，回复要落到快照里而不是丢掉
     if (!$("#chat-log")) { stashReplyToSnapshot(sendSlug, r); return; }
     if (wbThinkingBubble) { wbThinkingBubble.closest(".bubble-row")?.remove(); wbThinkingBubble = null; }
-    await wbFinishTurn(r);
-    // 给这一轮的气泡挂上统一日志 id（长按删除要用）
+    // 先挂 id 再播动画（撤掉上一轮在气泡逐条冒出的几秒内也可能被点）：
+    // 合并发送的多条用户消息共用一条日志 → 都挂 ids[0]；bot 气泡由 addBotReplyHumanLike 逐条挂 ids[1]
     const ids = Array.isArray(r.convIds) ? r.convIds : [];
     const rows = wbPendingUserRows.splice(0);
-    const lastUserRow = rows[rows.length - 1];
-    if (ids[0] && lastUserRow) lastUserRow.dataset.convId = ids[0];
+    if (ids[0]) rows.forEach((row) => { if (row) row.dataset.convId = ids[0]; });
+    await wbFinishTurn(r, ids[1]);
     if (ids[1]) {
-      // 拆条回复是多个气泡但只有一条日志记录 → 本轮所有还没挂 id 的 bot 气泡都挂上同一个 id，
-      // 这样「撤掉上一轮/删除」按 id 局部移除时能把整轮的气泡一起摘干净（以前只挂最后一个，会残留）
+      // 动画结束后兜底：仍有没挂 id 的 bot 气泡（如审批流程产生的）统一补挂
       document.querySelectorAll("#chat-log .bubble-row.bot:not([data-conv-id])").forEach((row) => {
         row.dataset.convId = ids[1];
       });
@@ -2000,10 +2026,11 @@ function stashReplyToSnapshot(slug, r) {
   }
 }
 
-async function wbFinishTurn(r) {
+async function wbFinishTurn(r, assistantConvId) {
   if (r.type === "reply") {
     // 走真人化渲染：后端拆好的 parts（段落/句号/逗号四级拆条）逐条冒出；没 parts 时退回按空行拆
-    await addBotReplyHumanLike(r.reply, r.parts);
+    // assistantConvId：本轮日志 id，动画中每条气泡创建时立即挂上（撤掉上一轮随时可能被点）
+    await addBotReplyHumanLike(r.reply, r.parts, assistantConvId);
     wbChatHistory.push({ role: "assistant", content: r.reply });
     // 不自动朗读：只有点气泡右上角的喇叭才合成语音（手动触发）
   } else if (r.type === "pending") {
@@ -5972,7 +5999,7 @@ function renderBubbleRow(role, text, convId, logEl) {
   const src = role === "user" ? getUserAvatarCached() : getCardAvatarCached();
   if (src) av.src = src;
   else av.src = "data:image/svg+xml;utf8," + encodeURIComponent(
-    `<svg xmlns='http://www.w3.org/2000/svg' width='72' height='72'><rect width='72' height='72' fill='#e8e4da'/><text x='36' y='46' font-size='30' text-anchor='middle' fill='#9a948a'>${role === "user" ? "我" : "AI"}</text></svg>`
+    `<svg xmlns='http://www.w3.org/2000/svg' width='72' height='72'><rect width='72' height='72' fill='#ececec'/><text x='36' y='46' font-size='30' text-anchor='middle' fill='#999999'>${role === "user" ? "我" : "AI"}</text></svg>`
   );
   row.appendChild(av);
   const div = document.createElement("div");
@@ -6072,7 +6099,7 @@ async function speakText(text, btn) {
  * 四级拆条 + 条数/字数约束）；没有 parts 时退回旧逻辑：multi_send 开 → 按空行切。
  * 逐条冒出来，每条之间按卡里的 chat.delay 停顿（与通道端 humanDelay 一致）。
  */
-async function addBotReplyHumanLike(rawText, serverParts) {
+async function addBotReplyHumanLike(rawText, serverParts, assistantConvId) {
   const card = curCard();
   // 正则替换统一在 addChatBubble 气泡层套用（历史消息同样生效），这里不再预处理
   let parts;
@@ -6085,7 +6112,7 @@ async function addBotReplyHumanLike(rawText, serverParts) {
       : [String(rawText)];
   }
   if (parts.length <= 1) {
-    addChatBubble("bot", rawText);
+    addChatBubble("bot", rawText, assistantConvId);
     return;
   }
   const base = Math.max(200, Number(card?.chat?.delay?.base_ms) || 1500);
@@ -6097,7 +6124,7 @@ async function addBotReplyHumanLike(rawText, serverParts) {
       const wait = Math.min(4000, base * jitter * Math.min(2, 0.4 + parts[i].length / 30));
       await new Promise((r) => setTimeout(r, wait));
     }
-    addChatBubble("bot", parts[i]);
+    addChatBubble("bot", parts[i], assistantConvId);
   }
 }
 
