@@ -3771,7 +3771,7 @@ function renderProvidersPage(type, title, desc) {
   </div>`;
 }
 
-let provState = { type: "chat", editing: null, allModels: [], selected: [] };
+let provState = { type: "chat", editing: null, allModels: [], selected: [], list: null };
 
 function initApi() { initProvidersPage("chat"); }
 function initImagegen() { initImgGenPage(); }
@@ -4044,7 +4044,11 @@ document.addEventListener("click", (e) => {
 });
 
 function initProvidersPage(type) {
-  provState = { type, editing: null, allModels: [], selected: [] };
+  // 不整体重置：provState.list 是列表的内存缓存，保留它返回列表页才能立刻渲染（不闪、不重载）
+  provState.type = type;
+  provState.editing = null;
+  provState.allModels = [];
+  provState.selected = [];
   $("#prov-add").addEventListener("click", () => { location.hash = "#/apiprovider"; });
   loadProvList();
 }
@@ -4052,60 +4056,80 @@ function initProvidersPage(type) {
 async function loadProvList() {
   const box = $("#prov-list");
   if (!box) return;
+  // 先用手上的数据立刻画（内存缓存 → 返回列表页零等待、不闪）；没有才显示加载中
+  if (provState.list) paintProvList();
+  else box.innerHTML = '<div class="card-box muted">加载中…</div>';
   try {
-    // 走缓存先渲染，后台刷新到新数据再重绘（公网上省掉一次往返）
-    const data = await cachedGet("/api/providers", () => { if ($("#prov-list")) loadProvList(); });
-    const list = provState.type === "chat" ? data.chat : data.image;
-    box.innerHTML = "";
-    if (!list.length) {
-      box.innerHTML = '<div class="card-box muted">还没有提供商，点下方按钮添加</div>';
-      return;
-    }
-    // 默认 = 第一个「启用中」的提供商（第一个被停用时，默认自动落到下一个可用的）
-    const defaultName = list.find((p) => p.enabled !== false)?.name;
-    list.forEach((p) => {
-      const off = p.enabled === false;
-      const isDefault = !off && p.name === defaultName;
-      const d = document.createElement("div");
-      d.className = "prov-item" + (isDefault ? " default" : "") + (off ? " disabled" : "");
-      d.innerHTML = `
-        <div class="prov-head">
-          <b>${escapeHtml(p.name)}</b>
-          ${isDefault ? '<span class="chip ok">默认</span>' : ""}
-          ${off ? '<span class="chip">已停用</span>' : ""}
-          <span class="prov-btns">
-            ${!off && !isDefault ? `<button class="ghost small-btn" data-act="default" data-name="${escapeHtml(p.name)}">设为默认</button>` : ""}
-            <button class="ghost small-btn" data-act="toggle" data-name="${escapeHtml(p.name)}" data-on="${off ? "1" : "0"}">${off ? "启用" : "停用"}</button>
-            <button class="ghost small-btn" data-act="edit" data-name="${escapeHtml(p.name)}">编辑</button>
-            <button class="danger small-btn" data-act="del" data-name="${escapeHtml(p.name)}">删除</button>
-          </span>
-        </div>`;
-      box.appendChild(d);
+    const data = await cachedGet("/api/providers", (fresh) => {
+      const next = provState.type === "chat" ? fresh.chat : fresh.image;
+      // 只有数据真的变了才重绘，避免返回列表时无谓闪动
+      if (JSON.stringify(next) !== JSON.stringify(provState.list)) {
+        provState.list = next;
+        if ($("#prov-list")) paintProvList();
+      }
     });
-    box.querySelectorAll("button[data-act]").forEach((b) =>
-      b.addEventListener("click", async () => {
-        const name = b.dataset.name;
-        if (b.dataset.act === "edit") location.hash = `#/apiprovider?name=${encodeURIComponent(name)}`;
-        else if (b.dataset.act === "del") {
-          if (!confirm(`删除提供商 ${name}？`)) return;
-          await api.send("/api/providers/delete", { method: "POST", body: JSON.stringify({ type: provState.type, name }) });
-          cacheInvalidate("/api/providers");
-          loadProvList();
-        } else if (b.dataset.act === "default") {
-          await api.send("/api/providers/set-default", { method: "POST", body: JSON.stringify({ type: provState.type, name }) });
-          cacheInvalidate("/api/providers");
-          loadProvList();
-          toast("✓ 已设为默认");
-        } else if (b.dataset.act === "toggle") {
-          const turnOn = b.dataset.on === "1";
-          await api.send("/api/providers/toggle", { method: "POST", body: JSON.stringify({ type: provState.type, name, enabled: turnOn }) });
-          cacheInvalidate("/api/providers");
-          loadProvList();
-          toast(turnOn ? `✓ 已启用 ${name}` : `已停用 ${name}（配置保留）`);
-        }
-      })
-    );
-  } catch (e) { box.innerHTML = `<div class="card-box muted">读取失败：${escapeHtml(e.message)}</div>`; }
+    const list = provState.type === "chat" ? data.chat : data.image;
+    if (JSON.stringify(list) !== JSON.stringify(provState.list)) {
+      provState.list = list;
+      paintProvList();
+    }
+  } catch (e) {
+    if (!provState.list) box.innerHTML = `<div class="card-box muted">读取失败：${escapeHtml(e.message)}</div>`;
+  }
+}
+
+function paintProvList() {
+  const box = $("#prov-list");
+  if (!box) return;
+  const list = provState.list ?? [];
+  box.innerHTML = "";
+  if (!list.length) {
+    box.innerHTML = '<div class="card-box muted">还没有提供商，点下方按钮添加</div>';
+    return;
+  }
+  // 默认 = 第一个「启用中」的提供商（第一个被停用时，默认自动落到下一个可用的）
+  const defaultName = list.find((p) => p.enabled !== false)?.name;
+  list.forEach((p) => {
+    const off = p.enabled === false;
+    const isDefault = !off && p.name === defaultName;
+    const d = document.createElement("div");
+    d.className = "prov-item" + (isDefault ? " default" : "") + (off ? " disabled" : "");
+    // 停用只表现为名称变灰划线（不加「已停用」文字）；启用/停用与设为默认都收进编辑页
+    d.innerHTML = `
+      <div class="prov-head">
+        <b>${escapeHtml(p.name)}</b>
+        ${isDefault ? '<span class="chip ok">默认</span>' : ""}
+        <span class="prov-btns">
+          <button class="ghost small-btn" data-act="edit" data-name="${escapeHtml(p.name)}">编辑</button>
+          <button class="danger small-btn" data-act="del" data-name="${escapeHtml(p.name)}">删除</button>
+        </span>
+      </div>`;
+    box.appendChild(d);
+  });
+  box.querySelectorAll("button[data-act]").forEach((b) =>
+    b.addEventListener("click", async () => {
+      const name = b.dataset.name;
+      if (b.dataset.act === "edit") location.hash = `#/apiprovider?name=${encodeURIComponent(name)}`;
+      else if (b.dataset.act === "del") {
+        if (!confirm(`删除提供商 ${name}？`)) return;
+        await api.send("/api/providers/delete", { method: "POST", body: JSON.stringify({ type: provState.type, name }) });
+        await refreshProvCache();
+        paintProvList();
+      }
+    })
+  );
+}
+
+/**
+ * 写操作（保存/拉取/设为默认/停用）后主动刷新内存与接口缓存：
+ * 这样返回列表页时直接用手上的数据立刻渲染，不再重新请求等待（公网 0.5-1.7s 的"大刷新"）。
+ */
+async function refreshProvCache() {
+  try {
+    const data = await api.get("/api/providers");
+    apiCache.set("/api/providers", { data, ts: Date.now(), inflight: null });
+    provState.list = provState.type === "chat" ? data.chat : data.image;
+  } catch { /* 取不到就交给下次进入页面时的正常加载 */ }
 }
 
 // ============================================================
@@ -4580,6 +4604,24 @@ function renderProviderEdit() {
     </div>
     <button id="pve-save" class="primary">${icon("save")} 保存</button>
 
+    <!-- 提供商级操作（编辑已有提供商时显示）：设为默认 / 停用·启用 -->
+    <div class="card-box pve-actions" id="pve-actions" hidden>
+      <div class="pve-action-row">
+        <div class="pve-action-text">
+          <b>设为默认</b>
+          <span class="hint" id="pve-default-hint">卡片未单独指定模型时使用这个提供商</span>
+        </div>
+        <button id="pve-set-default" class="ghost small-btn">设为默认</button>
+      </div>
+      <div class="pve-action-row">
+        <div class="pve-action-text">
+          <b id="pve-toggle-title">停用</b>
+          <span class="hint" id="pve-toggle-hint">停用后不参与聊天与解析，配置保留</span>
+        </div>
+        <button id="pve-toggle" class="ghost small-btn">停用</button>
+      </div>
+    </div>
+
     <div class="pv-sheet-ov" id="pve-sheet-ov" hidden>
       <div class="pv-sheet">
         <div class="pv-sheet-head">
@@ -4661,7 +4703,7 @@ async function initProviderEdit() {
       pveState.allModels = r.models ?? [];
       // 已勾选的模型若不在新列表里（上游下架/改名）则剔除
       pveState.selected = pveState.selected.filter((x) => pveState.allModels.includes(x));
-      cacheInvalidate("/api/providers");
+      await refreshProvCache(); // 主动回填缓存：返回列表页零等待、不重新加载
       $("#pve-msg").textContent = `✓ 拉取到 ${pveState.allModels.length} 个模型`;
       updateCount();
       openSheet();
@@ -4687,7 +4729,7 @@ async function initProviderEdit() {
     if (!f.models.length) return toast("请至少勾选一个模型（勾选的第一个为该提供商的默认模型）", false);
     try {
       await api.send("/api/providers/save", { method: "POST", body: JSON.stringify(f) });
-      cacheInvalidate("/api/providers");
+      await refreshProvCache(); // 主动回填缓存：返回列表页零等待、不重新加载
       toast("✓ 已保存");
       location.hash = "#/api";
     } catch (e) { toast("保存失败：" + e.message, false); }
@@ -4703,6 +4745,49 @@ async function initProviderEdit() {
     pveState.selected = [...(p.models ?? [])];
     pveState.allModels = [...(p.models ?? [])];
     updateCount();
+
+    // 提供商级操作：设为默认 / 停用·启用（立即生效，不等保存）
+    const list = data.chat ?? [];
+    const isDefault = list.find((x) => x.enabled !== false)?.name === pveState.name;
+    const off = p.enabled === false;
+    $("#pve-actions").hidden = false;
+    const setDefaultBtn = $("#pve-set-default");
+    setDefaultBtn.disabled = isDefault;
+    setDefaultBtn.textContent = isDefault ? "已是默认" : "设为默认";
+    $("#pve-default-hint").textContent = isDefault
+      ? "当前就是默认提供商（卡片未单独指定模型时用它）"
+      : "卡片未单独指定模型时使用这个提供商";
+    const toggleBtn = $("#pve-toggle");
+    let stopped = off; // 跟随实际状态（点击后翻转），不能用初始快照判断
+    const paintToggle = (s) => {
+      $("#pve-toggle-title").textContent = s ? "启用" : "停用";
+      $("#pve-toggle-hint").textContent = s ? "当前已停用：不参与聊天与解析，配置保留" : "停用后不参与聊天与解析，配置保留";
+      toggleBtn.textContent = s ? "启用" : "停用";
+      toggleBtn.classList.toggle("primary", s);
+      toggleBtn.classList.toggle("ghost", !s);
+    };
+    paintToggle(stopped);
+
+    setDefaultBtn.addEventListener("click", async () => {
+      try {
+        await api.send("/api/providers/set-default", { method: "POST", body: JSON.stringify({ type: pveState.type, name: pveState.name }) });
+        await refreshProvCache();
+        setDefaultBtn.disabled = true;
+        setDefaultBtn.textContent = "已是默认";
+        $("#pve-default-hint").textContent = "当前就是默认提供商（卡片未单独指定模型时用它）";
+        toast("✓ 已设为默认");
+      } catch (e) { toast("操作失败：" + e.message, false); }
+    });
+    toggleBtn.addEventListener("click", async () => {
+      const turnOn = stopped; // 停用中点 = 启用
+      try {
+        await api.send("/api/providers/toggle", { method: "POST", body: JSON.stringify({ type: pveState.type, name: pveState.name, enabled: turnOn }) });
+        await refreshProvCache();
+        stopped = !turnOn;
+        paintToggle(stopped);
+        toast(turnOn ? `✓ 已启用 ${pveState.name}` : `已停用 ${pveState.name}（配置保留）`);
+      } catch (e) { toast("操作失败：" + e.message, false); }
+    });
   }
 }
 

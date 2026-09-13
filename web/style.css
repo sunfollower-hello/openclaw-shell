@@ -1954,6 +1954,20 @@ body.lc-fullscreen .lc-root { height: 100dvh; }
 .pv-model-name::-webkit-scrollbar { display: none; }
 .pv-def-tag { color: var(--accent); font-size: 11px; }
 
+/* 编辑页的提供商级操作：设为默认 / 停用·启用 */
+.pve-actions { display: flex; flex-direction: column; gap: 4px; }
+.pve-action-row {
+  display: flex; align-items: center; gap: 10px;
+  padding: 9px 0;
+  border-bottom: 1px solid var(--border);
+}
+.pve-action-row:last-child { border-bottom: none; padding-bottom: 2px; }
+.pve-action-text { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.pve-action-text b { font-size: 14px; }
+.pve-action-text .hint { font-size: 12px; line-height: 1.4; }
+.pve-action-row button { flex-shrink: 0; }
+.pve-action-row button:disabled { opacity: 0.55; cursor: default; }
+
 /* ===== 表情面板：输入框「下方」展开（QQ 式），输入岛随之上移 =====
    面板在 .lc-dock 内、紧跟 .lc-island 之后。消息区 .lc-log 是 flex:1，
    面板一出现 dock 变高、log 被压缩 → 视觉上就是「输入框上移、下方让出表情区」。 */
