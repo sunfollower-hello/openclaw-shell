@@ -646,6 +646,17 @@ button:disabled { opacity: 0.4; cursor: not-allowed; transform: none; }
 }
 .prov-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 6px; }
 .prov-head b { font-size: 14.5px; }
+/* 提供商头像：知名厂商=品牌色淡底 + 官方 logo；自定义=名字首字（中性色） */
+.prov-avatar {
+  width: 34px; height: 34px; border-radius: 9px;
+  flex-shrink: 0;
+  display: inline-flex; align-items: center; justify-content: center;
+  background: var(--panel); color: var(--muted);
+  font-size: 15px; font-weight: 700;
+}
+.prov-avatar svg { width: 19px; height: 19px; }
+.prov-avatar-text { background: var(--panel); color: var(--muted); }
+.prov-item.disabled .prov-avatar { opacity: 0.6; }
 .prov-btns { margin-left: auto; display: flex; gap: 6px; flex-wrap: wrap; }
 .model-chips { display: flex; flex-wrap: wrap; gap: 7px; }
 .model-chip {
