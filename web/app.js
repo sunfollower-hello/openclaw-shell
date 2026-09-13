@@ -1978,7 +1978,7 @@ function stashReplyToSnapshot(slug, r) {
       const parts = Array.isArray(r.parts) && r.parts.length ? r.parts : [text];
       for (const p of parts) {
         const s = String(p ?? "").trim();
-        if (s) addChatBubble("bot", applyRegexScripts(s), convId || undefined);
+        if (s) addChatBubble("bot", s, convId || undefined); // 正则在 addChatBubble 里统一套
       }
     } else {
       addChatBubble("bot", text);
@@ -3251,6 +3251,9 @@ async function saveCard() {
     const res = await api.send(`/api/cards/${editingCard.slug}`, { method: "PUT", body: JSON.stringify(editingCard) });
     toast("✓ 已保存 v" + res.card.version);
     cacheInvalidate("/api/cards");
+    // 卡片编辑可能改了世界书/正则（影响聊天气泡显示与 AI 行为）：聊天快照 DOM 作废，
+    // 回聊天按新数据重新渲染
+    if (lcSnap.slug === editingCard.slug) { lcSnap.logHtml = ""; lcSnap.allEntries = []; lcSnap.renderedFrom = 0; }
     loadCardsGrid();
   } catch (e) { toast("保存失败：" + e.message, false); }
 }
@@ -5030,7 +5033,10 @@ async function cmLoadEntries() {
 }
 
 // ============================================================
-//  视图：世界书查看页（#/chatwb，只读；编辑在卡片编辑页）
+//  视图：世界书编辑页（#/chatwb，从聊天设置进来）
+//  与卡库编辑器同一份数据（sillytavern_v2.character_book.entries），
+//  保存 = PUT 整卡（后端会重编译 + 同步通道），所以通道端改完也生效。
+//  列表行：状态chip + 名称（超长省略）+ 编辑符号键 + 删除；添加 = 空白条目。
 // ============================================================
 function renderChatWb() {
   return `
@@ -5038,8 +5044,39 @@ function renderChatWb() {
     <div class="page-head ci-head">
       <button id="cw-back" class="ghost small-btn">← 返回</button>
       <h2>世界书</h2>
+      <span style="flex:1"></span>
+      <button id="cw-add" class="primary small-btn">${icon("plus")} 添加条目</button>
     </div>
     <div id="cw-list" class="cw-list"></div>
+  </div>`;
+}
+
+/** 世界书条目行：状态 + 名称 + 编辑/删除符号键；展开后 名称/关键词各占一行，常驻为按键 + 顺序 */
+function cwRowHTML(e, idx) {
+  const keys = Array.isArray(e?.keys) ? e.keys.join("、") : (e?.keys ?? "");
+  const title = e?.comment || e?.name || "未命名条目";
+  const on = e?.enabled !== false;
+  return `<div class="cw-item${on ? "" : " disabled"}" data-idx="${idx}">
+    <div class="cw-head">
+      <button type="button" class="cw-state${on ? " on" : ""}" data-act="state" title="${on ? "启用中，点击停用" : "已停用，点击启用"}">${on ? "启用中" : "已停用"}</button>
+      <span class="cw-name">${escapeHtml(String(title))}</span>
+      <span class="wb-spacer-flex"></span>
+      <button type="button" class="cw-icon-btn" data-act="edit" title="编辑条目">${icon("pen")}</button>
+      <button type="button" class="cw-icon-btn danger" data-act="del" title="删除条目">${icon("trash")}</button>
+    </div>
+    <div class="cw-detail" hidden>
+      <div class="wb-field"><label>条目名称</label><input class="cw-f-name" placeholder="如：人物形象 / 世界观 / 人物关系" value="${escapeHtml(String(title))}"></div>
+      <div class="wb-field"><label>触发关键词</label><input class="cw-f-keys" placeholder="多个关键词用逗号分隔；常驻条目可留空（始终生效，不靠关键词触发）" value="${escapeHtml(keys)}"></div>
+      <div class="cw-row2">
+        <button type="button" class="cw-constant${e?.constant ? " on" : ""}" title="常驻条目始终生效，不靠关键词触发">常驻</button>
+        <label class="cw-order-label">顺序 <input type="number" class="cw-f-order" min="0" value="${e?.insertion_order ?? 100}" title="多条条目同时触发时的排序"></label>
+      </div>
+      <div class="wb-field"><label>条目内容</label><textarea class="cw-f-content" rows="14" placeholder="这个世界观里发生了什么、角色是什么样的人…（触发或常驻时注入给 AI 的正文）">${escapeHtml(String(e?.content ?? ""))}</textarea></div>
+      <div class="wb-foot">
+        <button class="cw-cancel ghost small-btn" type="button">取消</button>
+        <button class="cw-save primary small-btn" type="button">${icon("check")} 保存</button>
+      </div>
+    </div>
   </div>`;
 }
 
@@ -5049,41 +5086,108 @@ function initChatWb() {
   $("#cw-back").addEventListener("click", () => {
     location.hash = slug ? `#/chatinfo?slug=${encodeURIComponent(slug)}` : "#/chats";
   });
-  (async () => {
-    const card = await api.get(`/api/cards/${encodeURIComponent(slug)}`).catch(() => null);
+  let card = null;
+
+  const draw = () => {
     const box = $("#cw-list");
-    if (!card) { box.innerHTML = '<div class="muted">卡片不存在</div>'; return; }
-    const entries = card.sillytavern_v2?.character_book?.entries ?? [];
-    if (!entries.length) { box.innerHTML = '<div class="muted">这张卡还没有世界书条目</div>'; return; }
-    box.innerHTML = entries
-      .map((e, i) => {
-        const name = e.name || e.comment || `条目 ${i + 1}`;
-        const keys = (e.keys ?? []).filter(Boolean);
-        return `<div class="cw-item" data-idx="${i}">
-        <div class="cw-head">
-          <span class="cw-name">${escapeHtml(String(name))}</span>
-          ${e.constant ? '<span class="cw-tag cw-on">常驻</span>' : ""}
-          ${e.enabled === false ? '<span class="cw-tag cw-off">已禁用</span>' : ""}
-          ${e.probability != null && e.probability < 100 ? `<span class="cw-tag">${e.probability}%</span>` : ""}
-        </div>
-        ${keys.length ? `<div class="cw-keys">触发：${keys.map((k) => escapeHtml(String(k))).join("、")}</div>` : ""}
-        <div class="cw-content" hidden>${escapeHtml(String(e.content ?? ""))}</div>
-      </div>`;
-      })
-      .join("");
-    // 点击条目展开/收起内容
-    box.querySelectorAll(".cw-item").forEach((el) => {
-      el.querySelector(".cw-head").addEventListener("click", () => {
-        const c = el.querySelector(".cw-content");
-        c.hidden = !c.hidden;
-        el.classList.toggle("open", !c.hidden);
-      });
-    });
+    const entries = chatStv(card)?.character_book?.entries ?? [];
+    if (!entries.length) { box.innerHTML = '<div class="muted">还没有条目，点右上角「添加条目」</div>'; return; }
+    box.innerHTML = entries.map((e, i) => cwRowHTML(e, i)).join("");
+  };
+
+  const save = async () => {
+    try {
+      await api.send(`/api/cards/${encodeURIComponent(slug)}`, { method: "PUT", body: JSON.stringify(card) });
+      cacheInvalidate("/api/cards");
+      // 世界书影响 AI 行为（通道端由 PUT 后的重编译同步）；聊天快照里的 DOM 作废，
+      // 回聊天重新渲染（不然快照贴回的还是旧世界书时代的样子）
+      if (lcSnap.slug === slug) { lcSnap.logHtml = ""; lcSnap.allEntries = []; lcSnap.renderedFrom = 0; }
+      return true;
+    } catch (e) {
+      toast("保存失败：" + e.message, false);
+      return false;
+    }
+  };
+
+  const blankEntry = () => ({
+    keys: [], secondary_keys: [], content: "", name: "", comment: "",
+    enabled: true, selective: false, constant: false,
+    insertion_order: 100, priority: 10, position: "before_char", probability: 100, depth: 4,
+  });
+
+  (async () => {
+    card = await api.get(`/api/cards/${encodeURIComponent(slug)}`).catch(() => null);
+    if (!card) { $("#cw-list").innerHTML = '<div class="muted">卡片不存在</div>'; return; }
+    draw();
   })();
+
+  // 添加条目 = 一律空白条目（不需要用户选模板）
+  $("#cw-add").addEventListener("click", async () => {
+    if (!card) return;
+    const st = chatStv(card);
+    st.character_book ??= { entries: [] };
+    st.character_book.entries ??= [];
+    st.character_book.entries.push(blankEntry());
+    if (!(await save())) { st.character_book.entries.pop(); return; }
+    draw();
+    // 新条目自动进入编辑态
+    const rows = [...$("#cw-list").querySelectorAll(".cw-item")];
+    const last = rows[rows.length - 1];
+    if (last) { last.querySelector(".cw-detail").hidden = false; last.querySelector(".cw-f-name").focus(); }
+  });
+
+  $("#cw-list").addEventListener("click", async (e) => {
+    if (!card) return;
+    const row = e.target.closest(".cw-item");
+    if (!row) return;
+    const idx = Number(row.dataset.idx);
+    const entries = chatStv(card).character_book?.entries ?? [];
+    const entry = entries[idx];
+    if (!entry) return;
+    const act = e.target.closest("[data-act]")?.dataset.act;
+    if (act === "state") {
+      entry.enabled = entry.enabled === false ? true : false;
+      if (!(await save())) { entry.enabled = !entry.enabled; draw(); return; }
+      draw();
+    } else if (act === "edit") {
+      const d = row.querySelector(".cw-detail");
+      d.hidden = !d.hidden;
+    } else if (act === "del") {
+      if (!confirm(`删除条目「${entry.comment || entry.name || "未命名"}」？`)) return;
+      entries.splice(idx, 1);
+      if (!(await save())) { draw(); return; }
+      draw();
+    } else if (e.target.closest(".cw-save")) {
+      entry.comment = row.querySelector(".cw-f-name").value.trim();
+      entry.name = entry.comment;
+      const keysRaw = row.querySelector(".cw-f-keys").value;
+      entry.keys = keysRaw.split(/[,，、]/).map((s) => s.trim()).filter(Boolean);
+      entry.constant = row.querySelector(".cw-constant").classList.contains("on");
+      entry.insertion_order = Number(row.querySelector(".cw-f-order").value) || 100;
+      entry.content = row.querySelector(".cw-f-content").value;
+      if (!(await save())) return;
+      draw();
+      toast("✓ 已保存");
+    } else if (e.target.closest(".cw-cancel")) {
+      draw(); // 丢弃输入，按已存数据重画
+    }
+  });
+  // 常驻按键：点击切换高亮（不是开关控件）
+  $("#cw-list").addEventListener("click", (e) => {
+    if (e.target.closest(".cw-constant")) e.target.closest(".cw-constant").classList.toggle("on");
+  });
+}
+
+/** 取卡的 sillytavern_v2 段（保证存在，方便直接改） */
+function chatStv(card) {
+  card.sillytavern_v2 ??= {};
+  return card.sillytavern_v2;
 }
 
 // ============================================================
-//  视图：正则查看页（#/chatrx，只读；编辑在卡片编辑页）
+//  视图：正则编辑页（#/chatrx，从聊天设置进来）
+//  同一份数据（sillytavern_v2.regex_scripts，兼容 extensions 旧位置），
+//  保存 = PUT 整卡。正则作用于本地聊天气泡的显示（见 addChatBubble）。
 // ============================================================
 function renderChatRx() {
   return `
@@ -5091,8 +5195,36 @@ function renderChatRx() {
     <div class="page-head ci-head">
       <button id="cr-back" class="ghost small-btn">← 返回</button>
       <h2>正则</h2>
+      <span style="flex:1"></span>
+      <button id="cr-add" class="primary small-btn">${icon("plus")} 添加正则</button>
     </div>
     <div id="cr-list" class="cw-list"></div>
+  </div>`;
+}
+
+/** 正则行：状态 + 名称 + 查找摘要 + 编辑/删除符号键 */
+function crRowHTML(s, idx) {
+  const name = s?.scriptName || "未命名正则";
+  const find = String(s?.findRegex ?? "");
+  const on = !(s?.disabled === true || s?.enabled === false);
+  return `<div class="cw-item${on ? "" : " disabled"}" data-idx="${idx}">
+    <div class="cw-head">
+      <button type="button" class="cw-state${on ? " on" : ""}" data-act="state" title="${on ? "启用中，点击停用" : "已停用，点击启用"}">${on ? "启用中" : "已停用"}</button>
+      <span class="cw-name">${escapeHtml(String(name))}</span>
+      <span class="cw-summary-meta">${escapeHtml(find.slice(0, 24))}${find.length > 24 ? "…" : ""}</span>
+      <span class="wb-spacer-flex"></span>
+      <button type="button" class="cw-icon-btn" data-act="edit" title="编辑正则">${icon("pen")}</button>
+      <button type="button" class="cw-icon-btn danger" data-act="del" title="删除正则">${icon("trash")}</button>
+    </div>
+    <div class="cw-detail" hidden>
+      <div class="wb-field"><label>名称</label><input class="cr-f-name" placeholder="如：去星号 / 去旁白" value="${escapeHtml(String(s?.scriptName ?? ""))}"></div>
+      <div class="wb-field"><label>查找（正则表达式）</label><input class="cr-f-find" placeholder="/\\*.*?\\*/g 或裸表达式，$1 等分组可用" value="${escapeHtml(find)}"></div>
+      <div class="wb-field"><label>替换为</label><input class="cr-f-rep" placeholder="留空 = 删除匹配内容" value="${escapeHtml(String(s?.replaceString ?? ""))}"></div>
+      <div class="wb-foot">
+        <button class="cr-cancel ghost small-btn" type="button">取消</button>
+        <button class="cr-save primary small-btn" type="button">${icon("check")} 保存</button>
+      </div>
+    </div>
   </div>`;
 }
 
@@ -5102,28 +5234,94 @@ function initChatRx() {
   $("#cr-back").addEventListener("click", () => {
     location.hash = slug ? `#/chatinfo?slug=${encodeURIComponent(slug)}` : "#/chats";
   });
-  (async () => {
-    const card = await api.get(`/api/cards/${encodeURIComponent(slug)}`).catch(() => null);
+  let card = null;
+
+  /** 正则统一存 sillytavern_v2.regex_scripts（schema 位置）；extensions 里若有旧副本一并同步，避免两处不一致 */
+  const getScripts = () => {
+    const stv = chatStv(card);
+    if (!Array.isArray(stv.regex_scripts)) {
+      stv.regex_scripts = [...(stv.extensions?.regex_scripts ?? [])];
+    }
+    return stv.regex_scripts;
+  };
+  const syncExtensions = () => {
+    const stv = chatStv(card);
+    if (stv.extensions && Array.isArray(stv.extensions.regex_scripts)) {
+      stv.extensions.regex_scripts = stv.regex_scripts;
+    }
+  };
+
+  const draw = () => {
     const box = $("#cr-list");
-    if (!card) { box.innerHTML = '<div class="muted">卡片不存在</div>'; return; }
-    const scripts = card.sillytavern_v2?.extensions?.regex_scripts ?? [];
-    if (!scripts.length) { box.innerHTML = '<div class="muted">这张卡还没有正则</div>'; return; }
-    box.innerHTML = scripts
-      .map((r, i) => {
-        const name = r.scriptName || r.script_name || `正则 ${i + 1}`;
-        const find = r.findRegex || r.find_regex || "";
-        const replace = r.replaceString ?? r.replace_string ?? "";
-        return `<div class="cw-item">
-        <div class="cw-head">
-          <span class="cw-name">${escapeHtml(String(name))}</span>
-          ${r.disabled ? '<span class="cw-tag cw-off">已停用</span>' : ""}
-        </div>
-        <div class="cw-keys">查找：<code>${escapeHtml(String(find))}</code></div>
-        ${replace ? `<div class="cw-keys">替换：<code>${escapeHtml(String(replace))}</code></div>` : ""}
-      </div>`;
-      })
-      .join("");
+    const scripts = getScripts();
+    if (!scripts.length) { box.innerHTML = '<div class="muted">还没有正则，点右上角「添加正则」</div>'; return; }
+    box.innerHTML = scripts.map((s, i) => crRowHTML(s, i)).join("");
+  };
+
+  const save = async () => {
+    try {
+      syncExtensions();
+      await api.send(`/api/cards/${encodeURIComponent(slug)}`, { method: "PUT", body: JSON.stringify(card) });
+      cacheInvalidate("/api/cards");
+      // 正则影响聊天气泡显示：快照 DOM 作废，回聊天按新正则重新渲染
+      if (lcSnap.slug === slug) { lcSnap.logHtml = ""; lcSnap.allEntries = []; lcSnap.renderedFrom = 0; }
+      return true;
+    } catch (e) {
+      toast("保存失败：" + e.message, false);
+      return false;
+    }
+  };
+
+  (async () => {
+    card = await api.get(`/api/cards/${encodeURIComponent(slug)}`).catch(() => null);
+    if (!card) { $("#cr-list").innerHTML = '<div class="muted">卡片不存在</div>'; return; }
+    getScripts(); // 归一化到顶层
+    draw();
   })();
+
+  $("#cr-add").addEventListener("click", async () => {
+    if (!card) return;
+    const scripts = getScripts();
+    scripts.push({ scriptName: "", findRegex: "", replaceString: "" });
+    if (!(await save())) { scripts.pop(); return; }
+    draw();
+    const rows = [...$("#cr-list").querySelectorAll(".cw-item")];
+    const last = rows[rows.length - 1];
+    if (last) { last.querySelector(".cw-detail").hidden = false; last.querySelector(".cr-f-name").focus(); }
+  });
+
+  $("#cr-list").addEventListener("click", async (e) => {
+    if (!card) return;
+    const row = e.target.closest(".cw-item");
+    if (!row) return;
+    const idx = Number(row.dataset.idx);
+    const scripts = getScripts();
+    const s = scripts[idx];
+    if (!s) return;
+    const act = e.target.closest("[data-act]")?.dataset.act;
+    if (act === "state") {
+      s.disabled = !(s.disabled === true);
+      if (!(await save())) { s.disabled = !s.disabled; draw(); return; }
+      draw();
+    } else if (act === "edit") {
+      const d = row.querySelector(".cw-detail");
+      d.hidden = !d.hidden;
+    } else if (act === "del") {
+      if (!confirm(`删除正则「${s.scriptName || "未命名"}」？`)) return;
+      scripts.splice(idx, 1);
+      if (!(await save())) { draw(); return; }
+      draw();
+    } else if (e.target.closest(".cr-save")) {
+      s.scriptName = row.querySelector(".cr-f-name").value.trim();
+      s.findRegex = row.querySelector(".cr-f-find").value.trim();
+      s.replaceString = row.querySelector(".cr-f-rep").value;
+      if (!(await save())) return;
+      draw();
+      toast("✓ 已保存");
+    } else if (e.target.closest(".cr-cancel")) {
+      draw();
+    }
+  });
 }
 
 // ============================================================
@@ -5734,6 +5932,9 @@ function appendChatContent(div, text) {
 
 /** 渲染气泡并返回**外层 .bubble-row 元素**（调用方依赖它挂 id / 移除 / 追加按钮） */
 function addChatBubble(role, text, convId, logEl) {
+  // 卡片正则（酒馆 regex_scripts）统一在气泡层套用：新回复与历史记录口径一致，
+  // 刷新/翻旧消息显示不会变回原文。只改显示，不改会话数据与上下文。
+  if (role === "bot") text = applyRegexScripts(text);
   // bot 消息里含 [表情:名] 标签时，表情独立成气泡（文本一个、每个表情一个），
   // 不再让图片挤在文本气泡里；未命中的表情名按原文显示（appendChatContent 兜底）
   if (role === "bot" && /\[表情:/.test(String(text ?? ""))) {
@@ -5873,18 +6074,18 @@ async function speakText(text, btn) {
  */
 async function addBotReplyHumanLike(rawText, serverParts) {
   const card = curCard();
-  const text = applyRegexScripts(rawText); // 卡里的正则替换（酒馆 regex_scripts）
+  // 正则替换统一在 addChatBubble 气泡层套用（历史消息同样生效），这里不再预处理
   let parts;
   if (Array.isArray(serverParts) && serverParts.length > 0) {
-    parts = serverParts.map((s) => applyRegexScripts(String(s ?? "").trim())).filter(Boolean);
+    parts = serverParts.map((s) => String(s ?? "").trim()).filter(Boolean);
   } else {
     const multi = card?.voice?.message_style?.multi_send === true;
     parts = multi
-      ? String(text).split(/\n{2,}/).map((s) => s.trim()).filter(Boolean)
-      : [String(text)];
+      ? String(rawText).split(/\n{2,}/).map((s) => s.trim()).filter(Boolean)
+      : [String(rawText)];
   }
   if (parts.length <= 1) {
-    addChatBubble("bot", text);
+    addChatBubble("bot", rawText);
     return;
   }
   const base = Math.max(200, Number(card?.chat?.delay?.base_ms) || 1500);

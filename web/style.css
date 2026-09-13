@@ -1823,16 +1823,44 @@ body.lc-fullscreen .lc-root { height: 100dvh; }
 .cw-list { display: flex; flex-direction: column; gap: 8px; }
 .cw-item {
   background: var(--card); border: 1px solid var(--border); border-radius: 12px;
-  padding: 10px 13px; cursor: pointer;
+  padding: 10px 13px;
 }
-.cw-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-.cw-name { font-weight: 700; font-size: 14px; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.cw-tag {
-  font-size: 10.5px; padding: 1px 7px; border-radius: 20px;
-  background: var(--panel); color: var(--muted); flex-shrink: 0;
+.cw-item.disabled .cw-name { color: var(--faint); text-decoration: line-through; }
+.cw-head { display: flex; align-items: center; gap: 8px; flex-wrap: nowrap; min-width: 0; }
+.cw-name {
+  font-weight: 700; font-size: 14px; flex: 1; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
-.cw-tag.cw-on { background: var(--ok-soft); color: var(--ok); }
-.cw-tag.cw-off { background: var(--danger-soft); color: var(--danger); }
+/* 状态 chip（点击切换启用/停用） */
+.cw-state {
+  flex-shrink: 0; padding: 2px 9px; border-radius: 20px;
+  border: 1px solid var(--border); background: var(--panel); color: var(--muted);
+  font-size: 11px; cursor: pointer; white-space: nowrap;
+}
+.cw-state.on { background: var(--ok-soft); border-color: var(--ok); color: var(--ok); font-weight: 600; }
+/* 编辑/删除 符号小键 */
+.cw-icon-btn {
+  flex-shrink: 0; width: 28px; height: 28px; padding: 0;
+  border: 1px solid var(--border); border-radius: 8px;
+  background: var(--card); color: var(--muted);
+  display: inline-flex; align-items: center; justify-content: center;
+  cursor: pointer;
+}
+.cw-icon-btn .ic { width: 14px; height: 14px; }
+.cw-icon-btn:hover { color: var(--accent); border-color: var(--accent); }
+.cw-icon-btn.danger:hover { color: var(--danger); border-color: var(--danger); }
+/* 编辑态：常驻按键 + 顺序 */
+.cw-row2 { display: flex; align-items: center; gap: 12px; margin: 10px 0 0; }
+.cw-constant {
+  padding: 6px 16px; border-radius: 20px;
+  border: 1px solid var(--border); background: var(--panel); color: var(--muted);
+  font-size: 13px; cursor: pointer;
+}
+.cw-constant.on { background: var(--ok-soft); border-color: var(--ok); color: var(--ok); font-weight: 700; }
+.cw-order-label { display: inline-flex; align-items: center; gap: 6px; font-size: 12.5px; color: var(--muted); }
+.cw-order-label input { width: 64px; text-align: center; }
+.cw-detail { margin-top: 10px; }
+.cw-summary-meta { flex-shrink: 0; font-size: 11.5px; color: var(--faint); max-width: 40%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .cw-keys { margin-top: 6px; font-size: 12px; color: var(--muted); word-break: break-all; }
 .cw-keys code { background: var(--panel); padding: 1px 5px; border-radius: 5px; font-size: 11.5px; }
 .cw-content {
