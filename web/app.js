@@ -833,6 +833,42 @@ let wbMirror = null;        // 跨端会话状态（绑定=联通；null=本地�
 let wbMirrorTimer = null;   // 通道消息轮询定时器
 let wbRenderedIds = new Set(); // 已渲染的会话条目 id（增量渲染防重复）
 
+// ---------- 时间戳分隔（微信式：相邻消息隔久了才显示时间） ----------
+// 基准 = 上一条已渲染"真实消息"的时间（ISO）；占位/错误提示等非时间线气泡不更新它。
+// 判定口径参考爱语逆向（相邻消息差 >N 分钟插时间分隔），阈值取微信口径 5 分钟。
+const WB_TIME_SEP_GAP_MS = 5 * 60 * 1000;
+let wbLastMsgTime = null;
+
+/** 时间分隔条文本（微信口径）：今天 HH:mm / 昨天 HH:mm / 星期X HH:mm / M月d日 HH:mm */
+function fmtChatSepTime(iso) {
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return "";
+  const now = new Date();
+  const hm = `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+  const startOfDay = (x) => { const z = new Date(x); z.setHours(0, 0, 0, 0); return z.getTime(); };
+  const dayDiff = Math.round((startOfDay(now) - startOfDay(d)) / 86400000);
+  if (dayDiff <= 0) return hm;
+  if (dayDiff === 1) return `昨天 ${hm}`;
+  if (dayDiff < 7) return `星期${["日", "一", "二", "三", "四", "五", "六"][d.getDay()]} ${hm}`;
+  return `${d.getMonth() + 1}月${d.getDate()}日 ${hm}`;
+}
+
+/** 相邻消息间隔超过阈值 → 返回一条居中时间分隔 div；否则 null（不显示） */
+function wbTimeSepDiv(prevIso, curIso) {
+  const cur = new Date(curIso);
+  if (isNaN(cur.getTime())) return null;
+  if (prevIso) {
+    const prev = new Date(prevIso);
+    if (!isNaN(prev.getTime()) && cur.getTime() - prev.getTime() < WB_TIME_SEP_GAP_MS && cur.getTime() >= prev.getTime()) {
+      return null; // 间隔不足且顺序正常 → 不显示
+    }
+  }
+  const div = document.createElement("div");
+  div.className = "lc-time-sep";
+  div.textContent = fmtChatSepTime(curIso);
+  return div;
+}
+
 // ---------- 聊天记录懒渲染（微信式：进聊天只画最近一屏，往上翻再补旧的） ----------
 // 为什么：几轮聊天就几百条气泡，全量渲染既慢又费内存（表情/生图尤其重）。
 // 策略：默认只渲染最近 15 轮；用户上翻、翻到顶部第 3 轮刚露头时就再补 5 轮，以此类推。
@@ -864,22 +900,23 @@ function wbRoundsStartIndex(entries, rounds) {
 function wbRenderEntryInto(e, logEl) {
   if (e.surface === "web") {
     // 拆条消息按 parts 逐条渲染（刷新后不再合并成一大块）；老数据无 parts 时按换行兜底拆
+    // 最后一个参数 e.t：历史消息用日志时间参与时间戳分隔判定
     if (e.role === "assistant" && Array.isArray(e.parts) && e.parts.length) {
       for (const p of e.parts) {
         if (!String(p ?? "").trim()) continue;
-        addChatBubble("bot", p, e.id, logEl);
+        addChatBubble("bot", p, e.id, logEl, e.t);
       }
     } else if (e.role === "assistant" && String(e.content).includes("\n")) {
       for (const line of String(e.content).split(/\n+/).map((s) => s.trim()).filter(Boolean)) {
-        addChatBubble("bot", line, e.id, logEl);
+        addChatBubble("bot", line, e.id, logEl, e.t);
       }
     } else {
-      addChatBubble(e.role === "assistant" ? "bot" : "user", e.content, e.id, logEl);
+      addChatBubble(e.role === "assistant" ? "bot" : "user", e.content, e.id, logEl, e.t);
     }
   } else if (wbMirror) {
     if (wbRenderedIds.has(e.id)) return;
     wbRenderedIds.add(e.id);
-    addChatBubble(e.role === "assistant" ? "bot" : "user", e.content, e.id, logEl);
+    addChatBubble(e.role === "assistant" ? "bot" : "user", e.content, e.id, logEl, e.t);
   }
 }
 
@@ -916,11 +953,28 @@ function wbPrependOlderBatch() {
     if (!older.length) { wbRenderedFrom = 0; return Promise.resolve(); }
     wbRenderedFrom = from;
     const frag = document.createDocumentFragment();
+    // 时间戳基准现场保护：批次按"无历史"基线渲染（批次内消息间正常插分隔，
+    // 第一条显示自己的时间），渲染完恢复为新消息用的基准
+    const savedLast = wbLastMsgTime;
+    wbLastMsgTime = null;
     for (const e of older) wbRenderEntryInto(e, frag);
+    const batchLast = wbLastMsgTime;
+    wbLastMsgTime = savedLast;
     if (!frag.childNodes.length) return Promise.resolve();
+    // 边界修正：锚点=现有顶部气泡行（连续补渲染时=上一批的第一行）。
+    // 批次必须插在锚点**之前**、上一批之后——绝不能 insertBefore(firstChild)，
+    // 否则后补的较新批次会跑到先补的较旧批次上面（实测时间倒挂）。
+    const topRow = log.querySelector(".bubble-row");
+    // 锚点前面的旧分隔是上一批次的边界残留，摘掉按真实间隔重插
+    const prev0 = topRow?.previousElementSibling;
+    if (prev0?.classList?.contains("lc-time-sep")) prev0.remove();
+    if (batchLast && topRow?.dataset?.t) {
+      const boundarySep = wbTimeSepDiv(batchLast, topRow.dataset.t);
+      if (boundarySep) frag.appendChild(boundarySep);
+    }
     const beforeH = log.scrollHeight;
     const beforeTop = log.scrollTop;
-    log.insertBefore(frag, log.firstChild);
+    log.insertBefore(frag, topRow ?? null);
     log.scrollTo({ top: beforeTop + (log.scrollHeight - beforeH), behavior: "instant" });
     upgradeEmojiFallback(log);
   } finally {
@@ -944,6 +998,7 @@ const lcSnap = {
   mirror: null,      // 联通状态（省一次 mirror/status）
   allEntries: [],    // 懒渲染：完整会话记录
   renderedFrom: 0,   // 懒渲染：已渲染区间起点
+  lastMsgTime: null, // 时间戳基准（上一条已渲染消息的时间）
   dot: { cls: "", title: "" },
   greeted: false,    // 已领过开场白（回来不再重复领）
 };
@@ -962,6 +1017,7 @@ function saveLcSnapshot() {
   // 懒渲染状态：快照里画到哪了，回来接着从那里往上补
   lcSnap.allEntries = wbAllEntries;
   lcSnap.renderedFrom = wbRenderedFrom;
+  lcSnap.lastMsgTime = wbLastMsgTime; // 时间戳基准跟着快照走
   const dot = $("#lc-dot");
   lcSnap.dot = { cls: dot?.className?.replace("lc-dot", "").trim() ?? "", title: dot?.title ?? "" };
 }
@@ -1004,6 +1060,7 @@ function restoreLcSnapshot() {
   // 懒渲染状态跟着快照走：上翻仍能继续补更早的消息
   wbAllEntries = lcSnap.allEntries ?? [];
   wbRenderedFrom = lcSnap.renderedFrom ?? 0;
+  wbLastMsgTime = lcSnap.lastMsgTime ?? null; // 时间戳基准恢复（DOM 里分隔条原样贴回）
   log.innerHTML = lcSnap.logHtml;
   // 头像与名字（快照里有卡对象，不用再请求）
   const c = wbCardObj;
@@ -1024,7 +1081,7 @@ function restoreLcSnapshot() {
   void wbFocusPendingHit();
   // 正在生成中就把占位气泡接回来（切页期间请求没断，见 wbDoSend）
   if (wbAbort && !$("#chat-log .lc-pending-row")) {
-    wbThinkingBubble = addChatBubble("bot", "（正在输出… 发新消息可截断重来）");
+    wbThinkingBubble = addChatBubble("bot", "（正在输出… 发新消息可截断重来）", undefined, undefined, null);
     wbThinkingBubble?.classList.add("lc-pending-row");
   }
   // 联通模式：重新挂上轮询（定时器在离开时被 cleanup 清掉了）
@@ -1200,6 +1257,7 @@ async function wbPickCard(slug) {
     lcSnap.history = null;
   }
   wbSlug = slug;
+  wbLastMsgTime = null; // 换卡时间基准重置
   wbCardObj = null;
   wbChatHistory = [];
   wbPending = null;
@@ -1282,6 +1340,7 @@ async function wbReloadHistoryInner() {
   wbChatHistory = [];
   wbPending = null;
   wbRenderedIds = new Set();
+  wbLastMsgTime = null; // 时间戳基准重置：重画后的第一条消息显示自己的时间
   $("#chat-log").innerHTML = "";
   const conv = await api.get(`/api/cards/${encodeURIComponent(wbSlug)}/conversation`).catch(() => ({ entries: [] }));
   wbAllEntries = conv.entries ?? [];
@@ -1531,7 +1590,7 @@ async function wbMirrorSync(slug) {
       if (e.surface === "web") continue; // 本地消息走 wbChatHistory，不重复渲染
       if (wbRenderedIds.has(e.id)) continue;
       wbRenderedIds.add(e.id);
-      addChatBubble(e.role === "assistant" ? "bot" : "user", e.content);
+      addChatBubble(e.role === "assistant" ? "bot" : "user", e.content, undefined, undefined, e.t);
     }
   } catch {
     // 单次同步失败：圆点变红提示联通异常，下轮重试
@@ -1812,7 +1871,7 @@ async function wbSend() {
   const input = $("#wb-input");
   const message = input.value.trim();
   if (!message) return;
-  if (!wbSlug) { addChatBubble("bot", "请先在顶部选一张卡片当助手。"); return; }
+  if (!wbSlug) { addChatBubble("bot", "请先在顶部选一张卡片当助手。", undefined, undefined, null); return; }
   wbPendingUserRows.push(addChatBubble("user", message));
   input.value = "";
   wbAutoGrow(input); // 清空后收回高度
@@ -1823,7 +1882,7 @@ async function wbSend() {
     wbAbort.abort();
     wbAbort = null;
     if (wbThinkingBubble) { wbThinkingBubble.closest(".bubble-row")?.remove(); wbThinkingBubble = null; }
-    addChatBubble("bot", "（已截断上一条输出，将结合你的新消息重新生成）");
+    addChatBubble("bot", "（已截断上一条输出，将结合你的新消息重新生成）", undefined, undefined, null);
   }
 
   // 防抖合并：入队后停顿 2 秒无新消息才真正请求
@@ -1851,7 +1910,7 @@ async function wbDoSend(msgs) {
   };
   const ctrl = new AbortController();
   wbAbort = ctrl;
-  wbThinkingBubble = addChatBubble("bot", "（正在输出… 发新消息可截断重来）");
+  wbThinkingBubble = addChatBubble("bot", "（正在输出… 发新消息可截断重来）", undefined, undefined, null);
   // 打标记：切页存快照时要能认出这条占位并在回复到达时替换掉它
   wbThinkingBubble?.classList.add("lc-pending-row");
   try {
@@ -1885,7 +1944,7 @@ async function wbDoSend(msgs) {
       return;
     }
     if (wbThinkingBubble) { wbThinkingBubble.closest(".bubble-row")?.remove(); wbThinkingBubble = null; }
-    addChatBubble("bot", "⚠ " + e.message);
+    addChatBubble("bot", "⚠ " + e.message, undefined, undefined, null);
   } finally {
     if (wbAbort === ctrl) wbAbort = null;
     const b = $("#wb-send");
@@ -1909,14 +1968,14 @@ function stashReplyToSnapshot(slug, r) {
   document.body.appendChild(holder);
   try {
     if (r?.type === "reply") {
-      // 快照里不做逐条延时动画（人不在场），按 parts 一次性渲染
+      // 快照里不做逐条延时动画（人不在场），按 parts 一次性渲染；时间戳=回复到达的现在
       const parts = Array.isArray(r.parts) && r.parts.length ? r.parts : [text];
       for (const p of parts) {
         const s = String(p ?? "").trim();
-        if (s) addChatBubble("bot", s, convId || undefined); // 正则在 addChatBubble 里统一套
+        if (s) addChatBubble("bot", s, convId || undefined, holder, new Date().toISOString()); // 正则在 addChatBubble 里统一套
       }
     } else {
-      addChatBubble("bot", text);
+      addChatBubble("bot", text, undefined, holder, null);
     }
     // 去掉快照里的「正在输出」占位，再把新气泡接上去。
     // 用 DOM 解析而不是正则替换：气泡是嵌套 div，正则匹配 </div></div> 很容易咬错边界。
@@ -1943,7 +2002,7 @@ async function wbFinishTurn(r, assistantConvId) {
     wbChatHistory.push({ role: "assistant", content: r.reply });
     // 不自动朗读：只有点气泡右上角的喇叭才合成语音（手动触发）
   } else if (r.type === "pending") {
-    const bubble = addChatBubble("bot", "需要确认：助手想调用\n" + r.pending.map((p) => "· " + p.name).join("\n"));
+    const bubble = addChatBubble("bot", "需要确认：助手想调用\n" + r.pending.map((p) => "· " + p.name).join("\n"), undefined, undefined, null);
     const row = document.createElement("div");
     row.className = "approve-row";
     const ok = document.createElement("button");
@@ -1965,7 +2024,7 @@ async function wbApprove() {
     const r = await api.send("/api/chat/approve", { method: "POST", body: JSON.stringify(wbPending) });
     wbPending = null;
     await wbFinishTurn(r);
-  } catch (e) { addChatBubble("bot", "⚠ " + e.message); }
+  } catch (e) { addChatBubble("bot", "⚠ " + e.message, undefined, undefined, null); }
   btn.disabled = false;
 }
 
@@ -5406,6 +5465,7 @@ async function ciWipeAll(slug) {
       wbRenderedIds = new Set();
       wbAllEntries = [];
       wbRenderedFrom = 0;
+      wbLastMsgTime = null;
       lcSnap.slug = ""; // 快照里存的还是旧聊天 DOM，一并作废
       lcSnap.logHtml = "";
       const log = $("#chat-log");
@@ -5876,8 +5936,9 @@ function appendChatContent(div, text) {
   }
 }
 
-/** 渲染气泡并返回**外层 .bubble-row 元素**（调用方依赖它挂 id / 移除 / 追加按钮） */
-function addChatBubble(role, text, convId, logEl) {
+/** 渲染气泡并返回**外层 .bubble-row 元素**（调用方依赖它挂 id / 移除 / 追加按钮）
+ *  t：消息时间。undefined=现在（新消息）；null=豁免（占位/错误提示等非时间线气泡，不插分隔也不动基准）；字符串=指定时间（历史渲染） */
+function addChatBubble(role, text, convId, logEl, t) {
   // 卡片正则（酒馆 regex_scripts）统一在气泡层套用：新回复与历史记录口径一致，
   // 刷新/翻旧消息显示不会变回原文。只改显示，不改会话数据与上下文。
   if (role === "bot") text = applyRegexScripts(text);
@@ -5891,12 +5952,12 @@ function addChatBubble(role, text, convId, logEl) {
       if (!seg) continue;
       // 同一轮拆出来的每个气泡都挂同一个 convId：删除时按 id 能把这轮的所有气泡一起摘掉
       // （以前只给第一条挂 id，局部删除会漏掉后面的表情气泡）
-      const r = renderBubbleRow(role, i % 2 === 1 ? `[表情:${seg}]` : seg, convId, logEl);
+      const r = renderBubbleRow(role, i % 2 === 1 ? `[表情:${seg}]` : seg, convId, logEl, t);
       if (r) last = r;
     }
     return last; // 表情拆分时返回最后一条（"正在输出"占位等场景不会走这里）
   }
-  return renderBubbleRow(role, text, convId, logEl);
+  return renderBubbleRow(role, text, convId, logEl, t);
 }
 
 /**
@@ -5904,9 +5965,18 @@ function addChatBubble(role, text, convId, logEl) {
  * logEl 不传 = 追加到当前 #chat-log 并滚到底；传容器（如 DocumentFragment）=
  * 离屏构建（上翻补渲染/快照回填用），不碰滚动。
  */
-function renderBubbleRow(role, text, convId, logEl) {
+function renderBubbleRow(role, text, convId, logEl, t) {
   const log = logEl ?? $("#chat-log");
   const detached = !(log instanceof Element) || !log.isConnected;
+  // 时间戳分隔：与上一条真实消息间隔超阈值就在本条上方插一条居中时间（微信式）。
+  // 每条气泡的时间记在 dataset.t 上，上翻补渲染的边界修正要用。
+  let sepDiv = null;
+  let ts = null;
+  if (t !== null) {
+    ts = t || new Date().toISOString();
+    sepDiv = wbTimeSepDiv(wbLastMsgTime, ts);
+    wbLastMsgTime = ts;
+  }
   const row = document.createElement("div");
   row.className = "bubble-row " + (role === "user" ? "me" : "bot");
   if (convId) row.dataset.convId = convId;
@@ -5926,6 +5996,8 @@ function renderBubbleRow(role, text, convId, logEl) {
   appendChatContent(div, String(text));
   // 朗读喇叭已按用户要求移除（原 bot 气泡右上角 hover 出现的 tts-speak-btn）
   row.appendChild(div);
+  if (sepDiv) log.appendChild(sepDiv);
+  if (ts) row.dataset.t = ts;
   log.appendChild(row);
   // 离屏构建（fragment/隐藏容器）不滚动；只有真往聊天区追加时才滚到底。
   // 滚到底必须显式 behavior:"instant"：.lc-log 的 CSS scroll-behavior:smooth 会把

@@ -4825,7 +4825,17 @@ function startLifeScheduler(): void {
         if (c?.life?.intervalHours && c.life.intervalHours > 0) cards.push({ slug: c.slug, life: c.life });
       }
       if (cards.length === 0) return;
-      const fired = await runLifeTick(cards, lifeTrigger, lifeKnownUsersOf, lifeAgentOf);
+      // lastMsgOf：该卡最后一条消息的时间 → 主动消息的 prompt 里注入"冷场了多久"
+      const fired = await runLifeTick(
+        cards,
+        lifeTrigger,
+        lifeKnownUsersOf,
+        lifeAgentOf,
+        async (slug) => {
+          const tail = await readConv(slug, 1).catch(() => []);
+          return tail.at(-1)?.t ?? "";
+        }
+      );
       if (fired.length) logInfo("AI生命", `本轮主动消息 ${fired.length} 条`);
     } catch (e) {
       logWarn("AI生命", `调度异常：${String(e).slice(0, 300)}`);

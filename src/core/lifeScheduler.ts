@@ -96,9 +96,11 @@ export function isQuietHour(now: Date, from: number, to: number): boolean {
 }
 
 /**
- * 按当前时间生成"情绪基调"注入文本（不同时段不同情绪，让主动消息自然）
+ * 按当前时间生成"情绪基调"注入文本（不同时段不同情绪，让主动消息自然）。
+ * lastMsgIso：会话日志里最后一条消息的时间——冷场多久是主动消息的关键情境
+ * （隔了几小时 vs 隔了好几天，AI 的开口方式应该完全不同）。
  */
-export function buildMoodPrompt(now: Date): string {
+export function buildMoodPrompt(now: Date, lastMsgIso?: string): string {
   const h = now.getHours();
   const weekday = ["周日", "周一", "周二", "周三", "周四", "周五", "周六"][now.getDay()];
   const hh = String(h).padStart(2, "0");
@@ -119,7 +121,31 @@ export function buildMoodPrompt(now: Date): string {
   } else {
     mood = "现在是凌晨，语气极轻极柔，像舍不得睡、悄悄发一句。";
   }
-  return `当前时间：${weekday} ${hh}:${mm}。${mood}（主动消息：自然地以角色身份发起话题，像真人想到对方一样，不要提"心跳""主动消息""系统"等词）`;
+  // 冷场时长：超过 5 分钟才算"有一阵没说话"（刚聊完就触发的主动消息不需要提示）
+  let idleText = "";
+  if (lastMsgIso) {
+    const last = new Date(lastMsgIso);
+    if (!isNaN(last.getTime())) {
+      const gapMin = Math.floor((now.getTime() - last.getTime()) / 60000);
+      if (gapMin >= 5) {
+        const gapText =
+          gapMin < 60
+            ? `${gapMin} 分钟`
+            : gapMin < 60 * 24
+              ? `${Math.floor(gapMin / 60)} 小时`
+              : `${Math.floor(gapMin / (60 * 24))} 天`;
+        idleText = `距离你们上一条对话已经过去 ${gapText} 了——开场要自然贴合这个间隔：`;
+        if (gapMin < 60 * 3) {
+          idleText += "像刚说完话又想起什么，顺口补一句。";
+        } else if (gapMin < 60 * 24) {
+          idleText += "像隔了一阵子没聊，带着点想念或好奇对方在干嘛，别像没事人一样突然换话题。";
+        } else {
+          idleText += "已经好几天没说话了，像很久没见那样重新开口，可以自然地表达「这段时间去忙什么了」「有点想你」，别装作刚聊过。";
+        }
+      }
+    }
+  }
+  return `当前时间：${weekday} ${hh}:${mm}。${idleText ? idleText : ""}${mood}（主动消息：自然地以角色身份发起话题，像真人想到对方一样，不要提"心跳""主动消息""系统"等词）`;
 }
 
 /** 该用户现在是否应该收到主动消息（间隔 + 静默 + 冷却 + 防骚扰综合判断） */
@@ -161,7 +187,8 @@ export async function runLifeTick(
   cards: { slug: string; life?: { intervalHours?: number; quietFrom?: number; quietTo?: number } }[],
   triggerFn: (slug: string, agentId: string, accountId: string, openid: string, moodPrompt: string) => Promise<boolean>,
   knownUsersOf: (slug: string) => Promise<{ openid: string }[]>,
-  agentOf: (slug: string) => Promise<{ agentId: string; accountId: string } | null>
+  agentOf: (slug: string) => Promise<{ agentId: string; accountId: string } | null>,
+  lastMsgOf?: (slug: string) => Promise<string>
 ): Promise<{ slug: string; openid: string }[]> {
   const now = new Date();
   const fired: { slug: string; openid: string }[] = [];
@@ -172,10 +199,12 @@ export async function runLifeTick(
     const users = await knownUsersOf(card.slug);
     const agent = await agentOf(card.slug);
     if (!agent) continue;
+    // 这张卡最后一条消息的时间（冷场时长是主动消息的关键情境）
+    const lastMsgIso = lastMsgOf ? await lastMsgOf(card.slug).catch(() => "") : "";
     for (const u of users) {
       const { due, reason } = shouldBeat(state, u.openid, now);
       if (!due) continue;
-      const ok = await triggerFn(card.slug, agent.agentId, agent.accountId, u.openid, buildMoodPrompt(now));
+      const ok = await triggerFn(card.slug, agent.agentId, agent.accountId, u.openid, buildMoodPrompt(now, lastMsgIso));
       if (ok) {
         // 更新状态
         const st = await loadLife(card.slug);

@@ -1706,6 +1706,17 @@ body.lc-fullscreen .lc-root { height: 100dvh; }
   100% { background: inherit; }
 }
 
+/* 时间戳分隔条（微信式：相邻消息隔久了显示时间） */
+.lc-time-sep {
+  align-self: center;
+  font-size: 11px;
+  color: #808080;
+  text-align: center;
+  margin: 10px 0 2px;
+  user-select: none;
+}
+.lc-log .lc-time-sep:first-child { margin-top: 4px; }
+
 /* ================= 通讯录（微信式会话列表） =================
    一条 = 一个人：头像靠左固定尺寸，右侧上行名字+时间、下行最后一句预览。 */
 .chat-search-wrap { padding: 0 0 10px; }
