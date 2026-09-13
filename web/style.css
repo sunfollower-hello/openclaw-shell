@@ -1881,6 +1881,79 @@ body.lc-fullscreen .lc-root { height: 100dvh; }
   white-space: pre-wrap; word-break: break-word;
 }
 
+/* ================= API 提供商编辑二级页 + 模型选取 bottom sheet ================= */
+.pv-edit-head { display: flex; align-items: center; justify-content: space-between; }
+.pv-close-btn {
+  width: 32px; height: 32px; padding: 0;
+  border: 1px solid var(--border); border-radius: 9px;
+  background: var(--card); color: var(--muted);
+  font-size: 15px; line-height: 1; cursor: pointer; flex-shrink: 0;
+  display: inline-flex; align-items: center; justify-content: center;
+}
+.pv-close-btn:hover { background: #ececec; color: #111; }
+/* API Key 行：输入框 + 眼睛按钮 */
+.pv-key-row { display: flex; gap: 8px; align-items: stretch; }
+.pv-key-row input { flex: 1; min-width: 0; font-family: ui-monospace, Consolas, monospace; letter-spacing: 0.5px; }
+.pv-eye-btn {
+  width: 42px; flex-shrink: 0;
+  border: 1px solid var(--border); border-radius: 10px;
+  background: var(--card); color: var(--muted);
+  cursor: pointer;
+  display: inline-flex; align-items: center; justify-content: center;
+}
+.pv-eye-btn .ic { width: 17px; height: 17px; }
+.pv-eye-btn:hover { color: var(--accent); border-color: var(--accent); }
+/* 模型选取 bottom sheet：从底部弹上来，最高到顶栏下方一点 */
+.pv-sheet-ov { position: fixed; inset: 0; background: rgba(0, 0, 0, 0.42); z-index: 420; }
+.pv-sheet {
+  position: fixed; left: 0; right: 0; bottom: 0; margin: 0 auto;
+  max-width: 720px;
+  max-height: calc(100dvh - 60px); /* 最高到 SoulBox 顶栏下方一点 */
+  background: var(--card);
+  border-radius: 16px 16px 0 0;
+  box-shadow: 0 -10px 34px rgba(0, 0, 0, 0.2);
+  display: flex; flex-direction: column; gap: 10px;
+  padding: 14px 14px calc(14px + env(safe-area-inset-bottom));
+}
+.pv-sheet-head { display: flex; align-items: center; gap: 8px; }
+.pv-sheet-head b { font-size: 15px; }
+.pv-sheet-foot { display: flex; justify-content: flex-end; }
+/* 模型列表框：纵向滚动（首屏约 8-10 个），长名称在行内左右滑动看全貌 */
+.pv-model-list {
+  overflow-y: auto;
+  max-height: 46vh;
+  min-height: 220px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 4px;
+  display: flex; flex-direction: column; gap: 2px;
+  background: var(--bg);
+}
+.pv-model-item {
+  display: flex; align-items: center; gap: 9px;
+  padding: 8px 9px; border-radius: 8px;
+  min-width: 0;
+}
+.pv-model-item.on { background: var(--accent-soft); }
+.pv-model-check {
+  width: 20px; height: 20px; padding: 0; flex-shrink: 0;
+  border-radius: 50%;
+  border: 1.5px solid var(--border-strong); background: #fff;
+  color: #fff; font-size: 12px; line-height: 1; cursor: pointer;
+  display: inline-flex; align-items: center; justify-content: center;
+}
+.pv-model-item.on .pv-model-check { background: var(--accent); border-color: var(--accent); }
+/* 长模型名：单行不换行，行内左右滑动看全貌（隐藏横向滚动条） */
+.pv-model-name {
+  flex: 1; min-width: 0;
+  white-space: nowrap; overflow-x: auto; overflow-y: hidden;
+  scrollbar-width: none;
+  font-size: 13px;
+  cursor: default;
+}
+.pv-model-name::-webkit-scrollbar { display: none; }
+.pv-def-tag { color: var(--accent); font-size: 11px; }
+
 /* ===== 表情面板：输入框「下方」展开（QQ 式），输入岛随之上移 =====
    面板在 .lc-dock 内、紧跟 .lc-island 之后。消息区 .lc-log 是 flex:1，
    面板一出现 dock 变高、log 被压缩 → 视觉上就是「输入框上移、下方让出表情区」。 */

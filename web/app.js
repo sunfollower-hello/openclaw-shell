@@ -206,6 +206,7 @@ const ICONS = {
   emoji: '<circle cx="12" cy="12" r="9"/><path d="M8.5 13.5a4.5 4.5 0 0 0 7 0"/><line x1="9" y1="9.5" x2="9.01" y2="9.5"/><line x1="15" y1="9.5" x2="15.01" y2="9.5"/>',
   store: '<path d="M3 9.5 4.5 4h15L21 9.5"/><path d="M4 9.5V20h16V9.5"/><path d="M9 20v-6h6v6"/><path d="M2.5 9.5h19"/>',
   chevron: '<path d="m9 18 6-6-6-6"/>',
+  eye: '<path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/>',
 };
 function icon(name, size) {
   return `<svg class="ic${size ? " ic-" + size : ""}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICONS[name] ?? ""}</svg>`;
@@ -3688,7 +3689,7 @@ function openImageCropper({ dataUrl, targetSize = 256, format = "image/jpeg", qu
 // ============================================================
 //  视图：API 与模型 / 生图配置（多提供商，模型自动拉取）
 // ============================================================
-function renderApi() { return renderProvidersPage("chat", "API 与模型", "对话 API 提供商；第一个为默认，卡片未单独指定时使用它。"); }
+function renderApi() { return renderProvidersPage("chat", "API 与模型", "对话 API 提供商。点「设为默认」选择默认提供商（卡片未单独指定时用它）；默认商里勾选的第一个模型即默认模型。"); }
 function renderImagegen() { return renderImgGenPage(); }
 
 // 生图配置专用页（NovelAI / OpenAI 兼容 / 本地 SD WebUI 三套参数，网页聊天与 QQ/微信共用）
@@ -3767,27 +3768,6 @@ function renderProvidersPage(type, title, desc) {
     <div class="page-head"><h2>${title}</h2><p class="hint">${desc}</p></div>
     <div id="prov-list"></div>
     <button id="prov-add" class="primary">${icon("plus")} 添加提供商</button>
-    <div id="prov-form" class="card-box" style="display:none;margin-top:12px">
-      <h3 id="pv-title">添加提供商</h3>
-      <div class="form">
-        <div class="cf-grid2">
-          <div><label>名称（任意字符，≤32 字）</label><input id="pv-name" placeholder="如 agnes / myrelay / 硅基流动"></div>
-          <div><label>Base URL（以 /v1 结尾）</label><input id="pv-url" placeholder="https://api.example.com/v1"></div>
-        </div>
-        <label>API Key（编辑时留空 = 保留原值）</label>
-        <input id="pv-key" type="password" placeholder="sk-...">
-        <div class="row">
-          <button id="pv-save-fetch" class="primary">保存并拉取模型</button>
-          <button id="pv-cancel" class="ghost">取消</button>
-        </div>
-        <div id="pv-fetch-msg" class="status"></div>
-        <div id="pv-models-wrap" style="display:none">
-          <label>点击模型加入/移除（★ 第一个为默认模型）</label>
-          <div id="pv-models" class="model-chips"></div>
-          <div class="row" style="margin-top:8px"><button id="pv-done" class="primary">完成</button></div>
-        </div>
-      </div>
-    </div>
   </div>`;
 }
 
@@ -4065,10 +4045,7 @@ document.addEventListener("click", (e) => {
 
 function initProvidersPage(type) {
   provState = { type, editing: null, allModels: [], selected: [] };
-  $("#prov-add").addEventListener("click", () => showProvForm(null));
-  $("#pv-cancel").addEventListener("click", () => ($("#prov-form").style.display = "none"));
-  $("#pv-save-fetch").addEventListener("click", provSaveAndFetch);
-  $("#pv-done").addEventListener("click", provDone);
+  $("#prov-add").addEventListener("click", () => { location.hash = "#/apiprovider"; });
   loadProvList();
 }
 
@@ -4102,15 +4079,13 @@ async function loadProvList() {
             <button class="ghost small-btn" data-act="edit" data-name="${escapeHtml(p.name)}">编辑</button>
             <button class="danger small-btn" data-act="del" data-name="${escapeHtml(p.name)}">删除</button>
           </span>
-        </div>
-        <div class="meta">${escapeHtml(p.baseUrl)} · key ${p.apiKey ? "••••••" : "未填"}</div>
-        <div class="meta">模型（${p.models.length}）：${escapeHtml(p.models.slice(0, 6).join("、"))}${p.models.length > 6 ? "…" : ""}</div>`;
+        </div>`;
       box.appendChild(d);
     });
     box.querySelectorAll("button[data-act]").forEach((b) =>
       b.addEventListener("click", async () => {
         const name = b.dataset.name;
-        if (b.dataset.act === "edit") showProvForm(name);
+        if (b.dataset.act === "edit") location.hash = `#/apiprovider?name=${encodeURIComponent(name)}`;
         else if (b.dataset.act === "del") {
           if (!confirm(`删除提供商 ${name}？`)) return;
           await api.send("/api/providers/delete", { method: "POST", body: JSON.stringify({ type: provState.type, name }) });
@@ -4566,96 +4541,195 @@ async function loadTtsUsage() {
 }
 
 
-async function showProvForm(name) {
-  provState.editing = name;
-  provState.allModels = [];
-  provState.selected = [];
-  const form = $("#prov-form");
-  form.style.display = "block";
-  $("#pv-title").textContent = name ? `编辑 ${name}` : "添加提供商";
-  $("#pv-name").value = name ?? "";
-  $("#pv-name").disabled = Boolean(name);
-  $("#pv-url").value = "";
-  $("#pv-key").value = "";
-  $("#pv-models-wrap").style.display = "none";
-  $("#pv-fetch-msg").textContent = name ? "（Base URL 留空 = 保留原值）" : "";
-  if (name) {
-    const data = await api.get("/api/providers");
-    const p = (provState.type === "chat" ? data.chat : data.image).find((x) => x.name === name);
-    if (p) {
-      $("#pv-url").value = p.baseUrl;
-      // 已配置过密钥：用点表示已添加（留空保存 = 保留原值），避免用户以为密钥丢了
-      $("#pv-key").placeholder = p.apiKey ? "•••••• 已设置（留空保留）" : "sk-...";
-      provState.selected = [...p.models];
-      if (p.models.length) {
-        provState.allModels = [...p.models];
-        renderModelChips();
-        $("#pv-models-wrap").style.display = "block";
-      }
+// ============================================================
+//  视图：API 提供商编辑二级页（#/apiprovider?name=…，name 空 = 新增）
+//  - 右上角 ✕ 关闭（不保存）；密钥用 •••• 占位，眼睛查看原文，点「保存」才更改
+//  - 模型选取从底部弹上来（bottom sheet）：搜索 + 滚动框，长名称可在行内左右滑看全貌
+//  - 不再自动把拉取列表的第一个设为默认：勾选的第一个模型才是该提供商的默认模型
+// ============================================================
+const PV_KEY_DOTS = "••••••••";
+let pveState = { type: "chat", name: "", originalKey: "", keyRevealed: false, allModels: [], selected: [] };
+
+function renderProviderEdit() {
+  return `
+  <div class="view pv-edit-page">
+    <div class="page-head pv-edit-head">
+      <h2 id="pve-title">编辑提供商</h2>
+      <button id="pve-close" class="pv-close-btn" title="关闭（不保存）">✕</button>
+    </div>
+    <div class="card-box">
+      <div class="form">
+        <label>名称（≤32 字）</label>
+        <input id="pve-name" placeholder="如 agnes / myrelay / 硅基流动">
+        <label style="margin-top:10px">Base URL（以 /v1 结尾）</label>
+        <input id="pve-url" placeholder="https://api.example.com/v1">
+        <label style="margin-top:10px">API Key</label>
+        <div class="pv-key-row">
+          <input id="pve-key" type="text" placeholder="sk-..." autocomplete="off" spellcheck="false">
+          <button type="button" id="pve-key-eye" class="pv-eye-btn" title="显示 / 隐藏密钥">
+            <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
+          </button>
+        </div>
+        <p class="hint">已保存的密钥用 ${PV_KEY_DOTS} 显示；点右边的眼睛查看原文。只有点「保存」后密钥才会更改。</p>
+        <div class="row" style="margin-top:12px">
+          <button id="pve-fetch" class="primary">保存并拉取模型</button>
+          <button id="pve-pick" class="ghost">选择模型（<span id="pve-count">0</span>）</button>
+        </div>
+        <div id="pve-msg" class="status"></div>
+      </div>
+    </div>
+    <button id="pve-save" class="primary">${icon("save")} 保存</button>
+
+    <div class="pv-sheet-ov" id="pve-sheet-ov" hidden>
+      <div class="pv-sheet">
+        <div class="pv-sheet-head">
+          <b>选择模型</b>
+          <span class="hint" style="flex:1">勾选的第一个 = 该提供商的默认模型</span>
+          <button id="pve-sheet-close" class="pv-close-btn" title="收起">✕</button>
+        </div>
+        <input id="pve-model-search" type="text" placeholder="搜索模型…">
+        <div id="pve-model-list" class="pv-model-list"></div>
+        <div class="pv-sheet-foot">
+          <button id="pve-sheet-done" class="primary">完成</button>
+        </div>
+      </div>
+    </div>
+  </div>`;
+}
+
+async function initProviderEdit() {
+  const m = (location.hash || "").match(/[?&]name=([^&]+)/);
+  pveState = {
+    type: "chat",
+    name: m ? decodeURIComponent(m[1]) : "",
+    originalKey: "",
+    keyRevealed: false,
+    allModels: [],
+    selected: [],
+  };
+  const editing = Boolean(pveState.name);
+  $("#pve-title").textContent = editing ? `编辑 ${pveState.name}` : "添加提供商";
+  $("#pve-name").value = pveState.name; // 编辑态回填名称（collect 要用到）
+  $("#pve-name").disabled = editing;
+  const updateCount = () => { const el = $("#pve-count"); if (el) el.textContent = String(pveState.selected.length); };
+
+  // 关闭（不保存）→ 回列表
+  $("#pve-close").addEventListener("click", () => { location.hash = "#/api"; });
+
+  // 眼睛：在「隐藏（占位符）」与「显示已保存原文」之间切换；没保存过就提示直接输入
+  $("#pve-key-eye").addEventListener("click", async () => {
+    const input = $("#pve-key");
+    if (pveState.keyRevealed) {
+      input.value = pveState.originalKey ? PV_KEY_DOTS : "";
+      pveState.keyRevealed = false;
+      return;
     }
-  }
-  form.scrollIntoView({ behavior: "smooth", block: "nearest" });
-}
-
-async function provSaveAndFetch() {
-  const name = $("#pv-name").value.trim();
-  const baseUrl = $("#pv-url").value.trim();
-  if (!name) return toast("请填名称", false);
-  if (!baseUrl && !provState.editing) return toast("请填 Base URL", false);
-  $("#pv-fetch-msg").textContent = "保存中，随后拉取模型…";
-  try {
-    await api.send("/api/providers/save", {
-      method: "POST",
-      body: JSON.stringify({ type: provState.type, name, baseUrl, apiKey: $("#pv-key").value.trim() || undefined }),
-    });
-    const r = await api.send("/api/providers/fetch-models", {
-      method: "POST",
-      body: JSON.stringify({ type: provState.type, name }),
-    });
-    provState.allModels = r.models;
-    if (!provState.selected.length) provState.selected = r.models.slice(0, 1);
-    renderModelChips();
-    $("#pv-models-wrap").style.display = "block";
-    $("#pv-fetch-msg").textContent = `✓ 拉取到 ${r.models.length} 个模型`;
-    cacheInvalidate("/api/providers");
-    loadProvList();
-  } catch (e) {
-    $("#pv-fetch-msg").textContent = "失败：" + e.message;
-  }
-}
-
-function renderModelChips() {
-  const box = $("#pv-models");
-  box.innerHTML = "";
-  provState.allModels.forEach((m) => {
-    const idx = provState.selected.indexOf(m);
-    const chip = document.createElement("button");
-    chip.type = "button";
-    chip.className = "model-chip" + (idx >= 0 ? " on" : "");
-    chip.textContent = (idx === 0 ? "★ " : "") + m;
-    chip.addEventListener("click", () => {
-      const i = provState.selected.indexOf(m);
-      if (i >= 0) provState.selected.splice(i, 1);
-      else provState.selected.push(m);
-      renderModelChips();
-    });
-    box.appendChild(chip);
+    if (editing && !pveState.originalKey) {
+      try {
+        const r = await api.get(`/api/providers/reveal-key?type=${pveState.type}&name=${encodeURIComponent(pveState.name)}`);
+        pveState.originalKey = r.apiKey ?? "";
+      } catch { /* 取不到就当没有 */ }
+    }
+    if (!pveState.originalKey) { toast("还没保存过密钥，直接输入即可", false); return; }
+    input.value = pveState.originalKey;
+    pveState.keyRevealed = true;
   });
+
+  // 收集表单：占位符（没动）或空 = 不传 apiKey（后端沿用原值）；只有真实输入才会更改密钥
+  const collect = () => ({
+    type: pveState.type,
+    name: $("#pve-name").value.trim(),
+    baseUrl: $("#pve-url").value.trim(),
+    apiKey: (() => { const v = $("#pve-key").value.trim(); return v && v !== PV_KEY_DOTS ? v : undefined; })(),
+    models: [...pveState.selected],
+  });
+
+  const openSheet = () => {
+    $("#pve-sheet-ov").hidden = false;
+    renderPveModelList();
+  };
+
+  // 保存并拉取模型：先保存，再拉取，然后弹模型选取
+  $("#pve-fetch").addEventListener("click", async () => {
+    const f = collect();
+    if (!f.name) return toast("请填名称", false);
+    if (!f.baseUrl) return toast("请填 Base URL", false);
+    $("#pve-msg").textContent = "保存中，随后拉取模型…";
+    try {
+      await api.send("/api/providers/save", { method: "POST", body: JSON.stringify({ ...f, models: undefined }) });
+      const r = await api.send("/api/providers/fetch-models", { method: "POST", body: JSON.stringify({ type: pveState.type, name: f.name }) });
+      pveState.allModels = r.models ?? [];
+      // 已勾选的模型若不在新列表里（上游下架/改名）则剔除
+      pveState.selected = pveState.selected.filter((x) => pveState.allModels.includes(x));
+      cacheInvalidate("/api/providers");
+      $("#pve-msg").textContent = `✓ 拉取到 ${pveState.allModels.length} 个模型`;
+      updateCount();
+      openSheet();
+    } catch (e) {
+      $("#pve-msg").textContent = "失败：" + e.message;
+    }
+  });
+
+  // 手动打开模型选取（不重新拉取）
+  $("#pve-pick").addEventListener("click", openSheet);
+
+  // 搜索过滤
+  $("#pve-model-search").addEventListener("input", () => renderPveModelList());
+  $("#pve-sheet-close").addEventListener("click", () => { $("#pve-sheet-ov").hidden = true; });
+  $("#pve-sheet-done").addEventListener("click", () => { $("#pve-sheet-ov").hidden = true; });
+  $("#pve-sheet-ov").addEventListener("click", (e) => { if (e.target === $("#pve-sheet-ov")) $("#pve-sheet-ov").hidden = true; });
+
+  // 保存 → 回列表
+  $("#pve-save").addEventListener("click", async () => {
+    const f = collect();
+    if (!f.name) return toast("请填名称", false);
+    if (!f.baseUrl) return toast("请填 Base URL", false);
+    if (!f.models.length) return toast("请至少勾选一个模型（勾选的第一个为该提供商的默认模型）", false);
+    try {
+      await api.send("/api/providers/save", { method: "POST", body: JSON.stringify(f) });
+      cacheInvalidate("/api/providers");
+      toast("✓ 已保存");
+      location.hash = "#/api";
+    } catch (e) { toast("保存失败：" + e.message, false); }
+  });
+
+  // 填充编辑数据
+  if (editing) {
+    const data = await api.get("/api/providers").catch(() => null);
+    const p = data?.chat?.find((x) => x.name === pveState.name);
+    if (!p) { toast("找不到该提供商", false); location.hash = "#/api"; return; }
+    $("#pve-url").value = p.baseUrl ?? "";
+    if (p.apiKey) $("#pve-key").value = PV_KEY_DOTS; // 圆点占位 = 已填写（真实值在服务端，眼睛可查）
+    pveState.selected = [...(p.models ?? [])];
+    pveState.allModels = [...(p.models ?? [])];
+    updateCount();
+  }
 }
 
-async function provDone() {
-  const name = $("#pv-name").value.trim();
-  const baseUrl = $("#pv-url").value.trim();
-  try {
-    await api.send("/api/providers/save", {
-      method: "POST",
-      body: JSON.stringify({ type: provState.type, name, baseUrl, apiKey: $("#pv-key").value.trim() || undefined, models: provState.selected }),
+function renderPveModelList() {
+  const box = $("#pve-model-list");
+  if (!box) return;
+  const q = ($("#pve-model-search")?.value ?? "").trim().toLowerCase();
+  const list = q ? pveState.allModels.filter((mm) => mm.toLowerCase().includes(q)) : pveState.allModels;
+  box.innerHTML = list.length ? "" : '<div class="muted" style="padding:12px">（无匹配模型）</div>';
+  for (const mm of list) {
+    const idx = pveState.selected.indexOf(mm);
+    const row = document.createElement("div");
+    row.className = "pv-model-item" + (idx >= 0 ? " on" : "");
+    row.innerHTML = `
+      <button type="button" class="pv-model-check" aria-label="选择模型">${idx >= 0 ? "✓" : ""}</button>
+      <span class="pv-model-name">${escapeHtml(mm)}${idx === 0 ? ' <b class="pv-def-tag">默认</b>' : ""}</span>`;
+    // 只有勾选圈触发选择；名称区留给左右滑动看全貌，不误触
+    row.querySelector(".pv-model-check").addEventListener("click", () => {
+      const i = pveState.selected.indexOf(mm);
+      if (i >= 0) pveState.selected.splice(i, 1);
+      else pveState.selected.push(mm);
+      renderPveModelList();
+      const el = $("#pve-count");
+      if (el) el.textContent = String(pveState.selected.length);
     });
-    $("#prov-form").style.display = "none";
-    toast("✓ 已保存");
-    cacheInvalidate("/api/providers");
-    loadProvList();
-  } catch (e) { toast("保存失败：" + e.message, false); }
+    box.appendChild(row);
+  }
 }
 
 // ============================================================
@@ -7572,6 +7646,7 @@ const routes = {
   chatmem: { render: renderChatMem, init: initChatMem },     // 聊天记忆页（本地/群聊二分）
   chatwb: { render: renderChatWb, init: initChatWb },        // 世界书查看页
   chatrx: { render: renderChatRx, init: initChatRx },        // 正则查看页
+  apiprovider: { render: renderProviderEdit, init: initProviderEdit }, // API 提供商编辑二级页
   cards: { render: renderCards, init: initCards },
   presets: { render: renderPresets, init: initPresets },
   create: { render: renderCreate, init: initCreate },

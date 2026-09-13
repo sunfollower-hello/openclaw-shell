@@ -14,6 +14,19 @@ export interface Provider {
   models: string[];
   /** false = 停用（配置留着但不参与选择/解析）；缺省视为启用 */
   enabled?: boolean;
+  /** 内置预设厂商标记（默认停用；用户未删除则始终补在列表尾部，新加的自定义商排在它前面） */
+  builtin?: boolean;
+}
+
+/** 内置预设厂商：默认停用，只给 name/baseUrl/预填模型，用户自己填 key 并启用 */
+export const BUILTIN_CHAT_PROVIDERS: { name: string; baseUrl: string; models: string[] }[] = [
+  { name: "DeepSeek", baseUrl: "https://api.deepseek.com/v1", models: ["deepseek-chat", "deepseek-reasoner"] },
+  { name: "硅基流动", baseUrl: "https://api.siliconflow.cn/v1", models: [] },
+  { name: "OpenRouter", baseUrl: "https://openrouter.ai/api/v1", models: [] },
+];
+
+function isBuiltinProvider(name: string): boolean {
+  return BUILTIN_CHAT_PROVIDERS.some((b) => b.name === name);
 }
 
 export interface ProvidersFile {
@@ -48,6 +61,26 @@ async function migrateFromOpenclaw(data: ProvidersFile): Promise<ProvidersFile> 
   return data;
 }
 
+/** 用户删除过的内置预设不再补回（记 name）；会话级足够（重启后也不补——删了就是删了） */
+const dismissedBuiltins = new Set<string>();
+
+/** 确保内置预设厂商存在（默认停用、排在列表尾部，用户新加的自定义商自然排在它前面） */
+function ensureBuiltinProviders(data: ProvidersFile): void {
+  data.chat ??= [];
+  for (const b of BUILTIN_CHAT_PROVIDERS) {
+    if (dismissedBuiltins.has(b.name)) continue;
+    if (data.chat.some((p) => p.name === b.name)) continue;
+    data.chat.push({
+      name: b.name,
+      baseUrl: b.baseUrl,
+      apiKey: "",
+      models: [...b.models],
+      enabled: false,
+      builtin: true,
+    });
+  }
+}
+
 export async function listProviders(maskKey = true): Promise<ProvidersFile> {
   let data: ProvidersFile;
   try {
@@ -62,6 +95,7 @@ export async function listProviders(maskKey = true): Promise<ProvidersFile> {
   for (const arr of [data.chat, data.image]) {
     for (const p of arr) p.enabled = p.enabled !== false;
   }
+  ensureBuiltinProviders(data);
   if (maskKey) {
     const mask = (p: Provider): Provider => ({ ...p, apiKey: p.apiKey ? p.apiKey.slice(0, 6) + "…" : "" });
     return { chat: data.chat.map(mask), image: data.image.map(mask) };
@@ -95,8 +129,14 @@ export async function saveProvider(
     enabled: prev ? prev.enabled !== false : true, // 编辑不改停用状态，新建默认启用
   };
   if (!entry.baseUrl) throw new Error("Base URL 不能为空");
-  if (i >= 0) arr[i] = entry;
-  else arr.push(entry);
+  if (i >= 0) {
+    arr[i] = entry;
+  } else {
+    // 新加的自定义商排在内置预设前面（用户要求：新加的上浮，预设往下挤）
+    const firstBuiltin = arr.findIndex((x) => x.builtin === true || isBuiltinProvider(x.name));
+    if (firstBuiltin >= 0) arr.splice(firstBuiltin, 0, entry);
+    else arr.push(entry);
+  }
   await writeProviders(data);
   if (type === "chat") await syncToOpenclaw(data);
   return entry;
@@ -106,6 +146,8 @@ export async function deleteProvider(type: ProviderType, name: string): Promise<
   const data = await listProviders(false);
   data[type] = data[type].filter((p) => p.name !== name);
   await writeProviders(data);
+  // 内置预设被用户删除：本会话内不再自动补回（不然删了又出现）
+  if (isBuiltinProvider(name)) dismissedBuiltins.add(name);
   if (type === "chat") await syncToOpenclaw(data);
 }
 
@@ -129,6 +171,13 @@ export async function moveProviderDefault(type: ProviderType, name: string): Pro
   data[type].unshift(p);
   await writeProviders(data);
   if (type === "chat") await syncToOpenclaw(data);
+}
+
+/** 取某个提供商的完整 API Key（编辑页「眼睛」查看用；页面本身有 Basic 认证保护） */
+export async function revealApiKey(type: ProviderType, name: string): Promise<string> {
+  const data = await listProviders(false);
+  const p = data[type].find((x) => x.name === name);
+  return p?.apiKey ?? "";
 }
 
 /** 从提供商拉取可用模型列表（GET /models） */

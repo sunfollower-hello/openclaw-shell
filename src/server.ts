@@ -1947,6 +1947,19 @@ app.post("/api/providers/set-default", async (req, res) => {
   }
 });
 
+// 查看某个提供商的完整 API Key（编辑页「眼睛」按钮；页面已有 Basic 认证保护）
+app.get("/api/providers/reveal-key", async (req, res) => {
+  try {
+    const type = String(req.query.type ?? "");
+    const name = String(req.query.name ?? "");
+    if ((type !== "chat" && type !== "image") || !name) return res.status(400).json({ error: "缺少 type / name" });
+    const { revealApiKey } = await import("./core/providers.js");
+    res.json({ ok: true, apiKey: await revealApiKey(type, name) });
+  } catch (e) {
+    res.status(400).json({ error: toUserError(e) });
+  }
+});
+
 // 停用 / 启用某个提供商（配置保留，不参与选择与解析）
 app.post("/api/providers/toggle", async (req, res) => {
   try {
