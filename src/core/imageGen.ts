@@ -7,6 +7,7 @@ import {
   getImageConfig,
   NAI_GATEWAY_BASE,
   NAI_GATEWAY_DEFAULT_MODEL,
+  rejectForeignKey,
   type ImageConfig,
 } from "./imageConfig.js";
 
@@ -135,6 +136,9 @@ export async function generateImage(params: GenParams, saveDir?: string): Promis
 
   try {
     if (provider === "novelai" && cfg.novelai.key) {
+      // 兜底：挡上游/官方密钥（正常在配置页就被拦了，这里防手改配置文件绕过）
+      const badKey = rejectForeignKey(cfg.novelai.key);
+      if (badKey) return { ok: false, error: badKey };
       // 走我们自己的中转站（new-api，OpenAI 兼容）的 /v1/chat/completions。
       // 生图模型在中转站里按次计费，请求正文是固定字段行的纯文本，
       // 回复正文是 markdown 图片链接（要再下载一次拿图）。

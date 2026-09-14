@@ -3,8 +3,15 @@
 import express from "express";
 import path from "node:path";
 import os from "node:os";
+import dns from "node:dns";
 import crypto from "node:crypto";
 import { promises as fs, existsSync } from "node:fs";
+
+// 出站请求一律优先 IPv4。本机（以及部分国内网络）IPv6 路由不通，而 Node 默认按 DNS
+// 返回顺序尝试，解析结果里 IPv6 排前时会连接超时（实测：fetch 报 UND_ERR_CONNECT_TIMEOUT
+// 而同一时刻 curl 正常——curl 有 Happy Eyeballs 兜底，Node 没有）。
+// 生图/密钥校验都要出国访问自己的中转站，这里统一兜住，省得以后又踩。
+dns.setDefaultResultOrder("ipv4first");
 import { CardStore, dataDir, newCardId, nowIso, isValidSlug } from "./core/cardStore.js";
 import { defaultCard, SCHEMA_VERSION, personaCardSchema, type PersonaCard } from "./core/schema.js";
 import { validateCard } from "./core/validator.js";
@@ -74,6 +81,8 @@ import {
   testNovelaiKey,
   testOpenAIImageKey,
   listNovelaiGatewayModels,
+  rejectForeignKey,
+  validateGatewayModel,
   NAI_GATEWAY_BASE,
 } from "./core/imageConfig.js";
 import { coversDir, saveCover, readCover, normalizeAvatar } from "./core/covers.js";
@@ -4040,6 +4049,20 @@ app.post("/api/image/config", async (req, res) => {
   try {
     const { provider, novelai, openai, artists, activeArtist, retentionDays, aspect } = req.body ?? {};
     const cur = await getImageConfig();
+    // ① 密钥守卫：只认本站签发的密钥，上游/官方密钥（STA1N-…/pst-…）一律拒绝，
+    //    避免有人填上游密钥绕过我们自己的站点
+    const incomingKey = String(novelai?.key ?? "").trim();
+    if (incomingKey) {
+      const bad = rejectForeignKey(incomingKey);
+      if (bad) return res.status(400).json({ error: bad });
+      // ② 模型守卫：模型必须来自本站 /v1/models（挡住手填上游模型名）
+      const mv = await validateGatewayModel(incomingKey, String(novelai?.model ?? ""));
+      if (!mv.ok) return res.status(400).json({ error: mv.info });
+    } else if (String(novelai?.model ?? "").trim() && cur.novelai.key) {
+      // 没改密钥但要改模型：用已保存的密钥校验
+      const mv = await validateGatewayModel(cur.novelai.key, String(novelai.model));
+      if (!mv.ok) return res.status(400).json({ error: mv.info });
+    }
     // 画师串列表：name/content 去空白过滤
     const nextArtists = Array.isArray(artists)
       ? (artists as { name?: string; content?: string }[])

@@ -96,6 +96,51 @@ export function maskKey(s?: string): string {
 }
 
 /**
+ * 只接受本中转站签发的密钥——挡住「把上游密钥直接填进来绕过我的站」。
+ * 上游密钥（STA1N-…）与 NovelAI 官方密钥（pst-…）都指向别的站点，
+ * 用它们等于跳过我们的计量与计费，所以一律拒绝并给出明确指引。
+ * 返回 null = 通过；返回字符串 = 拒绝原因。
+ */
+export function rejectForeignKey(key: string): string | null {
+  const k = String(key ?? "").trim();
+  if (!k) return null; // 空由调用方按「沿用已保存的值」处理
+  if (/^STA1N[-_]/i.test(k) || /^STA1N/i.test(k)) {
+    return "这是上游站点的密钥，本项目不直接使用它。请到「生图配置」页填入你自己站点签发的密钥（sk- 开头）。";
+  }
+  if (/^pst-/i.test(k)) {
+    return "这是 NovelAI 官方密钥，本项目不走官方直连。请填入你站点签发的密钥（sk- 开头）。";
+  }
+  if (!/^sk-/i.test(k)) {
+    return "密钥格式不对：请填入你站点签发的密钥（sk- 开头）。";
+  }
+  return null;
+}
+
+/**
+ * 模型校验：必须是我们站点 /v1/models 里真实存在的模型。
+ * 目的：挡住手填的上游模型名（如 `nai-diffusion-4-5-full:k_dpmpp_2m_sde`）——
+ * 那是上游的命名，我们站点对外是 `[次]nai-4.5`，填上游名会调不通，
+ * 也等于绕过我们自己的模型配置。校验要联网，故只在「保存配置」时做一次。
+ */
+export async function validateGatewayModel(
+  key: string,
+  model: string
+): Promise<{ ok: boolean; info?: string }> {
+  const m = String(model ?? "").trim();
+  if (!m) return { ok: true }; // 空 = 沿用已保存的模型
+  const r = await listNovelaiGatewayModels(key);
+  if (!r.ok) return { ok: false, info: r.info || "拉取模型列表失败，无法校验模型" };
+  const ids = r.models.map((x) => x.id);
+  if (!ids.includes(m)) {
+    return {
+      ok: false,
+      info: `模型「${m}」不在你站点的可用列表里，请点「拉取模型」从列表中选择。可用：${ids.slice(0, 5).join("、")}${ids.length > 5 ? " …" : ""}`,
+    };
+  }
+  return { ok: true };
+}
+
+/**
  * 生图密钥校验：查中转站的额度接口，不实际生图（不扣费）。
  * 中转站是 new-api，走标准的 /dashboard/billing/subscription（返回额度上限与已用量）。
  * 实测无效 key 与空 key 都会 401，可安全用于校验。
@@ -103,6 +148,9 @@ export function maskKey(s?: string): string {
 export async function testNovelaiKey(key: string): Promise<{ ok: boolean; info: string }> {
   const k = String(key ?? "").trim();
   if (!k) return { ok: false, info: "请先填写生图密钥" };
+  // 先挡「上游/官方密钥」这类会绕过我们站点的密钥
+  const bad = rejectForeignKey(k);
+  if (bad) return { ok: false, info: bad };
   try {
     const r = await fetch(`${NAI_GATEWAY_BASE}/dashboard/billing/subscription`, {
       headers: { Authorization: `Bearer ${k}` },
@@ -131,6 +179,8 @@ export async function listNovelaiGatewayModels(
 ): Promise<{ ok: boolean; models: { id: string; cost?: number; tier?: string }[]; info?: string }> {
   const k = String(key ?? "").trim();
   if (!k) return { ok: false, models: [], info: "请先填写生图密钥（拉取模型需要密钥）" };
+  const bad = rejectForeignKey(k);
+  if (bad) return { ok: false, models: [], info: bad };
   try {
     const r = await fetch(`${NAI_GATEWAY_BASE}/v1/models`, {
       headers: { Authorization: `Bearer ${k}` },

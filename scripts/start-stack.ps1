@@ -18,6 +18,11 @@ $env:TTS_FORCE_SILK = '1'
 # so the QQ channel TTS_ALLOWED_ROOTS check fails and blocks the audio. Long TMP unifies both.
 $env:TMP = Join-Path $env:SystemDrive "\Users\$env:USERNAME\AppData\Local\Temp"
 $env:TEMP = $env:TMP
+# Prefer IPv4 for outbound connections in every node process we start (web server AND the
+# OpenClaw gateway). This network's IPv6 route is dead, and Node tries DNS answers in order:
+# when IPv6 comes first it just times out (UND_ERR_CONNECT_TIMEOUT) while curl still works
+# (curl has Happy Eyeballs, Node does not). Image gen / key checks go out to our relay.
+$env:NODE_OPTIONS = if ($env:NODE_OPTIONS) { $env:NODE_OPTIONS } else { '--dns-result-order=ipv4first' }
 # Bind the web UI to localhost (public access goes through the optional Cloudflare tunnel,
 # which also sets Basic-auth via .env). Set HOST=0.0.0.0 to expose on the LAN explicitly.
 $env:HOST = if ($env:HOST) { $env:HOST } else { '127.0.0.1' }
