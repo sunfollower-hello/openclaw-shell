@@ -3770,10 +3770,12 @@ function renderImgGenPage() {
             <button id="ig-artist-add" class="ghost small-btn" style="margin-top:6px">${icon("plus")} 添加画师串</button>
             <div id="ig-artist-edit" style="display:none;margin-top:6px;border:1px dashed var(--border);border-radius:8px;padding:8px">
               <input id="ig-artist-name" placeholder="名称（如：默认画风）">
-              <textarea id="ig-artist-content" rows="2" style="margin-top:6px" placeholder="画师串内容，如 masterpiece, best quality, [artist:ciloranko], ..."></textarea>
+              <textarea id="ig-artist-content" rows="6" style="margin-top:6px" placeholder="画师串内容，如 masterpiece, best quality, [artist:ciloranko], ..."></textarea>
               <div class="row" style="margin-top:6px">
                 <button id="ig-artist-save" class="small-btn primary">保存</button>
                 <button id="ig-artist-cancel" class="small-btn ghost">取消</button>
+                <span style="flex:1"></span>
+                <button id="ig-artist-del" class="small-btn danger" style="display:none">删除</button>
               </div>
             </div>
           </div>
@@ -3790,30 +3792,24 @@ function renderImgGenPage() {
           </div>
           <div id="ig-oai-models-status" class="status"></div>
         </div>
+        <label style="margin-top:14px">出图尺寸</label>
+        <div class="cap-toggles ig-aspect-row">
+          <button type="button" class="cap-toggle" data-aspect="auto">自动</button>
+          <button type="button" class="cap-toggle" data-aspect="portrait">竖图</button>
+          <button type="button" class="cap-toggle" data-aspect="landscape">横图</button>
+          <button type="button" class="cap-toggle" data-aspect="square">方图</button>
+        </div>
         <div class="row" style="margin-top:12px">
           <button id="ig-save" class="primary">${icon("save")} 保存配置</button>
-          <button id="ig-test" class="ghost">测试 Key / 服务</button>
+          <button id="ig-test" class="ghost">测试</button>
         </div>
         <div id="ig-status" class="status"></div>
       </div>
     </div>
+    <!-- 测试结果：点「测试」后在这里直接出图（内置提示词，不用用户写） -->
     <div class="card-box">
-      <h3>试生一张</h3>
-      <div class="form">
-        <label>提示词</label>
-        <textarea id="ig-test-prompt" rows="2" placeholder="如：一个穿和服的少女，樱花树下，黄昏光线，精致细节"></textarea>
-        <div class="row">
-          <select id="ig-test-aspect">
-            <option value="auto">自动</option>
-            <option value="square">方图 1024×1024</option>
-            <option value="portrait">竖图 832×1216</option>
-            <option value="landscape">横图 1216×832</option>
-          </select>
-          <button id="ig-test-go" class="primary">生成</button>
-        </div>
-        <div id="ig-test-status" class="status"></div>
-        <div id="ig-test-img"></div>
-      </div>
+      <div id="ig-test-status" class="status"></div>
+      <div id="ig-test-img" class="ig-test-img"><div class="muted">点上面的「测试」按钮出图</div></div>
     </div>
   </div>`;
 }
@@ -3906,6 +3902,16 @@ function initImagegen() { initImgGenPage(); }
 function igRadio() {
   return document.querySelector(".cap-toggle[data-provider].on")?.dataset?.provider ?? "novelai";
 }
+/** 出图尺寸：点一下即选中（互斥高亮），默认「自动」 */
+function igAspect() {
+  return document.querySelector(".cap-toggle[data-aspect].on")?.dataset?.aspect ?? "auto";
+}
+function setIgAspect(aspect) {
+  const v = ["auto", "portrait", "landscape", "square"].includes(aspect) ? aspect : "auto";
+  document.querySelectorAll(".cap-toggle[data-aspect]").forEach((b) => {
+    b.classList.toggle("on", b.dataset.aspect === v);
+  });
+}
 let imgState = { artists: [], activeArtist: "", originalKey: "", keyRevealed: false };
 let artistEditing = null; // 正在编辑的画师串下标（null = 新增）
 
@@ -3925,6 +3931,7 @@ function collectImgForm() {
   const v = (id) => { const el = $(id); return el ? el.value.trim() : ""; };
   return {
     provider: igRadio(),
+    aspect: igAspect(),
     // 服务地址不提交（后端固定）；密钥：占位点号或留空 = 不传（后端沿用原值），
     // 只有真实输入才会改密钥——与文本 API 的收集口径一致
     novelai: {
@@ -3938,6 +3945,7 @@ function collectImgForm() {
 }
 function fillImgForm(cfg) {
   setIgProvider(cfg.provider);
+  setIgAspect(cfg.aspect);
   // 服务地址由后端下发（只读展示，防止用户以为能改成别的站）
   if ($("#ig-nai-base") && cfg.novelai?.base) $("#ig-nai-base").value = cfg.novelai.base;
   // 密钥：与文本 API 配置同一做法——已保存的用点号占位，点眼睛时再去后端取原文；
@@ -3986,8 +3994,7 @@ function renderArtistsList() {
     box.innerHTML = `<div class="muted">还没有画师串</div>`;
     return;
   }
-  // 一行一个：只显示名称（点名称=选中，高亮表示生效），右侧 编辑 / 删除。
-  // 内容改动全部在「编辑」里做，所以列表不再显示内容预览，也没有单独的启用键。
+  // 一行一个：只显示名称（点名称=选用，高亮表示生效），「删除」在编辑框里，列表不放假按钮。
   box.innerHTML = imgState.artists
     .map((a, i) => {
       const on = a.name === imgState.activeArtist;
@@ -3995,7 +4002,6 @@ function renderArtistsList() {
     <div class="artist-item${on ? " on" : ""}">
       <button type="button" class="artist-name-btn" data-pick="${i}" title="${on ? "点一下取消选用" : "点一下选用这个画师串"}">${escapeHtml(a.name)}</button>
       <button class="ghost small-btn" data-edit="${i}">编辑</button>
-      <button class="danger small-btn" data-del="${i}">删除</button>
     </div>`;
     })
     .join("");
@@ -4012,9 +4018,6 @@ function renderArtistsList() {
   box.querySelectorAll("[data-edit]").forEach((b) =>
     b.addEventListener("click", () => openArtistEdit(Number(b.dataset.edit)))
   );
-  box.querySelectorAll("[data-del]").forEach((b) =>
-    b.addEventListener("click", () => deleteArtist(Number(b.dataset.del)))
-  );
 }
 function openArtistEdit(i) {
   artistEditing = i;
@@ -4022,7 +4025,9 @@ function openArtistEdit(i) {
   $("#ig-artist-name").value = a?.name ?? "";
   $("#ig-artist-content").value = a?.content ?? "";
   $("#ig-artist-edit").style.display = "block";
-  $("#ig-artist-name").focus();
+  // 删除键只在编辑已有条目时出现（新增时没有可删的）
+  $("#ig-artist-del").style.display = i === null ? "none" : "";
+  // 刻意不自动聚焦：手机上会自动弹键盘、遮住半屏，用户点了输入框或内容区才弹
 }
 function closeArtistEdit() {
   artistEditing = null;
@@ -4033,6 +4038,7 @@ function deleteArtist(i) {
   if (!a || !confirm(`删除画师串「${a.name}」？`)) return;
   imgState.artists.splice(i, 1);
   if (imgState.activeArtist === a.name) imgState.activeArtist = "";
+  closeArtistEdit(); // 从编辑框里删的，删完顺手收起
   renderArtistsList();
   saveImgConfig();
 }
@@ -4044,10 +4050,20 @@ async function saveImgConfig() {
   else setStatus("#ig-status", "保存失败：" + (r.error ?? "未知错误"), false);
 }
 async function initImgGenPage() {
-  imgState = { artists: [], activeArtist: "" };
+  imgState = { artists: [], activeArtist: "", originalKey: "", keyRevealed: false };
+  artistEditing = null;
+  const imgBox = $("#ig-test-img");
+  if (imgBox) imgBox.innerHTML = '<div class="muted">点上面的「测试」按钮出图</div>';
   artistEditing = null;
   document.querySelectorAll(".cap-toggle[data-provider]").forEach((b) =>
     b.addEventListener("click", () => setIgProvider(b.dataset.provider))
+  );
+  // 出图尺寸：点一下即选中并立刻存盘（默认自动）
+  document.querySelectorAll(".cap-toggle[data-aspect]").forEach((b) =>
+    b.addEventListener("click", () => {
+      setIgAspect(b.dataset.aspect);
+      void saveImgConfig();
+    })
   );
   // 生图模型：服务地址固定，模型由用户从自己密钥可用的列表里挑
   $("#ig-nai-models").addEventListener("click", async () => {
@@ -4103,11 +4119,34 @@ async function initImgGenPage() {
       setStatus("#ig-status", "✓ 已保存", true);
     } else setStatus("#ig-status", "保存失败：" + (r.error ?? "未知错误"), false);
   });
+  // 「测试」= 校验密钥 + 用内置提示词出一张图，结果直接展示在下面的图片区
   $("#ig-test").addEventListener("click", async () => {
     const f = collectImgForm();
-    setStatus("#ig-status", "测试中…");
-    const r = await api.send("/api/image/test", { method: "POST", body: JSON.stringify(f) });
-    setStatus("#ig-status", r.info ?? "无返回", r.ok);
+    const btn = $("#ig-test");
+    const imgBox = $("#ig-test-img");
+    btn.disabled = true;
+    imgBox.innerHTML = '<div class="muted">生成中（约 5-30 秒）…</div>';
+    setStatus("#ig-test-status", "", true);
+    try {
+      // ① 先校验密钥（快、不扣费），失败就没必要往下走
+      const t = await api.send("/api/image/test", { method: "POST", body: JSON.stringify(f) });
+      setStatus("#ig-test-status", t.info ?? "", t.ok);
+      if (!t.ok) { imgBox.innerHTML = '<div class="muted">密钥不可用，未生成</div>'; return; }
+      // ② 出图（不传 prompt → 后端按提供商挑内置提示词；不传 aspect → 用全局尺寸设置）
+      const r = await api.send("/api/image/generate", { method: "POST", body: JSON.stringify(f) });
+      if (!r.ok) {
+        imgBox.innerHTML = `<div class="muted">生成失败：${escapeHtml(r.error ?? "未知错误")}</div>`;
+        return;
+      }
+      imgBox.innerHTML = `<img src="${escapeHtml(r.url)}" alt="测试图" class="ig-test-pic" data-lb="${escapeHtml(r.url)}">
+        <div class="muted ig-test-meta">${r.width}×${r.height}</div>`;
+      setStatus("#ig-test-status", `✓ 出图成功（${r.width}×${r.height}）`, true);
+    } catch (e) {
+      setStatus("#ig-test-status", "失败：" + e.message, false);
+      imgBox.innerHTML = `<div class="muted">生成失败：${escapeHtml(e.message)}</div>`;
+    } finally {
+      btn.disabled = false;
+    }
   });
   // 眼睛：在「点号占位」与「已保存的密钥原文」之间切换（与文本 API 配置同一做法）
   $("#ig-nai-key-eye").addEventListener("click", async () => {
@@ -4141,6 +4180,10 @@ async function initImgGenPage() {
   });
   $("#ig-artist-add").addEventListener("click", () => openArtistEdit(null));
   $("#ig-artist-cancel").addEventListener("click", closeArtistEdit);
+  $("#ig-artist-del").addEventListener("click", () => {
+    if (artistEditing === null) return;
+    deleteArtist(artistEditing);
+  });
   $("#ig-artist-save").addEventListener("click", () => {
     const name = $("#ig-artist-name").value.trim();
     const content = $("#ig-artist-content").value.trim();
@@ -4159,31 +4202,6 @@ async function initImgGenPage() {
     closeArtistEdit();
     renderArtistsList();
     saveImgConfig();
-  });
-  $("#ig-test-go").addEventListener("click", async () => {
-    const prompt = $("#ig-test-prompt")?.value?.trim();
-    if (!prompt) return toast("先填提示词", false);
-    const f = collectImgForm();
-    setStatus("#ig-test-status", "生成中（约 30-120 秒，请耐心等待）…");
-    $("#ig-test-img").innerHTML = "";
-    const btn = $("#ig-test-go");
-    btn.disabled = true;
-    try {
-      const r = await api.send("/api/image/generate", {
-        method: "POST",
-        body: JSON.stringify({ prompt, aspect: $("#ig-test-aspect")?.value ?? "square", ...f }),
-      });
-      if (!r.ok || r.ok === false) {
-        setStatus("#ig-test-status", "生成失败：" + (r.error ?? "未知错误"), false);
-      } else {
-        setStatus("#ig-test-status", `✓ 生成完成（${r.width}×${r.height}）`, true);
-        $("#ig-test-img").innerHTML = `<img src="${r.url}" alt="测试图" data-lb="${escapeHtml(r.url)}" style="cursor:zoom-in">`;
-      }
-    } catch (e) {
-      setStatus("#ig-test-status", "生成失败：" + e.message, false);
-    } finally {
-      btn.disabled = false;
-    }
   });
   try {
     // 走缓存先填表单（公网上省掉一次 0.5-1.7s 往返）。后台刷新只更新缓存，

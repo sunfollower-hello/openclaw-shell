@@ -24,10 +24,16 @@ export interface ArtistPreset {
   content: string;
 }
 
+/** 出图尺寸：auto=由 AI 按画面内容判断（默认）；其余为固定档 */
+export type ImageAspect = "auto" | "square" | "portrait" | "landscape";
+const ASPECTS: ImageAspect[] = ["auto", "square", "portrait", "landscape"];
+
 export interface ImageConfig {
   provider: "novelai" | "openai";
   /** 图片自动清理：保留最近 N 天的正式生图（0 = 不自动清理） */
   retentionDays: number;
+  /** 出图尺寸：auto=AI 按场景自行判断，其余定死（全局，聊天出图与试生共用） */
+  aspect: ImageAspect;
   /** NovelAI 网关：站点地址固定（NAI_GATEWAY_BASE），用户只填 key 与选模型 */
   novelai: { key: string; model: string };
   openai: { baseUrl: string; key: string; model: string };
@@ -40,6 +46,7 @@ export interface ImageConfig {
 const DEFAULTS: ImageConfig = {
   provider: "novelai",
   retentionDays: 30,
+  aspect: "auto",
   novelai: { key: "", model: NAI_GATEWAY_DEFAULT_MODEL },
   openai: { baseUrl: "", key: "", model: "agnes-image-2.0-flash" },
   artists: [],
@@ -65,6 +72,7 @@ export async function getImageConfig(): Promise<ImageConfig> {
     return {
       provider: c.provider === "openai" ? "openai" : "novelai",
       retentionDays: Number(c.retentionDays) || DEFAULTS.retentionDays,
+      aspect: ASPECTS.includes(c.aspect as ImageAspect) ? (c.aspect as ImageAspect) : DEFAULTS.aspect,
       novelai: {
         key: String(c.novelai?.key ?? ""),
         model: String(c.novelai?.model ?? DEFAULTS.novelai.model) || DEFAULTS.novelai.model,

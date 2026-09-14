@@ -59,6 +59,24 @@ const NAI_NEGATIVE =
 const OAI_DEFAULT_MODEL = "agnes-image-2.0-flash";
 const OAI_FALLBACK_SIZE = "1024x1024";
 
+/**
+ * 试生用的内置提示词（配置页「测试」按钮用，用户不用自己写）。
+ * 两套写法是因为两家模型吃的输入不同：NAI 吃 Danbooru 标签，OpenAI 兼容通道吃自然语言。
+ * 画面：黑色风衣、黑长发、小猫耳发箍的可爱女生，雨夜倚在屋檐下等雨停。
+ */
+export const TEST_PROMPT_NAI =
+  "1girl, solo, cute girl, long black hair, cat ear headband, black trench coat, " +
+  "standing under eaves, leaning against wall, waiting for the rain to stop, " +
+  "rainy night, rain, wet street, night, city lights, glowing windows, reflections, " +
+  "looking at viewer, from side, upper body, detailed face, " +
+  "masterpiece, best quality, very aesthetic, absurdres";
+
+export const TEST_PROMPT_OPENAI =
+  "A cute girl with long black hair, wearing a cat-ear headband and a black trench coat, " +
+  "standing and leaning against the wall under the eaves of a building on a rainy night, " +
+  "waiting for the rain to stop. Rain falls beyond the eaves, the wet street reflects warm city lights, " +
+  "cinematic composition, moody atmosphere, soft rim light, highly detailed anime illustration.";
+
 export interface GenParams {
   prompt: string;
   negative?: string;
@@ -102,7 +120,9 @@ export async function generateImage(params: GenParams, saveDir?: string): Promis
   const cfg = params.cfg ?? (await getImageConfig());
   const prompt = String(params.prompt ?? "").trim();
   if (!prompt) return { ok: false, error: "提示词为空" };
-  const [w, h] = resolveAspect(prompt, params.aspect);
+  // 尺寸：调用方显式传的优先（如封面固定竖图），否则用全局设置；
+  // auto = 按提示词画面内容推断构图，选定了档位就定死
+  const [w, h] = resolveAspect(prompt, params.aspect ?? cfg.aspect);
 
   // 画师串只拼 NovelAI（Danbooru 标签风格；OpenAI 兼容端点吃自然语言，拼标签会污染画面——
   // 2026-09-08 用户确认分流：OpenAI 生图走纯 prompt）

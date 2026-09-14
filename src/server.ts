@@ -4014,6 +4014,7 @@ app.get("/api/image/config", async (_req, res) => {
     res.json({
       provider: cfg.provider,
       retentionDays: cfg.retentionDays,
+      aspect: cfg.aspect,
       // NovelAI 走固定网关：站点地址由后端下发（前端只展示、不可改），用户只填 key + 选模型
       novelai: { key: maskKey(cfg.novelai.key), model: cfg.novelai.model, base: NAI_GATEWAY_BASE },
       openai: { baseUrl: cfg.openai.baseUrl, key: maskKey(cfg.openai.key), model: cfg.openai.model },
@@ -4037,7 +4038,7 @@ app.get("/api/image/reveal-key", async (_req, res) => {
 
 app.post("/api/image/config", async (req, res) => {
   try {
-    const { provider, novelai, openai, artists, activeArtist, retentionDays } = req.body ?? {};
+    const { provider, novelai, openai, artists, activeArtist, retentionDays, aspect } = req.body ?? {};
     const cur = await getImageConfig();
     // 画师串列表：name/content 去空白过滤
     const nextArtists = Array.isArray(artists)
@@ -4048,6 +4049,10 @@ app.post("/api/image/config", async (req, res) => {
     const next = {
       provider: provider === "openai" ? "openai" : provider === "novelai" ? "novelai" : cur.provider,
       retentionDays: Number.isFinite(Number(retentionDays)) ? Math.max(0, Math.floor(Number(retentionDays))) : cur.retentionDays,
+      aspect:
+        aspect === "square" || aspect === "portrait" || aspect === "landscape" || aspect === "auto"
+          ? (aspect as "auto" | "square" | "portrait" | "landscape")
+          : cur.aspect,
       novelai: {
         key: novelai?.key ? String(novelai.key) : cur.novelai.key,
         // 站点地址不接受前端传值（固定在 imageConfig 常量里），只允许换模型
@@ -4072,15 +4077,18 @@ app.post("/api/image/config", async (req, res) => {
 app.post("/api/image/test", async (req, res) => {
   try {
     const { provider, novelai, openai } = req.body ?? {};
+    // 密钥用「空串也算没传」判断，不能用 ??：前端在密钥已保存时提交的是空串
+    // （输入框显示点号占位，不代表用户改了密钥），用 ?? 会导致空串被当成有效值、直接报"未填密钥"。
+    const cfg = await getImageConfig();
     if (provider === "novelai") {
-      const key = novelai?.key ?? (await getImageConfig()).novelai.key;
+      const key = String(novelai?.key ?? "").trim() || cfg.novelai.key;
       if (!key) return res.json({ ok: false, info: "未填生图密钥" });
       res.json(await testNovelaiKey(String(key)));
       return;
     }
     if (provider === "openai") {
-      const baseUrl = openai?.baseUrl ?? (await getImageConfig()).openai.baseUrl;
-      const key = openai?.key ?? (await getImageConfig()).openai.key;
+      const baseUrl = String(openai?.baseUrl ?? "").trim() || cfg.openai.baseUrl;
+      const key = String(openai?.key ?? "").trim() || cfg.openai.key;
       if (!baseUrl || !key) return res.json({ ok: false, info: "未填 Base URL / Key" });
       res.json(await testOpenAIImageKey(String(baseUrl), String(key)));
       return;
@@ -4141,10 +4149,17 @@ app.post("/api/image/generate", async (req, res) => {
       },
     };
     const saveDir = path.join(dataDir(), "images", "_test");
+    const useProvider = override.provider;
+    // 没传提示词就用内置的试生提示词：NAI 吃 Danbooru 标签、OpenAI 兼容吃自然语言，
+    // 所以两家各一套（用户在配置页点「测试」不用自己写词）
+    const { TEST_PROMPT_NAI, TEST_PROMPT_OPENAI } = await import("./core/imageGen.js");
+    const finalPrompt =
+      String(prompt ?? "").trim() || (useProvider === "openai" ? TEST_PROMPT_OPENAI : TEST_PROMPT_NAI);
     const r = await generateImage(
       {
-        prompt: String(prompt ?? ""),
+        prompt: finalPrompt,
         negative: negative ? String(negative) : undefined,
+        // 传了 aspect 用它；没传则由 generateImage 落到全局设置（cfg.aspect，默认 auto）
         aspect: aspect ? String(aspect) : undefined,
         cfg: override,
       },
