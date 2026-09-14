@@ -115,9 +115,10 @@ export async function generateImage(params: GenParams, saveDir?: string): Promis
 
   try {
     if (provider === "novelai" && cfg.novelai.key) {
-      // NovelAI 网关（Nai2API）：OpenAI 兼容的 /v1/chat/completions，
-      // 请求正文是固定字段行的纯文本，回复正文是 markdown 图片链接（要再下载一次拿图）。
-      // 采样器由模型 id 决定（<底模>:<采样器>），所以这里不单独传采样器行。
+      // 走我们自己的中转站（new-api，OpenAI 兼容）的 /v1/chat/completions。
+      // 生图模型在中转站里按次计费，请求正文是固定字段行的纯文本，
+      // 回复正文是 markdown 图片链接（要再下载一次拿图）。
+      // 采样器由模型决定，这里不单独传采样器行。
       const model = String(cfg.novelai.model || NAI_GATEWAY_DEFAULT_MODEL);
       const lines = [
         `提示词:${usedPrompt}`,
@@ -133,19 +134,19 @@ export async function generateImage(params: GenParams, saveDir?: string): Promis
         body: JSON.stringify({ model, messages: [{ role: "user", content: lines.join("\n") }] }),
         signal: AbortSignal.timeout(GEN_TIMEOUT),
       });
-      if (!r.ok) return { ok: false, error: httpError("NovelAI 网关", r.status, await r.text().catch(() => "")) };
+      if (!r.ok) return { ok: false, error: httpError("生图服务", r.status, await r.text().catch(() => "")) };
       const j = (await r.json()) as {
         choices?: { message?: { content?: string } }[];
         error?: { message?: string };
       };
-      if (j.error?.message) return { ok: false, error: "NovelAI 网关返回错误：" + j.error.message };
+      if (j.error?.message) return { ok: false, error: "生图服务返回错误：" + j.error.message };
       const content = String(j.choices?.[0]?.message?.content ?? "");
       // 先取 markdown ![](url)，取不到再退回正文里的第一个裸链接
       const imgUrl = content.match(/!\[[^\]]*\]\((https?:\/\/[^\s)]+)\)/i)?.[1]
         ?? content.match(/https?:\/\/[^\s"'<>)]+/i)?.[0]
         ?? "";
       if (!imgUrl) {
-        return { ok: false, error: "NovelAI 网关没返回图片地址：" + content.slice(0, 120) };
+        return { ok: false, error: "生图服务没返回图片地址：" + content.slice(0, 120) };
       }
       const img = await fetch(imgUrl, { signal: AbortSignal.timeout(GEN_TIMEOUT) });
       if (!img.ok) return { ok: false, error: `图片已生成但下载失败 HTTP ${img.status}` };

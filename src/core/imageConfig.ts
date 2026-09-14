@@ -4,17 +4,20 @@ import path from "node:path";
 import { dataDir } from "./cardStore.js";
 
 /**
- * NovelAI 生图走自建/指定的 Nai2API 网关（不是 NovelAI 官方 image.novelai.net）。
- * 站点地址固定在代码里（用户只填 key、选模型），换站要改这里一处。
- * 契约见网关的 OPENAI_CALLING_GUIDE.md：
- *   GET  <BASE>/v1/models              → 模型列表（id 形如 nai-diffusion-4-5-full:k_dpmpp_2m_sde）
+ * NovelAI 生图走**我们自己的中转站**（api.319274.xyz），不是 NovelAI 官方、
+ * 也不直连上游网关——上游只作为中转站背后的一个渠道存在，用户完全看不到。
+ * 这样用户填的是我们签发的密钥、用量与计价都在我们自己手里。
+ * 站点地址固定在代码里（用户只填密钥、选模型），换站改这里一处。
+ *
+ * 中转站是 new-api（OpenAI 兼容），生图模型走 chat 接口：
+ *   GET  <BASE>/v1/models              → 模型列表（我们自己的模型名，如 [次]nai-4.5）
  *   POST <BASE>/v1/chat/completions    → 出图，回复正文是 markdown 图片链接
- * 认证：Authorization: Bearer <用户密钥>
+ * 认证：Authorization: Bearer <我们签发的密钥>
  */
-export const NAI_GATEWAY_BASE = "https://nai.sta1n.cn";
-export const NAI_GATEWAY_NAME = "NovelAI 网关";
-/** 网关默认模型（V4.5 普通档 + 默认采样器，成本最低的一档） */
-export const NAI_GATEWAY_DEFAULT_MODEL = "nai-diffusion-4-5-full:k_dpmpp_2m_sde";
+export const NAI_GATEWAY_BASE = "https://api.319274.xyz";
+export const NAI_GATEWAY_NAME = "SoulBox 生图服务";
+/** 默认模型：我们中转站里对外的生图模型名（按次计费，普通档） */
+export const NAI_GATEWAY_DEFAULT_MODEL = "[次]nai-4.5";
 
 export interface ArtistPreset {
   name: string;
@@ -85,24 +88,22 @@ export function maskKey(s?: string): string {
 }
 
 /**
- * NovelAI 网关 key 校验：查网关自己的额度接口，不实际生图（不扣点）。
- * 网关的 /api/me?token=<key> 返回 { balance, enabled, ... }；
- * 注意不能用 /v1/models 验 key —— 那个接口不校验密钥，任何字符串都会返回模型列表（实测），
- * 拿它当校验会把无效 key 判成有效。
+ * 生图密钥校验：查中转站的额度接口，不实际生图（不扣费）。
+ * 中转站是 new-api，走标准的 /dashboard/billing/subscription（返回额度上限与已用量）。
+ * 实测无效 key 与空 key 都会 401，可安全用于校验。
  */
 export async function testNovelaiKey(key: string): Promise<{ ok: boolean; info: string }> {
   const k = String(key ?? "").trim();
-  if (!k) return { ok: false, info: "请先填写网关密钥" };
+  if (!k) return { ok: false, info: "请先填写生图密钥" };
   try {
-    const r = await fetch(`${NAI_GATEWAY_BASE}/api/me?token=${encodeURIComponent(k)}`, {
+    const r = await fetch(`${NAI_GATEWAY_BASE}/dashboard/billing/subscription`, {
+      headers: { Authorization: `Bearer ${k}` },
       signal: AbortSignal.timeout(15000),
     });
     if (r.ok) {
-      const j = (await r.json()) as { balance?: number; enabled?: boolean };
-      if (j.enabled === false) return { ok: false, info: "这个密钥已被禁用" };
-      const bal = Number(j.balance ?? 0);
-      // 普通档 1 点/张，直接把可出图张数算给用户看
-      return { ok: true, info: `密钥有效，剩余 ${bal} 点（普通档约可出 ${bal} 张）` };
+      const j = (await r.json()) as { hard_limit_usd?: number; system_hard_limit_usd?: number };
+      const limit = Number(j.hard_limit_usd ?? j.system_hard_limit_usd ?? 0);
+      return { ok: true, info: limit > 0 ? `密钥有效，可用额度 $${limit.toFixed(2)}` : "密钥有效" };
     }
     if (r.status === 401) return { ok: false, info: "密钥无效或已被禁用（HTTP 401）" };
     return { ok: false, info: `HTTP ${r.status}` };
@@ -111,20 +112,30 @@ export async function testNovelaiKey(key: string): Promise<{ ok: boolean; info: 
   }
 }
 
-/** 拉取网关可用模型列表（供前端下拉选择；这个接口不需要 key 也能读） */
+/**
+ * 拉取中转站可用的生图模型（供前端下拉选择）。
+ * 中转站的 /v1/models 会返回该密钥能用的**全部**模型（含聊天模型），
+ * 所以这里过滤出生图相关的：模型名里带 nai / diffusion / image 的。
+ * 注意：中转站的 /v1/models 对无效 key 会 401（与上游那个不校验的接口不同），所以必须带 key。
+ */
 export async function listNovelaiGatewayModels(
   key?: string
 ): Promise<{ ok: boolean; models: { id: string; cost?: number; tier?: string }[]; info?: string }> {
+  const k = String(key ?? "").trim();
+  if (!k) return { ok: false, models: [], info: "请先填写生图密钥（拉取模型需要密钥）" };
   try {
-    const headers: Record<string, string> = {};
-    const k = String(key ?? "").trim();
-    if (k) headers.Authorization = `Bearer ${k}`;
-    const r = await fetch(`${NAI_GATEWAY_BASE}/v1/models`, { headers, signal: AbortSignal.timeout(15000) });
-    if (!r.ok) return { ok: false, models: [], info: `HTTP ${r.status}` };
-    const j = (await r.json()) as { data?: { id?: string; cost?: number; resolution_tier?: string }[] };
-    const models = (j.data ?? [])
-      .map((m) => ({ id: String(m?.id ?? ""), cost: Number(m?.cost ?? 0), tier: String(m?.resolution_tier ?? "") }))
-      .filter((m) => m.id);
+    const r = await fetch(`${NAI_GATEWAY_BASE}/v1/models`, {
+      headers: { Authorization: `Bearer ${k}` },
+      signal: AbortSignal.timeout(15000),
+    });
+    if (!r.ok) {
+      return { ok: false, models: [], info: r.status === 401 ? "密钥无效（HTTP 401）" : `HTTP ${r.status}` };
+    }
+    const j = (await r.json()) as { data?: { id?: string }[] };
+    const all = (j.data ?? []).map((m) => String(m?.id ?? "")).filter(Boolean);
+    // 只挑生图模型：名字里含 nai / diffusion / image（中转站里也有一堆聊天模型）
+    const imageLike = all.filter((id) => /nai|diffusion|image/i.test(id));
+    const models = (imageLike.length ? imageLike : all).map((id) => ({ id }));
     return { ok: true, models };
   } catch (e) {
     return { ok: false, models: [], info: String(e) };

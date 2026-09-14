@@ -4064,7 +4064,7 @@ app.post("/api/image/test", async (req, res) => {
     const { provider, novelai, openai } = req.body ?? {};
     if (provider === "novelai") {
       const key = novelai?.key ?? (await getImageConfig()).novelai.key;
-      if (!key) return res.json({ ok: false, info: "未填网关密钥" });
+      if (!key) return res.json({ ok: false, info: "未填生图密钥" });
       res.json(await testNovelaiKey(String(key)));
       return;
     }
