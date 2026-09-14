@@ -16,7 +16,20 @@ export interface Provider {
   enabled?: boolean;
   /** 内置预设厂商标记（默认停用；用户未删除则始终补在列表尾部，新加的自定义商排在它前面） */
   builtin?: boolean;
+  /** 官方自营中转站：永远置顶（不被新增挤下去），多机器人第 3 个起强制走它 */
+  official?: boolean;
 }
+
+/**
+ * 官方中转站（自营）：永远排在列表第一位，用户新增的提供商一律插在它下面，
+ * 不像其他内置预设那样被新增挤下去。多机器人从第 3 个起强制走它（见 OFFICIAL_PROVIDER_NAME 用法）。
+ */
+export const OFFICIAL_PROVIDER_NAME = "Soul API";
+export const OFFICIAL_PROVIDER: { name: string; baseUrl: string; models: string[] } = {
+  name: OFFICIAL_PROVIDER_NAME,
+  baseUrl: "https://api.319274.xyz/v1",
+  models: [],
+};
 
 /** 内置预设厂商：默认停用，只给 name/baseUrl/预填模型，用户自己填 key 并启用 */
 export const BUILTIN_CHAT_PROVIDERS: { name: string; baseUrl: string; models: string[] }[] = [
@@ -27,6 +40,10 @@ export const BUILTIN_CHAT_PROVIDERS: { name: string; baseUrl: string; models: st
 
 function isBuiltinProvider(name: string): boolean {
   return BUILTIN_CHAT_PROVIDERS.some((b) => b.name === name);
+}
+
+export function isOfficialProvider(name: string): boolean {
+  return name === OFFICIAL_PROVIDER_NAME;
 }
 
 export interface ProvidersFile {
@@ -79,6 +96,33 @@ function ensureBuiltinProviders(data: ProvidersFile): void {
       builtin: true,
     });
   }
+  ensureOfficialFirst(data);
+}
+
+/**
+ * 官方中转站置顶：不存在就补（默认停用，等用户填 key），已存在就挪到第 0 位。
+ * 与其他内置预设的区别：它不会被用户新增的提供商挤下去，永远是列表第一个。
+ */
+function ensureOfficialFirst(data: ProvidersFile): void {
+  data.chat ??= [];
+  const i = data.chat.findIndex((p) => p.name === OFFICIAL_PROVIDER_NAME);
+  if (i < 0) {
+    if (dismissedBuiltins.has(OFFICIAL_PROVIDER_NAME)) return; // 用户本会话删过就不补回
+    data.chat.unshift({
+      name: OFFICIAL_PROVIDER.name,
+      baseUrl: OFFICIAL_PROVIDER.baseUrl,
+      apiKey: "",
+      models: [...OFFICIAL_PROVIDER.models],
+      enabled: false,
+      builtin: true,
+      official: true,
+    });
+    return;
+  }
+  const [p] = data.chat.splice(i, 1);
+  p.official = true; // 老数据补标记
+  p.builtin = true;
+  data.chat.unshift(p);
 }
 
 export async function listProviders(maskKey = true): Promise<ProvidersFile> {
@@ -132,11 +176,13 @@ export async function saveProvider(
   if (i >= 0) {
     arr[i] = entry;
   } else {
-    // 新加的自定义商排在内置预设前面（用户要求：新加的上浮，预设往下挤）
-    const firstBuiltin = arr.findIndex((x) => x.builtin === true || isBuiltinProvider(x.name));
+    // 新加的自定义商排在内置预设前面（用户要求：新加的上浮，预设往下挤），
+    // 但官方中转站永远置顶：从索引 1 起找第一个内置预设的位置插入（0 号位留给官方）
+    const firstBuiltin = arr.findIndex((x, idx) => idx > 0 && (x.builtin === true || isBuiltinProvider(x.name)));
     if (firstBuiltin >= 0) arr.splice(firstBuiltin, 0, entry);
     else arr.push(entry);
   }
+  if (type === "chat") ensureOfficialFirst(data); // 插入后再兜一次，确保官方仍在首位
   await writeProviders(data);
   if (type === "chat") await syncToOpenclaw(data);
   return entry;
@@ -162,13 +208,22 @@ export async function setProviderEnabled(type: ProviderType, name: string, enabl
   return p;
 }
 
-/** 把某个提供商移到第一位（成为默认） */
+/**
+ * 把某个提供商移到第一位（成为默认）。
+ * 官方中转站占 0 号位不动：设别的商为默认时排到它后面（索引 1），
+ * 「默认」的实际含义是「第一个启用中的商」——官方没填 key/未启用时不影响用户的默认选择。
+ */
 export async function moveProviderDefault(type: ProviderType, name: string): Promise<void> {
   const data = await listProviders(false);
   const i = data[type].findIndex((x) => x.name === name);
   if (i < 0) throw new Error(`找不到提供商 ${name}`);
   const [p] = data[type].splice(i, 1);
-  data[type].unshift(p);
+  if (type === "chat" && !isOfficialProvider(name) && data.chat.some((x) => x.name === OFFICIAL_PROVIDER_NAME)) {
+    data.chat.splice(1, 0, p); // 官方之后
+  } else {
+    data[type].unshift(p);
+  }
+  if (type === "chat") ensureOfficialFirst(data);
   await writeProviders(data);
   if (type === "chat") await syncToOpenclaw(data);
 }
@@ -235,10 +290,21 @@ export async function syncToOpenclaw(data?: ProvidersFile): Promise<void> {
  * 卡片指定的提供商若已被停用，同样回落到默认，避免聊天直接失败。
  */
 export async function resolveChatLLM(
-  card?: { model?: { provider?: string; model?: string } }
+  card?: { model?: { provider?: string; model?: string } },
+  opts?: { forceOfficial?: boolean }
 ): Promise<{ baseUrl: string; apiKey: string; model: string; provider: string } | null> {
   const d = await listProviders(false);
   const usable = d.chat.filter((x) => x.enabled !== false);
+  // 强制官方（多机器人第 3 个起）：只认官方中转站，卡片选的别的商一律忽略；
+  // 卡片指定的模型若是官方站也有的同名模型则保留，否则用官方第一个模型。
+  if (opts?.forceOfficial) {
+    const official = usable.find((x) => isOfficialProvider(x.name));
+    if (!official || !official.apiKey) return null;
+    const want = card?.model?.model;
+    const model = want && official.models.includes(want) ? want : official.models[0];
+    if (!model) return null;
+    return { baseUrl: official.baseUrl, apiKey: official.apiKey, model, provider: official.name };
+  }
   let p = card?.model?.provider ? usable.find((x) => x.name === card.model?.provider) : undefined;
   let modelId = card?.model?.model;
   if (!p) {

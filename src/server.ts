@@ -23,6 +23,12 @@ import {
   deleteProvider,
   fetchModels,
   resolveChatLLM,
+  moveProviderDefault,
+  setProviderEnabled,
+  revealApiKey,
+  syncToOpenclaw,
+  OFFICIAL_PROVIDER_NAME,
+  isOfficialProvider,
 } from "./core/providers.js";
 import { runDistill } from "./distiller/pipeline.js";
 import { parsePlainText } from "./distiller/parser.js";
@@ -694,6 +700,24 @@ app.delete("/api/cards/:slug", async (req, res) => {
  *   （包括默认的 `main`）都读这里。只写前者的话，消息落到 main 时会读到"上一次编译的别的卡"，
  *   表现就是"绑定了 A 卡，QQ 里回话的却是 B 卡"。
  */
+/**
+ * 这个机器人是否必须走官方中转站（Soul API）。
+ * 规则（用户拍板）：通道机器人按创建时间排序，**第 3 个起**强制锁定官方中转站，
+ * 不能改用其他模型商（前两个自由选）。本地网页聊天完全不受影响（它不走这里）。
+ * @param cardSlug 目标卡；该卡还没有 bot 时按"即将成为第 N 个"预判
+ */
+async function mustUseOfficialProvider(cardSlug?: string): Promise<boolean> {
+  const bots = await listBots().catch(() => []);
+  const idx = cardSlug ? bots.findIndex((b) => b.cardSlug === cardSlug) : -1;
+  // 已存在：按它在创建顺序中的位次（0/1 自由，2 起锁定）
+  if (idx >= 0) return idx >= OFFICIAL_LOCK_FROM - 1;
+  // 还没建：算上自己是第 bots.length + 1 个
+  return bots.length + 1 >= OFFICIAL_LOCK_FROM;
+}
+
+/** 从第几个机器人开始强制用官方中转站（第 1、2 个自由选商） */
+const OFFICIAL_LOCK_FROM = 3;
+
 async function compileForBot(card: PersonaCard): Promise<{ workspace: string; files: string[] }> {
   const parsed = personaCardSchema.parse(card); // 补全默认字段，避免残缺卡编译崩溃
   const out = await compileCard(parsed, agentWorkspaceDir(parsed.slug));
@@ -711,7 +735,8 @@ async function syncCardToChannel(card: PersonaCard): Promise<string> {
   const out = await compileForBot(card);
   notes.push(`已重编译 ${out.files.length} 个文件`);
   // ② 模型：卡的高级配置改了模型 → agent 模型（agents add 只写了一次，必须这里同步）
-  const llm = await resolveChatLLM(card);
+  //    第 3 个起的机器人强制官方中转站（卡里选了别的商也忽略）
+  const llm = await resolveChatLLM(card, { forceOfficial: await mustUseOfficialProvider(card.slug) });
   if (llm) {
     const model = `${llm.provider}/${llm.model}`;
     const changed = await applyAgentModel(bot.agentId, model).catch(() => false);
@@ -1275,30 +1300,39 @@ app.get("/api/bots", async (req, res) => {
     const bots = await listBots();
     const limits = { maxQq: MAX_QQ_BOTS, maxWeixin: MAX_WEIXIN_BOTS };
     // 没有实例就不必查 agent 状态，省掉 CLI 冷启动
-    if (bots.length === 0) return res.json({ bots: [], limits });
+    if (bots.length === 0) {
+      return res.json({ bots: [], limits, official: { name: OFFICIAL_PROVIDER_NAME, lockFrom: OFFICIAL_LOCK_FROM, nextLocked: false } });
+    }
     const labels = await loadAccountLabels();
     // skipStatus=1：只要实例数据不查存活（前端开面板首屏用，秒回）
+    // 官方锁定：第 3 个起（按创建顺序）强制走官方中转站，前端据此禁用模型选择
+    const official = { name: OFFICIAL_PROVIDER_NAME, lockFrom: OFFICIAL_LOCK_FROM, nextLocked: bots.length + 1 >= OFFICIAL_LOCK_FROM };
+    const withLock = (b: BotInstance, i: number) => ({ officialLocked: i >= OFFICIAL_LOCK_FROM - 1 });
     if (req.query.skipStatus === "1") {
       return res.json({
-        bots: bots.map((b) => ({
+        bots: bots.map((b, i) => ({
           ...b,
           channelLabel: CHANNEL_LABELS[b.channel],
           accountLabel: accountDisplayName(labels, b.channel, b.accountId),
           agentExists: null,
+          ...withLock(b, i),
         })),
         limits,
+        official,
       });
     }
     const { text: agentsText, ok: listOk } = await getAgentsList(req.query.refresh === "1");
     res.json({
-      bots: bots.map((b) => ({
+      bots: bots.map((b, i) => ({
         ...b,
         channelLabel: CHANNEL_LABELS[b.channel],
         accountLabel: accountDisplayName(labels, b.channel, b.accountId),
         // CLI 跑挂/超时时输出不完整，不能断言"不存在"，返回 null 表示未知
         agentExists: listOk ? new RegExp(`^-\\s+${b.agentId}(\\s|$)`, "m").test(agentsText) : null,
+        ...withLock(b, i),
       })),
       limits,
+      official,
     });
   } catch (e) {
     res.status(500).json({ error: toUserError(e) });
@@ -1367,11 +1401,18 @@ app.post("/api/bots", async (req, res) => {
     // ① 编译卡（agent 专属 workspace + 共享 workspace 兜底，见 compileForBot 注释）
     const compile = await compileForBot(card);
 
-    // ② 解析模型：卡单独配置优先，否则默认提供商
-    const llm = await resolveChatLLM(card);
+    // ② 解析模型：卡单独配置优先，否则默认提供商；第 3 个起强制官方中转站
+    const forceOfficial = await mustUseOfficialProvider(card.slug);
+    const llm = await resolveChatLLM(card, { forceOfficial });
     if (!llm) {
       await removeBot(bot.id);
       await fs.rm(agentWorkspaceDir(bot.cardSlug), { recursive: true, force: true }).catch(() => {});
+      if (forceOfficial) {
+        return res.status(400).json({
+          error: `第 ${OFFICIAL_LOCK_FROM} 个及以后的机器人必须使用「${OFFICIAL_PROVIDER_NAME}」。请先到「API 与模型」页给它填好 Key 并启用（拉取一次模型），再来创建。`,
+          officialRequired: true,
+        });
+      }
       return res.status(400).json({ error: "没有可用模型（先在 API 页配置模型提供商）" });
     }
 
@@ -1479,9 +1520,17 @@ app.post("/api/bots/transfer", async (req, res) => {
     }
     // ① 编译新卡
     const compile = await compileForBot(card);
-    // ② 解析模型
-    const llm = await resolveChatLLM(card);
-    if (!llm) return res.status(400).json({ error: "没有可用模型（先在 API 页配置模型提供商）" });
+    // ② 解析模型（换卡：位次跟着被转移的那个 bot，仍按第 3 个起强制官方）
+    const forceOfficialTransfer = await mustUseOfficialProvider(oldBot.cardSlug);
+    const llm = await resolveChatLLM(card, { forceOfficial: forceOfficialTransfer });
+    if (!llm) {
+      return res.status(400).json({
+        error: forceOfficialTransfer
+          ? `第 ${OFFICIAL_LOCK_FROM} 个及以后的机器人必须使用「${OFFICIAL_PROVIDER_NAME}」，请先在「API 与模型」页为它填 Key 并启用。`
+          : "没有可用模型（先在 API 页配置模型提供商）",
+        officialRequired: forceOfficialTransfer || undefined,
+      });
+    }
     // ③ 直写配置完成换卡（原来跑 3 条 openclaw CLI，每条冷启动 5-15s；直接改
     //    openclaw.json 的 agents.list + bindings 是毫秒级，网关会重读配置）
     const upserted = await upsertAgentEntry({
@@ -1582,11 +1631,15 @@ app.post("/api/bots/:id/recompile", async (req, res) => {
     // 卡片专属模型改了也要跟着更新：模型只在 agents add 时写过一次，
     // 不在这里同步的话用户改完模型点了"重新应用"，通道端还在用旧模型。
     let modelNote = "";
-    const llm = await resolveChatLLM(card);
+    const forceOfficialRecompile = await mustUseOfficialProvider(card.slug);
+    const llm = await resolveChatLLM(card, { forceOfficial: forceOfficialRecompile });
     if (llm) {
       const model = `${llm.provider}/${llm.model}`;
       const changed = await applyAgentModel(bot.agentId, model).catch(() => false);
       if (changed) modelNote = `，模型已切到 ${model}`;
+    } else if (forceOfficialRecompile) {
+      // 锁定官方但官方还没配好：保持原模型继续跑（不打断服务），但要如实告知
+      modelNote = `（该机器人为第 ${OFFICIAL_LOCK_FROM} 个及以后，需使用「${OFFICIAL_PROVIDER_NAME}」；它还没填 Key/拉取模型，暂时沿用原模型）`;
     }
     res.json({ ok: true, files: out.files, workspace: out.workspace, modelNote });
   } catch (e) {

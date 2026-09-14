@@ -2811,6 +2811,46 @@ async function startBotLogin(botId) {
 // ============================================================
 let advChatProviders = [];
 
+/**
+ * 通道机器人第 3 个起强制走官方中转站（Soul API）：锁死高级配置里的提供商/模型选择。
+ * 判定用 /api/bots 返回的 officialLocked（已建的按创建位次）/ official.nextLocked（还没建的预判）。
+ * 本地网页聊天不受影响——这里只锁「接 QQ/微信 的机器人」用哪个商。
+ */
+function applyAdvModelLock() {
+  const provSel = $("#adv-model-provider"), modelSel = $("#adv-model-id"), tip = $("#adv-model-lock");
+  if (!provSel || !modelSel) return;
+  const bots = botsData.bots ?? [];
+  const mine = bots.find((b) => b.cardSlug === botDialogSlug);
+  const lockFrom = botsData.official?.lockFrom ?? 3;
+  // 这张卡已有机器人 → 看它自己的位次；还没有 → 看「再建一个是否会被锁」
+  const locked = mine ? mine.officialLocked === true : botsData.official?.nextLocked === true;
+  if (!locked) {
+    provSel.disabled = false; modelSel.disabled = false;
+    if (tip) tip.style.display = "none";
+    return;
+  }
+  const name = botsData.official?.name ?? OFFICIAL_PROVIDER_NAME;
+  // 强制选中官方商并按它的模型列表刷新
+  const official = advChatProviders.find((p) => p.name === name);
+  if (official) {
+    if (![...provSel.options].some((o) => o.value === name)) {
+      provSel.insertAdjacentHTML("afterbegin", `<option value="${escapeHtml(name)}">${escapeHtml(name)}</option>`);
+    }
+    provSel.value = name;
+    const cur = modelSel.value;
+    modelSel.innerHTML = (official.models ?? []).map((m) => `<option value="${escapeHtml(m)}">${escapeHtml(m)}</option>`).join("") || `<option value=""></option>`;
+    if ((official.models ?? []).includes(cur)) modelSel.value = cur;
+  }
+  provSel.disabled = true; // 商锁死，模型仍可在官方站内部选
+  modelSel.disabled = false;
+  if (tip) {
+    tip.style.display = "";
+    tip.textContent = official
+      ? `第 ${lockFrom} 个及以后的机器人固定使用「${name}」，只能在它的模型里选。本地聊天不受此限制。`
+      : `第 ${lockFrom} 个及以后的机器人必须使用「${name}」，请先到「API 与模型」页给它填 Key、启用并拉取模型。`;
+  }
+}
+
 function closeAdvConfig() {
   if (botLoginTimer) { clearInterval(botLoginTimer); botLoginTimer = null; }
   $("#adv-overlay")?.remove();
@@ -3044,6 +3084,7 @@ async function openAdvConfig() {
         <label>提供商<select id="adv-model-provider">${provOpts}</select></label>
         <label>模型<select id="adv-model-id">${modelOpts}</select></label>
       </div>
+      <p class="hint" id="adv-model-lock" style="display:none"></p>
     </div>
 
     <div class="adv-sec">
@@ -3099,6 +3140,7 @@ async function openAdvConfig() {
   ov.addEventListener("click", (e) => { if (e.target === ov) closeAdvConfig(); });
   $("#adv-close").addEventListener("click", closeAdvConfig);
   renderBotBody(bot ?? null);
+  applyAdvModelLock(); // 第 3 个起的机器人：模型锁定官方中转站
   // 底部「连接 / 创建」：只在账号选了「新建」档时出现（其它情况用「保存配置」就能换绑）
   $("#adv-create").addEventListener("click", () => $("#bot-create")?.click());
   syncAdvCreateBtn();
@@ -3109,6 +3151,7 @@ async function openAdvConfig() {
       botsData = full;
       const fresh = (full.bots ?? []).find((b) => b.cardSlug === botDialogSlug);
       if (fresh && !botLoginTimer) renderBotBody(fresh); // 正在扫码时不要重绘掉二维码
+      applyAdvModelLock();
     }).catch(() => {});
   }
 
@@ -3813,8 +3856,14 @@ function providerBrand(name) {
   return null;
 }
 
-/** 列表左侧的提供商头像：知名厂商=品牌色淡底 + 官方 logo；自定义=名字首字 */
+/** 官方自营中转站名（与后端 OFFICIAL_PROVIDER_NAME 一致；永远置顶、多机器人第 3 个起强制用它） */
+const OFFICIAL_PROVIDER_NAME = "Soul API";
+
+/** 列表左侧的提供商头像：官方站=站点 logo；知名厂商=品牌色淡底 + 官方 logo；自定义=名字首字 */
 function providerAvatarHTML(name) {
+  if (name === OFFICIAL_PROVIDER_NAME) {
+    return `<span class="prov-avatar prov-avatar-img"><img src="assets/soul-api.png" alt="Soul API"></span>`;
+  }
   const b = providerBrand(name);
   if (b) {
     const inner = b.stroke
@@ -4163,6 +4212,7 @@ function paintProvList() {
       <div class="prov-head">
         ${providerAvatarHTML(p.name)}
         <b>${escapeHtml(p.name)}</b>
+        ${p.name === OFFICIAL_PROVIDER_NAME ? '<span class="chip ok">官方</span>' : ""}
         ${isDefault ? '<span class="chip ok">默认</span>' : ""}
         <span class="prov-btns">
           <button class="ghost small-btn" data-act="edit" data-name="${escapeHtml(p.name)}">编辑</button>

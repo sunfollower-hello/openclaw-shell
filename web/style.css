@@ -656,6 +656,9 @@ button:disabled { opacity: 0.4; cursor: not-allowed; transform: none; }
 }
 .prov-avatar svg { width: 19px; height: 19px; }
 .prov-avatar-text { background: var(--panel); color: var(--muted); }
+/* 官方站头像：站点 logo 图片铺满圆角方块 */
+.prov-avatar-img { background: #fff; overflow: hidden; border: 1px solid var(--border); }
+.prov-avatar-img img { width: 100%; height: 100%; object-fit: cover; display: block; }
 .prov-item.disabled .prov-avatar { opacity: 0.6; }
 .prov-btns { margin-left: auto; display: flex; gap: 6px; flex-wrap: wrap; }
 .model-chips { display: flex; flex-wrap: wrap; gap: 7px; }
