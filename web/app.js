@@ -3748,9 +3748,18 @@ function renderImgGenPage() {
           <button type="button" class="cap-toggle" data-provider="openai">OpenAI</button>
         </div>
         <div id="ig-pane-novelai" class="ig-pane">
-          
-          <label>API Key（留空 = 保留原值）</label>
-          <input id="ig-nai-key" type="password" placeholder="NovelAI 官方 key（pst-… 开头）">
+          <label>服务地址（固定，不可修改）</label>
+          <input id="ig-nai-base" value="https://nai.sta1n.cn" readonly disabled
+                 style="background:var(--panel);color:var(--muted);cursor:not-allowed">
+          <label style="margin-top:8px">网关密钥（留空 = 保留原值）</label>
+          <input id="ig-nai-key" type="password" placeholder="网关密钥（STA1N-… 开头）">
+          <label style="margin-top:8px">生图模型</label>
+          <div class="row">
+            <select id="ig-nai-model" style="flex:1;min-width:200px"><option value="">（点右边拉取模型）</option></select>
+            <button id="ig-nai-models" class="ghost small-btn">拉取模型</button>
+          </div>
+          <p class="hint">模型名格式是「底模:采样器」，普通档最便宜（1 点/张），带 [2K]/[4K] 前缀的更贵。</p>
+          <div id="ig-nai-models-status" class="status"></div>
           <div class="artists-box" style="margin-top:10px">
             <label>画师串（仅 NovelAI 生效：生成时自动拼到提示词末尾；OpenAI 兼容生图走纯提示词不拼。可以存多条，点右边「启用」切换；再点一下取消，取消后就不拼）</label>
             <div id="ig-artists-list"></div>
@@ -3912,7 +3921,8 @@ function collectImgForm() {
   const v = (id) => { const el = $(id); return el ? el.value.trim() : ""; };
   return {
     provider: igRadio(),
-    novelai: { key: v("#ig-nai-key") },
+    // 站点地址不提交（后端固定），只交 key 与所选模型
+    novelai: { key: v("#ig-nai-key"), model: v("#ig-nai-model") },
     openai: { baseUrl: v("#ig-oai-url"), key: v("#ig-oai-key"), model: v("#ig-oai-model") },
     artists: imgState.artists,
     activeArtist: imgState.activeArtist,
@@ -3921,6 +3931,19 @@ function collectImgForm() {
 function fillImgForm(cfg) {
   setIgProvider(cfg.provider);
   if ($("#ig-nai-key")) $("#ig-nai-key").value = "";
+  // 网关地址由后端下发（只读展示，防止用户以为能改成别的站）
+  if ($("#ig-nai-base") && cfg.novelai?.base) $("#ig-nai-base").value = cfg.novelai.base;
+  // 已保存的网关模型：不在下拉里就补一个选项，保证能显示当前值
+  if ($("#ig-nai-model")) {
+    const sel = $("#ig-nai-model");
+    const cur = cfg.novelai?.model ?? "";
+    if (cur) {
+      if (!Array.from(sel.options).some((o) => o.value === cur)) {
+        sel.innerHTML = `<option value="${escapeHtml(cur)}">${escapeHtml(cur)}</option>`;
+      }
+      sel.value = cur;
+    }
+  }
   if ($("#ig-oai-url")) $("#ig-oai-url").value = cfg.openai?.baseUrl ?? "";
   if ($("#ig-oai-key")) $("#ig-oai-key").value = "";
   if ($("#ig-oai-model")) {
@@ -3939,7 +3962,7 @@ function fillImgForm(cfg) {
   imgState.activeArtist = cfg.activeArtist ?? "";
   renderArtistsList();
   // 已设置密钥的输入框用点提示（留空保存 = 保留原值），避免用户以为密钥丢了
-  if ($("#ig-nai-key")) $("#ig-nai-key").placeholder = cfg.novelai?.key ? "•••••• 已设置（留空保留）" : "sk-...";
+  if ($("#ig-nai-key")) $("#ig-nai-key").placeholder = cfg.novelai?.key ? "•••••• 已设置（留空保留）" : "STA1N-...";
   if ($("#ig-oai-key")) $("#ig-oai-key").placeholder = cfg.openai?.key ? "•••••• 已设置（留空保留）" : "sk-...";
 }
 function renderArtistsList() {
@@ -4014,6 +4037,37 @@ async function initImgGenPage() {
   document.querySelectorAll(".cap-toggle[data-provider]").forEach((b) =>
     b.addEventListener("click", () => setIgProvider(b.dataset.provider))
   );
+  // NovelAI 网关模型：站点固定，模型让用户挑（普通档 1 点最便宜，2K/4K 更贵，下拉里标出来）
+  $("#ig-nai-models").addEventListener("click", async () => {
+    const key = $("#ig-nai-key")?.value?.trim();
+    setStatus("#ig-nai-models-status", "拉取中…");
+    try {
+      const r = await api.send("/api/image/nai-models", {
+        method: "POST",
+        body: JSON.stringify({ key: key || undefined }),
+      });
+      if (r.error) { setStatus("#ig-nai-models-status", "拉取失败：" + r.error, false); return; }
+      const models = r.models ?? [];
+      if (!models.length) { setStatus("#ig-nai-models-status", "网关没返回模型", false); return; }
+      const sel = $("#ig-nai-model");
+      const cur = sel.value || "";
+      // 普通档排前面（最便宜），2K/4K 往后；标注点数便于判断成本
+      const order = { standard: 0, "2K": 1, "4K": 2 };
+      const sorted = [...models].sort(
+        (a, b) => (order[a.tier] ?? 9) - (order[b.tier] ?? 9) || a.id.localeCompare(b.id)
+      );
+      sel.innerHTML = sorted
+        .map((m) => {
+          const tag = m.cost ? `（${m.cost} 点${m.tier && m.tier !== "standard" ? " · " + m.tier : ""}）` : "";
+          return `<option value="${escapeHtml(m.id)}">${escapeHtml(m.id)}${tag}</option>`;
+        })
+        .join("");
+      if (cur && sorted.some((m) => m.id === cur)) sel.value = cur;
+      setStatus("#ig-nai-models-status", `✓ 拉取到 ${models.length} 个模型${cur ? "，已保留原选择" : ""}`, true);
+    } catch (e) {
+      setStatus("#ig-nai-models-status", "拉取失败：" + e.message, false);
+    }
+  });
   $("#ig-oai-models").addEventListener("click", async () => {
     const baseUrl = $("#ig-oai-url")?.value?.trim();
     const key = $("#ig-oai-key")?.value?.trim();

@@ -3,7 +3,12 @@
 // 三档比例（NAI 标准普通分辨率）：方 1024x1024 / 竖 832x1216 / 横 1216x832
 import { promises as fs } from "node:fs";
 import path from "node:path";
-import { getImageConfig, type ImageConfig } from "./imageConfig.js";
+import {
+  getImageConfig,
+  NAI_GATEWAY_BASE,
+  NAI_GATEWAY_DEFAULT_MODEL,
+  type ImageConfig,
+} from "./imageConfig.js";
 
 export const ASPECT_SIZES: Record<string, [number, number]> = {
   square: [1024, 1024],
@@ -23,13 +28,23 @@ export function resolveAspect(prompt: string, aspect?: string): [number, number]
   return ASPECT_SIZES.square;
 }
 
-// NovelAI 固定默认参数（不对用户开放；对齐 RP-Hub：steps 40 / scale 6 / k_dpmpp_2m_sde / karras）
-const NAI_MODEL = "nai-diffusion-4-5-full";
-const NAI_STEPS = 40;
-const NAI_SCALE = 6;
-const NAI_SAMPLER = "k_dpmpp_2m_sde";
-const NAI_NOISE_SCHEDULE = "karras";
-const NAI_UC_PRESET = 2; // heavy
+// NovelAI 网关（Nai2API）固定默认参数（不对用户开放）。
+// 采样器跟随所选模型（模型 id 形如 <底模>:<采样器>），这里只定引导值等。
+const NAI_SCALE = 6;   // 提示词引导值
+const NAI_CFG = 0;     // 缩放引导值（rescale）
+// 网关按「竖图 / 横图 / 方图」三档收尺寸，不接受像素值；像素由网关按档位决定：
+// 竖 832x1216 / 横 1216x832 / 方 1024x1024（普通档）
+const NAI_SIZE_LABEL: Record<string, string> = {
+  portrait: "竖图",
+  landscape: "横图",
+  square: "方图",
+};
+/** 像素尺寸 → 网关的中文档位标签 */
+function naiSizeLabel(w: number, h: number): string {
+  if (h > w) return NAI_SIZE_LABEL.portrait;
+  if (w > h) return NAI_SIZE_LABEL.landscape;
+  return NAI_SIZE_LABEL.square;
+}
 // 负面提示词：由用户两套常用负面合并去重而来（保留 NAI 权重语法）
 const NAI_NEGATIVE =
   "worst quality, bad quality, low quality, lowres, blurry, jpeg artifacts, film grain, scan artifacts, chromatic aberration, dithering, disorganized colors, unfinished, incomplete, sloppiness, cheesy, artistic error, " +
@@ -100,32 +115,44 @@ export async function generateImage(params: GenParams, saveDir?: string): Promis
 
   try {
     if (provider === "novelai" && cfg.novelai.key) {
-      const r = await fetch("https://image.novelai.net/ai/generate-image", {
+      // NovelAI 网关（Nai2API）：OpenAI 兼容的 /v1/chat/completions，
+      // 请求正文是固定字段行的纯文本，回复正文是 markdown 图片链接（要再下载一次拿图）。
+      // 采样器由模型 id 决定（<底模>:<采样器>），所以这里不单独传采样器行。
+      const model = String(cfg.novelai.model || NAI_GATEWAY_DEFAULT_MODEL);
+      const lines = [
+        `提示词:${usedPrompt}`,
+        `画师串:`, // 画师串已拼进提示词，这里留空避免重复
+        `尺寸:${naiSizeLabel(w, h)}`,
+        `提示词引导值:${NAI_SCALE}`,
+        `缩放引导值:${NAI_CFG}`,
+        `负面提示词:${String(params.negative ?? NAI_NEGATIVE)}`,
+      ];
+      const r = await fetch(`${NAI_GATEWAY_BASE}/v1/chat/completions`, {
         method: "POST",
         headers: { Authorization: `Bearer ${cfg.novelai.key}`, "Content-Type": "application/json" },
-        body: JSON.stringify({
-          input: usedPrompt,
-          model: NAI_MODEL,
-          action: "generate",
-          parameters: {
-            width: w,
-            height: h,
-            scale: NAI_SCALE,
-            negative_prompt: String(params.negative ?? NAI_NEGATIVE),
-            steps: NAI_STEPS,
-            sampler: NAI_SAMPLER,
-            seed: params.seed ?? 0,
-            n_samples: 1,
-            noise_schedule: NAI_NOISE_SCHEDULE,
-            ucPreset: NAI_UC_PRESET,
-          },
-        }),
+        body: JSON.stringify({ model, messages: [{ role: "user", content: lines.join("\n") }] }),
         signal: AbortSignal.timeout(GEN_TIMEOUT),
       });
-      if (!r.ok) return { ok: false, error: httpError("NovelAI", r.status, await r.text().catch(() => "")) };
-      const ct = r.headers.get("content-type") ?? "";
+      if (!r.ok) return { ok: false, error: httpError("NovelAI 网关", r.status, await r.text().catch(() => "")) };
+      const j = (await r.json()) as {
+        choices?: { message?: { content?: string } }[];
+        error?: { message?: string };
+      };
+      if (j.error?.message) return { ok: false, error: "NovelAI 网关返回错误：" + j.error.message };
+      const content = String(j.choices?.[0]?.message?.content ?? "");
+      // 先取 markdown ![](url)，取不到再退回正文里的第一个裸链接
+      const imgUrl = content.match(/!\[[^\]]*\]\((https?:\/\/[^\s)]+)\)/i)?.[1]
+        ?? content.match(/https?:\/\/[^\s"'<>)]+/i)?.[0]
+        ?? "";
+      if (!imgUrl) {
+        return { ok: false, error: "NovelAI 网关没返回图片地址：" + content.slice(0, 120) };
+      }
+      const img = await fetch(imgUrl, { signal: AbortSignal.timeout(GEN_TIMEOUT) });
+      if (!img.ok) return { ok: false, error: `图片已生成但下载失败 HTTP ${img.status}` };
+      const ct = img.headers.get("content-type") ?? "";
       if (/jpeg|jpg/i.test(ct)) mimeType = "image/jpeg";
-      buf = Buffer.from(await r.arrayBuffer());
+      else if (/webp/i.test(ct)) mimeType = "image/webp";
+      buf = Buffer.from(await img.arrayBuffer());
     } else if (provider === "openai" && cfg.openai.baseUrl && cfg.openai.key) {
       const size = `${w}x${h}`;
       // 不带 response_format：部分兼容端点（如 agnes t2i）不支持 b64_json 参数，

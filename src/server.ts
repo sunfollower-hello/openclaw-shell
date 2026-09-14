@@ -67,7 +67,15 @@ import { queryLogs, clearLogs, logInfo, logWarn, logError } from "./core/logger.
 import { parseUsage, recordLlmUsage, summarizeLlmUsage } from "./core/llmUsage.js";
 import { cardToCCv2, ccv2ToCard } from "./core/cardConvert.js";
 import { solidPng, pngWithTexts, extractCardJson, pngStripCardMeta, isPng } from "./core/png.js";
-import { getImageConfig, saveImageConfig, maskKey, testNovelaiKey, testOpenAIImageKey } from "./core/imageConfig.js";
+import {
+  getImageConfig,
+  saveImageConfig,
+  maskKey,
+  testNovelaiKey,
+  testOpenAIImageKey,
+  listNovelaiGatewayModels,
+  NAI_GATEWAY_BASE,
+} from "./core/imageConfig.js";
 import { coversDir, saveCover, readCover, normalizeAvatar } from "./core/covers.js";
 import {
   getTtsConfig,
@@ -4006,7 +4014,8 @@ app.get("/api/image/config", async (_req, res) => {
     res.json({
       provider: cfg.provider,
       retentionDays: cfg.retentionDays,
-      novelai: { key: maskKey(cfg.novelai.key) },
+      // NovelAI 走固定网关：站点地址由后端下发（前端只展示、不可改），用户只填 key + 选模型
+      novelai: { key: maskKey(cfg.novelai.key), model: cfg.novelai.model, base: NAI_GATEWAY_BASE },
       openai: { baseUrl: cfg.openai.baseUrl, key: maskKey(cfg.openai.key), model: cfg.openai.model },
       artists: cfg.artists,
       activeArtist: cfg.activeArtist,
@@ -4029,7 +4038,11 @@ app.post("/api/image/config", async (req, res) => {
     const next = {
       provider: provider === "openai" ? "openai" : provider === "novelai" ? "novelai" : cur.provider,
       retentionDays: Number.isFinite(Number(retentionDays)) ? Math.max(0, Math.floor(Number(retentionDays))) : cur.retentionDays,
-      novelai: { key: novelai?.key ? String(novelai.key) : cur.novelai.key },
+      novelai: {
+        key: novelai?.key ? String(novelai.key) : cur.novelai.key,
+        // 站点地址不接受前端传值（固定在 imageConfig 常量里），只允许换模型
+        model: novelai?.model !== undefined && String(novelai.model).trim() ? String(novelai.model).trim() : cur.novelai.model,
+      },
       openai: {
         baseUrl: openai?.baseUrl !== undefined ? String(openai.baseUrl) : cur.openai.baseUrl,
         key: openai?.key ? String(openai.key) : cur.openai.key,
@@ -4051,7 +4064,7 @@ app.post("/api/image/test", async (req, res) => {
     const { provider, novelai, openai } = req.body ?? {};
     if (provider === "novelai") {
       const key = novelai?.key ?? (await getImageConfig()).novelai.key;
-      if (!key) return res.json({ ok: false, info: "未填 NovelAI Key" });
+      if (!key) return res.json({ ok: false, info: "未填网关密钥" });
       res.json(await testNovelaiKey(String(key)));
       return;
     }
@@ -4082,6 +4095,18 @@ app.post("/api/image/openai-models", async (req, res) => {
   }
 });
 
+// 拉取 NovelAI 网关可用模型（站点固定，模型让用户选；网关的 /v1/models 不需要 key 也能读）
+app.post("/api/image/nai-models", async (req, res) => {
+  try {
+    const key = req.body?.key ?? (await getImageConfig()).novelai.key;
+    const r = await listNovelaiGatewayModels(key ? String(key) : "");
+    if (!r.ok) return res.json({ error: r.info || "拉取模型失败", models: [] });
+    res.json({ models: r.models, base: NAI_GATEWAY_BASE });
+  } catch (e) {
+    res.status(400).json({ error: toUserError(e) });
+  }
+});
+
 // 真实生成一张测试图（保存到 data/images/_test/），配置页「试生一张」用
 app.post("/api/image/generate", async (req, res) => {
   try {
@@ -4096,6 +4121,7 @@ app.post("/api/image/generate", async (req, res) => {
       novelai: {
         ...cfg.novelai,
         key: novelai?.key ? String(novelai.key) : cfg.novelai.key,
+        model: novelai?.model !== undefined && String(novelai.model).trim() ? String(novelai.model).trim() : cfg.novelai.model,
       },
       openai: {
         ...cfg.openai,
