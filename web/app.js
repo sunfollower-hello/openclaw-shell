@@ -3748,24 +3748,28 @@ function renderImgGenPage() {
           <button type="button" class="cap-toggle" data-provider="openai">OpenAI</button>
         </div>
         <div id="ig-pane-novelai" class="ig-pane">
-          <label>服务地址（固定，不可修改）</label>
+          <label>服务地址</label>
           <input id="ig-nai-base" readonly disabled
                  style="background:var(--panel);color:var(--muted);cursor:not-allowed">
-          <label style="margin-top:8px">生图密钥（留空 = 保留原值）</label>
-          <input id="ig-nai-key" type="password" placeholder="sk-…">
-          <label style="margin-top:8px">生图模型</label>
+          <label style="margin-top:10px">API Key</label>
+          <div class="pv-key-row">
+            <input id="ig-nai-key" type="text" placeholder="sk-..." autocomplete="off" spellcheck="false">
+            <button type="button" id="ig-nai-key-eye" class="pv-eye-btn" title="显示 / 隐藏密钥">
+              <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
+            </button>
+          </div>
+          <label style="margin-top:10px">生图模型</label>
           <div class="row">
             <select id="ig-nai-model" style="flex:1;min-width:200px"><option value="">（点右边拉取模型）</option></select>
             <button id="ig-nai-models" class="ghost small-btn">拉取模型</button>
           </div>
-          <p class="hint">填好密钥后点「拉取模型」，选一个生图模型即可。</p>
           <div id="ig-nai-models-status" class="status"></div>
-          <div class="artists-box" style="margin-top:10px">
-            <label>画师串（仅 NovelAI 生效：生成时自动拼到提示词末尾；OpenAI 兼容生图走纯提示词不拼。可以存多条，点右边「启用」切换；再点一下取消，取消后就不拼）</label>
+          <div class="artists-box" style="margin-top:12px">
+            <label>画师串</label>
             <div id="ig-artists-list"></div>
             <button id="ig-artist-add" class="ghost small-btn" style="margin-top:6px">${icon("plus")} 添加画师串</button>
             <div id="ig-artist-edit" style="display:none;margin-top:6px;border:1px dashed var(--border);border-radius:8px;padding:8px">
-              <input id="ig-artist-name" placeholder="画师串名称（如：默认画风）">
+              <input id="ig-artist-name" placeholder="名称（如：默认画风）">
               <textarea id="ig-artist-content" rows="2" style="margin-top:6px" placeholder="画师串内容，如 masterpiece, best quality, [artist:ciloranko], ..."></textarea>
               <div class="row" style="margin-top:6px">
                 <button id="ig-artist-save" class="small-btn primary">保存</button>
@@ -3902,7 +3906,7 @@ function initImagegen() { initImgGenPage(); }
 function igRadio() {
   return document.querySelector(".cap-toggle[data-provider].on")?.dataset?.provider ?? "novelai";
 }
-let imgState = { artists: [], activeArtist: "" };
+let imgState = { artists: [], activeArtist: "", originalKey: "", keyRevealed: false };
 let artistEditing = null; // 正在编辑的画师串下标（null = 新增）
 
 function showIgPane(provider) {
@@ -3921,8 +3925,12 @@ function collectImgForm() {
   const v = (id) => { const el = $(id); return el ? el.value.trim() : ""; };
   return {
     provider: igRadio(),
-    // 站点地址不提交（后端固定），只交 key 与所选模型
-    novelai: { key: v("#ig-nai-key"), model: v("#ig-nai-model") },
+    // 服务地址不提交（后端固定）；密钥：占位点号或留空 = 不传（后端沿用原值），
+    // 只有真实输入才会改密钥——与文本 API 的收集口径一致
+    novelai: {
+      key: (() => { const s = v("#ig-nai-key"); return s && s !== PV_KEY_DOTS ? s : ""; })(),
+      model: v("#ig-nai-model"),
+    },
     openai: { baseUrl: v("#ig-oai-url"), key: v("#ig-oai-key"), model: v("#ig-oai-model") },
     artists: imgState.artists,
     activeArtist: imgState.activeArtist,
@@ -3930,9 +3938,17 @@ function collectImgForm() {
 }
 function fillImgForm(cfg) {
   setIgProvider(cfg.provider);
-  if ($("#ig-nai-key")) $("#ig-nai-key").value = "";
-  // 网关地址由后端下发（只读展示，防止用户以为能改成别的站）
+  // 服务地址由后端下发（只读展示，防止用户以为能改成别的站）
   if ($("#ig-nai-base") && cfg.novelai?.base) $("#ig-nai-base").value = cfg.novelai.base;
+  // 密钥：与文本 API 配置同一做法——已保存的用点号占位，点眼睛时再去后端取原文；
+  // 不搞「留空=保留原值」那套（用户明确要求去掉）。
+  // 注意 originalKey 初始必须是空串（表示"还不知道原文"），不能存点号，
+  // 否则眼睛会误判成"没有原文"而直接清空输入框（实测踩到）。
+  if ($("#ig-nai-key")) {
+    imgState.keyRevealed = false;
+    imgState.originalKey = "";
+    $("#ig-nai-key").value = cfg.novelai?.key ? PV_KEY_DOTS : "";
+  }
   // 已保存的网关模型：不在下拉里就补一个选项，保证能显示当前值
   if ($("#ig-nai-model")) {
     const sel = $("#ig-nai-model");
@@ -3961,36 +3977,32 @@ function fillImgForm(cfg) {
   imgState.artists = (cfg.artists ?? []).map((a) => ({ name: a.name, content: a.content }));
   imgState.activeArtist = cfg.activeArtist ?? "";
   renderArtistsList();
-  // 已设置密钥的输入框用点提示（留空保存 = 保留原值），避免用户以为密钥丢了
-  if ($("#ig-nai-key")) $("#ig-nai-key").placeholder = cfg.novelai?.key ? "•••••• 已设置（留空保留）" : "STA1N-...";
   if ($("#ig-oai-key")) $("#ig-oai-key").placeholder = cfg.openai?.key ? "•••••• 已设置（留空保留）" : "sk-...";
 }
 function renderArtistsList() {
   const box = $("#ig-artists-list");
   if (!box) return;
   if (!imgState.artists.length) {
-    box.innerHTML = `<div class="muted">还没有画师串。添加一个后，生成图片时会自动拼到提示词末尾。</div>`;
+    box.innerHTML = `<div class="muted">还没有画师串</div>`;
     return;
   }
+  // 一行一个：只显示名称（点名称=选中，高亮表示生效），右侧 编辑 / 删除。
+  // 内容改动全部在「编辑」里做，所以列表不再显示内容预览，也没有单独的启用键。
   box.innerHTML = imgState.artists
     .map((a, i) => {
       const on = a.name === imgState.activeArtist;
       return `
-    <div class="artist-item">
-      <div class="artist-main">
-        <div class="artist-name">${escapeHtml(a.name)}${on ? ' <span class="mem-badge">生效中</span>' : ""}</div>
-        <div class="artist-content">${escapeHtml(a.content.slice(0, 90))}${a.content.length > 90 ? "…" : ""}</div>
-      </div>
-      <button class="${on ? "primary" : "ghost"} small-btn" data-toggle="${i}" title="${on ? "点一下停用" : "点一下启用"}">${on ? "已启用" : "启用"}</button>
+    <div class="artist-item${on ? " on" : ""}">
+      <button type="button" class="artist-name-btn" data-pick="${i}" title="${on ? "点一下取消选用" : "点一下选用这个画师串"}">${escapeHtml(a.name)}</button>
       <button class="ghost small-btn" data-edit="${i}">编辑</button>
       <button class="danger small-btn" data-del="${i}">删除</button>
     </div>`;
     })
     .join("");
-  // 启用/停用：点已生效的那条就取消（都不启用时生成不拼画师串）；换别的等于切换
-  box.querySelectorAll("[data-toggle]").forEach((b) =>
+  // 点名称 = 选用（只能选一个；再点已选中的取消 = 生成时不拼画师串）
+  box.querySelectorAll("[data-pick]").forEach((b) =>
     b.addEventListener("click", () => {
-      const a = imgState.artists[Number(b.dataset.toggle)];
+      const a = imgState.artists[Number(b.dataset.pick)];
       if (!a) return;
       imgState.activeArtist = imgState.activeArtist === a.name ? "" : a.name;
       renderArtistsList();
@@ -4096,6 +4108,36 @@ async function initImgGenPage() {
     setStatus("#ig-status", "测试中…");
     const r = await api.send("/api/image/test", { method: "POST", body: JSON.stringify(f) });
     setStatus("#ig-status", r.info ?? "无返回", r.ok);
+  });
+  // 眼睛：在「点号占位」与「已保存的密钥原文」之间切换（与文本 API 配置同一做法）
+  $("#ig-nai-key-eye").addEventListener("click", async () => {
+    const input = $("#ig-nai-key");
+    if (!input) return;
+    if (imgState.keyRevealed) {
+      input.value = imgState.originalKey ? PV_KEY_DOTS : "";
+      imgState.keyRevealed = false;
+      return;
+    }
+    if (!imgState.originalKey) {
+      // 还没保存过密钥（或刚清空）：先问后端要一次真实值
+      try {
+        const r = await api.get("/api/image/reveal-key");
+        if (r.key) imgState.originalKey = r.key;
+      } catch { /* 取不到就当没有 */ }
+    }
+    if (!imgState.originalKey || imgState.originalKey === PV_KEY_DOTS) {
+      input.value = "";
+      imgState.keyRevealed = true; // 允许直接输入
+      input.focus();
+      return;
+    }
+    input.value = imgState.originalKey;
+    imgState.keyRevealed = true;
+  });
+  // 手输密钥后同步缓存，避免下一次点眼睛又去后端取（也避免把点号当原文）
+  $("#ig-nai-key").addEventListener("input", () => {
+    const v = $("#ig-nai-key").value.trim();
+    if (v && v !== PV_KEY_DOTS) { imgState.originalKey = v; imgState.keyRevealed = true; }
   });
   $("#ig-artist-add").addEventListener("click", () => openArtistEdit(null));
   $("#ig-artist-cancel").addEventListener("click", closeArtistEdit);

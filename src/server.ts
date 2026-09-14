@@ -4025,6 +4025,16 @@ app.get("/api/image/config", async (_req, res) => {
   }
 });
 
+// 查看生图密钥原文（前端点「眼睛」时调；与文本 API 的 reveal-key 同一做法）
+app.get("/api/image/reveal-key", async (_req, res) => {
+  try {
+    const cfg = await getImageConfig();
+    res.json({ key: cfg.novelai.key ?? "" });
+  } catch (e) {
+    res.status(500).json({ error: toUserError(e) });
+  }
+});
+
 app.post("/api/image/config", async (req, res) => {
   try {
     const { provider, novelai, openai, artists, activeArtist, retentionDays } = req.body ?? {};

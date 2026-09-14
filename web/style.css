@@ -1328,6 +1328,20 @@ button:disabled { opacity: 0.4; cursor: not-allowed; transform: none; }
 .artist-item:last-child { border-bottom: 0; }
 .artist-main { flex: 1; min-width: 0; }
 .artist-name { font-weight: 600; font-size: 13px; }
+/* 一行一个：只显示名称，点名称=选用（高亮=生效中），右侧只有 编辑 / 删除 */
+.artist-item .artist-name-btn {
+  flex: 1; min-width: 0; text-align: left;
+  padding: 6px 10px; border-radius: 8px;
+  border: 1px solid var(--border); background: var(--card); color: var(--text);
+  font-size: 13px; font-weight: 600; cursor: pointer;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  transition: border-color 0.15s, background 0.15s, color 0.15s;
+}
+.artist-item .artist-name-btn:hover { border-color: var(--accent); color: var(--accent); }
+/* 生效中的画师串整行高亮 */
+.artist-item.on { background: var(--accent-soft); border-radius: 8px; padding-left: 6px; padding-right: 6px; }
+.artist-item.on .artist-name-btn { background: var(--accent); border-color: var(--accent); color: #fff; }
+.artist-item.on .artist-name-btn:hover { background: var(--accent-dark); border-color: var(--accent-dark); color: #fff; }
 .artist-content {
   color: var(--muted); font-size: 12px; margin-top: 2px;
   /* 长画师串只显示一行，超出省略——不加这个会被逐字符折行糊成一列 */
