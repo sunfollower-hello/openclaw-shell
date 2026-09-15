@@ -3868,10 +3868,11 @@ function providerBrand(name) {
 /** 官方自营中转站名（与后端 OFFICIAL_PROVIDER_NAME 一致；永远置顶、多机器人第 3 个起强制用它） */
 const OFFICIAL_PROVIDER_NAME = "Soul API";
 
-/** 列表左侧的提供商头像：官方站=站点 logo；知名厂商=品牌色淡底 + 官方 logo；自定义=名字首字 */
+/** 列表左侧的提供商头像：官方站/soulAPI=用户指定图；知名厂商=品牌色淡底 + 官方 logo；自定义=名字首字 */
 function providerAvatarHTML(name) {
-  if (name === OFFICIAL_PROVIDER_NAME) {
-    return `<span class="prov-avatar prov-avatar-img"><img src="assets/soul-api.png" alt="Soul API"></span>`;
+  // 官方自营站（Soul API）与用户自建的 soulAPI：都用用户指定的图标
+  if (name === OFFICIAL_PROVIDER_NAME || /^soul[_ -]?api$/i.test(String(name ?? "").trim())) {
+    return `<span class="prov-avatar prov-avatar-img"><img src="assets/soulapi.jpg" alt="soulAPI"></span>`;
   }
   const b = providerBrand(name);
   if (b) {
@@ -3982,7 +3983,8 @@ function fillImgForm(cfg) {
       sel.value = cfg.openai.model;
     }
   }
-  imgState.artists = (cfg.artists ?? []).map((a) => ({ name: a.name, content: a.content }));
+  // builtin 标记必须一起拷：丢了它内置串就会渲染成普通可编辑行（实测踩到）
+  imgState.artists = (cfg.artists ?? []).map((a) => ({ name: a.name, content: a.content, builtin: a.builtin === true }));
   imgState.activeArtist = cfg.activeArtist ?? "";
   renderArtistsList();
   if ($("#ig-oai-key")) $("#ig-oai-key").placeholder = cfg.openai?.key ? "•••••• 已设置（留空保留）" : "sk-...";
@@ -3995,12 +3997,12 @@ function renderArtistsList() {
     return;
   }
   // 一行一个：只显示名称（点名称=选用，高亮表示生效），「删除」在编辑框里，列表不放假按钮。
-  // 内置默认串：显示「默认」徽标、没有编辑键（改不了也删不掉，见 openArtistEdit 的守卫）。
+  // 内置默认串：编辑键照常显示但**变灰禁用**（用户点名要求：变灰、不能调用），改不了也删不掉。
   box.innerHTML = imgState.artists
     .map((a, i) => {
       const on = a.name === imgState.activeArtist;
       const ops = a.builtin
-        ? '<span class="mem-badge" title="内置默认串，不可编辑">默认</span>'
+        ? '<button class="ghost small-btn" disabled title="内置默认串，不可编辑">编辑</button>'
         : '<button class="ghost small-btn" data-edit="' + i + '">编辑</button>';
       return `
     <div class="artist-item${on ? " on" : ""}">

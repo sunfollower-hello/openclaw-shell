@@ -1337,6 +1337,12 @@ button:disabled { opacity: 0.4; cursor: not-allowed; transform: none; }
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
   transition: border-color 0.15s, background 0.15s, color 0.15s;
 }
+/* 内置默认串的编辑键：变灰禁用（用户点名：看得见但调不动） */
+.artist-item .small-btn:disabled {
+  opacity: 0.4; cursor: not-allowed;
+  color: var(--muted); border-style: dashed;
+}
+.artist-item .small-btn:disabled:hover { border-color: var(--border); background: var(--card); color: var(--muted); }
 .artist-item .artist-name-btn:hover { border-color: var(--accent); color: var(--accent); }
 /* 生效中的画师串整行高亮 */
 .artist-item.on { background: var(--accent-soft); border-radius: 8px; padding-left: 6px; padding-right: 6px; }
