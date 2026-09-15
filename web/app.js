@@ -1349,6 +1349,8 @@ async function wbReloadHistoryInner() {
   // 更早的消息等用户上翻时由 wbPrependOlderBatch 补（懒渲染，见顶部说明）
   for (const e of wbAllEntries) {
     if (e.surface === "web") wbChatHistory.push({ role: e.role, content: e.content });
+    // 生图元数据（url→提示词）：历史渲染建记录时带上提示词，URL 失效后卡片能显示出来
+    if (Array.isArray(e.images)) for (const im of e.images) if (im?.url) ocUrlPrompt.set(im.url, im.prompt || "");
   }
   wbRenderedFrom = wbRoundsStartIndex(wbAllEntries, WB_RENDER_ROUNDS);
   const tail = wbAllEntries.slice(wbRenderedFrom);
@@ -1927,6 +1929,8 @@ async function wbDoSend(msgs) {
     // 先挂 id 再播动画（撤掉上一轮在气泡逐条冒出的几秒内也可能被点）：
     // 合并发送的多条用户消息共用一条日志 → 都挂 ids[0]；bot 气泡由 addBotReplyHumanLike 逐条挂 ids[1]
     const ids = Array.isArray(r.convIds) ? r.convIds : [];
+    // 生图记录入本地媒体库（NAI=url 记录；OpenAI=顺手把字节拉进 IndexedDB）
+    void ocSaveImageMeta(r, wbSlug);
     const rows = wbPendingUserRows.splice(0);
     if (ids[0]) rows.forEach((row) => { if (row) row.dataset.convId = ids[0]; });
     await wbFinishTurn(r, ids[1]);
@@ -1960,6 +1964,7 @@ async function wbDoSend(msgs) {
  */
 function stashReplyToSnapshot(slug, r) {
   if (lcSnap.slug !== slug) return; // 期间换了卡：这轮结果留在服务端日志里，下次进那张卡自然会读到
+  if (r?.type === "reply") void ocSaveImageMeta(r, slug); // 不在聊天页生成的图也要入库
   const text = r?.type === "reply" ? String(r.reply ?? "") : `⚠ ${r?.message ?? "生成失败"}`;
   const convId = Array.isArray(r?.convIds) ? r.convIds[1] : "";
   // 离屏渲染：临时挂一个 id=chat-log 的容器，让 addChatBubble 照常工作
@@ -3740,6 +3745,7 @@ function renderImgGenPage() {
   return `
   <div class="view">
     <div class="page-head"><h2>生图配置</h2></div>
+    <p class="hint">提示：NAI 生图的上游只保存约 15 天，过期后聊天里的图会失效。有需要请到 设置 → 本地存储 开启自动保存，或在聊天设置页手动保存。</p>
     <div class="card-box">
       <div class="form">
         <label>提供商（互斥，开启一个另一个关闭）</label>
@@ -5223,6 +5229,7 @@ function renderChatInfo() {
 
     <div class="card-box">
       <button id="ci-goto-search" class="ghost" style="width:100%">${icon("search")} 查找聊天记录</button>
+      <button id="ci-goto-imgsave" class="ghost" style="width:100%;margin-top:8px">${icon("package")} 保存图片到本地</button>
     </div>
 
     <div class="card-box ci-mem-nav">
@@ -5272,6 +5279,10 @@ function initChatInfo() {
   // 查找聊天记录 → 独立搜索页（搜索框 + 图片/时间筛选，微信式）
   $("#ci-goto-search").addEventListener("click", () => {
     location.hash = `#/chatsearch?slug=${encodeURIComponent(slug)}`;
+  });
+  // 保存图片 → 批量保存页（拉起这张卡还没存过的图，微信式多选）
+  $("#ci-goto-imgsave").addEventListener("click", () => {
+    location.hash = `#/imgsave?slug=${encodeURIComponent(slug)}`;
   });
   // 置顶开关
   $("#ci-pin").addEventListener("change", async (e) => {
@@ -6194,7 +6205,9 @@ async function clearMem() {
 // ============================================================
 //  聊天（模型由服务端按卡解析）
 // ============================================================
-const CHAT_IMG_RE = /(\/img\/[A-Za-z0-9_./-]+\.(?:png|jpe?g|webp|gif))/gi;
+// 图片识别：① 「已生成图片：<url>」整行（上游图链可能无扩展名，必须按前缀认）
+// ② https 图片直链 ③ /api/image/<id> 服务器内存图 ④ /img/ 本地历史图
+const CHAT_IMG_RE = /(已生成图片：\s*\S+|https?:\/\/[^\s"'<>()]+?\.(?:png|jpe?g|webp|gif)(?:\?[^\s"'<>()]*)?|\/api\/image\/[A-Za-z0-9_-]+|\/img\/[A-Za-z0-9_./-]+\.(?:png|jpe?g|webp|gif))/gi;
 // 半角/全角方括号都认（模型在通道常把 [表情:名] 写成【表情:名】，同步时已转半角，这里双保险）
 const CHAT_EMOJI_RE = /\[表情:([^\]]+)\]/g;
 const CHAT_EMOJI_NORM_RE = /【表情:([^】]+)】/g;
@@ -6311,25 +6324,25 @@ function appendChatContent(div, text) {
       }
       continue;
     }
-    // 文本段里还可能混着生图路径
+    // 文本段里还可能混着生图；「已生成图片：<url>」按前缀整段认成图片
+    // （上游图链可能没有扩展名，如 sta1n 的 /api/images/xxx/content，不能只靠扩展名匹配）
     const imgParts = seg.split(CHAT_IMG_RE);
     for (let j = 0; j < imgParts.length; j++) {
       const p = imgParts[j];
       if (!p) continue;
       if (j % 2 === 1) {
+        const src = p.replace(/^已生成图片：\s*/, "");
         const img = document.createElement("img");
-        img.src = p;
+        img.src = src;
         img.className = "chat-img";
         img.alt = "AI 生成的图片";
         img.loading = "lazy";
-        // 图片加载失败（文件不存在/被删/网络问题）→ 换成灰色提示，不显示难看的裂图/alt 文本
-        img.addEventListener("error", () => {
-          const tip = document.createElement("span");
-          tip.className = "chat-img-fail";
-          tip.textContent = "（图片加载失败）";
-          img.replaceWith(tip);
-        });
-        img.addEventListener("click", () => showLightbox(p));
+        img.dataset.imgUrl = src;
+        // 渲染链：本地有就换本地（OpenAI blob / NAI 已保存的文件夹文件），失败逐级兜底
+        ocHydrateChatImage(img, src);
+        // 加载失败 → NAI 已保存文件兜底 → 提示词卡片（"URL 不会露给用户"）
+        img.addEventListener("error", () => ocImgFail(img, src));
+        img.addEventListener("click", () => showLightbox(img.src));
         div.appendChild(img);
       } else {
         div.appendChild(document.createTextNode(p));
@@ -6462,17 +6475,30 @@ async function speakText(text, btn) {
   ttsLoading = true;
   if (btn) { ttsOwner = btn; btn.classList.add("playing"); }
   try {
-    // 后端直接回音频流（不落盘），这里收成 Blob 再放
-    const resp = await fetchApi("/api/tts/synthesize", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ text: String(text).slice(0, 500) }),
-    });
-    if (!resp.ok) {
-      const err = await resp.json().catch(() => ({}));
-      throw new Error(err.error || resp.statusText);
+    // 本地音频缓存：同一段朗读第二次起直接放本地，不再烧一次合成
+    const cacheKey = ocAudioKey(curCard()?.slug || "local", String(text).slice(0, 500));
+    // 已删除（墓碑）→ 提示已删除，不重新合成（避免悄悄再花钱）
+    const tomb = await ocTx("audio", "readonly", (s) => s.get(cacheKey)).catch(() => null);
+    if (tomb?.deleted) {
+      stopSpeak();
+      toast("这条语音已删除", false);
+      return;
     }
-    const blob = await resp.blob();
+    let blob = await ocAudioGet(cacheKey).catch(() => null);
+    if (!blob) {
+      // 后端直接回音频流（不落盘），这里收成 Blob 再放
+      const resp = await fetchApi("/api/tts/synthesize", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text: String(text).slice(0, 500) }),
+      });
+      if (!resp.ok) {
+        const err = await resp.json().catch(() => ({}));
+        throw new Error(err.error || resp.statusText);
+      }
+      blob = await resp.blob();
+      void ocAudioPut(cacheKey, curCard()?.slug || "local", String(text).slice(0, 500), blob).catch(() => {});
+    }
     // 取音频期间用户可能已点了停止
     if (btn && ttsOwner !== btn) return;
     ttsUrl = URL.createObjectURL(blob);
@@ -7413,6 +7439,7 @@ function renderSettings() {
     <div class="page-head"><h2>设置</h2></div>
     <div class="setting-rows">
       ${row("logs", "clipboard", "运行日志", "聊天 / 通道 / 生图 / 语音 / 记忆的报错记录，出问题先看这里（留最近 500 条）")}
+      ${row("storage", "database", "本地存储", "图片与语音存放在这台设备上：占用统计 / 保存位置 / 自动保存 / 压缩 / 删除")}
       ${row("plugins", "store", "插件", "已安装插件只读列表", "暂未开放")}
       ${row("data", "package", "数据备份与记忆", "全部卡片 + 记忆 + 配置导出为 JSON；查看全部记忆")}
     </div>
@@ -7980,6 +8007,8 @@ const routes = {
   workbench: { render: renderWorkbenchSettings, init: initWorkbenchSettings },
   capabilities: { render: renderWorkbenchSettings, init: initWorkbenchSettings }, // 旧地址 #/capabilities 兼容
   settings: { render: renderSettings, init: initSettings },
+  storage: { render: () => ocRenderStoragePage(), init: () => { ocSt.view = "overview"; ocBindStorage(); } },
+  imgsave: { render: () => ocRenderImgSave(), init: () => ocInitImgSave() },
 };
 
 $("#btn-menu").addEventListener("click", openDrawer);
@@ -7990,6 +8019,1032 @@ document.querySelectorAll(".drawer-nav a").forEach((a) => a.addEventListener("cl
 document.querySelectorAll(".drawer-nav a").forEach((a) => {
   a.insertAdjacentHTML("afterbegin", icon(a.dataset.icon));
 });
+// 首屏启动调用已移到文件末尾（本地媒体库的 const 状态声明之后执行），
+// 否则 #/storage 首次进入会撞 TDZ：Cannot access 'ocSt' before initialization
+
+// ==================== 本地媒体库（图片 / 语音） ====================
+// 设计：图片与语音存用户浏览器 IndexedDB（磁盘，不占内存）；用户可选保存到本地文件夹。
+// NAI 图 = 只存记录（url+提示词），显示走上游 URL，URL 死了读文件夹里的文件，再不行显示提示词卡片；
+// OpenAI 图 = 字节从服务器内存图库拉进 IndexedDB（服务器不留）；语音 = 朗读缓存，重听不再合成。
+const OC_DB_NAME = "ocs-media";
+/** url → 提示词：会话记录里带着生图元数据，历史渲染建记录时用它补上提示词 */
+const ocUrlPrompt = new Map();
+let ocDbPromise = null;
+function ocMediaDB() {
+  if (ocDbPromise) return ocDbPromise;
+  ocDbPromise = new Promise((resolve, reject) => {
+    const req = indexedDB.open(OC_DB_NAME, 1);
+    req.onupgradeneeded = () => {
+      const db = req.result;
+      if (!db.objectStoreNames.contains("images")) {
+        const s = db.createObjectStore("images", { keyPath: "id" });
+        s.createIndex("by-url", "url", { unique: false });
+        s.createIndex("by-slug", "slug", { unique: false });
+      }
+      if (!db.objectStoreNames.contains("audio")) {
+        const s = db.createObjectStore("audio", { keyPath: "id" });
+        s.createIndex("by-slug", "slug", { unique: false });
+      }
+      if (!db.objectStoreNames.contains("meta")) db.createObjectStore("meta", { keyPath: "k" });
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+  return ocDbPromise;
+}
+async function ocTx(store, mode, fn) {
+  const db = await ocMediaDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction([store], mode);
+    const req = fn(tx.objectStore(store));
+    tx.oncomplete = () => resolve(req ? req.result : undefined);
+    tx.onerror = () => reject(tx.error);
+    tx.onabort = () => reject(tx.error);
+  });
+}
+const ocImgPut = (rec) => ocTx("images", "readwrite", (s) => s.put(rec));
+const ocImgDel = (id) => ocTx("images", "readwrite", (s) => s.delete(id));
+const ocImgGetByUrl = (url) => ocTx("images", "readonly", (s) => s.index("by-url").get(url)).then((r) => r || null);
+const ocMetaGet = (k) => ocTx("meta", "readonly", (s) => s.get(k)).then((r) => r?.v ?? null);
+const ocMetaPut = (k, v) => ocTx("meta", "readwrite", (s) => s.put({ k, v }));
+/** 流式遍历图片记录（只留元数据，逐条释放，防大库 OOM——同 RP-Hub 的游标做法） */
+function ocImgForEach(cb) {
+  return ocMediaDB().then(
+    (db) =>
+      new Promise((resolve) => {
+        const req = db.transaction(["images"], "readonly").objectStore("images").openCursor();
+        req.onsuccess = () => {
+          const c = req.result;
+          if (!c) return resolve();
+          try {
+            const v = c.value;
+            cb({ id: v.id, url: v.url, slug: v.slug, provider: v.provider, prompt: v.prompt, fileRel: v.fileRel, savedAt: v.savedAt, createdAt: v.createdAt, bytes: v.blob?.size || 0, deleted: !!v.deleted });
+          } catch { /* 单条出错不影响整体 */ }
+          c.continue();
+        };
+        req.onerror = () => resolve();
+      })
+  );
+}
+/** 生图响应入库：NAI 存 url 记录；OpenAI 顺手把字节拉进本地（服务器只暂存 2 小时） */
+async function ocSaveImageMeta(r, slug) {
+  try {
+    const metas = Array.isArray(r?.images) ? r.images : [];
+    if (!metas.length) return;
+    for (const m of metas) {
+      const url = String(m?.url || "");
+      if (!url || url.startsWith("/img/")) continue; // 旧 /img 本地图不入库
+      if (m?.prompt) ocUrlPrompt.set(url, String(m.prompt));
+      if (await ocImgGetByUrl(url).catch(() => null)) continue;
+      const rec = {
+        id: "i_" + Date.now().toString(36) + Math.random().toString(36).slice(2, 7),
+        url,
+        provider: url.startsWith("/api/image/") ? "openai" : "nai",
+        slug: slug || "",
+        prompt: String(m?.prompt || ""),
+        blob: null,
+        fileRel: "",
+        savedAt: 0,
+        createdAt: Date.now(),
+      };
+      if (rec.provider === "openai") {
+        const resp = await fetchApi(url).catch(() => null);
+        if (resp?.ok) rec.blob = await resp.blob().catch(() => null);
+      }
+      await ocImgPut(rec).catch(() => {});
+      // 自动保存（默认关）：NAI 图经服务器代理拉一次字节写进文件夹；OpenAI 图本来就在应用内本地
+      if (rec.provider === "nai" && ocTgl("ocs_as_nai", false)) void ocSaveRecords([rec]);
+    }
+  } catch (e) {
+    console.warn("图片入库失败：", e);
+  }
+}
+/** 渲染链：本地有副本就用本地（NAI=已保存文件；OpenAI=IndexedDB blob），上游 URL 只做即时显示 */
+async function ocHydrateChatImage(img, url) {
+  try {
+    let rec = await ocImgGetByUrl(url).catch(() => null);
+    // 已删除（墓碑）：只显示提示词占位，不重新加载、不二次生图
+    if (rec?.deleted) {
+      ocShowDeadCard(img, rec, "图片已删除");
+      return;
+    }
+    // 已有记录但缺提示词（老数据/历史建的记录）→ 用会话里的元数据补上
+    if (rec && !rec.prompt && ocUrlPrompt.get(url)) {
+      rec.prompt = ocUrlPrompt.get(url);
+      await ocImgPut(rec).catch(() => {});
+    }
+    if (!rec) {
+      if (url.startsWith("/api/image/")) {
+        const resp = await fetchApi(url).catch(() => null);
+        if (resp?.ok) {
+          const blob = await resp.blob();
+          rec = { id: "i_" + Date.now().toString(36) + Math.random().toString(36).slice(2, 7), url, provider: "openai", slug: wbSlug || "", prompt: "", blob, fileRel: "", savedAt: 0, createdAt: Date.now() };
+          await ocImgPut(rec).catch(() => {});
+        }
+      } else if (/^https?:/i.test(url)) {
+        // 历史里的 NAI 图（例如重启后从会话记录渲染出来）也要入库，才能在存储页管理与删除
+        rec = {
+          id: "i_" + Date.now().toString(36) + Math.random().toString(36).slice(2, 7),
+          url,
+          provider: "nai",
+          slug: wbSlug || "",
+          prompt: ocUrlPrompt.get(url) || "",
+          blob: null,
+          fileRel: "",
+          savedAt: 0,
+          createdAt: Date.now(),
+        };
+        await ocImgPut(rec).catch(() => {});
+      }
+      if (!rec) return;
+    }
+    if (rec.blob) {
+      img.src = URL.createObjectURL(rec.blob);
+      return;
+    }
+    if (rec.provider === "nai" && rec.fileRel) {
+      const blob = await ocReadSavedFile(rec.fileRel).catch(() => null);
+      if (blob) img.src = URL.createObjectURL(blob);
+    }
+  } catch { /* 交给 onerror 链 */ }
+}
+/** 图片加载失败兜底链：NAI 本地文件 → 提示词卡片（绝不把 URL 露给用户当文本） */
+async function ocImgFail(img, url) {
+  try {
+    const rec = await ocImgGetByUrl(url).catch(() => null);
+    if (rec?.deleted) {
+      ocShowDeadCard(img, rec, "图片已删除");
+      return;
+    }
+    if (rec) {
+      if (rec.blob) {
+        img.src = URL.createObjectURL(rec.blob);
+        return;
+      }
+      if (rec.fileRel) {
+        const blob = await ocReadSavedFile(rec.fileRel).catch(() => null);
+        if (blob) {
+          img.src = URL.createObjectURL(blob);
+          return;
+        }
+      }
+    }
+    ocShowDeadCard(img, rec);
+  } catch {
+    ocShowDeadCard(img, null);
+  }
+}
+function ocShowDeadCard(img, rec, title) {
+  const prompt = String(rec?.prompt || "").trim();
+  const box = document.createElement("div");
+  box.className = "chat-img-dead";
+  box.innerHTML =
+    `<div class="cid-t">${escapeHtml(title || "图片已过期（上游只保存约 15 天）")}</div>` +
+    (prompt
+      ? `<div class="cid-p">${escapeHtml(prompt.slice(0, 200))}${prompt.length > 200 ? "…" : ""}</div>` +
+        `<button type="button" class="ghost small-btn cid-copy">复制提示词</button>`
+      : `<div class="cid-p">没有记录到提示词</div>`);
+  const btn = box.querySelector(".cid-copy");
+  if (btn)
+    btn.addEventListener("click", async () => {
+      try {
+        await navigator.clipboard.writeText(prompt);
+        toast("提示词已复制，可粘贴到聊天里重新生成");
+      } catch {
+        toast("复制失败，请手动选中复制", false);
+      }
+    });
+  img.replaceWith(box);
+}
+
+// ---------- 文件夹保存（File System Access API；手机浏览器不支持 → 退回下载文件夹） ----------
+function ocTgl(key, def) {
+  const v = localStorage.getItem(key);
+  return v === null ? def : v === "1";
+}
+const ocDirSupported = typeof window.showDirectoryPicker === "function";
+async function ocPickSaveDir() {
+  if (!ocDirSupported) {
+    toast("这个浏览器不支持选择文件夹，保存会直接进「下载」文件夹", false);
+    return null;
+  }
+  try {
+    const h = await window.showDirectoryPicker({ mode: "readwrite", id: "ocs-save" });
+    await ocMetaPut("dirHandle", h).catch(() => {});
+    await ocMetaPut("dirName", h.name).catch(() => {});
+    toast(`保存位置已设为：${h.name}`);
+    return h;
+  } catch {
+    return null; // 用户取消
+  }
+}
+/** 取目录句柄并确保权限（浏览器重启后首次会被问一次，点「允许」即可；Chrome 可选「每次访问都允许」） */
+async function ocEnsureDirPerm() {
+  const h = await ocMetaGet("dirHandle").catch(() => null);
+  if (!h) return null;
+  try {
+    let p = await h.queryPermission({ mode: "readwrite" });
+    if (p !== "granted") {
+      // requestPermission 需要用户手势：自动保存时若刚点过发送通常也算，失败就静默跳过
+      p = await h.requestPermission({ mode: "readwrite" });
+    }
+    return p === "granted" ? h : null;
+  } catch {
+    return null;
+  }
+}
+async function ocWriteToFolder(slug, blob) {
+  const h = await ocEnsureDirPerm().catch(() => null);
+  if (!h) return "";
+  try {
+    const dir = await h.getDirectoryHandle(String(slug || "未分类"), { create: true });
+    const d = new Date();
+    const p2 = (n) => String(n).padStart(2, "0");
+    const ts = `${d.getFullYear()}${p2(d.getMonth() + 1)}${p2(d.getDate())}_${p2(d.getHours())}${p2(d.getMinutes())}${p2(d.getSeconds())}`;
+    const ext = blob.type === "image/webp" ? "webp" : blob.type === "image/jpeg" ? "jpg" : "png";
+    const name = `${ts}_${Math.random().toString(36).slice(2, 6)}.${ext}`;
+    const fh = await dir.getFileHandle(name, { create: true });
+    const w = await fh.createWritable();
+    await w.write(blob);
+    await w.close();
+    return `${slug || "未分类"}/${name}`;
+  } catch (e) {
+    console.warn("写入文件夹失败：", e);
+    return "";
+  }
+}
+async function ocReadSavedFile(rel) {
+  const h = await ocMetaGet("dirHandle").catch(() => null);
+  if (!h || !rel) return null;
+  const parts = String(rel).split("/");
+  if (parts.length !== 2) return null;
+  const p = await h.queryPermission({ mode: "readwrite" }).catch(() => "denied");
+  if (p !== "granted") {
+    const rp = await h.requestPermission({ mode: "readwrite" }).catch(() => "denied");
+    if (rp !== "granted") return null;
+  }
+  const dir = await h.getDirectoryHandle(parts[0]);
+  const fh = await dir.getFileHandle(parts[1]);
+  return await fh.getFile();
+}
+async function ocRemoveSavedFile(rel) {
+  try {
+    const h = await ocEnsureDirPerm();
+    if (!h || !rel) return;
+    const parts = String(rel).split("/");
+    if (parts.length !== 2) return;
+    const dir = await h.getDirectoryHandle(parts[0]);
+    await dir.removeEntry(parts[1]);
+  } catch { /* 文件已被用户删掉等情况，忽略 */ }
+}
+/** 压缩开关（服务端配置，保存文件用 WebP） */
+async function ocCompressEnabled() {
+  try {
+    const cfg = await api.get("/api/image/config");
+    return cfg?.compression?.enabled === true;
+  } catch {
+    return false;
+  }
+}
+async function ocSetCompress(on) {
+  const p = await api.send("/api/image/config", { method: "POST", body: JSON.stringify({ compression: { enabled: !!on } }) });
+  return !!p?.ok;
+}
+async function ocToWebp(blob, q = 0.85) {
+  try {
+    if (blob.type === "image/webp") return blob;
+    const bmp = await createImageBitmap(blob);
+    const cv = document.createElement("canvas");
+    cv.width = bmp.width;
+    cv.height = bmp.height;
+    cv.getContext("2d").drawImage(bmp, 0, 0);
+    const out = await new Promise((res) => cv.toBlob(res, "image/webp", q));
+    if (out && out.size > 0 && out.size < blob.size) return out;
+    return blob;
+  } catch {
+    return blob;
+  }
+}
+/** 下载兜底（没有文件夹权限时）：直接进「下载」文件夹 */
+function ocDownloadBlob(blob, name) {
+  const u = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = u;
+  a.download = name;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(u), 10_000);
+}
+/**
+ * 批量保存：NAI 图经服务器代理拉字节（绕 CORS）；压缩开 → WebP。
+ * 有文件夹 → 写进「保存位置/角色卡名/时间戳.webp」；没有 → 下载到下载文件夹。
+ */
+async function ocSaveRecords(records) {
+  records = records.filter((r) => !r.deleted); // 墓碑记录不参与保存
+  const compress = await ocCompressEnabled().catch(() => false);
+  let ok = 0;
+  let fail = 0;
+  let usedFolder = false;
+  for (const rec of records) {
+    try {
+      let bytes = rec.blob || null;
+      if (!bytes && rec.url && /^https?:/i.test(rec.url)) {
+        const resp = await fetchApi(`/api/image/fetch?url=${encodeURIComponent(rec.url)}${compress ? "&fmt=webp" : ""}`);
+        if (!resp.ok) throw new Error("上游图片拉取失败");
+        bytes = await resp.blob();
+      }
+      if (!bytes) throw new Error("没有图片数据");
+      if (compress) bytes = await ocToWebp(bytes);
+      const rel = await ocWriteToFolder(rec.slug || "未分类", bytes);
+      if (rel) usedFolder = true;
+      else if (ocDirSupported) {
+        // 有 API 但没授权/没选位置 → 落下载文件夹，保证用户拿到图
+        ocDownloadBlob(bytes, `${rec.slug || "image"}_${(rec.id || "").slice(2, 8)}.${bytes.type === "image/webp" ? "webp" : bytes.type === "image/jpeg" ? "jpg" : "png"}`);
+      } else {
+        ocDownloadBlob(bytes, `${rec.slug || "image"}_${(rec.id || "").slice(2, 8)}.${bytes.type === "image/webp" ? "webp" : bytes.type === "image/jpeg" ? "jpg" : "png"}`);
+      }
+      rec.fileRel = rel;
+      rec.savedAt = Date.now();
+      if (rec.provider !== "openai") rec.blob = null; // NAI 图不入 IndexedDB（文件夹就是它的家）
+      await ocImgPut(rec).catch(() => {});
+      ok++;
+    } catch (e) {
+      fail++;
+      console.warn("保存失败：", e);
+    }
+  }
+  return { ok, fail, usedFolder };
+}
+
+// ---------- 语音缓存（朗读音频存本地，重听不再合成） ----------
+function ocAudioKey(slug, text) {
+  let h = 5381;
+  const s = String(text);
+  for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) | 0;
+  return `a_${slug}_${(h >>> 0).toString(36)}`;
+}
+async function ocAudioGet(id) {
+  const r = await ocTx("audio", "readonly", (s) => s.get(id)).catch(() => null);
+  if (!r || r.deleted) return null; // 已删除（墓碑）→ 不再合成
+  return r.blob || null;
+}
+async function ocAudioPut(id, slug, text, blob) {
+  await ocTx("audio", "readwrite", (s) => s.put({ id, slug, text, blob, size: blob.size, createdAt: Date.now() }));
+}
+function ocAudioForEach(cb) {
+  return ocMediaDB().then(
+    (db) =>
+      new Promise((resolve) => {
+        const req = db.transaction(["audio"], "readonly").objectStore("audio").openCursor();
+        req.onsuccess = () => {
+          const c = req.result;
+          if (!c) return resolve();
+          try {
+            const v = c.value;
+            cb({ id: v.id, slug: v.slug, text: v.text, size: v.size || v.blob?.size || 0, createdAt: v.createdAt, deleted: !!v.deleted });
+          } catch { /* 忽略单条 */ }
+          c.continue();
+        };
+        req.onerror = () => resolve();
+      })
+  );
+}
+const ocFmtSize = (n) =>
+  !n
+    ? "0 B"
+    : n > 1024 * 1024
+      ? `${(n / 1024 / 1024).toFixed(1)} MB`
+      : `${Math.max(1, Math.round(n / 1024))} KB`;
+
+// ---------- 设置 → 本地存储（RP-Hub 式：空间条 + 分类占用 + 按角色卡钻取） ----------
+const ocSt = { view: "overview", slug: "", name: "" };
+let ocStCache = null; // 本次进视图的扫描结果（浏览器 + 服务端 + 用户文件夹）
+const ocStColors = { chat: "#1677ff", card: "#f59e0b", mem: "#8b5cf6", img: "#1677ff", au: "#22c55e" };
+
+function ocStGo(view, slug, name) {
+  ocSt.view = view;
+  if (slug !== undefined) ocSt.slug = slug;
+  if (name !== undefined) ocSt.name = name;
+  // 不主动统计：缓存跨视图/进出保留，只有用户点「重新统计」或删除后才重算
+  const host = $("#view");
+  if (!host) return;
+  host.innerHTML = ocRenderStoragePage();
+  ocBindStorage();
+  host.scrollTop = 0;
+}
+function ocStHead(title, backTo) {
+  return `<div class="page-head">
+    <button class="ghost small-btn" data-back="${backTo}">← 返回</button>
+    <h2>${title}</h2>
+  </div>`;
+}
+function ocStRow(label, valueHtml, color, go) {
+  return `<div class="oc-row"${go ? ` data-go="${go}"` : ""}>
+    ${color ? `<span class="oc-bar" style="background:${color}"></span>` : ""}
+    <span class="oc-row-label">${label}</span>
+    <span class="oc-row-val">${valueHtml}</span>
+    ${go ? `<span class="oc-chev">›</span>` : ""}
+  </div>`;
+}
+function ocRenderStoragePage() {
+  if (ocSt.view === "chats") return ocRenderCatPage("聊天记录", "chats", ocStColors.chat);
+  if (ocSt.view === "cards") return ocRenderCatPage("角色卡", "cards", ocStColors.card);
+  if (ocSt.view === "mems") return ocRenderCatPage("记忆", "mems", ocStColors.mem);
+  if (ocSt.view === "img_card") return ocRenderImgCard();
+  if (ocSt.view === "au_card") return ocRenderAuCard();
+  return ocRenderStOverview();
+}
+function ocRenderStOverview() {
+  return `
+  <div class="view">
+    <div class="page-head"><h2>${icon("database")} 本地存储</h2>${settingsBack()}</div>
+
+    <div class="card-box oc-card">
+      <div class="oc-card-head">
+        <h3>网页存储空间</h3>
+        <button id="oc-calc" class="ghost small-btn">重新统计</button>
+      </div>
+      <div class="oc-space-row"><span class="oc-space-val" id="oc-usage-text">—</span><span class="oc-space-total" id="oc-quota-text"></span></div>
+      <div class="oc-meter"><i id="oc-meter-fill" style="width:0%"></i></div>
+    </div>
+
+    <div class="card-box oc-card">
+      <h3>分类占用</h3>
+      <div class="oc-rows">
+        ${ocStRow("聊天记录", '<span id="oc-chat-total">—</span>', ocStColors.chat, "chats")}
+        ${ocStRow("角色卡", '<span id="oc-card-total">—</span>', ocStColors.card, "cards")}
+        ${ocStRow("记忆", '<span id="oc-mem-total">—</span>', ocStColors.mem, "mems")}
+      </div>
+    </div>
+
+    <div class="card-box oc-card">
+      <h3>保存设置</h3>
+      <div class="oc-rows">
+        <div class="oc-row">
+          <span class="oc-row-label">保存位置</span>
+          <span class="oc-row-val" id="oc-dir-name"></span>
+          <button id="oc-pick-dir" class="ghost small-btn"${ocDirSupported ? "" : " disabled"}>选择文件夹</button>
+        </div>
+        <div class="oc-row">
+          <span class="oc-row-label">自动保存 NAI 图</span>
+          <label class="switch"><input type="checkbox" id="oc-as-nai"><span class="slider"></span></label>
+        </div>
+        <div class="oc-row">
+          <span class="oc-row-label">保存时压缩</span>
+          <label class="switch"><input type="checkbox" id="oc-compress"><span class="slider"></span></label>
+        </div>
+      </div>
+    </div>
+  </div>`;
+}
+function ocRenderCatPage(title, kind, color) {
+  return `
+  <div class="view">
+    ${ocStHead(title, "overview")}
+    <div class="card-box oc-card">
+      <div class="oc-rows" id="oc-${kind}-list"><div class="oc-empty">统计中…</div></div>
+    </div>
+  </div>`;
+}
+function ocRenderImgCard() {
+  return `
+  <div class="view">
+    ${ocStHead(escapeHtml(ocSt.name || ocSt.slug), "chats")}
+    <div class="card-box oc-card">
+      <div class="oc-card-head"><h3>图片</h3><button id="oc-del-all" class="danger small-btn">全部删除</button></div>
+      <div class="oc-grid" id="oc-grid"><div class="oc-empty">统计中…</div></div>
+    </div>
+  </div>`;
+}
+function ocRenderAuCard() {
+  return `
+  <div class="view">
+    ${ocStHead(escapeHtml(ocSt.name || ocSt.slug), "chats")}
+    <div class="card-box oc-card">
+      <div class="oc-card-head"><h3>语音</h3><button id="oc-del-all-au" class="danger small-btn">全部删除</button></div>
+      <div class="oc-rows" id="oc-au-rows"><div class="oc-empty">统计中…</div></div>
+    </div>
+  </div>`;
+}
+function ocBindStorage() {
+  document.querySelectorAll("#view [data-back]").forEach((b) =>
+    b.addEventListener("click", () => ocStGo(b.dataset.back))
+  );
+  document.querySelectorAll("#view .oc-row[data-go]").forEach((r) =>
+    r.addEventListener("click", () => ocStGo(r.dataset.go))
+  );
+  if (ocSt.view === "overview") {
+    $("#oc-pick-dir")?.addEventListener("click", async () => {
+      if (!ocDirSupported) return;
+      const h = await ocPickSaveDir();
+      if (h) await ocFillDirName();
+    });
+    $("#oc-calc")?.addEventListener("click", () => {
+      const t = $("#oc-usage-text");
+      if (t) t.textContent = "统计中…";
+      void ocFillOverview(true);
+    });
+    const nai = $("#oc-as-nai");
+    if (nai) {
+      nai.checked = ocTgl("ocs_as_nai", false);
+      nai.addEventListener("change", () => localStorage.setItem("ocs_as_nai", nai.checked ? "1" : "0"));
+    }
+    const cpx = $("#oc-compress");
+    if (cpx) {
+      ocCompressEnabled().then((on) => { cpx.checked = on; });
+      cpx.addEventListener("change", async () => {
+        const ok = await ocSetCompress(cpx.checked).catch(() => false);
+        if (!ok) {
+          cpx.checked = !cpx.checked;
+          toast("保存失败", false);
+        }
+      });
+    }
+    void ocFillDirName();
+    void ocFillOverview();
+    return;
+  }
+  if (ocSt.view === "chats") return void ocFillChats();
+  if (ocSt.view === "cards") return void ocFillCat("card");
+  if (ocSt.view === "mems") return void ocFillCat("mem");
+  if (ocSt.view === "img_card") return void ocFillImgCard();
+  if (ocSt.view === "au_card") return void ocFillAuCard();
+}
+
+async function ocFillDirName() {
+  const el = $("#oc-dir-name");
+  if (!el) return;
+  if (!ocDirSupported) {
+    el.textContent = "";
+    return;
+  }
+  const h = await ocMetaGet("dirHandle").catch(() => null);
+  if (!h) {
+    el.textContent = "未选择";
+    return;
+  }
+  const name = await ocMetaGet("dirName").catch(() => null);
+  let perm = "prompt";
+  try { perm = await h.queryPermission({ mode: "readwrite" }); } catch { /* 忽略 */ }
+  el.textContent = (name || "已选择") + (perm === "granted" ? "" : " · 待授权");
+}
+async function ocCardName(slug) {
+  return (await api.get(`/api/cards/${encodeURIComponent(slug)}`).catch(() => null))?.name || slug;
+}
+/** 一次扫描拿全三类数据：服务端（聊天/角色卡/记忆/服务器图片）+ 浏览器（图片/语音）+ 用户文件夹
+ *  force=true 强制重算（用户点「重新统计」）；否则命中缓存直接返回 */
+async function ocStData(force) {
+  if (ocStCache && !force) return ocStCache;
+  const d = {
+    usage: 0, quota: 0,
+    serverCards: [], totals: { chat: 0, mem: 0, card: 0, img: 0 },
+    browserImgs: [], browserAu: [],
+    legacy: new Map(), folder: new Map(),
+  };
+  try {
+    const e = await navigator.storage.estimate();
+    d.usage = e.usage || 0;
+    d.quota = e.quota || 0;
+  } catch { /* 部分浏览器不支持 */ }
+  await ocImgForEach((m) => { if (!m.deleted) d.browserImgs.push(m); });
+  await ocAudioForEach((m) => { if (!m.deleted) d.browserAu.push(m); });
+  const sb = await api.get("/api/storage/breakdown").catch(() => null);
+  if (sb) {
+    d.serverCards = sb.cards ?? [];
+    d.totals = sb.totals ?? d.totals;
+  }
+  const lg = await api.get("/api/image/list").catch(() => null);
+  for (const it of lg?.images ?? []) {
+    if (!d.legacy.has(it.dir)) d.legacy.set(it.dir, []);
+    d.legacy.get(it.dir).push(it);
+  }
+  const h = await ocMetaGet("dirHandle").catch(() => null);
+  if (h) {
+    let perm = "denied";
+    try { perm = await h.queryPermission({ mode: "readwrite" }); } catch { /* 忽略 */ }
+    if (perm === "granted") {
+      try {
+        for await (const [name, handle] of h.entries()) {
+          if (handle.kind !== "directory") continue;
+          const files = [];
+          let bytes = 0;
+          for await (const [fname, fh] of handle.entries()) {
+            if (fh.kind !== "file") continue;
+            const f = await fh.getFile().catch(() => null);
+            if (!f) continue;
+            bytes += f.size;
+            files.push({ name: fname, size: f.size, mtime: f.lastModified || 0, rel: `${name}/${fname}` });
+          }
+          d.folder.set(name, { bytes, files });
+        }
+      } catch (e) {
+        console.warn("读取保存文件夹失败：", e);
+      }
+    }
+  }
+  ocStCache = d;
+  return d;
+}
+/** 按角色卡合并三类数据（服务端占用 + 浏览器图片/语音 + 服务器历史图 + 文件夹） */
+function ocStMerged(d) {
+  const m = new Map();
+  const get = (slug) => {
+    if (!m.has(slug)) {
+      m.set(slug, { slug, name: slug, chat: 0, mem: 0, card: 0, serverImg: 0, records: [], audio: [], legacy: [], folder: { bytes: 0, files: [] } });
+    }
+    return m.get(slug);
+  };
+  for (const c of d.serverCards) {
+    const x = get(c.slug);
+    x.name = c.name || c.slug;
+    x.chat = c.chat || 0;
+    x.mem = c.mem || 0;
+    x.card = c.card || 0;
+    x.serverImg = c.img || 0;
+  }
+  for (const r of d.browserImgs) get(r.slug || "未分类").records.push(r);
+  for (const a of d.browserAu) get(a.slug || "未分类").audio.push(a);
+  for (const [slug, items] of d.legacy) get(slug).legacy = items;
+  for (const [slug, f] of d.folder) get(slug).folder = f;
+  return m;
+}
+function ocStTotal(x) {
+  const recBytes = x.records.reduce((s, r) => s + (r.bytes || 0), 0);
+  const auBytes = x.audio.reduce((s, a) => s + (a.size || 0), 0);
+  const legacyBytes = x.legacy.reduce((s, l) => s + (l.size || 0), 0);
+  return x.chat + x.mem + x.card + x.serverImg + recBytes + auBytes + legacyBytes + x.folder.bytes;
+}
+async function ocStFixNames(merged) {
+  for (const x of merged.values()) {
+    if (!x.name || x.name === x.slug) x.name = await ocCardName(x.slug);
+  }
+}
+async function ocFillOverview(force) {
+  if (ocSt.view !== "overview" || !$("#oc-usage-text")) return;
+  // 不主动统计：没有缓存且不是用户点「重新统计」→ 显示占位，等用户点
+  if (!ocStCache && !force) {
+    const set = (sel, v) => { const el = $(sel); if (el) el.textContent = v; };
+    set("#oc-usage-text", "—");
+    set("#oc-quota-text", "");
+    set("#oc-chat-total", "—");
+    set("#oc-card-total", "—");
+    set("#oc-mem-total", "—");
+    const fill = $("#oc-meter-fill");
+    if (fill) fill.style.width = "0%";
+    return;
+  }
+  const d = await ocStData(force);
+  if (ocSt.view !== "overview" || !$("#oc-usage-text")) return;
+  $("#oc-usage-text").textContent = ocFmtSize(d.usage);
+  $("#oc-quota-text").textContent = d.quota ? `/ ${ocFmtSize(d.quota)}` : "";
+  const fill = $("#oc-meter-fill");
+  if (fill) fill.style.width = Math.min(100, d.quota ? (d.usage / d.quota) * 100 : 0) + "%";
+  const browserImg = d.browserImgs.reduce((s, r) => s + (r.bytes || 0), 0);
+  const browserAu = d.browserAu.reduce((s, a) => s + (a.size || 0), 0);
+  const folder = [...d.folder.values()].reduce((s, f) => s + f.bytes, 0);
+  const legacy = [...d.legacy.values()].reduce((s, arr) => s + arr.reduce((t, i) => t + (i.size || 0), 0), 0);
+  const set = (sel, v) => { const el = $(sel); if (el) el.textContent = v; };
+  set("#oc-chat-total", ocFmtSize(d.totals.chat + browserImg + browserAu + folder + legacy));
+  set("#oc-card-total", ocFmtSize(d.totals.card));
+  set("#oc-mem-total", ocFmtSize(d.totals.mem));
+}
+async function ocFillChats() {
+  const d = await ocStData();
+  const box = $("#oc-chats-list");
+  if (!box) return;
+  const merged = ocStMerged(d);
+  await ocStFixNames(merged);
+  const list = [...merged.values()].filter((x) => ocStTotal(x) > 0 || x.records.length || x.audio.length);
+  list.sort((a, b) => ocStTotal(b) - ocStTotal(a));
+  if (!list.length) {
+    box.innerHTML = `<div class="oc-empty">暂无记录</div>`;
+    return;
+  }
+  box.innerHTML = "";
+  for (const x of list) {
+    const row = document.createElement("div");
+    row.className = "oc-row";
+    row.innerHTML = `
+      <span class="oc-bar" style="background:${ocStColors.chat}"></span>
+      <span class="oc-row-label">${escapeHtml(x.name)}</span>
+      <span class="oc-row-val">${ocFmtSize(ocStTotal(x))}</span>
+      <button class="ghost small-btn oc-more-btn">更多</button>`;
+    const panel = document.createElement("div");
+    panel.className = "oc-more-panel";
+    panel.hidden = true;
+    const imgBtn = document.createElement("button");
+    imgBtn.className = "ghost small-btn";
+    const imgCount = x.records.length + x.legacy.length + x.folder.files.length;
+    imgBtn.textContent = `图片${imgCount ? ` ${imgCount}` : ""}`;
+    imgBtn.addEventListener("click", () => ocStGo("img_card", x.slug, x.name));
+    const auBtn = document.createElement("button");
+    auBtn.className = "ghost small-btn";
+    auBtn.textContent = `语音${x.audio.length ? ` ${x.audio.length}` : ""}`;
+    auBtn.addEventListener("click", () => ocStGo("au_card", x.slug, x.name));
+    panel.append(imgBtn, auBtn);
+    row.querySelector(".oc-more-btn").addEventListener("click", (e) => {
+      e.stopPropagation();
+      panel.hidden = !panel.hidden;
+    });
+    box.append(row, panel);
+  }
+}
+async function ocFillCat(kind) {
+  const d = await ocStData();
+  const box = $("#oc-" + (kind === "card" ? "cards" : "mems") + "-list");
+  if (!box) return;
+  const merged = ocStMerged(d);
+  await ocStFixNames(merged);
+  const list = [...merged.values()].filter((x) => (kind === "card" ? x.card : x.mem) > 0);
+  list.sort((a, b) => (kind === "card" ? b.card - a.card : b.mem - a.mem));
+  if (!list.length) {
+    box.innerHTML = `<div class="oc-empty">暂无数据</div>`;
+    return;
+  }
+  const color = kind === "card" ? ocStColors.card : ocStColors.mem;
+  box.innerHTML = list
+    .map(
+      (x) => `<div class="oc-row">
+        <span class="oc-bar" style="background:${color}"></span>
+        <span class="oc-row-label">${escapeHtml(x.name)}</span>
+        <span class="oc-row-val">${ocFmtSize(kind === "card" ? x.card : x.mem)}</span>
+      </div>`
+    )
+    .join("");
+}
+async function ocFillImgCard() {
+  const d = await ocStData();
+  const merged = ocStMerged(d);
+  const x = merged.get(ocSt.slug);
+  const grid = $("#oc-grid");
+  if (!grid) return;
+  // 三类图片混排成一条时间线（最新在前）：本机记录 / 服务器历史图 / 已保存到文件夹的文件
+  const items = [];
+  for (const r of x?.records ?? []) items.push({ kind: "record", ts: r.createdAt || 0, rec: r });
+  for (const l of x?.legacy ?? []) items.push({ kind: "legacy", ts: l.mtime || 0, legacy: l });
+  for (const f of x?.folder?.files ?? []) items.push({ kind: "folder", ts: f.mtime || 0, file: f });
+  items.sort((a, b) => b.ts - a.ts);
+  if (!items.length) {
+    grid.innerHTML = `<div class="oc-empty">暂无图片</div>`;
+    return;
+  }
+  grid.innerHTML = "";
+  for (const it of items) grid.appendChild(ocImgCell(it));
+  $("#oc-del-all")?.addEventListener("click", async () => {
+    if (!confirm(`删除「${ocSt.name || ocSt.slug}」的 ${items.length} 张图片？`)) return;
+    for (const it of items) {
+      if (it.kind === "record") await ocDeleteImageRecord(it.rec);
+      else if (it.kind === "legacy") await api.send("/api/image/delete", { method: "POST", body: JSON.stringify({ url: it.legacy.url }) }).catch(() => {});
+      else await ocRemoveSavedFile(it.file.rel);
+    }
+    void ocStAfterDelete();
+  });
+}
+/** 图片格子（三种来源统一渲染：状态/大小角标 + 右上删除 + 点击看大图） */
+function ocImgCell(it) {
+  const cell = document.createElement("div");
+  cell.className = "oc-cell";
+  const img = document.createElement("img");
+  img.alt = "图片";
+  img.loading = "lazy";
+  const mark = document.createElement("span");
+  mark.className = "oc-cell-mark";
+  const del = document.createElement("button");
+  del.className = "oc-cell-del";
+  del.title = "删除";
+  del.textContent = "✕";
+  cell.append(img, mark, del);
+  const guard = (fn) => async (e) => {
+    e.stopPropagation();
+    if (!confirm("删除这张图片？")) return;
+    await fn();
+    void ocStAfterDelete();
+  };
+  if (it.kind === "record") {
+    const r = it.rec;
+    cell.dataset.id = r.id;
+    mark.textContent = r.savedAt ? "已存文件" : r.provider === "nai" ? "仅链接" : "应用内";
+    del.addEventListener("click", guard(() => ocDeleteImageRecord(r)));
+    cell.addEventListener("click", (e) => { if (e.target !== del && img.src) showLightbox(img.src); });
+    ocLazyThumb(img, r);
+    return cell;
+  }
+  if (it.kind === "legacy") {
+    const l = it.legacy;
+    img.src = l.url; // 同源 /img/ 直出
+    mark.textContent = ocFmtSize(l.size || 0);
+    del.addEventListener("click", guard(() => api.send("/api/image/delete", { method: "POST", body: JSON.stringify({ url: l.url }) }).catch(() => {})));
+    cell.addEventListener("click", (e) => { if (e.target !== del) showLightbox(l.url); });
+    return cell;
+  }
+  const f = it.file;
+  mark.textContent = ocFmtSize(f.size || 0);
+  void (async () => {
+    const b = await ocReadSavedFile(f.rel).catch(() => null);
+    if (b) img.src = URL.createObjectURL(b);
+  })();
+  del.addEventListener("click", guard(() => ocRemoveSavedFile(f.rel)));
+  cell.addEventListener("click", (e) => { if (e.target !== del && img.src) showLightbox(img.src); });
+  return cell;
+}
+/** 删除后：缓存作废并原地刷新当前视图（数字跟着变；只有删除会触发重算） */
+async function ocStAfterDelete() {
+  ocStCache = null;
+  if (ocSt.view === "img_card") return void ocFillImgCard();
+  if (ocSt.view === "au_card") return void ocFillAuCard();
+  if (ocSt.view === "chats") return void ocFillChats();
+  if (ocSt.view === "cards") return void ocFillCat("card");
+  if (ocSt.view === "mems") return void ocFillCat("mem");
+  return void ocFillOverview(true);
+}
+async function ocFillAuCard() {
+  const d = await ocStData();
+  const merged = ocStMerged(d);
+  const items = (merged.get(ocSt.slug)?.audio ?? []).slice().sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+  const box = $("#oc-au-rows");
+  if (!box) return;
+  if (!items.length) {
+    box.innerHTML = `<div class="oc-empty">暂无语音</div>`;
+    return;
+  }
+  box.innerHTML = "";
+  let curAudio = null;
+  for (const it of items) {
+    const row = document.createElement("div");
+    row.className = "oc-row";
+    const txt = String(it.text || "");
+    row.innerHTML = `<span class="oc-au-text">${escapeHtml(txt.slice(0, 40))}${txt.length > 40 ? "…" : ""}</span><span class="oc-row-val">${ocFmtSize(it.size || 0)}</span>`;
+    const play = document.createElement("button");
+    play.className = "ghost small-btn";
+    play.textContent = "▶";
+    play.addEventListener("click", async () => {
+      const blob = await ocAudioGet(it.id);
+      if (!blob) return toast("语音已删除", false);
+      if (curAudio) curAudio.pause();
+      curAudio = new Audio(URL.createObjectURL(blob));
+      void curAudio.play().catch(() => {});
+    });
+    const del = document.createElement("button");
+    del.className = "danger small-btn";
+    del.textContent = "✕";
+    del.addEventListener("click", async () => {
+      await ocAudioDelete(it.id, it.slug, it.text);
+      void ocStAfterDelete();
+    });
+    row.append(play, del);
+    box.appendChild(row);
+  }
+  $("#oc-del-all-au")?.addEventListener("click", async () => {
+    if (!confirm(`删除「${ocSt.name || ocSt.slug}」的 ${items.length} 条语音？`)) return;
+    for (const it of items) await ocAudioDelete(it.id, it.slug, it.text);
+    void ocStAfterDelete();
+  });
+}
+
+/** 缩略图加载：直接取源（延迟交给 img 的 loading="lazy"）。
+ *  之前用 IntersectionObserver，在 #view 这个自滚动容器里实测不触发，导致空格子。 */
+function ocLazyThumb(img, it) {
+  const load = async () => {
+    if (it.provider === "openai" && it.bytes === 0 && it.savedAt === 0) {
+      img.src = it.url;
+      return;
+    }
+    if (it.provider === "nai" && !it.savedAt) {
+      img.src = it.url;
+      return;
+    }
+    if (it.fileRel) {
+      const b = await ocReadSavedFile(it.fileRel).catch(() => null);
+      if (b) { img.src = URL.createObjectURL(b); return; }
+    }
+    const rec = await ocTx("images", "readonly", (s) => s.get(it.id)).catch(() => null);
+    if (rec?.blob) img.src = URL.createObjectURL(rec.blob);
+    else img.src = it.url;
+  };
+  void load();
+}
+/**
+ * 删除图片：清掉本地 blob、删掉文件夹里的文件，但保留一条「墓碑」记录——
+ * 聊天里那张图从此只显示提示词占位，且绝不触发二次生图。
+ */
+async function ocDeleteImageRecord(it) {
+  if (it.fileRel) await ocRemoveSavedFile(it.fileRel);
+  const rec = await ocTx("images", "readonly", (s) => s.get(it.id)).catch(() => null);
+  await ocImgPut({
+    id: it.id,
+    url: it.url || rec?.url || "",
+    slug: it.slug || rec?.slug || "",
+    provider: it.provider || rec?.provider || "nai",
+    prompt: it.prompt || rec?.prompt || "",
+    blob: null,
+    fileRel: "",
+    savedAt: 0,
+    createdAt: it.createdAt || rec?.createdAt || Date.now(),
+    deleted: true,
+  }).catch(() => {});
+}
+/** 删除语音：同样留墓碑（保住正文文本），聊天气泡再点朗读提示已删除、不再重新合成 */
+async function ocAudioDelete(id, slug, text) {
+  await ocTx("audio", "readwrite", (s) =>
+    s.put({ id, slug, text: String(text || ""), blob: null, size: 0, createdAt: Date.now(), deleted: true })
+  ).catch(() => {});
+}
+
+// ---------- 聊天设置 → 保存图片（批量多选，微信式） ----------
+function ocRenderImgSave() {
+  return `
+  <div class="view">
+    <div class="page-head">
+      <button id="oims-back" class="ghost small-btn">← 返回</button>
+      <h2>保存图片到本地</h2>
+      <p class="hint">勾选要保存的图片，点「保存」。</p>
+    </div>
+    <div class="card-box">
+      <div class="row" style="gap:8px;flex-wrap:wrap">
+        <button id="oims-all" class="ghost small-btn">全选</button>
+        <span class="hint" id="oims-count">已选 0 张</span>
+        <button id="oims-save" class="small-btn">保存</button>
+      </div>
+    </div>
+    <div class="card-box"><div id="oims-grid" class="oc-grid">读取中…</div></div>
+  </div>`;
+}
+function ocInitImgSave() {
+  const m = (location.hash || "").match(/[?&]slug=([^&]+)/);
+  const slug = m ? decodeURIComponent(m[1]) : chatSettingsSlug || localStorage.getItem("ocs_workbench_slug") || "";
+  $("#oims-back").addEventListener("click", () => {
+    location.hash = `#/chatinfo?slug=${encodeURIComponent(slug)}`;
+  });
+  const grid = $("#oims-grid");
+  const selected = new Set();
+  const items = [];
+  const refreshCount = () => { $("#oims-count").textContent = `已选 ${selected.size} 张`; };
+  $("#oims-all").addEventListener("click", () => {
+    const all = selected.size === items.length;
+    selected.clear();
+    if (!all) items.forEach((i) => selected.add(i.id));
+    grid.querySelectorAll(".oc-cell").forEach((c) => c.classList.toggle("sel", selected.has(c.dataset.id)));
+    refreshCount();
+  });
+  $("#oims-save").addEventListener("click", async () => {
+    const picked = items.filter((i) => selected.has(i.id));
+    if (!picked.length) return toast("先勾选要保存的图片", false);
+    toast(`正在保存 ${picked.length} 张…`);
+    const r = await ocSaveRecords(picked);
+    toast(`保存完成：成功 ${r.ok} 张${r.fail ? `，失败 ${r.fail} 张` : ""}`);
+    void loadImgSaveList(slug, grid, items, selected, refreshCount);
+    ocStCache = null;
+  });
+  void loadImgSaveList(slug, grid, items, selected, refreshCount);
+}
+// 列表加载代际号：并发/重复加载时丢弃过期结果，避免两次加载共用一个数组互相清空（实测丢记录）
+let oimsListGen = 0;
+async function loadImgSaveList(slug, grid, items, selected, refreshCount) {
+  const gen = ++oimsListGen;
+  const found = [];
+  const skip = [];
+  await ocImgForEach((rec) => {
+    if (slug && rec.slug !== slug) return;
+    if (rec.savedAt) { skip.push(rec); return; }
+    if (rec.deleted) return; // 已删除的图不再出现在待保存列表
+    found.push(rec);
+  });
+  if (gen !== oimsListGen) return; // 期间又发起了一次加载：这次结果作废
+  found.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+  items.length = 0;
+  found.forEach((f) => items.push(f));
+  selected.clear();
+  grid.innerHTML = "";
+  if (!items.length) {
+    grid.innerHTML = `<p class="hint">这张卡没有待保存的图片${skip.length ? `（已有 ${skip.length} 张保存过了）` : ""}。</p>`;
+    refreshCount();
+    return;
+  }
+  for (const it of items) {
+    const cell = document.createElement("div");
+    cell.className = "oc-cell";
+    cell.dataset.id = it.id;
+    const img = document.createElement("img");
+    img.alt = "生图";
+    img.loading = "lazy";
+    const circle = document.createElement("span");
+    circle.className = "oc-pick";
+    cell.append(img, circle);
+    cell.addEventListener("click", () => {
+      if (selected.has(it.id)) selected.delete(it.id);
+      else selected.add(it.id);
+      cell.classList.toggle("sel", selected.has(it.id));
+      refreshCount();
+    });
+    grid.appendChild(cell);
+    ocLazyThumb(img, it);
+  }
+  refreshCount();
+}
+
+
+// ==================== 启动（必须放在文件末尾：本地媒体库的 const 状态需先初始化） ====================
 // 立刻渲染首屏，不等任何网络请求。
 // 原来是 `loadProfile().finally(() => router())`——必须等 /api/profile 回来才画第一屏，
 // 公网上这一等就是 1-2s，期间页面只有顶栏 + 背景色（用户看到的「只有 SoulBox 加黄页」）。

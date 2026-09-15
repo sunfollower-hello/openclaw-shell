@@ -26,6 +26,8 @@ export interface ConvEntry {
   srcId?: string;
   /** 本地聊天回复的拆条结果（刷新页面后按条渲染；无此字段的老数据按换行兜底拆分） */
   parts?: string[];
+  /** 本轮生图元数据（url + 提示词）：刷新/换浏览器后仍能建图记录、URL 失效时显示提示词卡片 */
+  images?: { url: string; prompt: string }[];
 }
 
 export function convFile(slug: string): string {
@@ -39,7 +41,7 @@ function newConvId(): string {
 /** 追加一条记录（自动补 id/t）；返回完整条目 */
 export async function appendConv(
   slug: string,
-  input: { role: "user" | "assistant"; content: string; surface: ConvSurface; ns: string; srcId?: string; parts?: string[] }
+  input: { role: "user" | "assistant"; content: string; surface: ConvSurface; ns: string; srcId?: string; parts?: string[]; images?: { url: string; prompt: string }[] }
 ): Promise<ConvEntry> {
   const entry: ConvEntry = {
     id: newConvId(),
@@ -50,6 +52,9 @@ export async function appendConv(
     t: new Date().toISOString(),
     ...(input.srcId ? { srcId: input.srcId } : {}),
     ...(Array.isArray(input.parts) && input.parts.length ? { parts: input.parts.map((p) => String(p).slice(0, 5000)) } : {}),
+    ...(Array.isArray(input.images) && input.images.length
+      ? { images: input.images.map((im) => ({ url: String(im.url ?? "").slice(0, 2000), prompt: String(im.prompt ?? "").slice(0, 2000) })).filter((im) => im.url) }
+      : {}),
   };
   const file = convFile(slug);
   await fs.mkdir(path.dirname(file), { recursive: true });
@@ -78,6 +83,13 @@ export async function readConv(slug: string, limit = 0): Promise<ConvEntry[]> {
           ...(typeof o.srcId === "string" && o.srcId ? { srcId: o.srcId } : {}),
           ...(Array.isArray(o.parts) && o.parts.length
             ? { parts: o.parts.filter((p): p is string => typeof p === "string").map((p) => p.slice(0, 5000)) }
+            : {}),
+          ...(Array.isArray(o.images) && o.images.length
+            ? {
+                images: (o.images as { url?: unknown; prompt?: unknown }[])
+                  .map((im) => ({ url: String(im?.url ?? ""), prompt: String(im?.prompt ?? "") }))
+                  .filter((im) => im.url),
+              }
             : {}),
         });
       }

@@ -69,6 +69,7 @@ import {
 } from "./core/lifeScheduler.js";
 import { TOOL_REGISTRY, toolsToOpenAI, resolveInSandbox, type ToolDef, type ToolCtx } from "./tools/registry.js";
 import { FEATURES, filterDisabledTools } from "./core/features.js";
+import { getMemImage } from "./core/memImages.js";
 import { toUserError } from "./core/errors.js";
 import { queryLogs, clearLogs, logInfo, logWarn, logError } from "./core/logger.js";
 import { parseUsage, recordLlmUsage, summarizeLlmUsage } from "./core/llmUsage.js";
@@ -2393,14 +2394,15 @@ interface ToolCallMsg {
   function?: { name?: string; arguments?: string };
 }
 
-// 工具结果里提取图片 URL（"已生成图片：/img/xxx.png" 形态）；模型可能不复述工具结果，
-// 服务端在返回回复时强制附加，前端 CHAT_IMG_RE 渲染成图
-const TOOL_IMG_URL_RE = /\/img\/[A-Za-z0-9_./-]+\.(?:png|jpe?g|webp|gif)/g;
+// 工具结果里提取图片 URL：三种形态 —— ① /img/... 本地历史图 ② /api/image/<id> 内存图
+// ③ https 上游图链（NAI 直显）；模型可能不复述工具结果，服务端在返回回复时强制附加，前端 CHAT_IMG_RE 渲染成图
+const TOOL_IMG_URL_RE =
+  /(?:https?:\/\/[^\s"'<>()]+?\.(?:png|jpe?g|webp|gif)(?:\?[^\s"'<>()]*)?|\/api\/image\/[A-Za-z0-9_-]+|\/img\/[A-Za-z0-9_./-]+\.(?:png|jpe?g|webp|gif))/g;
 
 /**
  * 剔除回复里「指向不存在文件」的 /img/ 地址（模型没调工具却编造图片地址时，
  * 前端渲染 <img> 会 404 显示 alt 文本，实锤现象「AI生成的图片」）。
- * 只针对 /img/（本地文件，可直接校验）；http 地址不做校验（远程图）。
+ * 只针对 /img/（本地文件，可直接校验）；远程图链与内存图不做校验、一律保留。
  */
 function stripFakeImgUrls(text: string): string {
   const urls = text.match(TOOL_IMG_URL_RE);
@@ -2408,6 +2410,7 @@ function stripFakeImgUrls(text: string): string {
   let bad = false;
   const imgRoot = path.join(dataDir(), "images");
   for (const u of urls) {
+    if (!u.startsWith("/img/")) continue;
     // /img/<dir>/<file> → data/images/<dir>/<file>
     const rel = u.replace(/^\/img\//, "");
     if (rel && rel.split("/").length === 2) {
@@ -2428,6 +2431,7 @@ function stripFakeImgUrls(text: string): string {
       if (!m) return line;
       let out = line;
       for (const u of m) {
+        if (!u.startsWith("/img/")) continue;
         const rel = u.replace(/^\/img\//, "");
         const file = path.join(imgRoot, rel);
         let ok = false;
@@ -2444,8 +2448,19 @@ function stripFakeImgUrls(text: string): string {
     .join("\n");
 }
 
-async function executeToolCalls(tools: ToolDef[], toolCalls: ToolCallMsg[], messages: unknown[], ctx: ToolCtx): Promise<string[]> {
+interface ImageMeta {
+  url: string;
+  prompt: string;
+}
+
+async function executeToolCalls(
+  tools: ToolDef[],
+  toolCalls: ToolCallMsg[],
+  messages: unknown[],
+  ctx: ToolCtx
+): Promise<{ imgs: string[]; imageMeta: ImageMeta[] }> {
   const imgs: string[] = [];
+  const imageMeta: ImageMeta[] = [];
   for (const tc of toolCalls) {
     const def = tools.find((t) => t.id === tc.function?.name);
     let result = `未知工具: ${tc.function?.name ?? "?"}`;
@@ -2455,6 +2470,12 @@ async function executeToolCalls(tools: ToolDef[], toolCalls: ToolCallMsg[], mess
         for (const m of result.matchAll(TOOL_IMG_URL_RE)) {
           if (!imgs.includes(m[0])) imgs.push(m[0]);
         }
+        // 生图工具结果带「已生成图片：<url>\n提示词：<prompt>」——抓成元数据给前端；
+        // 图链可能没有扩展名（如 sta1n 的 /api/images/xxx/content），所以这里必须**按前缀取 URL**，
+        // 不能只靠扩展名正则（否则图不会追加进回复、前端也渲染不出来）
+        const gen = result.match(/已生成图片：(\S+)\n提示词：([\s\S]*)/);
+        if (gen && !imageMeta.some((x) => x.url === gen[1])) imageMeta.push({ url: gen[1], prompt: gen[2].trim() });
+        if (gen && !imgs.includes(gen[1])) imgs.push(gen[1]);
       } catch (e) {
         logError("工具", `${tc.function?.name ?? "?"} 执行出错`, e);
         result = `工具执行出错: ${String(e)}`;
@@ -2462,11 +2483,11 @@ async function executeToolCalls(tools: ToolDef[], toolCalls: ToolCallMsg[], mess
     }
     messages.push({ role: "tool", tool_call_id: tc.id ?? "", content: result });
   }
-  return imgs;
+  return { imgs, imageMeta };
 }
 
 type LoopResult =
-  | { type: "reply"; reply: string; toolImages?: string[] }
+  | { type: "reply"; reply: string; toolImages?: string[]; imageMeta?: ImageMeta[] }
   | { type: "pending"; pending: { id: string; name: string; args: string }[]; messages: unknown[] };
 
 async function runToolLoop(
@@ -2480,13 +2501,14 @@ async function runToolLoop(
   meta?: { kind?: string; slug?: string }
 ): Promise<LoopResult> {
   const toolImages: string[] = [];
+  const imageMeta: ImageMeta[] = [];
   for (let i = 0; i < 4; i++) {
     if (externalSignal?.aborted) return { type: "reply", reply: "（已截断）" };
     const data = await chatCompletions(llm, messages, tools.length ? toolsToOpenAI(tools) : undefined, reasoning, externalSignal, meta);
     const msg = data.choices?.[0]?.message;
     const toolCalls = ((msg?.tool_calls ?? []) as ToolCallMsg[]).filter((tc) => tc.function?.name);
     if (toolCalls.length === 0) {
-      return { type: "reply", reply: msg?.content ?? "（空回复）", toolImages };
+      return { type: "reply", reply: msg?.content ?? "（空回复）", toolImages, imageMeta };
     }
     messages.push({ role: "assistant", content: msg?.content ?? "", tool_calls: toolCalls });
     const hasDangerous = toolCalls.some((tc) => tools.find((t) => t.id === tc.function?.name)?.dangerous);
@@ -2501,10 +2523,11 @@ async function runToolLoop(
         messages,
       };
     }
-    const imgs = await executeToolCalls(tools, toolCalls, messages, ctx);
+    const { imgs, imageMeta: metas } = await executeToolCalls(tools, toolCalls, messages, ctx);
     if (imgs.length) toolImages.push(...imgs);
+    if (metas.length) imageMeta.push(...metas);
   }
-  return { type: "reply", reply: "（达到工具轮次上限）", toolImages };
+  return { type: "reply", reply: "（达到工具轮次上限）", toolImages, imageMeta };
 }
 async function resolveChatTools(enabledTools: string[]): Promise<{ defs: ToolDef[] }> {
   // 未启用的功能在这里统一拦掉：即使请求里带了这些工具也不会生效
@@ -2691,8 +2714,16 @@ app.post("/api/chat", async (req, res) => {
       // 模型可能不复述工具结果里的图片 URL → 服务端强制附加（前端 CHAT_IMG_RE 渲染成图）；
       // 落盘/拆条用附加后的文本（刷新后图仍在），记忆总结用原始回复（避免路径噪音进记忆）
       const rawReply = String(result.reply ?? "");
-      const toolImages = (result.toolImages ?? []).filter((u) => !rawReply.includes(u));
-      const displayReply = stripFakeImgUrls(toolImages.length ? `${rawReply}\n\n${toolImages.join("\n")}` : rawReply);
+      // 图片行归一化：模型复述的图链（带前缀或裸 URL）一律从正文剔掉，再由服务端统一以
+      // 「已生成图片：<url>」追加一次——保证 URL 不会以文本形式出现在气泡里，且无扩展名的图链也能成图
+      const allToolImages = result.toolImages ?? [];
+      let replyText = rawReply;
+      for (const u of allToolImages) {
+        replyText = replyText.split(`已生成图片：${u}`).join("").split(u).join("");
+      }
+      const displayReply = stripFakeImgUrls(
+        `${replyText.trim()}${allToolImages.length ? `\n\n${allToolImages.map((u) => `已生成图片：${u}`).join("\n")}` : ""}`
+      );
       // 回复拆条（活人感分段）：按卡配置的条数区间 + 风格字数约束拆成多条。
       // 段落/句号/逗号四级拆法见 core/splitter.ts；表情包/图片由通道侧独立发送，这里只拆文本。
       const style: SplitStyle = card.presets?.style === "rich" ? "rich" : "chat";
@@ -2701,13 +2732,13 @@ app.post("/api/chat", async (req, res) => {
       if (splitRes.count > 1) {
         logInfo("拆条", `${card.name} 回复拆成 ${describeSplit(splitRes)}`);
       }
-      const aEntry = await appendConv(slug, { role: "assistant", content: displayReply, surface: "web", ns, parts: splitRes.parts }).catch(() => null);
+      const aEntry = await appendConv(slug, { role: "assistant", content: displayReply, surface: "web", ns, parts: splitRes.parts, images: result.imageMeta ?? [] }).catch(() => null);
       if (aEntry) convIds.push(aEntry.id);
       // 滑动分批自动总结记忆（后台执行，不阻塞回复）
       void autoMemorize(slug, card, message, rawReply, ns).catch(() => {});
       // 本地聊天原文 → 通道侧刷新（防抖 6s）：history md 导出（100 轮可检索）+ USER.md 注入近 3 轮
       scheduleChannelMemoryRefresh(slug);
-      res.json({ ...result, reply: displayReply, parts: splitRes.parts, convIds });
+      res.json({ ...result, reply: displayReply, parts: splitRes.parts, convIds, images: result.imageMeta ?? [] });
       return;
     }
     // convIds：这轮对话在统一日志里的 id（网页端长按删除消息要用）
@@ -4023,8 +4054,8 @@ app.get("/api/image/config", async (_req, res) => {
     const cfg = await getImageConfig();
     res.json({
       provider: cfg.provider,
-      retentionDays: cfg.retentionDays,
       aspect: cfg.aspect,
+      compression: cfg.compression,
       // NovelAI 走固定网关：站点地址由后端下发（前端只展示、不可改），用户只填 key + 选模型
       novelai: { key: maskKey(cfg.novelai.key), model: cfg.novelai.model, base: NAI_GATEWAY_BASE },
       openai: { baseUrl: cfg.openai.baseUrl, key: maskKey(cfg.openai.key), model: cfg.openai.model },
@@ -4048,7 +4079,7 @@ app.get("/api/image/reveal-key", async (_req, res) => {
 
 app.post("/api/image/config", async (req, res) => {
   try {
-    const { provider, novelai, openai, artists, activeArtist, retentionDays, aspect } = req.body ?? {};
+    const { provider, novelai, openai, artists, activeArtist, compression, aspect } = req.body ?? {};
     const cur = await getImageConfig();
     // ① 密钥守卫：只认本站签发的密钥，上游/官方密钥（STA1N-…/pst-…）一律拒绝，
     //    避免有人填上游密钥绕过我们自己的站点
@@ -4074,7 +4105,6 @@ app.post("/api/image/config", async (req, res) => {
     const nextArtists = incomingArtists;
     const next = {
       provider: provider === "openai" ? "openai" : provider === "novelai" ? "novelai" : cur.provider,
-      retentionDays: Number.isFinite(Number(retentionDays)) ? Math.max(0, Math.floor(Number(retentionDays))) : cur.retentionDays,
       aspect:
         aspect === "square" || aspect === "portrait" || aspect === "landscape" || aspect === "auto"
           ? (aspect as "auto" | "square" | "portrait" | "landscape")
@@ -4100,6 +4130,8 @@ app.post("/api/image/config", async (req, res) => {
           : typeof activeArtist === "string" && (isBuiltinArtist(activeArtist) || nextArtists.some((a) => a.name === activeArtist))
             ? activeArtist
             : "",
+      // 压缩开关：只认布尔；没传就沿用原值（前端局部保存不会误关）
+      compression: { enabled: compression?.enabled === undefined ? cur.compression.enabled : compression.enabled === true },
     };
     await saveImageConfig(next);
     // 提供商切换后通道侧 SKILL.md 里的生图规则要跟着换（NAI 标签版 ↔ OpenAI 自然语言版）。
@@ -4228,10 +4260,9 @@ app.post("/api/image/generate", async (req, res) => {
   }
 });
 
-// 图片库：列出 data/images 下全部图片（按时间倒序），供管理/删除；先顺手清理过期图片
+// 图片库：列出 data/images 下全部图片（按时间倒序），供管理/删除（仅剩试生图等历史数据；聊天生图已不再落盘）
 app.get("/api/image/list", async (_req, res) => {
   try {
-    await cleanupImages();
     const root = path.join(dataDir(), "images");
     const out: { dir: string; file: string; url: string; size: number; mtime: number }[] = [];
     for (const dir of await fs.readdir(root).catch(() => [] as string[])) {
@@ -4268,35 +4299,94 @@ app.post("/api/image/delete", async (req, res) => {
   }
 });
 
-/** 图片自动清理：_test 试生图超 15 天即删；正式生图保留 retentionDays 天（0 = 不自动清理正式图） */
-async function cleanupImages(): Promise<{ removed: number }> {
+/** 图片自动清理已移除（2026-09-15）：聊天生图不再落盘（NAI=上游 URL 直显 / OpenAI=内存暂存给浏览器），
+ *  服务器没有可清理的对象；用户图片由浏览器 IndexedDB 与本地文件夹自行管理。 */
+
+// ---------- 图片内存图库（OpenAI 网页生图字节中转）+ 上游图链代理 ----------
+// 注意注册顺序：这两个必须放在 /api/image/list、/api/image/delete 之后，
+// 否则 /api/image/:id 会把 "list"/"delete" 当成 id 截胡。
+// 代理拉取上游图链（NAI 图保存到本地时用：绕浏览器 CORS；fmt=webp 时顺手压缩）
+app.get("/api/image/fetch", async (req, res) => {
   try {
-    const { getImageConfig } = await import("./core/imageConfig.js");
-    const cfg = await getImageConfig();
-    const root = path.join(dataDir(), "images");
-    const now = Date.now();
-    const DAY = 24 * 3600 * 1000;
-    let removed = 0;
-    for (const dir of await fs.readdir(root).catch(() => [] as string[])) {
-      const full = path.join(root, dir);
-      const st = await fs.stat(full).catch(() => null);
-      if (!st?.isDirectory()) continue;
-      const maxAge = dir === "_test" ? 15 * DAY : cfg.retentionDays > 0 ? cfg.retentionDays * DAY : Infinity;
-      if (!Number.isFinite(maxAge)) continue;
-      for (const f of await fs.readdir(full).catch(() => [] as string[])) {
-        if (!/\.(png|jpe?g|webp|gif)$/i.test(f)) continue;
-        const fst = await fs.stat(path.join(full, f)).catch(() => null);
-        if (fst?.isFile() && now - fst.mtimeMs > maxAge) {
-          await fs.unlink(path.join(full, f)).catch(() => {});
-          removed++;
-        }
+    const url = String(req.query.url ?? "");
+    if (!/^https?:\/\//i.test(url)) return res.status(400).json({ error: "缺少合法的图片地址" });
+    const r = await fetch(url, { signal: AbortSignal.timeout(60_000) });
+    if (!r.ok) return res.status(502).json({ error: `上游图片拉取失败 HTTP ${r.status}` });
+    const src = Buffer.from(await r.arrayBuffer());
+    let buf: Buffer = src;
+    let mime = r.headers.get("content-type") ?? "image/png";
+    if (String(req.query.fmt ?? "") === "webp") {
+      const { recompress } = await import("./core/imageGen.js");
+      const c = await recompress(src, "webp");
+      if (c) {
+        buf = c.buf;
+        mime = c.mime;
       }
     }
-    return { removed };
-  } catch {
-    return { removed: 0 };
+    res.setHeader("Content-Type", mime);
+    res.setHeader("Cache-Control", "private, max-age=86400");
+    res.send(buf);
+  } catch (e) {
+    res.status(500).json({ error: toUserError(e) });
   }
+});
+
+// ---------- 存储占用统计（服务端数据：聊天记录 / 角色卡 / 记忆 / 历史图片） ----------
+// 供「本地存储」页分类占用：每张卡一份，前端与浏览器侧（图片/语音 IndexedDB）合并展示。
+async function pathBytes(p: string): Promise<number> {
+  const st = await fs.lstat(p).catch(() => null);
+  if (!st) return 0;
+  if (st.isSymbolicLink()) return 0; // 软链不计（避免重复统计）
+  if (st.isFile()) return st.size;
+  if (!st.isDirectory()) return 0;
+  let total = 0;
+  for (const e of await fs.readdir(p, { withFileTypes: true }).catch(() => [])) {
+    total += await pathBytes(path.join(p, e.name));
+  }
+  return total;
 }
+
+app.get("/api/storage/breakdown", async (_req, res) => {
+  try {
+    const root = dataDir();
+    const cards = await store.list().catch(() => []);
+    const rows: { slug: string; name: string; chat: number; mem: number; card: number; img: number }[] = [];
+    for (const c of cards) {
+      const slug = c.slug;
+      const chat =
+        (await pathBytes(path.join(root, "conversations", `${slug}.jsonl`))) +
+        (await pathBytes(path.join(root, "memory", `${slug}.chatlog.jsonl`)));
+      const mem =
+        (await pathBytes(path.join(root, "memory", `${slug}.mem`))) +
+        (await pathBytes(path.join(root, "memory", `${slug}.greeted.json`))) +
+        (await pathBytes(path.join(root, "memory", `${slug}.mirror.json`))) +
+        (await pathBytes(path.join(root, "memory-export", `${slug}.md`))) +
+        (await pathBytes(path.join(root, "history-export", `${slug}.md`)));
+      const card =
+        (await pathBytes(path.join(root, "cards", slug))) +
+        (await pathBytes(path.join(coversDir(), `${slug}.png`))) +
+        (await pathBytes(path.join(coversDir(), slug)));
+      const img = await pathBytes(path.join(root, "images", slug));
+      rows.push({ slug, name: c.name ?? slug, chat, mem, card, img });
+    }
+    const totals = rows.reduce(
+      (a, r) => ({ chat: a.chat + r.chat, mem: a.mem + r.mem, card: a.card + r.card, img: a.img + r.img }),
+      { chat: 0, mem: 0, card: 0, img: 0 }
+    );
+    res.json({ cards: rows, totals });
+  } catch (e) {
+    res.status(500).json({ error: toUserError(e) });
+  }
+});
+
+// 内存图库取图（OpenAI 网页生图：前端拉一次存进 IndexedDB，此后不再依赖服务器）
+app.get("/api/image/:id", async (req, res) => {
+  const img = getMemImage(String(req.params.id ?? ""));
+  if (!img) return res.status(404).json({ error: "图片已过期或不存在（服务器只暂存 2 小时，请重新生成）" });
+  res.setHeader("Content-Type", img.mime);
+  res.setHeader("Cache-Control", "private, max-age=3600");
+  res.send(img.buf);
+});
 
 // ---------- 语音合成（TTS）：上游聚合（OpenAI 兼容，可售卖）+ 本地兜底（Edge/SAPI） ----------
 app.get("/api/tts/config", async (_req, res) => {
@@ -4932,11 +5022,7 @@ await ensureMemorySearchExtraPaths().then((changed) => {
 app.listen(PORT, HOST, () => {
   logInfo("启动", `服务已启动 http://${HOST}:${PORT}`);
   console.log(`卡片目录: ${store["dir"]}`);
-  // 生图图片自动清理：启动清一次 + 每天清一次（_test 试生图超 15 天删；正式图超 retentionDays 删）
-  void cleanupImages().then((r) => {
-    if (r.removed > 0) logInfo("生图", `自动清理了 ${r.removed} 张过期图片`);
-  });
-  setInterval(() => void cleanupImages(), 24 * 3600 * 1000);
+  // 图片自动清理已移除：聊天生图不落盘，无清理对象
   // 记忆导出：启动时同步全部卡的记忆到 md（供 OpenClaw memorySearch.extraPaths 索引）
   void exportAllMemoriesToMarkdown().then((slugs) => {
     if (slugs.length) logInfo("记忆", `已导出 ${slugs.length} 张卡的记忆`);

@@ -97,9 +97,48 @@ export interface GenResult {
   /** saveDir 提供时，保存后的文件绝对路径 */
   file?: string;
   provider?: string;
+  /** NAI 网页直显模式：上游图床的原始 URL（不下载字节，浏览器直连显示） */
+  url?: string;
 }
 
 const GEN_TIMEOUT = 180_000;
+
+// ---------- 压缩（sharp，按需加载；缺失/失败时静默跳过用原图） ----------
+type SharpFn = (buf: Buffer) => {
+  webp(o: { quality: number }): { toBuffer(): Promise<Buffer> };
+  jpeg(o: { quality: number }): { toBuffer(): Promise<Buffer> };
+};
+let sharpCache: SharpFn | null | undefined;
+async function getSharp(): Promise<SharpFn | null> {
+  if (sharpCache !== undefined) return sharpCache;
+  try {
+    const mod = await import("sharp");
+    sharpCache = ((mod as { default?: SharpFn }).default ?? mod) as unknown as SharpFn;
+  } catch {
+    sharpCache = null;
+  }
+  return sharpCache;
+}
+/** 重编码：webp=本地保存文件（体积最小）；jpeg=通道发送（腾讯接口兼容最稳）。失败返回 null 用原图。 */
+export async function recompress(buf: Buffer, format: "webp" | "jpeg"): Promise<{ buf: Buffer; mime: string } | null> {
+  try {
+    const sharp = await getSharp();
+    if (!sharp) return null;
+    const out =
+      format === "webp"
+        ? await sharp(buf).webp({ quality: 85 }).toBuffer()
+        : await sharp(buf).jpeg({ quality: 88 }).toBuffer();
+    return { buf: out, mime: format === "webp" ? "image/webp" : "image/jpeg" };
+  } catch {
+    return null;
+  }
+}
+
+/** 网页聊天模式的附加行为 */
+export interface GenOpts {
+  /** NAI 只返回上游 URL 不下载；OpenAI 不落盘（字节交内存图库，由浏览器拉取自存） */
+  web?: boolean;
+}
 
 function httpError(service: string, status: number, body: string): string {
   const b = body.slice(0, 160);
@@ -117,7 +156,7 @@ function classifyError(e: unknown): string {
   return "生图失败: " + msg;
 }
 
-export async function generateImage(params: GenParams, saveDir?: string): Promise<GenResult> {
+export async function generateImage(params: GenParams, saveDir?: string, opts?: GenOpts): Promise<GenResult> {
   const cfg = params.cfg ?? (await getImageConfig());
   const prompt = String(params.prompt ?? "").trim();
   if (!prompt) return { ok: false, error: "提示词为空" };
@@ -172,6 +211,10 @@ export async function generateImage(params: GenParams, saveDir?: string): Promis
       if (!imgUrl) {
         return { ok: false, error: "生图服务没返回图片地址：" + content.slice(0, 120) };
       }
+      // 网页直显模式：URL 原样交前端（浏览器直连上游图床加载），不下载字节、不落盘
+      if (opts?.web) {
+        return { ok: true, url: imgUrl, provider, width: w, height: h };
+      }
       const img = await fetch(imgUrl, { signal: AbortSignal.timeout(GEN_TIMEOUT) });
       if (!img.ok) return { ok: false, error: `图片已生成但下载失败 HTTP ${img.status}` };
       const ct = img.headers.get("content-type") ?? "";
@@ -219,11 +262,21 @@ export async function generateImage(params: GenParams, saveDir?: string): Promis
     return { ok: false, error: classifyError(e) };
   }
 
+  // 压缩开关（生图配置页）：网页模式 → WebP（本地保存/浏览器存储都小）；
+  // 落盘模式（通道发 QQ/微信）→ JPEG（腾讯接口兼容最稳）。封面等其他调用保持原图。
+  if (buf && cfg.compression?.enabled && (opts?.web || saveDir)) {
+    const c = await recompress(buf, opts?.web ? "webp" : "jpeg");
+    if (c) {
+      buf = c.buf;
+      mimeType = c.mime;
+    }
+  }
+
   let file: string | undefined;
   if (saveDir && buf) {
     try {
       await fs.mkdir(saveDir, { recursive: true });
-      const ext = mimeType === "image/jpeg" ? ".jpg" : ".png";
+      const ext = mimeType === "image/jpeg" ? ".jpg" : mimeType === "image/webp" ? ".webp" : ".png";
       const p = path.join(saveDir, `gen-${Date.now()}${ext}`);
       await fs.writeFile(p, buf);
       file = p;

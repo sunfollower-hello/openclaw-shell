@@ -352,6 +352,8 @@ const imageGen: ToolDef = {
     const { generateImage } = await import("../core/imageGen.js");
     const prompt = String(args.prompt ?? "");
     if (!prompt.trim()) return "错误：提示词为空";
+    // 网页聊天：图不再落服务器磁盘——NAI 返回上游 URL 直显（浏览器直连），
+    // OpenAI 字节进内存图库（/api/image/<id> 给前端拉取自存 IndexedDB）
     const res = await generateImage(
       {
         prompt,
@@ -359,11 +361,19 @@ const imageGen: ToolDef = {
         aspect: args.aspect ? String(args.aspect) : undefined,
         seed: typeof args.seed === "number" ? args.seed : undefined,
       },
-      ctx.imagesDir
+      undefined,
+      { web: true }
     );
     if (!res.ok) return res.error ?? "生图失败";
-    const file = res.file ? path.basename(res.file) : "gen.png";
-    const url = `/img/${path.basename(ctx.imagesDir)}/${file}`;
+    let url: string;
+    if (res.url) {
+      url = res.url;
+    } else if (res.buffer) {
+      const { storeMemImage } = await import("../core/memImages.js");
+      url = `/api/image/${storeMemImage(res.buffer, res.mimeType ?? "image/png")}`;
+    } else {
+      return "生图失败";
+    }
     return `已生成图片：${url}\n提示词：${prompt}`;
   },
 };

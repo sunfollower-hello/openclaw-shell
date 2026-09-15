@@ -63,8 +63,6 @@ const ASPECTS: ImageAspect[] = ["auto", "square", "portrait", "landscape"];
 
 export interface ImageConfig {
   provider: "novelai" | "openai";
-  /** 图片自动清理：保留最近 N 天的正式生图（0 = 不自动清理） */
-  retentionDays: number;
   /** 出图尺寸：auto=AI 按场景自行判断，其余定死（全局，聊天出图与试生共用） */
   aspect: ImageAspect;
   /** NovelAI 网关：站点地址固定（NAI_GATEWAY_BASE），用户只填 key 与选模型 */
@@ -74,16 +72,18 @@ export interface ImageConfig {
   artists: ArtistPreset[];
   /** 当前生效的画师串名（空 = 不用画师串） */
   activeArtist: string;
+  /** 压缩：开启后本地保存的图转 WebP、通道发送前转 JPEG（外观基本不变，体积大减） */
+  compression: { enabled: boolean };
 }
 
 const DEFAULTS: ImageConfig = {
   provider: "novelai",
-  retentionDays: 30,
   aspect: "auto",
   novelai: { key: "", model: NAI_GATEWAY_DEFAULT_MODEL },
   openai: { baseUrl: "", key: "", model: "agnes-image-2.0-flash" },
   artists: [],
   activeArtist: "",
+  compression: { enabled: false },
 };
 
 async function cfgPath(): Promise<string> {
@@ -111,7 +111,6 @@ export async function getImageConfig(): Promise<ImageConfig> {
     if (!activeArtist && hadOld25 && c.activeArtist === "2.5") activeArtist = "2.5D写实";
     return {
       provider: c.provider === "openai" ? "openai" : "novelai",
-      retentionDays: Number(c.retentionDays) || DEFAULTS.retentionDays,
       aspect: ASPECTS.includes(c.aspect as ImageAspect) ? (c.aspect as ImageAspect) : DEFAULTS.aspect,
       novelai: {
         key: String(c.novelai?.key ?? ""),
@@ -122,6 +121,7 @@ export async function getImageConfig(): Promise<ImageConfig> {
       // 用上面带收编迁移的变量，不能再算一遍——否则迁移结果被丢弃，
       // 旧「2.5」的选中状态迁移不到「2.5D写实」（实测踩到：迁移代码成了死代码）
       activeArtist,
+      compression: { enabled: c.compression?.enabled === true },
     };
   } catch {
     return structuredClone(DEFAULTS);
