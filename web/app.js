@@ -3995,13 +3995,17 @@ function renderArtistsList() {
     return;
   }
   // 一行一个：只显示名称（点名称=选用，高亮表示生效），「删除」在编辑框里，列表不放假按钮。
+  // 内置默认串：显示「默认」徽标、没有编辑键（改不了也删不掉，见 openArtistEdit 的守卫）。
   box.innerHTML = imgState.artists
     .map((a, i) => {
       const on = a.name === imgState.activeArtist;
+      const ops = a.builtin
+        ? '<span class="mem-badge" title="内置默认串，不可编辑">默认</span>'
+        : '<button class="ghost small-btn" data-edit="' + i + '">编辑</button>';
       return `
     <div class="artist-item${on ? " on" : ""}">
       <button type="button" class="artist-name-btn" data-pick="${i}" title="${on ? "点一下取消选用" : "点一下选用这个画师串"}">${escapeHtml(a.name)}</button>
-      <button class="ghost small-btn" data-edit="${i}">编辑</button>
+      ${ops}
     </div>`;
     })
     .join("");
@@ -4020,8 +4024,9 @@ function renderArtistsList() {
   );
 }
 function openArtistEdit(i) {
-  artistEditing = i;
   const a = i === null ? null : imgState.artists[i];
+  if (a?.builtin) return; // 内置默认串不可编辑（后端也会剥掉，这里是防误点）
+  artistEditing = i;
   $("#ig-artist-name").value = a?.name ?? "";
   $("#ig-artist-content").value = a?.content ?? "";
   $("#ig-artist-edit").style.display = "block";

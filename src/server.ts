@@ -83,6 +83,7 @@ import {
   listNovelaiGatewayModels,
   rejectForeignKey,
   validateGatewayModel,
+  isBuiltinArtist,
   NAI_GATEWAY_BASE,
 } from "./core/imageConfig.js";
 import { coversDir, saveCover, readCover, normalizeAvatar } from "./core/covers.js";
@@ -4063,12 +4064,14 @@ app.post("/api/image/config", async (req, res) => {
       const mv = await validateGatewayModel(cur.novelai.key, String(novelai.model));
       if (!mv.ok) return res.status(400).json({ error: mv.info });
     }
-    // 画师串列表：name/content 去空白过滤
-    const nextArtists = Array.isArray(artists)
+    // 画师串列表：name/content 去空白过滤；内置默认串（2.5D写实/超写实二次元）不可改不可删——
+    // 前端传来的列表里剥掉内置同名条目，落盘的永远只是用户自建串（读回时 getImageConfig 会合并内置）
+    const incomingArtists = Array.isArray(artists)
       ? (artists as { name?: string; content?: string }[])
           .map((a) => ({ name: String(a?.name ?? "").trim(), content: String(a?.content ?? "").trim() }))
-          .filter((a) => a.name && a.content)
-      : cur.artists;
+          .filter((a) => a.name && a.content && !isBuiltinArtist(a.name))
+      : cur.artists.filter((a) => !a.builtin);
+    const nextArtists = incomingArtists;
     const next = {
       provider: provider === "openai" ? "openai" : provider === "novelai" ? "novelai" : cur.provider,
       retentionDays: Number.isFinite(Number(retentionDays)) ? Math.max(0, Math.floor(Number(retentionDays))) : cur.retentionDays,
@@ -4088,13 +4091,13 @@ app.post("/api/image/config", async (req, res) => {
       },
       artists: nextArtists,
       // 只有前端真的传了 activeArtist 才改；没传（如只切提供商的局部保存）沿用原值——
-      // 否则「切一下提供商」会把用户选中的画师串清空（实测踩到）
+      // 校验范围 = 内置默认串 + 用户自建串（内置不在 nextArtists 里，选了内置也必须能存）
       activeArtist:
         activeArtist === undefined
-          ? nextArtists.some((a) => a.name === cur.activeArtist)
+          ? (isBuiltinArtist(cur.activeArtist) || nextArtists.some((a) => a.name === cur.activeArtist))
             ? cur.activeArtist
             : ""
-          : typeof activeArtist === "string" && nextArtists.some((a) => a.name === activeArtist)
+          : typeof activeArtist === "string" && (isBuiltinArtist(activeArtist) || nextArtists.some((a) => a.name === activeArtist))
             ? activeArtist
             : "",
     };

@@ -22,6 +22,33 @@ export const NAI_GATEWAY_DEFAULT_MODEL = "[次]nai-4.5";
 export interface ArtistPreset {
   name: string;
   content: string;
+  /** 内置默认串：随代码分发，前端不可编辑/删除，保存时也不会被覆盖 */
+  builtin?: boolean;
+}
+
+/**
+ * 内置默认画师串（与预设内置条目同思路：代码里定义，读写时合并，用户改不掉也删不掉）。
+ * 用户自己的画师串仍存在 imageConfig.json，两者按 name 去重后合并（内置在前）。
+ */
+export const BUILTIN_ARTISTS: ArtistPreset[] = [
+  {
+    name: "2.5D写实",
+    builtin: true,
+    // 原用户自建的「2.5」串原样收编（含其中的字面 \n，保持字节一致）
+    content: "0.9::misaka_12003-gou ::, dino_(dinoartforame), wanke, liduke, year 2025, realistic, 4k, -2::green ::, textless version, The image is highly intricate finished drawn. Only the character's face is in anime style, but their body is in realistic style. 1.35::A highly finished photo-style artwork that has lively color, graphic texture, realistic skin surface, and lifelike flesh with little obliques::. 1.63::photorealistic::, 1.63::photo(medium)::, \\n20::best quality, absurdres, very aesthetic, detailed, masterpiece::,, very aesthetic, masterpiece, no text,",
+  },
+  {
+    name: "超写实二次元",
+    builtin: true,
+    content: "1.3::artist:mingon, artist:Grande, artist:been::, artist:meion, artist:ningen_mame, 1.4::artist:azuuru::, artist:misyune, artist:kedama_milk, 1.3::artist:torino_aqua, artist:fuzichoco, artist:atdan, artist:chen_bin, artist:orange_maru_(YD)::, artist:niro, artist:hiten::, 0.5::artist:wlop::, year_2025, realistic, 4k, {Only the character's face is in anime style, but their body is in realistic style}, 1.35::A highly finished photo-style artwork that has lively color, graphic texture, realistic skin surface, and lifelike flesh with little obliques::, 1.63::photorealistic::, 1.63::photo(medium), pale skin::, 20::best quality, absurdres, very aesthetic, detailed, masterpiece::, -5::flat_color, multiple_views::",
+  },
+];
+
+const BUILTIN_NAMES = new Set(BUILTIN_ARTISTS.map((a) => a.name));
+
+/** 是不是内置默认串（内置串不可编辑/删除/覆盖） */
+export function isBuiltinArtist(name: string): boolean {
+  return BUILTIN_NAMES.has(String(name ?? "").trim());
 }
 
 /** 出图尺寸：auto=由 AI 按画面内容判断（默认）；其余为固定档 */
@@ -60,7 +87,7 @@ async function cfgPath(): Promise<string> {
 export async function getImageConfig(): Promise<ImageConfig> {
   try {
     const c = JSON.parse(await fs.readFile(await cfgPath(), "utf8"));
-    const artists = Array.isArray(c.artists)
+    let artists = Array.isArray(c.artists)
       ? (c.artists as unknown[])
           .filter((a) => a && typeof a === "object")
           .map((a) => {
@@ -69,6 +96,13 @@ export async function getImageConfig(): Promise<ImageConfig> {
           })
           .filter((a) => a.name && a.content)
       : [];
+    // 收编迁移：旧的「2.5」串已升级为内置「2.5D写实」，去掉旧条目并迁移选中状态
+    const hadOld25 = artists.some((a) => a.name === "2.5");
+    artists = artists.filter((a) => a.name !== "2.5" && !BUILTIN_NAMES.has(a.name));
+    // 合并内置（内置在前），按 name 去重——用户列表里混进来的同名内置条目以代码版本为准
+    artists = [...BUILTIN_ARTISTS.map((a) => ({ ...a })), ...artists];
+    let activeArtist = artists.some((a) => a.name === c.activeArtist) ? String(c.activeArtist) : "";
+    if (!activeArtist && hadOld25 && c.activeArtist === "2.5") activeArtist = "2.5D写实";
     return {
       provider: c.provider === "openai" ? "openai" : "novelai",
       retentionDays: Number(c.retentionDays) || DEFAULTS.retentionDays,
@@ -79,7 +113,9 @@ export async function getImageConfig(): Promise<ImageConfig> {
       },
       openai: { baseUrl: String(c.openai?.baseUrl ?? ""), key: String(c.openai?.key ?? ""), model: String(c.openai?.model ?? DEFAULTS.openai.model) },
       artists,
-      activeArtist: artists.some((a) => a.name === c.activeArtist) ? String(c.activeArtist) : "",
+      // 用上面带收编迁移的变量，不能再算一遍——否则迁移结果被丢弃，
+      // 旧「2.5」的选中状态迁移不到「2.5D写实」（实测踩到：迁移代码成了死代码）
+      activeArtist,
     };
   } catch {
     return structuredClone(DEFAULTS);
