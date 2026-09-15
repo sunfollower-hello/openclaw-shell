@@ -69,6 +69,8 @@ import {
 } from "./core/lifeScheduler.js";
 import { TOOL_REGISTRY, toolsToOpenAI, resolveInSandbox, type ToolDef, type ToolCtx } from "./tools/registry.js";
 import { FEATURES, filterDisabledTools } from "./core/features.js";
+import { runAsUser, userRoot, DEVICE_ID_RE } from "./core/dataRoot.js";
+import { ensureDevice, listDevices, setDeviceDisabled } from "./core/users.js";
 import { getMemImage } from "./core/memImages.js";
 import { toUserError } from "./core/errors.js";
 import { queryLogs, clearLogs, logInfo, logWarn, logError } from "./core/logger.js";
@@ -216,11 +218,27 @@ const app = express();
 app.use(express.json({ limit: "20mb" }));
 const store = new CardStore();
 
-// 内容资源（表情/生图/封面）先于认证挂载：<img> 标签无法携带 Basic 凭证，
-// 之前挂在认证后导致图片 401 加载失败（实锤）。图片 URL 含随机文件名，同源内网/隧道可见，风险可接受。
-app.use("/emojis", express.static(path.join(dataDir(), "emojis")));
-app.use("/img", express.static(path.join(dataDir(), "images")));
-app.use("/covers", express.static(coversDir(), { etag: true, maxAge: 0 }));
+// ---------- 设备身份（分发形态：无注册无登录，设备随机 ID 即身份） ----------
+// 识别顺序：X-Device-Id 头 > oc_device cookie（<img> 等子资源带不了自定义头，靠 cookie）。
+// 识别结果挂 res.locals，Basic 认证在其后：管理员（Basic 有效）覆盖设备身份走全局 data/，
+// 设备请求免 Basic、整条链路跑在 data/users/<id>/ 作用域里（AsyncLocalStorage）。
+app.use((req, res, next) => {
+  const cookies: Record<string, string> = {};
+  for (const part of String(req.headers.cookie ?? "").split(";")) {
+    const i = part.indexOf("=");
+    if (i > 0) {
+      try {
+        cookies[part.slice(0, i).trim()] = decodeURIComponent(part.slice(i + 1).trim());
+      } catch {
+        /* 忽略坏 cookie */
+      }
+    }
+  }
+  res.locals.ocCookies = cookies;
+  const cand = String(req.headers["x-device-id"] ?? cookies["oc_device"] ?? "").toLowerCase();
+  if (DEVICE_ID_RE.test(cand) && ensureDevice(cand)) res.locals.ocDevice = cand;
+  next();
+});
 
 // 公网暴露时启用 Basic 认证（设置 OPENCLAW_SHELL_UI_USER / OPENCLAW_SHELL_UI_PASS）
 const UI_USER = process.env.OPENCLAW_SHELL_UI_USER;
@@ -237,12 +255,60 @@ if (UI_USER && UI_PASS) {
       const idx = decoded.indexOf(":");
       const user = idx >= 0 ? decoded.slice(0, idx) : "";
       const pass = idx >= 0 ? decoded.slice(idx + 1) : "";
-      if (user === UI_USER && pass === UI_PASS) return next();
+      if (user === UI_USER && pass === UI_PASS) {
+        res.locals.ocDevice = null; // 管理员永远压过设备身份（浏览器会同时带设备 cookie + Basic）
+        return next();
+      }
     }
+    // 设备身份请求免 Basic（分发用户无账号体系）
+    if (res.locals.ocDevice) return next();
     res.setHeader("WWW-Authenticate", 'Basic realm="openclaw-shell"');
     res.status(401).json({ error: "需要登录" });
   });
 }
+
+// 设备请求包进用户作用域（此后所有 dataDir() 都指向 data/users/<id>/）
+app.use((req, res, next) => {
+  const dev = res.locals.ocDevice;
+  if (dev) return runAsUser({ deviceId: dev, root: userRoot(dev) }, () => next());
+  next();
+});
+
+// 管理员专属端点：设备（分发用户）不可触达
+const ADMIN_ONLY_PREFIXES = [
+  "/api/bots",
+  "/api/channels",
+  "/api/distill",
+  "/api/plugins",
+  "/api/mcp",
+  "/api/users",
+  "/api/backup",
+  "/api/workspace/",
+];
+app.use((req, res, next) => {
+  if (res.locals.ocDevice && ADMIN_ONLY_PREFIXES.some((p) => req.path === p || req.path.startsWith(p))) {
+    return res.status(403).json({ error: "该功能不在此版本开放" });
+  }
+  next();
+});
+
+// 内容资源（表情/生图/封面）按请求作用域取目录：<img> 靠 oc_device cookie 带身份。
+// 注意必须挂在 ALS 包装之后。同根缓存静态中间件实例，避免每请求重建。
+const ocStaticCache = new Map<string, ReturnType<typeof express.static>>();
+function ocScopedStatic(sub: string) {
+  return (req: express.Request, res: express.Response, next: express.NextFunction) => {
+    const root = path.join(dataDir(), sub);
+    let mw = ocStaticCache.get(root);
+    if (!mw) {
+      mw = express.static(root);
+      ocStaticCache.set(root, mw);
+    }
+    mw(req, res, next);
+  };
+}
+app.use("/emojis", ocScopedStatic("emojis"));
+app.use("/img", ocScopedStatic("images"));
+app.use("/covers", ocScopedStatic("covers"));
 
 const projectRoot = findProjectRoot();
 
@@ -4386,6 +4452,17 @@ app.get("/api/image/:id", async (req, res) => {
   res.setHeader("Content-Type", img.mime);
   res.setHeader("Cache-Control", "private, max-age=3600");
   res.send(img.buf);
+});
+
+// ---------- 设备管理（管理员）：列出注册设备 / 停用恢复 ----------
+app.get("/api/users", async (_req, res) => {
+  res.json({ devices: listDevices() });
+});
+app.post("/api/users/disable", async (req, res) => {
+  const { id, disabled } = req.body ?? {};
+  const ok = setDeviceDisabled(String(id ?? ""), disabled === true);
+  if (!ok) return res.status(400).json({ error: "设备不存在或 id 不合法" });
+  res.json({ ok: true });
 });
 
 // ---------- 语音合成（TTS）：上游聚合（OpenAI 兼容，可售卖）+ 本地兜底（Edge/SAPI） ----------

@@ -2,16 +2,32 @@
 const $ = (sel) => document.querySelector(sel);
 const $$ = (sel) => document.querySelectorAll(sel);
 
+// ================= 设备身份（分发形态：无注册无登录） =================
+// 首次启动生成 32 位随机 hex 存 localStorage + cookie（cookie 让 <img> 等子资源也能带上身份）。
+// 服务器按这个 ID 分数据命名空间；删 App/清数据 = 新 ID = 全新空白。
+const OC_DEVICE = (() => {
+  let id = localStorage.getItem("oc_device");
+  if (!id || !/^[a-f0-9]{32}$/.test(id)) {
+    const b = new Uint8Array(16);
+    crypto.getRandomValues(b);
+    id = [...b].map((x) => x.toString(16).padStart(2, "0")).join("");
+    localStorage.setItem("oc_device", id);
+  }
+  document.cookie = "oc_device=" + id + "; path=/; max-age=31536000; SameSite=Lax";
+  return id;
+})();
+
 // ================= 基础 =================
 // 某些浏览器（如内嵌 webview）打开 URL 内嵌凭据（user:pass@host）时，页面内 fetch 不会自动携带，
 // 首次 401 就用 URL 里的凭据显式重试一次
 async function fetchApi(path, options = {}) {
-  let r = await fetch(path, options);
+  const headers = { "X-Device-Id": OC_DEVICE, ...(options.headers ?? {}) };
+  let r = await fetch(path, { ...options, headers });
   if (r.status === 401 && location.username) {
     const token = btoa(unescape(encodeURIComponent(`${location.username}:${location.password}`)));
     r = await fetch(path, {
       ...options,
-      headers: { ...(options.headers ?? {}), Authorization: "Basic " + token },
+      headers: { ...headers, Authorization: "Basic " + token },
     });
   }
   return r;

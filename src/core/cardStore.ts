@@ -19,9 +19,8 @@ export function findProjectRoot(startDir = __dirname): string {
   }
 }
 
-export function dataDir(): string {
-  return process.env.OPENCLAW_SHELL_DATA ?? path.join(findProjectRoot(), "data");
-}
+export { dataDir } from "./dataRoot.js";
+import { dataDir } from "./dataRoot.js";
 
 export function cardsDir(): string {
   return path.join(dataDir(), "cards");
@@ -43,7 +42,10 @@ export function isValidSlug(slug: string): boolean {
 }
 
 export class CardStore {
-  constructor(private dir: string = cardsDir()) {}
+  // 目录每次调用时取：多租户下随请求作用域变化（管理员=全局 data/，设备=data/users/<id>/）
+  private get dir(): string {
+    return cardsDir();
+  }
 
   private cardPath(slug: string): string {
     if (!isValidSlug(slug)) throw new Error(`非法 slug: ${slug}`);
