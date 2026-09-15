@@ -4074,7 +4074,10 @@ async function initImgGenPage() {
   );
   // 生图模型：服务地址固定，模型由用户从自己密钥可用的列表里挑
   $("#ig-nai-models").addEventListener("click", async () => {
-    const key = $("#ig-nai-key")?.value?.trim();
+    const raw = $("#ig-nai-key")?.value?.trim();
+    // 密钥显示为点号占位时 = 用已保存的密钥（与「测试」同一口径）。
+    // 别把点号字符串当真密钥发出去——否则隐藏密钥时拉取模型必 401（实测踩到）。
+    const key = raw && raw !== PV_KEY_DOTS ? raw : undefined;
     setStatus("#ig-nai-models-status", "拉取中…");
     try {
       const r = await api.send("/api/image/nai-models", {
