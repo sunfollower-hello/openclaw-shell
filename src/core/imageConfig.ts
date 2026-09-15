@@ -42,6 +42,12 @@ export const BUILTIN_ARTISTS: ArtistPreset[] = [
     builtin: true,
     content: "1.3::artist:mingon, artist:Grande, artist:been::, artist:meion, artist:ningen_mame, 1.4::artist:azuuru::, artist:misyune, artist:kedama_milk, 1.3::artist:torino_aqua, artist:fuzichoco, artist:atdan, artist:chen_bin, artist:orange_maru_(YD)::, artist:niro, artist:hiten::, 0.5::artist:wlop::, year_2025, realistic, 4k, {Only the character's face is in anime style, but their body is in realistic style}, 1.35::A highly finished photo-style artwork that has lively color, graphic texture, realistic skin surface, and lifelike flesh with little obliques::, 1.63::photorealistic::, 1.63::photo(medium), pale skin::, 20::best quality, absurdres, very aesthetic, detailed, masterpiece::, -5::flat_color, multiple_views::",
   },
+  {
+    name: "同人风",
+    builtin: true,
+    // 上游工作台的「动漫同人风」预设原文：纯风格词、无画师名（站方按自家模型调的，稳定）
+    content: "masterpiece, best quality, very aesthetic, modern Japanese anime, official anime art, anime key visual, anime screencap, soft cel shading, soft anime coloring, smooth color transitions, natural skin tones, restrained color palette, slightly desaturated, muted colors, soft ambient lighting, gentle contrast, subtle gradients, subtle bloom, detailed anime background",
+  },
 ];
 
 const BUILTIN_NAMES = new Set(BUILTIN_ARTISTS.map((a) => a.name));
