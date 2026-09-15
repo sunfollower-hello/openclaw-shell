@@ -4087,11 +4087,40 @@ app.post("/api/image/config", async (req, res) => {
         model: openai?.model !== undefined ? String(openai.model) : cur.openai.model,
       },
       artists: nextArtists,
+      // 只有前端真的传了 activeArtist 才改；没传（如只切提供商的局部保存）沿用原值——
+      // 否则「切一下提供商」会把用户选中的画师串清空（实测踩到）
       activeArtist:
-        typeof activeArtist === "string" && nextArtists.some((a) => a.name === activeArtist) ? activeArtist : "",
+        activeArtist === undefined
+          ? nextArtists.some((a) => a.name === cur.activeArtist)
+            ? cur.activeArtist
+            : ""
+          : typeof activeArtist === "string" && nextArtists.some((a) => a.name === activeArtist)
+            ? activeArtist
+            : "",
     };
     await saveImageConfig(next);
-    res.json({ ok: true, hint: "已保存。工作模式勾选「生图」工具即可让 AI 生成图片" });
+    // 提供商切换后通道侧 SKILL.md 里的生图规则要跟着换（NAI 标签版 ↔ OpenAI 自然语言版）。
+    // 网页侧每次请求都会重新 resolve，不用管；通道侧是编译快照，必须重编开了生图的卡。
+    // 只在提供商真变了时才做（画师串/尺寸改动不影响规则文本）。
+    let recompiled = 0;
+    if (next.provider !== cur.provider) {
+      const bots = await listBots().catch(() => []);
+      for (const b of bots) {
+        const card = await store.get(b.cardSlug).catch(() => null);
+        if (!card) continue;
+        const tools = card.tools?.enabled ?? [];
+        if (!tools.includes("image_gen")) continue;
+        await syncCardToChannel(card).catch(() => {});
+        recompiled++;
+      }
+    }
+    res.json({
+      ok: true,
+      hint:
+        next.provider !== cur.provider
+          ? `已保存，生图规则已切到${next.provider === "openai" ? " OpenAI 自然语言" : " NovelAI 标签"}版${recompiled ? `（已重编译 ${recompiled} 张通道卡）` : ""}`
+          : "已保存",
+    });
   } catch (e) {
     res.status(500).json({ error: toUserError(e) });
   }

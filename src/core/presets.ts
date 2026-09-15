@@ -245,18 +245,82 @@ const BUILTIN_STYLES: PresetGroup[] = [
 ];
 
 // ---------- 能力触发规则（随对应能力开关注入） ----------
-export const ABILITY_IMAGE_RULE = `# 能力触发（生图）
-- 生图：用户要求看图片、生成图片、换一张/再来一张图时，按角色设定判断——【可以拒绝】（傲娇/剧情需要时直接拒绝，符合人设）；但只要你【同意】生成图片，就必须调用 image_gen 真实生成新图，绝不能只口头描述画面、把上一张当新图或假装已生成。
-- 【不要写地址】图片生成后系统会自动附带在回复末尾，不要在回复正文里写图片地址/路径。
-- 工具调用不取代文字：图片作为文字回复的补充，而不是替代。`;
+//
+// 生图规则按「当前生效的生图提供商」分流注入，不让模型自己猜写法：
+//   NAI（走我们中转站的 NovelAI 模型）→ 英文 Danbooru 标签，允许 NSFW
+//   OpenAI 兼容                        → 英文自然语言，不写 NSFW 相关引导
+// 两版共用的部分（何时生图、形象一致性、不许假装生成）抽成常量，避免两边改漏。
+
+/** 何时该生图 / 何时可以拒绝——两种提供商、网页与通道四种组合都一样 */
+const IMAGE_WHEN = `- 何时生图：用户要求看图片/自拍/生成图片/换一张再来一张时，按角色设定判断——【可以拒绝】（傲娇、害羞、剧情不合适时直接拒绝，符合人设即可）；一旦你【同意】，就必须真实生成，绝不能只用文字描述画面、把上一张当新图、或假装已经生成过。`;
+
+/** 画面内容怎么定：形象一致性 + 按剧情创作（用户明确要求的核心） */
+const IMAGE_CONTENT_RULE = `- 【形象必须一致】画面里出现角色本人时，外貌必须照人设写（发色发型、瞳色、身材、惯常穿着、显著特征如猫耳/眼镜/伤痕），不要每次换一个长相；画面里出现对方（用户）时，照【和你说话的人】里他给自己设定的形象写，没写就别硬编他的样貌（可以只画你自己，或用背影/手部等不露脸的处理）。
+- 【按剧情写，不是套模板】画面要贴合此刻的场景与情绪：地点、时间光线、天气、衣着是否符合当前情节（刚洗完澡就不该是外出装）、表情动作要对应你现在的心情和你们的关系。用户提了具体要求就以他的要求为主，你再补齐合理细节。
+- 图片是文字回复的补充，不是替代：该说的话照说，别只丢一张图。`;
+
+/** NAI 标签写法教学（含正例，给不懂"标签风格"的模型看） */
+const IMAGE_NAI_HOWTO = `- 【提示词必须是英文 Danbooru 标签】用英文单词或短词组，逗号分隔，不写整句英文、不写中文。顺序习惯：人数与主体 → 外貌 → 服饰 → 表情动作 → 场景环境 → 光线氛围 → 镜头构图 → 画质词。
+- 常用标签举例（按需挑，不要全堆）：
+  · 主体：1girl, 1boy, solo, 2people
+  · 外貌：long black hair, silver hair, twintails, blue eyes, cat ears, glasses, pale skin, slender
+  · 服饰：school uniform, black trench coat, white shirt, pleated skirt, hoodie, kimono, off-shoulder, barefoot
+  · 表情：smile, blush, shy, crying, angry, half-closed eyes, seductive smile
+  · 动作：sitting, lying on bed, leaning against wall, hugging, looking at viewer, looking away, arms crossed
+  · 场景：bedroom, classroom, city street at night, cafe, rainy night, hot spring, on the bed, indoors
+  · 光线氛围：warm lighting, backlighting, neon lights, moonlight, soft light, cinematic lighting
+  · 构图：upper body, full body, close-up, from side, from above, portrait
+  · 画质（结尾常带）：masterpiece, best quality, very aesthetic, absurdres, highly detailed
+- 一个完整例子（雨夜等人）：\`1girl, solo, long black hair, cat ear headband, black trench coat, standing under eaves, leaning against wall, looking at viewer, rainy night, wet street, neon lights, upper body, cinematic lighting, masterpiece, best quality, very aesthetic\`
+- 【不用写负面词】负面提示词与画质参数已由系统固定，你只写正面画面标签就行。`;
+
+/** NAI 的 NSFW 规则（只在 NAI 档注入；OpenAI 档绝不注入） */
+const IMAGE_NAI_NSFW = `- 【NSFW 必须打标】画面涉及裸露、性行为、情色场景时，提示词开头必须加 \`nsfw\`（露骨程度高时用 \`nsfw, explicit\`），漏标会导致出图不符合预期。
+- NSFW 相关标签举例：nsfw, explicit, nude, topless, bottomless, underwear, lingerie, see-through, wet clothes, spread legs, sex, vaginal, oral, cum, blush, sweat, heavy breathing, bed, bedroom, night
+- 尺度跟随剧情与角色状态，不必每次都露骨；日常场景就别加 nsfw。`;
+
+/** 网页侧（AI 调 image_gen 工具）：NAI 档 */
+export const ABILITY_IMAGE_RULE_NAI = `# 能力触发（生图 · 当前为 NovelAI 模型）
+${IMAGE_WHEN}同意后调用 image_gen 工具生成。
+${IMAGE_CONTENT_RULE}
+${IMAGE_NAI_HOWTO}
+${IMAGE_NAI_NSFW}
+- 【不要写地址】图片生成后系统会自动附带在回复末尾，不要在正文里写图片地址或路径。`;
+
+/** 网页侧：OpenAI 兼容档（自然语言，不提 NSFW） */
+export const ABILITY_IMAGE_RULE_OPENAI = `# 能力触发（生图 · 当前为 OpenAI 兼容模型）
+${IMAGE_WHEN}同意后调用 image_gen 工具生成。
+${IMAGE_CONTENT_RULE}
+- 【提示词用英文自然语言】写 2-4 句连贯的英文句子描述画面，不要写逗号分隔的标签串、不要写中文。句子里要交代清楚：人物外貌与服饰、正在做什么、所处场景、时间与光线氛围、镜头远近（如 upper body portrait / full body / close-up）。
+- 一个完整例子（雨夜等人）：\`A girl with long black hair wearing a cat-ear headband and a black trench coat, leaning against the wall under the eaves on a rainy night, looking at the viewer. Wet street reflecting neon lights, cinematic moody lighting, upper body portrait, highly detailed anime illustration.\`
+- 【不要写地址】图片生成后系统会自动附带在回复末尾，不要在正文里写图片地址或路径。`;
+
+/** 兼容旧引用：默认给 NAI 版（compiler 会按提供商替换成对应的通道版） */
+export const ABILITY_IMAGE_RULE = ABILITY_IMAGE_RULE_NAI;
 
 // 通道侧（QQ/微信）生图规则：指令式（v10，爱语同源但自定格式）——
 // 模型在回复正文里插入 <生图:图片描述>，通道补丁解析后调独立生图接口出图，
 // 一次聊天模型调用完成（不再有「工具回合 + 复读 MEDIA:」的两次调用）。
-export const ABILITY_IMAGE_RULE_CHANNEL = `# 能力触发（生图）
-- 生图：用户要求看图片、生成图片、换一张/再来一张图时，按角色设定判断——【可以拒绝】（傲娇/剧情需要时直接拒绝，符合人设）；但只要你【同意】生成图片，就在回复正文中插入生图指令 <生图:图片描述>（尖括号内写清画面内容，系统会自动生成图片并发送），绝不能只口头描述画面、把上一张当新图或假装已生成。
+const IMAGE_CHANNEL_HOW = `一旦同意，就在回复正文中插入生图指令 \`<生图:提示词>\`（尖括号内直接写提示词，系统会自动生成并发送图片）。
 - 【不要调用任何工具】生图由系统解析指令自动完成，不要为生图调用 image_gen 或任何工具，也不要写图片地址/路径。
-- 每次回复最多 1 张：图片作为文字回复的补充，而不是替代。`;
+- 每次回复最多插入 1 个生图指令。`;
+
+/** 通道侧：NAI 档 */
+export const ABILITY_IMAGE_RULE_CHANNEL_NAI = `# 能力触发（生图 · 当前为 NovelAI 模型）
+${IMAGE_WHEN}${IMAGE_CHANNEL_HOW}
+${IMAGE_CONTENT_RULE}
+${IMAGE_NAI_HOWTO}
+${IMAGE_NAI_NSFW}`;
+
+/** 通道侧：OpenAI 兼容档（自然语言，不提 NSFW） */
+export const ABILITY_IMAGE_RULE_CHANNEL_OPENAI = `# 能力触发（生图 · 当前为 OpenAI 兼容模型）
+${IMAGE_WHEN}${IMAGE_CHANNEL_HOW}
+${IMAGE_CONTENT_RULE}
+- 【提示词用英文自然语言】写 2-4 句连贯的英文句子描述画面，不要写逗号分隔的标签串、不要写中文。句子里要交代清楚：人物外貌与服饰、正在做什么、所处场景、时间与光线氛围、镜头远近（如 upper body portrait / full body / close-up）。
+- 一个完整例子（雨夜等人）：\`<生图:A girl with long black hair wearing a cat-ear headband and a black trench coat, leaning against the wall under the eaves on a rainy night, looking at the viewer. Wet street reflecting neon lights, cinematic moody lighting, upper body portrait, highly detailed anime illustration.>\``;
+
+/** 兼容旧引用 */
+export const ABILITY_IMAGE_RULE_CHANNEL = ABILITY_IMAGE_RULE_CHANNEL_NAI;
 
 // 网页侧语音规则：网页没有主动发语音的能力（朗读是用户点按钮触发），明确禁止模型输出语音指令
 export const ABILITY_TTS_RULE = `# 能力触发（语音）
@@ -488,7 +552,13 @@ export async function resolveCardPresetBlocks(card: PersonaCard): Promise<string
   blocks.push(...resolveGroup(tier).systemBlocks);
   blocks.push(...resolveGroup(style).systemBlocks);
   const tools = card.tools?.enabled ?? [];
-  if (tools.includes("image_gen")) blocks.push(ABILITY_IMAGE_RULE);
+  if (tools.includes("image_gen")) {
+    // 按当前生效的生图提供商注入对应规则（不让模型自己猜写法）。
+    // 网页侧走工具版；通道侧 compiler 会把这块换成指令版。
+    const { getImageConfig } = await import("./imageConfig.js");
+    const img = await getImageConfig().catch(() => ({ provider: "novelai" as const }));
+    blocks.push(img.provider === "openai" ? ABILITY_IMAGE_RULE_OPENAI : ABILITY_IMAGE_RULE_NAI);
+  }
   if (card.abilities?.tts === true) blocks.push(ABILITY_TTS_RULE);
   // 拆条模板变量：{split_min}/{split_max} 按卡的高级配置替换（默认 1/7）。
   // 预设文本里写的是「默认 1~7」的说明，这里用真实值覆盖，两处口径一致。
