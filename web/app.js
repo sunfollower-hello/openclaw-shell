@@ -713,26 +713,11 @@ function greeting() {
   return "晚上好";
 }
 
-/** 今天的日期 + 一句应景的诗词（按月份选，副标题用） */
+/** 今天的日期（首页副标题用） */
 function todayLine() {
   const d = new Date();
   const weeks = ["日", "一", "二", "三", "四", "五", "六"];
-  const dateStr = `${d.getFullYear()}年${d.getMonth() + 1}月${d.getDate()}日 星期${weeks[d.getDay()]}`;
-  const poems = {
-    1: "爆竹声中一岁除，春风送暖入屠苏。",
-    2: "碧玉妆成一树高，万条垂下绿丝绦。",
-    3: "等闲识得东风面，万紫千红总是春。",
-    4: "人间四月芳菲尽，山寺桃花始盛开。",
-    5: "小荷才露尖尖角，早有蜻蜓立上头。",
-    6: "接天莲叶无穷碧，映日荷花别样红。",
-    7: "绿树阴浓夏日长，楼台倒影入池塘。",
-    8: "云天收夏色，木叶动秋声。",
-    9: "自古逢秋悲寂寥，我言秋日胜春朝。",
-    10: "停车坐爱枫林晚，霜叶红于二月花。",
-    11: "落红不是无情物，化作春泥更护花。",
-    12: "墙角数枝梅，凌寒独自开。",
-  };
-  return `${dateStr} · ${poems[d.getMonth() + 1] ?? ""}`;
+  return `${d.getFullYear()}年${d.getMonth() + 1}月${d.getDate()}日 星期${weeks[d.getDay()]}`;
 }
 
 function renderHome() {
