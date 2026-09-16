@@ -293,7 +293,7 @@ async function renderSkill(card: PersonaCard, presetBlocks: string[] = [], emoji
       lines.push("");
       lines.push(`### ${title}${richOnly ? "（重描写专属）" : e.constant ? "（常驻）" : ""}`);
       if (richOnly) {
-        lines.push("- 当前为重描写风格，本条生效：按下面的特征写动作与心理（心理用（）、动作神态用 {}）");
+        lines.push("- 当前为重描写风格，本条生效：按下面的特征写动作与心理（心理用 {} 包裹、动作神态用（）包裹）");
       } else if (e.constant) {
         lines.push("- 常驻生效：始终作为角色背景与行为依据");
       } else if (keys) {
@@ -462,7 +462,7 @@ async function renderAgents(
       const keys = Array.isArray(e.keys) && e.keys.length ? e.keys.filter((k) => String(k).trim() !== RICH_ONLY_KEY).join("、") : "";
       lines.push("");
       lines.push(
-        `### ${title}${richOnly ? "（重描写专属：按本条写动作与心理，心理用（）、动作神态用 {}）" : e.constant ? "（常驻）" : `（聊天出现关键词【${keys}】时按本条行事）`}`
+        `### ${title}${richOnly ? "（重描写专属：按本条写动作与心理，心理用 {} 包裹、动作神态用（）包裹）" : e.constant ? "（常驻）" : `（聊天出现关键词【${keys}】时按本条行事）`}`
       );
       lines.push(String(e.content ?? "").trim());
     }
