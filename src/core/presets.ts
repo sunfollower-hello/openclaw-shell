@@ -387,15 +387,29 @@ function normalizeGroup(g: Partial<PresetGroup> | null, builtin: PresetGroup): P
   };
 }
 
+/**
+ * 归一化：内置组按代码定义补全/覆盖，**自定义组原样保留**。
+ *
+ * 【2026-09-16 修 bug】原来只有 `def.tiers.map(...)` —— 以**内置定义**为唯一来源遍历，
+ * 于是文件里 id 不在内置里的组（也就是用户自己新增的档位/风格组）**每次读都被丢掉**：
+ * 「新增」时内存里 push 进去、界面看着创建成功，下一次 loadPresets() 就没了（刷新即消失），
+ * 属于从来没真正生效的功能。现在内置走一遍归一化，自定义组接在后面。
+ */
 function normalize(parsed: unknown, def: PresetStore): PresetStore {
   const p = (parsed as PresetStore) ?? {};
   const tiers = Array.isArray(p.tiers) ? p.tiers : [];
   const styles = Array.isArray(p.styles) ? p.styles : [];
-  const tierById = new Map(tiers.map((g) => [g?.id, g]));
-  const styleById = new Map(styles.map((g) => [g?.id, g]));
+  const merge = (stored: Partial<PresetGroup>[], defs: PresetGroup[]): PresetGroup[] => {
+    const byId = new Map(stored.filter((g) => g?.id).map((g) => [String(g.id), g]));
+    const builtinPart = defs.map((b) => normalizeGroup(byId.get(b.id) ?? null, b));
+    const customPart = stored
+      .filter((g) => g?.id && !defs.some((b) => b.id === g.id))
+      .map((g) => normalizeGroup(g, { id: String(g.id), name: String(g.name || g.id), builtin: false, items: [] }));
+    return [...builtinPart, ...customPart];
+  };
   return {
-    tiers: def.tiers.map((b) => normalizeGroup(tierById.get(b.id) ?? null, b)),
-    styles: def.styles.map((b) => normalizeGroup(styleById.get(b.id) ?? null, b)),
+    tiers: merge(tiers, def.tiers),
+    styles: merge(styles, def.styles),
   };
 }
 
@@ -512,12 +526,22 @@ export async function deleteItem(kind: PresetKind, groupId: string, itemId: stri
 }
 
 /** 恢复内置：组与条目文本重置为代码默认（自定义组/条目保留） */
+/**
+ * 恢复内置：内置组的名字与内置条目的文本重置为代码默认，自定义组/自定义条目原样保留。
+ *
+ * 【2026-09-16 修 bug】原来这里是 `normalizeGroup({ ...g, builtin: true }, b)` —— 而
+ * normalizeGroup 的规则是「文件里已有的同 id 条目原样收下，只用内置补缺失的 id」，
+ * 等于把存的东西又原样传回去，**结果这个接口只补缺失条目、从不重置任何文本**（组名也不重置），
+ * 与按钮承诺的「内置条目的文本会重置为代码默认」完全不符。现在直接以内置定义为底重建。
+ */
 export async function resetBuiltinPresets(): Promise<PresetStore> {
   const store = await loadPresets();
   const reset = (list: PresetGroup[], defs: PresetGroup[]): PresetGroup[] =>
     list.map((g) => {
       const b = defs.find((x) => x.id === g.id);
-      return b ? normalizeGroup({ ...g, builtin: true }, b) : g;
+      if (!b) return g; // 自定义组：原样保留
+      const custom = g.items.filter((it) => !b.items.some((bi) => bi.id === it.id));
+      return { ...b, builtin: true, items: [...b.items.map((bi) => ({ ...bi })), ...custom] };
     });
   store.tiers = reset(store.tiers, BUILTIN_TIERS);
   store.styles = reset(store.styles, BUILTIN_STYLES);
