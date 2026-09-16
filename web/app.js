@@ -550,7 +550,6 @@ function cardFormHTML(mode) {
     <textarea id="cf-first" class="cf-autogrow" rows="2" placeholder="只写一句话，不要环境描写：把事由全用说话带出来，结尾留话头。如：哥哥你终于回消息了，我便当都热第三遍了，到底还要不要吃？"></textarea>
   </div>
   <div class="cf-section"><h3>世界书</h3>
-    <p class="hint" id="cf-book-hint">世界书分三块写：人物档案约一千字、对话与性格约两千字（情景+台词+缘由）、动作心理约一千二百字（重描写专属）。可以一条写满，也可以按关键词拆条。</p>
     <div id="cf-book"></div>
     <div class="wb-add-row">
       <button id="cf-book-add" class="ghost small-btn" type="button">＋ 添加条目</button>
@@ -7155,6 +7154,7 @@ function renderPresets() {
       <div class="preset-group-name">${escapeHtml(g.name)}</div>
       <div class="preset-group-meta">${g.items.length} 条${g.builtin ? " · 内置" : ""}</div>
     </div>`;
+  // 档位区（对外叫「通用基础预设」）：按键只留「添加」，「恢复内置」只在风格区保留
   const section = (kind, title, hint, groups) => `
     <div class="card-box">
       <h3>${icon("sliders")} ${title}</h3>
@@ -7163,8 +7163,8 @@ function renderPresets() {
         ${groups.length ? groups.map((g) => groupCard(kind, g)).join("") : '<div class="muted">还没有组，点下方「新增」创建</div>'}
       </div>
       <div class="row" style="margin-top:10px">
-        <button class="ghost small-btn preset-group-add" data-kind="${kind}">${icon("plus")} 新增${kind === "tier" ? "档位" : kind === "guard" ? "全局规则组" : "风格"}</button>
-        <button class="ghost small-btn preset-reset-all" data-kind="${kind}" style="margin-left:8px">恢复内置</button>
+        <button class="ghost small-btn preset-group-add" data-kind="${kind}">${icon("plus")} ${kind === "tier" ? "添加" : "新增" + (kind === "guard" ? "全局规则组" : "风格")}</button>
+        ${kind === "tier" ? "" : `<button class="ghost small-btn preset-reset-all" data-kind="${kind}" style="margin-left:8px">恢复内置</button>`}
       </div>
     </div>`;
   return `
@@ -7173,7 +7173,7 @@ function renderPresets() {
       <h2>${icon("sliders")} 角色扮演预设</h2>
       
     </div>
-    ${section("tier", "档位", "", presetStoreData.tiers)}
+    ${section("tier", "通用基础预设", "", presetStoreData.tiers)}
     <div style="height:12px"></div>
     ${section("style", "风格", "", presetStoreData.styles)}
   </div>`;
@@ -7303,7 +7303,7 @@ function bindPresets() {
   document.querySelectorAll(".preset-group-add").forEach((btn) => {
     btn.addEventListener("click", async () => {
       const kind = btn.dataset.kind;
-      const name = prompt("新" + (kind === "tier" ? "档位" : "风格") + "名称：");
+      const name = prompt(kind === "tier" ? "新预设名称：" : "新风格名称：");
       if (!name || !name.trim()) return;
       try {
         presetStoreData = await api.send("/api/presets", { method: "POST", body: JSON.stringify({ kind, name: name.trim() }) });
