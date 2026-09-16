@@ -518,6 +518,12 @@ export interface SynthesizeOptions {
   providerId?: string; // 指定上游；缺省用 defaultProvider
   voice?: string;
   speed?: number;
+  /**
+   * 是否允许走本地兜底（Edge 在线 / Windows SAPI 离线）。
+   * 分发形态（托管多租户）下本地兜底跑在服务器上：SAPI 是 Windows-only 在 Linux 上根本不可用，
+   * Edge 的免费额度与出口 IP 是运营者的 —— 只给管理员/单用户版留着当调试与兜底，对用户一律关。
+   */
+  allowLocal?: boolean;
 }
 
 /** 按配置合成文本，返回音频 Buffer；providerId 不存在时抛错 */
@@ -527,10 +533,12 @@ export async function synthesize(text: string, opts?: SynthesizeOptions): Promis
   if (!t) throw new Error("文本为空");
   const target = opts?.providerId ?? cfg.defaultProvider;
   if (target === "local") {
+    if (opts?.allowLocal === false) throw new Error("本地语音不在此版本开放，请到「语音合成」页添加一个语音上游");
     // 本地兜底（Edge/SAPI）：现在是单选列表里的一个普通条目，被选中才走这里
     if (cfg.local.engine === "sapi") return synthSapi(t);
     return synthEdge(t, cfg.local.voice, cfg.local.rate, cfg.local.pitch);
   }
+  if (!target) throw new Error("还没有可用的语音上游，请到「语音合成」页添加一个");
   const provider = cfg.providers.find((p) => p.id === target) ?? null;
   if (!provider) throw new Error(`未找到 TTS 上游「${target}」`);
   // 单选机制：defaultProvider 就是激活的那个，不再有"未启用兜底本地"（用户拍板取消）
@@ -566,13 +574,14 @@ export async function convertAudio(buf: Buffer, target: "mp3" | "wav" | "silk"):
 }
 
 /** 测试某个上游（或本地），返回可播放的 dataUrl（前端出播放器，学 rikkahub） */
-export async function testTts(target?: string): Promise<{ ok: boolean; info: string; dataUrl?: string }> {
+export async function testTts(target?: string, opts?: { allowLocal?: boolean }): Promise<{ ok: boolean; info: string; dataUrl?: string }> {
   const cfg = await getTtsConfig();
   const id = target ?? cfg.defaultProvider;
   try {
     let buf: Buffer;
     let desc: string;
     if (id === "local") {
+      if (opts?.allowLocal === false) return { ok: false, info: "本地语音不在此版本开放" };
       buf = cfg.local.engine === "sapi" ? await synthSapi("你好，我是离线语音测试。") : await synthEdge("你好，我是语音合成测试。", cfg.local.voice, cfg.local.rate, cfg.local.pitch);
       desc = cfg.local.engine === "sapi" ? "Windows SAPI（离线）" : `Edge（${cfg.local.voice}）`;
     } else {

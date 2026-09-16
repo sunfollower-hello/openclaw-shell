@@ -1399,6 +1399,10 @@ button:disabled { opacity: 0.4; cursor: not-allowed; transform: none; }
 }
 .preset-group-card:hover { border-color: var(--accent); }
 .preset-group-card:active { transform: scale(0.97); }
+/* 锁住的组（内置档位组「默认」）：普通用户不能打开编辑，视觉上就不给"可点"的信号 */
+.preset-group-card.locked { cursor: not-allowed; opacity: 0.72; }
+.preset-group-card.locked:hover { border-color: var(--border); }
+.preset-group-card.locked:active { transform: none; }
 .preset-group-name { font-size: 13.5px; font-weight: 700; margin-bottom: 3px; }
 .preset-group-meta { font-size: 12px; color: var(--muted); }
 
@@ -2116,6 +2120,15 @@ body.lc-fullscreen .lc-root { height: 100dvh; }
 .oc-row-val { margin-left: auto; font-size: 12.5px; font-weight: 600; color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
 .oc-chev { color: var(--faint); font-size: 16px; }
 .oc-row button:disabled { opacity: .4; cursor: not-allowed; }
+
+/* 设备管理页：顶部搜索行 + 两行式设备块（完整 32 位 ID 要能看全、能选中复制） */
+.u-search-row { display: flex; align-items: center; gap: 10px; padding-bottom: 10px; border-bottom: 1px solid var(--border); }
+.u-search-row input { flex: 1; min-width: 0; }
+.u-count { font-size: 12px; color: var(--muted); white-space: nowrap; }
+.u-dev-main { display: flex; flex-direction: column; gap: 3px; min-width: 0; flex: 1; }
+.u-dev-id { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12.5px; word-break: break-all; cursor: copy; }
+.u-dev-id .oc-cell-mark { margin-left: 6px; font-family: var(--font); }
+.u-dev-meta { font-size: 11.5px; color: var(--muted); font-variant-numeric: tabular-nums; }
 .oc-empty { padding: 26px 0; text-align: center; font-size: 12.5px; color: var(--faint); }
 
 .oc-grid {

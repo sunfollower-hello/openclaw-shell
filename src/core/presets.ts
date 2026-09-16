@@ -46,9 +46,10 @@ export const OUTPUT_GUARD = `## 输出铁律（优先级最高，违反即失败
 
 
 // ---------- 内置档位组：默认（内含 破甲/防神化/防抢话/防跑偏 等独立条目） ----------
-// 组名对外叫「默认」——名字是唯一会被用户看到的地方（预设页与卡片高级配置的档位下拉都显示它）。
+// 组名对外叫「默认」（曾叫「破甲（最高）」）——名字是唯一会被用户看到的地方
+// （预设页与卡片高级配置的档位下拉都显示它），改名的用意是别把内部叫法摊给用户。
 // 注意：data/presets.json 里存过的组名会**压过**这里（normalizeGroup 取存储的 name），
-// 所以改过名的老安装会保留旧名，可在预设页把那个组直接改回来。
+// 所以改名要三处同步：这里 + 本机 data/presets.json + 服务器 data/presets.json。
 const BUILTIN_TIERS: PresetGroup[] = [
   {
     id: "break",
@@ -392,7 +393,7 @@ function normalizeGroup(g: Partial<PresetGroup> | null, builtin: PresetGroup): P
  *
  * 【2026-09-16 修 bug】原来只有 `def.tiers.map(...)` —— 以**内置定义**为唯一来源遍历，
  * 于是文件里 id 不在内置里的组（也就是用户自己新增的档位/风格组）**每次读都被丢掉**：
- * 「新增」时内存里 push 进去、界面看着创建成功，下一次 loadPresets() 就没了（刷新即消失），
+ * 「新增」时内存里push 进去、界面看着创建成功，下一次 loadPresets() 就没了（刷新即消失），
  * 属于从来没真正生效的功能。现在内置走一遍归一化，自定义组接在后面。
  */
 function normalize(parsed: unknown, def: PresetStore): PresetStore {
@@ -525,16 +526,25 @@ export async function deleteItem(kind: PresetKind, groupId: string, itemId: stri
   return store;
 }
 
-/** 恢复内置：组与条目文本重置为代码默认（自定义组/条目保留） */
+/**
+ * 受保护的内置档位组（对外叫「默认」，id 仍是 break）：
+ * 普通用户不能打开、不能改（前端不给入口，后端拦写）；管理员照旧能看能改。
+ * 判 id 而不判名字——名字随时可能再改（改过一版：破甲（最高）→ 默认）。
+ */
+export function isBuiltinTierGroup(kind: string, groupId: string): boolean {
+  return kind === "tier" && BUILTIN_TIERS.some((g) => g.id === groupId);
+}
+
 /**
  * 恢复内置：内置组的名字与内置条目的文本重置为代码默认，自定义组/自定义条目原样保留。
  *
  * 【2026-09-16 修 bug】原来这里是 `normalizeGroup({ ...g, builtin: true }, b)` —— 而
  * normalizeGroup 的规则是「文件里已有的同 id 条目原样收下，只用内置补缺失的 id」，
- * 等于把存的东西又原样传回去，**结果这个接口只补缺失条目、从不重置任何文本**（组名也不重置），
- * 与按钮承诺的「内置条目的文本会重置为代码默认」完全不符。现在直接以内置定义为底重建。
+ * 等于把存的东西又原样传回去，**结果这个接口只补缺失条目、从不重置任何文本**（组名也不重置）。
+ * 与按钮承诺的「内置条目的文本会重置为代码默认」完全不符（09-11 记的同一个坑，只是换了入口）。
+ * 现在直接以内置定义为底重建，只把自定义条目接回去。
  */
-export async function resetBuiltinPresets(): Promise<PresetStore> {
+export async function resetBuiltinPresets(kind?: PresetKind): Promise<PresetStore> {
   const store = await loadPresets();
   const reset = (list: PresetGroup[], defs: PresetGroup[]): PresetGroup[] =>
     list.map((g) => {
@@ -543,8 +553,8 @@ export async function resetBuiltinPresets(): Promise<PresetStore> {
       const custom = g.items.filter((it) => !b.items.some((bi) => bi.id === it.id));
       return { ...b, builtin: true, items: [...b.items.map((bi) => ({ ...bi })), ...custom] };
     });
-  store.tiers = reset(store.tiers, BUILTIN_TIERS);
-  store.styles = reset(store.styles, BUILTIN_STYLES);
+  if (kind !== "style") store.tiers = reset(store.tiers, BUILTIN_TIERS);
+  if (kind !== "tier") store.styles = reset(store.styles, BUILTIN_STYLES);
   await savePresets(store);
   return store;
 }

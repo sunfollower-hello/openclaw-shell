@@ -16,8 +16,8 @@ import { dataDir } from "./cardStore.js";
  */
 export const NAI_GATEWAY_BASE = "https://api.319274.xyz";
 export const NAI_GATEWAY_NAME = "SoulBox 生图服务";
-/** 默认模型：我们中转站里对外的生图模型名（按次计费，普通档） */
-export const NAI_GATEWAY_DEFAULT_MODEL = "[次]nai-4.5";
+// 注：中转站里对外的生图模型名形如 "[次]nai-4.5"（按次计费），但**不作为默认值预填** ——
+// 必须由用户在「生图配置」页点「拉取模型」拿到上游真实列表后再选。
 
 export interface ArtistPreset {
   name: string;
@@ -47,6 +47,25 @@ export const BUILTIN_ARTISTS: ArtistPreset[] = [
     builtin: true,
     // 上游工作台的「动漫同人风」预设原文：纯风格词、无画师名（站方按自家模型调的，稳定）
     content: "masterpiece, best quality, very aesthetic, modern Japanese anime, official anime art, anime key visual, anime screencap, soft cel shading, soft anime coloring, smooth color transitions, natural skin tones, restrained color palette, slightly desaturated, muted colors, soft ambient lighting, gentle contrast, subtle gradients, subtle bloom, detailed anime background",
+  },
+  // ---- 可爱粉彩偶像系三候选（09-15 交付，用户要留作默认；未实测，效果以实际出图为准）----
+  {
+    name: "经典可爱基底",
+    builtin: true,
+    // ciloranko 主导：粉彩肤色软萌基底（ciloranko/sho=粉彩、tianliang=透明感、kani_biimu/aki99=可爱脸型）
+    content: "5::best quality, amazing quality, masterpiece::, 1.4::artist:ciloranko::, 1.2::artist:sho_(sho_lwlw)::, 1.1::artist:tianliang_duohe_fangdongye::, 0.8::artist:baku-p::, 0.9::artist:kani_biimu::, 0.8::artist:aki99::, 0.7::artist:kedama_milk::, year_2026, year_2025, year_2024, newest",
+  },
+  {
+    name: "偶像梦幻感",
+    builtin: true,
+    // yoneyama_mai 主导：透亮偶像感／梦境光（mika_pikazo=高饱和流行色、hanekoto/meyoco=空气感柔光）
+    content: "5::best quality, amazing quality, masterpiece::, 1.3::artist:yoneyama_mai::, 1.2::artist:mika_pikazo::, 1.1::artist:ciloranko::, 0.9::artist:hanekoto::, 0.8::artist:meyoco::, 0.8::artist:puuzaki_puuna::, 0.7::artist:hayana_neru::, 0.7::artist:rokita::, year_2026, year_2025, year_2024, newest",
+  },
+  {
+    name: "清透水彩感",
+    builtin: true,
+    // tianliang_duohe_fangdongye 主导：水彩透明感（creayus=渐变配色、ke-ta=压饱和）
+    content: "5::best quality, amazing quality, masterpiece::, 1.5::artist:tianliang_duohe_fangdongye::, 1.2::artist:creayus::, 1.1::artist:ke-ta::, 0.9::artist:huanxiang_heitu::, 0.8::artist:haneru::, 0.8::artist:sasa_onigiri::, 0.7::artist:kanzakietc::, year_2026, year_2025, year_2024, newest",
   },
 ];
 
@@ -79,8 +98,9 @@ export interface ImageConfig {
 const DEFAULTS: ImageConfig = {
   provider: "novelai",
   aspect: "auto",
-  novelai: { key: "", model: NAI_GATEWAY_DEFAULT_MODEL },
-  openai: { baseUrl: "", key: "", model: "agnes-image-2.0-flash" },
+  // 生图模型**不给默认值**：必须点「拉取模型」拿到真实列表后再选（免得默认值跟上上游对不上）
+  novelai: { key: "", model: "" },
+  openai: { baseUrl: "", key: "", model: "" },
   artists: [],
   activeArtist: "",
   compression: { enabled: false },
@@ -114,9 +134,9 @@ export async function getImageConfig(): Promise<ImageConfig> {
       aspect: ASPECTS.includes(c.aspect as ImageAspect) ? (c.aspect as ImageAspect) : DEFAULTS.aspect,
       novelai: {
         key: String(c.novelai?.key ?? ""),
-        model: String(c.novelai?.model ?? DEFAULTS.novelai.model) || DEFAULTS.novelai.model,
+        model: String(c.novelai?.model ?? ""),
       },
-      openai: { baseUrl: String(c.openai?.baseUrl ?? ""), key: String(c.openai?.key ?? ""), model: String(c.openai?.model ?? DEFAULTS.openai.model) },
+      openai: { baseUrl: String(c.openai?.baseUrl ?? ""), key: String(c.openai?.key ?? ""), model: String(c.openai?.model ?? "") },
       artists,
       // 用上面带收编迁移的变量，不能再算一遍——否则迁移结果被丢弃，
       // 旧「2.5」的选中状态迁移不到「2.5D写实」（实测踩到：迁移代码成了死代码）
@@ -124,7 +144,9 @@ export async function getImageConfig(): Promise<ImageConfig> {
       compression: { enabled: c.compression?.enabled === true },
     };
   } catch {
-    return structuredClone(DEFAULTS);
+    // 还没有配置文件（全新安装/全新设备）：内置画师串也要能看见，
+    // 否则新用户打开生图配置是空列表（用户实测"默认画师串没放上去"就是这个观感）
+    return { ...structuredClone(DEFAULTS), artists: BUILTIN_ARTISTS.map((a) => ({ ...a })) };
   }
 }
 

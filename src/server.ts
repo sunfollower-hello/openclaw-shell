@@ -51,6 +51,7 @@ import {
   updateItem as updatePresetItem,
   deleteItem as deletePresetItem,
   resetBuiltinPresets,
+  isBuiltinTierGroup,
   resolveCardPresetBlocks,
   resolveCardPresetExamples,
   type PresetKind,
@@ -69,6 +70,19 @@ import {
 } from "./core/lifeScheduler.js";
 import { TOOL_REGISTRY, toolsToOpenAI, resolveInSandbox, type ToolDef, type ToolCtx } from "./tools/registry.js";
 import { FEATURES, filterDisabledTools } from "./core/features.js";
+import { runAsUser, userRoot, DEVICE_ID_RE, currentDeviceId } from "./core/dataRoot.js";
+import { ensureDevice, isDeviceAdmin, listDevices, setDeviceAdmin, setDeviceDisabled } from "./core/users.js";
+import {
+  accountOwner,
+  setAccountOwner,
+  clearAccountOwner,
+  moveAccountOwner,
+  ownsAccount,
+  beginLoginClaim,
+  endLoginClaim,
+  claimNewAccounts,
+} from "./core/channelOwners.js";
+import { runRetention, runRetentionForDevice, RETENTION_DAYS } from "./core/retention.js";
 import { getMemImage } from "./core/memImages.js";
 import { toUserError } from "./core/errors.js";
 import { queryLogs, clearLogs, logInfo, logWarn, logError } from "./core/logger.js";
@@ -119,12 +133,14 @@ import {
   syncEmojisToChannelMedia,
   MAX_EMOJIS,
 } from "./core/emojiStore.js";
+import { parseEmojiPack } from "./core/emojiPack.js";
 import {
   listBots,
   addBot,
   removeBot,
   getBotByCard,
   agentWorkspaceDir,
+  deviceAgentId,
   applyAgentHumanDelay,
   applyAgentModel,
   applyAgentBlockStreaming,
@@ -216,20 +232,78 @@ const app = express();
 app.use(express.json({ limit: "20mb" }));
 const store = new CardStore();
 
-// 内容资源（表情/生图/封面）先于认证挂载：<img> 标签无法携带 Basic 凭证，
-// 之前挂在认证后导致图片 401 加载失败（实锤）。图片 URL 含随机文件名，同源内网/隧道可见，风险可接受。
-app.use("/emojis", express.static(path.join(dataDir(), "emojis")));
-app.use("/img", express.static(path.join(dataDir(), "images")));
-app.use("/covers", express.static(coversDir(), { etag: true, maxAge: 0 }));
-
-// 公网暴露时启用 Basic 认证（设置 OPENCLAW_SHELL_UI_USER / OPENCLAW_SHELL_UI_PASS）
+// 公网暴露时启用管理员认证（设置 OPENCLAW_SHELL_UI_USER / OPENCLAW_SHELL_UI_PASS）
+// 有认证 = 托管模式（多租户：设备各自命名空间）；无认证 = 单用户模式（全部走全局 data/，
+// 就像用户自己拉代码在本机跑起来那样，不需要设备隔离）。
 const UI_USER = process.env.OPENCLAW_SHELL_UI_USER;
 const UI_PASS = process.env.OPENCLAW_SHELL_UI_PASS;
+const HOSTED_MODE = !!(UI_USER && UI_PASS);
+
+// ---------- 设备身份（分发形态：无注册无登录，设备随机 ID 即身份） ----------
+// 识别顺序：X-Device-Id 头 > oc_device cookie（<img> 等子资源带不了自定义头，靠 cookie）。
+// 识别结果挂 res.locals，Basic 认证在其后：管理员（Basic 有效）覆盖设备身份走全局 data/，
+// 设备请求免 Basic、整条链路跑在 data/users/<id>/ 作用域里（AsyncLocalStorage）。
+app.use((req, res, next) => {
+  const cookies: Record<string, string> = {};
+  for (const part of String(req.headers.cookie ?? "").split(";")) {
+    const i = part.indexOf("=");
+    if (i > 0) {
+      try {
+        cookies[part.slice(0, i).trim()] = decodeURIComponent(part.slice(i + 1).trim());
+      } catch {
+        /* 忽略坏 cookie */
+      }
+    }
+  }
+  res.locals.ocCookies = cookies;
+  if (!HOSTED_MODE) return next(); // 单用户模式：不做设备隔离
+  const cand = String(req.headers["x-device-id"] ?? cookies["oc_device"] ?? "").toLowerCase();
+  if (DEVICE_ID_RE.test(cand) && ensureDevice(cand)) {
+    if (isDeviceAdmin(cand)) {
+      // 管理员设备（运营者自己的浏览器/App）：全局作用域，免密码
+      res.locals.ocAdmin = true;
+      res.locals.ocAdminVia = "device";
+    } else {
+      res.locals.ocDevice = cand;
+    }
+  }
+  next();
+});
+
+// 两条身份路线互不干扰：
+//   ① 管理员 = Basic 凭据 或 管理员登录 cookie（oc_admin）；走全局 data/，能看到全部用户数据
+//   ② 分发用户 = 设备随机 ID（cookie/头）；走 data/users/<id>/，免任何登录
+// 管理员登录 cookie 让"浏览器已经带了设备 cookie"的情况下也能进管理端（否则 Basic 弹窗永远不出现）。
+/** 无状态管理员令牌：HMAC(账号:密码)，改密码即全体失效，不需要会话存储 */
+const ADMIN_COOKIE = "oc_admin";
+function adminToken(): string {
+  if (!UI_USER || !UI_PASS) return "";
+  return crypto.createHmac("sha256", "openclaw-shell-admin").update(`${UI_USER}:${UI_PASS}`).digest("hex");
+}
+function setAdminCookie(req: express.Request, res: express.Response): void {
+  const secure = /^https/i.test(String(req.headers["x-forwarded-proto"] ?? "")) || req.secure;
+  res.setHeader(
+    "Set-Cookie",
+    `${ADMIN_COOKIE}=${adminToken()}; Path=/; Max-Age=2592000; HttpOnly; SameSite=Lax${secure ? "; Secure" : ""}`
+  );
+}
+// 免认证页面/接口：登录页要能打开（外壳静态 + 登录相关端点）
+const PUBLIC_SHELL_PATHS = ["/", "/index.html", "/app.js", "/style.css"];
+function isPublicPath(p: string): boolean {
+  return (
+    PUBLIC_SHELL_PATHS.includes(p) ||
+    p.startsWith("/assets/") ||
+    p.startsWith("/api/admin/")
+  );
+}
 if (UI_USER && UI_PASS) {
   app.use((req, res, next) => {
     const ip = String(req.ip || req.socket.remoteAddress || "");
     const local = ip === "127.0.0.1" || ip === "::1" || ip.endsWith("127.0.0.1");
     if (local && req.path.startsWith("/api/internal/")) return next();
+    if (isPublicPath(req.path)) return next();
+    // 管理员设备已在设备中间件识别（ocAdmin=true）→ 直接放行走全局 data/
+    if (res.locals.ocAdmin) return next();
     const auth = req.headers.authorization ?? "";
     const [type, token] = auth.split(" ");
     if (type === "Basic" && token) {
@@ -237,12 +311,183 @@ if (UI_USER && UI_PASS) {
       const idx = decoded.indexOf(":");
       const user = idx >= 0 ? decoded.slice(0, idx) : "";
       const pass = idx >= 0 ? decoded.slice(idx + 1) : "";
-      if (user === UI_USER && pass === UI_PASS) return next();
+      if (user === UI_USER && pass === UI_PASS) {
+        res.locals.ocDevice = null; // 管理员压过设备身份
+        res.locals.ocAdmin = true;
+        res.locals.ocAdminVia = "basic";
+        return next();
+      }
     }
+    // 管理员登录 cookie（浏览器里没有 Basic 也能进管理端）
+    if (res.locals.ocCookies?.[ADMIN_COOKIE] && res.locals.ocCookies[ADMIN_COOKIE] === adminToken()) {
+      res.locals.ocDevice = null;
+      res.locals.ocAdmin = true;
+      res.locals.ocAdminVia = "cookie";
+      return next();
+    }
+    // 分发用户：设备身份免登录
+    if (res.locals.ocDevice) return next();
     res.setHeader("WWW-Authenticate", 'Basic realm="openclaw-shell"');
     res.status(401).json({ error: "需要登录" });
   });
 }
+
+// 管理员登录/登出/状态（免认证，见 isPublicPath）
+app.post("/api/admin/login", (req, res) => {
+  if (!UI_USER || !UI_PASS) return res.json({ ok: true, admin: true, hint: "未启用认证" });
+  const { user, pass } = req.body ?? {};
+  if (String(user ?? "") === UI_USER && String(pass ?? "") === UI_PASS) {
+    setAdminCookie(req, res);
+    return res.json({ ok: true, admin: true });
+  }
+  res.status(401).json({ error: "账号或密码不对" });
+});
+app.post("/api/admin/logout", (_req, res) => {
+  res.setHeader("Set-Cookie", `${ADMIN_COOKIE}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax`);
+  res.json({ ok: true });
+});
+app.get("/api/admin/me", (req, res) => {
+  // 该路径在免认证清单里（登录页要能查状态），所以这里自行判定管理员身份
+  // hosted 供前端区分「托管多租户」与「单用户自部署」：只有托管形态才需要对用户隐藏管理向功能
+  if (!UI_USER || !UI_PASS) return res.json({ admin: true, authDisabled: true, hosted: false });
+  if (res.locals.ocAdmin) return res.json({ admin: true, via: res.locals.ocAdminVia, hosted: true });
+  const cookie = res.locals.ocCookies?.[ADMIN_COOKIE];
+  if (cookie && cookie === adminToken()) return res.json({ admin: true, via: "cookie", hosted: true });
+  const auth = req.headers.authorization ?? "";
+  const [type, token] = auth.split(" ");
+  if (type === "Basic" && token) {
+    const decoded = Buffer.from(token, "base64").toString("utf8");
+    const idx = decoded.indexOf(":");
+    if (decoded.slice(0, idx) === UI_USER && decoded.slice(idx + 1) === UI_PASS) {
+      return res.json({ admin: true, via: "basic", hosted: true });
+    }
+  }
+  res.json({ admin: false, hosted: true });
+});
+/**
+ * 管理员看某个设备的卡库。
+ * **管理员设备要读全局空间**：管理员身份的请求一律走全局 data/，它从不往
+ * data/users/<自己的id>/ 里写东西 —— 按命名空间读会永远是空的（运营者实测：
+ * "我电脑里明明有卡，打开我的却看不见聊天记录"）。所以：
+ *   管理员设备 → 读全局（它平时看到的就是全局那份）；普通设备 → 读它自己的命名空间。
+ */
+app.get("/api/users/:id/cards", async (req, res) => {
+  const id = String(req.params.id ?? "").toLowerCase();
+  if (!DEVICE_ID_RE.test(id)) return res.status(400).json({ error: "设备 ID 不合法" });
+  const admin = isDeviceAdmin(id);
+  try {
+    const list = admin
+      ? await store.list()
+      : await runAsUser({ deviceId: id, root: userRoot(id) }, () => store.list());
+    res.json({
+      admin,
+      cards: list.map((c) => ({ slug: c.slug, name: c.name, updated_at: c.updated_at, avatar: c.avatar })),
+    });
+  } catch (e) {
+    res.status(500).json({ error: toUserError(e) });
+  }
+});
+
+// 管理员看某个设备某张卡的聊天记录（纯文本条目，前端一行一句渲染）
+app.get("/api/users/:id/chats/:slug", async (req, res) => {
+  const id = String(req.params.id ?? "").toLowerCase();
+  const slug = String(req.params.slug ?? "");
+  if (!DEVICE_ID_RE.test(id) || !isValidSlug(slug)) return res.status(400).json({ error: "参数不合法" });
+  const admin = isDeviceAdmin(id);
+  try {
+    const rows = admin
+      ? await readConv(slug)
+      : await runAsUser({ deviceId: id, root: userRoot(id) }, () => readConv(slug));
+    const entries = rows.map((e) => ({ t: e.t, role: e.role, surface: e.surface, content: e.content }));
+    res.json({ entries, admin, retentionDays: RETENTION_DAYS });
+  } catch (e) {
+    res.status(500).json({ error: toUserError(e) });
+  }
+});
+
+// 管理员手动跑保留策略（或预演）
+app.post("/api/users/retention", async (req, res) => {
+  try {
+    const days = Number(req.body?.days) > 0 ? Number(req.body.days) : RETENTION_DAYS;
+    const dryRun = req.body?.dryRun === true;
+    const one = typeof req.body?.id === "string" && DEVICE_ID_RE.test(req.body.id.toLowerCase()) ? req.body.id.toLowerCase() : "";
+    const stats = one ? [await runRetentionForDevice(one, { days, dryRun })] : await runRetention({ days, dryRun });
+    res.json({ ok: true, dryRun, days, stats });
+  } catch (e) {
+    res.status(500).json({ error: toUserError(e) });
+  }
+});
+
+// 管理员把某台设备设为/取消管理员（跨设备迁移管理端用）
+app.post("/api/users/admin", (req, res) => {
+  const { id, admin } = req.body ?? {};
+  const ok = setDeviceAdmin(String(id ?? ""), admin === true);
+  if (!ok) return res.status(400).json({ error: "设备不存在或 id 不合法" });
+  res.json({ ok: true });
+});
+
+// 设备请求包进用户作用域（此后所有 dataDir() 都指向 data/users/<id>/）
+app.use((req, res, next) => {
+  const dev = res.locals.ocDevice;
+  if (dev) return runAsUser({ deviceId: dev, root: userRoot(dev) }, () => next());
+  next();
+});
+
+// 管理员专属端点：设备（分发用户）不可触达
+// ⚠️ `/api/bots` 与 `/api/channels` **不在**这个名单里：通道是用户的核心体验，
+// 设备也要能扫码绑自己的机器人 —— 隔离靠"账号归属"（channelOwners.ts）+ 各端点里的
+// ownsAccount 检查，而不是靠整块 403。运行日志/模型用量是进程级共用的，仍然只给管理员。
+// 蒸馏对**用户也开放**（上传自己的聊天记录做人设是核心流程，写进的就是它自己的设备空间）；
+// 唯一不给的是「直连本机 WeFlow」那条 —— 那会让服务器去连跑服务那台机器上的本地服务。
+const ADMIN_ONLY_PREFIXES = [
+  "/api/plugins",
+  "/api/mcp",
+  "/api/users",
+  "/api/backup",
+  "/api/workspace/",
+  "/api/logs",
+  "/api/llm-usage",
+  "/api/llm/usage",
+];
+app.use((req, res, next) => {
+  if (res.locals.ocDevice && ADMIN_ONLY_PREFIXES.some((p) => req.path === p || req.path.startsWith(p))) {
+    return res.status(403).json({ error: "该功能不在此版本开放" });
+  }
+  next();
+});
+
+/**
+ * 预设：普通用户**照旧能用**预设页 —— 新增预设组、新增/改风格、改自定义组的条目都放行；
+ * 唯一的例外是**内置档位组（对外叫「默认」，id=break）**：那是运营者管的破甲预设，
+ * 用户既不能打开它（前端不给点），也不能通过接口改它（组名/条目/恢复内置全部拦住）。
+ * 管理员不受限（读接口本来就不拦，卡片高级配置的档位下拉还要靠它填）。
+ */
+app.use((req, res, next) => {
+  if (!res.locals.ocDevice || req.method === "GET") return next();
+  const m = req.path.match(/^\/api\/presets\/(tier|style)\/([^/]+)/);
+  if (m && isBuiltinTierGroup(m[1], m[2])) {
+    return res.status(403).json({ error: "该预设不在此版本开放" });
+  }
+  next();
+});
+
+// 内容资源（表情/生图/封面）按请求作用域取目录：<img> 靠 oc_device cookie 带身份。
+// 注意必须挂在 ALS 包装之后。同根缓存静态中间件实例，避免每请求重建。
+const ocStaticCache = new Map<string, ReturnType<typeof express.static>>();
+function ocScopedStatic(sub: string) {
+  return (req: express.Request, res: express.Response, next: express.NextFunction) => {
+    const root = path.join(dataDir(), sub);
+    let mw = ocStaticCache.get(root);
+    if (!mw) {
+      mw = express.static(root);
+      ocStaticCache.set(root, mw);
+    }
+    mw(req, res, next);
+  };
+}
+app.use("/emojis", ocScopedStatic("emojis"));
+app.use("/img", ocScopedStatic("images"));
+app.use("/covers", ocScopedStatic("covers"));
 
 const projectRoot = findProjectRoot();
 
@@ -852,11 +1097,38 @@ function channelUsable(st?: ChannelStatus): boolean {
   return st.configured || st.connected || st.accounts.length > 0;
 }
 
+/**
+ * 设备作用域下把通道状态里的账号列表过滤成自己的（管理员原样返回）。
+ * 通道级的状态缓存是全服共用的，所以过滤必须在**返回前**按请求做，不能塞进缓存里。
+ */
+function filterChannelStatus(channel: string, st: ChannelStatus | undefined, dev: string | null | undefined): ChannelStatus | undefined {
+  if (!dev || !st) return st;
+  const mine = (st.accounts ?? []).filter((id) => ownsAccount(channel, id, dev));
+  return { ...st, accounts: mine, connected: mine.length > 0 ? st.connected : false };
+}
+
+/** 设备作用域下必须拥有该账号才能操作；返回 false 时已经写过 403 响应 */
+function requireOwnedAccount(channel: string, accountId: string, res: express.Response): boolean {
+  const dev = res.locals.ocDevice as string | null | undefined;
+  if (!dev) return true;
+  if (ownsAccount(channel, accountId, dev)) return true;
+  res.status(403).json({ error: "这个账号不属于你" });
+  return false;
+}
+
+/** 设备点了扫码：记下当前账号快照，之后新出现的账号才算它扫的（老账号含运营者的不会被认领） */
+async function beginClaimForDevice(channel: BotChannel, res: express.Response): Promise<void> {
+  const dev = res.locals.ocDevice as string | null | undefined;
+  if (!dev) return;
+  const known = (await scanAllAccounts().catch(() => [])).filter((a) => a.channel === channel).map((a) => a.accountId);
+  beginLoginClaim(channel, dev, known);
+}
+
 // ---------- 通道：微信 ----------
 app.get("/api/channels/wechat/status", async (req, res) => {
   try {
     const all = await getChannelStatuses(req.query.refresh === "1");
-    const st = all["openclaw-weixin"];
+    const st = filterChannelStatus("openclaw-weixin", all["openclaw-weixin"], res.locals.ocDevice);
     res.json({
       connected: channelUsable(st),
       accounts: st?.accounts ?? [],
@@ -877,6 +1149,7 @@ app.post("/api/channels/wechat/login", async (_req, res) => {
       slot,
     });
   }
+  await beginClaimForDevice("openclaw-weixin", res);
   res.json(startChannelLogin("openclaw-weixin"));
 });
 
@@ -915,6 +1188,8 @@ app.get("/api/channels/wechat/login", async (_req, res) => {
 });
 
 app.get("/api/channels/wechat/pairing", async (_req, res) => {
+  // 配对是运营者自己 ClawBot 账号的事（灰度通道），不给分发用户用
+  if (res.locals.ocDevice) return res.json({ raw: "" });
   try {
     const r = await runOpenclaw(["pairing", "list", "openclaw-weixin"], { timeoutMs: 20000 });
     res.json({ raw: stripAnsi(r.stdout + r.stderr) });
@@ -924,6 +1199,7 @@ app.get("/api/channels/wechat/pairing", async (_req, res) => {
 });
 
 app.post("/api/channels/wechat/pairing/approve", async (req, res) => {
+  if (res.locals.ocDevice) return res.status(403).json({ error: "该功能不在此版本开放" });
   try {
     const code = req.body?.code;
     if (!code) return res.status(400).json({ error: "缺少 code" });
@@ -938,7 +1214,7 @@ app.post("/api/channels/wechat/pairing/approve", async (req, res) => {
 app.get("/api/channels/qq/status", async (req, res) => {
   try {
     const all = await getChannelStatuses(req.query.refresh === "1");
-    const st = all["qqbot"];
+    const st = filterChannelStatus("qqbot", all["qqbot"], res.locals.ocDevice);
     res.json({
       // 通道在 openclaw 的清单里出现即说明插件已装（不用再单独跑一次 plugins list）
       pluginInstalled: st !== undefined,
@@ -952,6 +1228,7 @@ app.get("/api/channels/qq/status", async (req, res) => {
 });
 
 app.post("/api/channels/qq/login", async (_req, res) => {
+  await beginClaimForDevice("qqbot", res);
   const slot = await accountSlotState("qqbot").catch(() => null);
   if (slot?.full) {
     return res.status(400).json({
@@ -969,6 +1246,8 @@ app.get("/api/channels/qq/login", async (_req, res) => {
 
 // 取消扫码：前端关掉二维码弹窗/离开页面时调。登录进程会一直挂着等扫码（实测能占 200MB+），必须回收
 app.post("/api/channels/:kind/login/cancel", (req, res) => {
+  // 用户放弃扫码：清掉待领取快照（管理员无快照，调用无副作用）
+  if (res.locals.ocDevice) endLoginClaim(String(req.params.kind) === "qq" ? "qqbot" : "openclaw-weixin", String(res.locals.ocDevice));
   const kind = String(req.params.kind);
   const channel = kind === "qq" ? "qqbot" : kind === "wechat" ? "openclaw-weixin" : "";
   if (!channel) return res.status(400).json({ error: "未知通道" });
@@ -1036,7 +1315,11 @@ async function accountSlotState(channel: BotChannel): Promise<{ used: number; ma
 }
 
 /** 扫描已认证渠道账号：QQ 读 openclaw.json channels.qqbot（默认+多账号），微信读插件账号索引 */
-async function scanKnownAccounts(): Promise<KnownAccount[]> {
+/**
+ * 全局扫一遍网关里已认证的渠道账号（不过滤归属）。
+ * 设备作用域下**必须**走 scanKnownAccounts() 那个带过滤的版本，否则会把别人的账号摊出来。
+ */
+async function scanAllAccounts(): Promise<KnownAccount[]> {
   const out: KnownAccount[] = [];
   try {
     const cfg = JSON.parse(await fs.readFile(path.join(os.homedir(), ".openclaw", "openclaw.json"), "utf8"));
@@ -1063,6 +1346,22 @@ async function scanKnownAccounts(): Promise<KnownAccount[]> {
 }
 
 /**
+ * 带归属过滤的账号扫描（全项目读账号都走这里）：
+ *  - 管理员/单用户作用域（currentDeviceId 为空）：全部可见，与以前完全一致；
+ *  - 设备作用域：只看得到**归属自己的**账号；没有归属记录的（老账号、运营者自己的）
+ *    一律看不见；同时把"本次扫码新出现的账号"认领给正在扫码的那台设备。
+ */
+async function scanKnownAccounts(): Promise<KnownAccount[]> {
+  const all = await scanAllAccounts();
+  const dev = currentDeviceId();
+  if (!dev) return all;
+  for (const ch of ["qqbot", "openclaw-weixin"]) {
+    claimNewAccounts(ch, all.filter((a) => a.channel === ch).map((a) => a.accountId));
+  }
+  return all.filter((a) => accountOwner(a.channel, a.accountId) === dev);
+}
+
+/**
  * 校正 bot 的渠道账号 id。
  * 微信登录成功后，真实 accountId 是服务器下发的（形如 `xxxx-im-bot`），而我们创建 bot 时
  * 只能先填一个占位名（`wx-main`）。若不校正，`agents bind openclaw-weixin:wx-main` 指向的
@@ -1086,6 +1385,8 @@ async function reconcileBotAccount(bot: BotInstance): Promise<BotInstance | null
   );
   if (bind.code !== 0) return null;
   const updated = await updateBotAccount(bot.id, target.accountId);
+  // 归属跟着搬：占位名（wx-main）换成网关下发的真实 id，别让它变成"无主的运营者账号"
+  moveAccountOwner(bot.channel, bot.accountId, target.accountId);
   invalidateAgentsCache();
     invalidateChannelStatus();
     invalidateBindingsCache();
@@ -1238,6 +1539,7 @@ app.post("/api/channels/accounts/label", async (req, res) => {
     if (channel !== "qqbot" && channel !== "openclaw-weixin") return res.status(400).json({ error: "通道选择不正确" });
     const acc = String(accountId ?? "").trim();
     if (!acc) return res.status(400).json({ error: "缺少账号 id" });
+    if (!requireOwnedAccount(channel, acc, res)) return;
     const labels = await setAccountLabel(channel, acc, String(label ?? ""));
     res.json({ ok: true, labels });
   } catch (e) {
@@ -1256,6 +1558,7 @@ app.post("/api/channels/accounts/delete", async (req, res) => {
     if (channel !== "qqbot" && channel !== "openclaw-weixin") return res.status(400).json({ error: "通道选择不正确" });
     const acc = String(accountId ?? "").trim();
     if (!acc) return res.status(400).json({ error: "缺少账号 id" });
+    if (!requireOwnedAccount(channel, acc, res)) return;
     const notes: string[] = [];
 
     // ① 该账号若还绑着卡，先把 bot 实例和 agent 一起卸掉
@@ -1304,6 +1607,7 @@ app.post("/api/channels/accounts/delete", async (req, res) => {
     }
 
     await removeAccountLabel(channel, acc).catch(() => {});
+    clearAccountOwner(channel, acc); // 槽位释放后 id 可能被复用，归属一并清掉
     invalidateAgentsCache();
     invalidateChannelStatus();
     invalidateBindingsCache();
@@ -1372,6 +1676,18 @@ app.post("/api/bots", async (req, res) => {
       return res.status(400).json({ error: "这张卡的英文标识含特殊字符，无法接入机器人，请重新建卡" });
     }
     const account = String(accountId ?? "").trim() || (channel === "qqbot" ? `qq-${Date.now().toString(36).slice(-4)}` : "wx-main");
+    // 设备侧归属检查：这次要绑的账号必须
+    //   ① 已归它自己（之前扫过/建过），或 ② 是个还没在网关里出现过的新占位名（它正要扫码）
+    // —— 别人的账号（含运营者的老账号）一律拒绝，别看列表里没有就能硬绑
+    const dev = res.locals.ocDevice as string | null | undefined;
+    if (dev) {
+      const alreadyOwned = accountOwner(channel, account) === dev;
+      const existsInGateway = (await scanAllAccounts()).some((a) => a.channel === channel && a.accountId === account);
+      if (!alreadyOwned && existsInGateway) {
+        return res.status(403).json({ error: "这个账号不属于你" });
+      }
+      setAccountOwner(channel, account, dev); // 新占位名直接认领；已归自己的幂等
+    }
     // 新建扫码账号（没传 accountId）前先看槽位：满了就别让用户白扫一次码
     if (!String(accountId ?? "").trim()) {
       const slot = await accountSlotState(channel);
@@ -1490,6 +1806,8 @@ app.post("/api/bots/:id/bind", async (req, res) => {
     if (channel !== "qqbot" && channel !== "openclaw-weixin") return res.status(400).json({ error: "通道选择不正确" });
     const acc = String(accountId ?? "").trim();
     if (!acc) return res.status(400).json({ error: "缺少机器人编号" });
+    // 设备只能绑自己名下的账号（别人的账号列表本来就看不见，这里再兜一层）
+    if (!requireOwnedAccount(channel, acc, res)) return;
     // 校验账号已认证（凭证在 → 免扫码）
     const known = (await scanKnownAccounts()).find((a) => a.channel === channel && a.accountId === acc);
     if (!known) return res.status(400).json({ error: "该账号还没扫码认证过，无法免扫码绑定（先用扫码绑定创建）" });
@@ -1552,22 +1870,24 @@ app.post("/api/bots/transfer", async (req, res) => {
     }
     // ③ 直写配置完成换卡（原来跑 3 条 openclaw CLI，每条冷启动 5-15s；直接改
     //    openclaw.json 的 agents.list + bindings 是毫秒级，网关会重读配置）
+    //    agent 名一律走 deviceAgentId（设备作用下带前缀），不能用裸 slug——否则跨用户撞名
+    const newAgentId = deviceAgentId(card.slug);
     const upserted = await upsertAgentEntry({
-      agentId: card.slug,
+      agentId: newAgentId,
       workspace: agentWorkspaceDir(card.slug),
       model: `${llm.provider}/${llm.model}`,
     });
     if (!upserted) {
       return res.status(500).json({ error: "写入 openclaw 配置失败（~/.openclaw/openclaw.json 不可读写）" });
     }
-    const bound = await bindAccountDirect({ agentId: card.slug, channel: oldBot.channel, accountId: oldBot.accountId });
+    const bound = await bindAccountDirect({ agentId: newAgentId, channel: oldBot.channel, accountId: oldBot.accountId });
     if (!bound.ok) return res.status(500).json({ error: "写入绑定失败（~/.openclaw/openclaw.json 不可读写）" });
     // ④ 清掉旧 agent 的会话：不清的话同一用户继续发消息会沿用旧会话（连带旧人格上下文），
     //    表现就是"网页换卡成功但聊起来还是原来的卡"。这一步是换卡真正生效的关键。
     const clearedOld = await clearAgentSessions(oldBot.agentId).catch(() => 0);
     // 新卡也清一次：它可能残留上一次绑定时的会话，否则会带着上次的上下文回来
-    const clearedNew = oldBot.agentId === card.slug ? 0 : await clearAgentSessions(card.slug).catch(() => 0);
-    if (targetExisting && targetExisting.agentId !== card.slug) {
+    const clearedNew = oldBot.agentId === newAgentId ? 0 : await clearAgentSessions(newAgentId).catch(() => 0);
+    if (targetExisting && targetExisting.agentId !== newAgentId) {
       await clearAgentSessions(targetExisting.agentId).catch(() => 0);
     }
     invalidateAgentsCache();
@@ -1577,7 +1897,7 @@ app.post("/api/bots/transfer", async (req, res) => {
     const bots = await listBots();
     const idx = bots.findIndex((b) => b.id === oldBot.id);
     if (idx >= 0) {
-      bots[idx] = { ...bots[idx], cardSlug: card.slug, agentId: card.slug };
+      bots[idx] = { ...bots[idx], cardSlug: card.slug, agentId: newAgentId };
     }
     // 目标卡原有 bot 记录移除（被顶掉）
     const cleaned = bots.filter((b) => b.id !== targetExisting?.id);
@@ -1600,6 +1920,13 @@ app.post("/api/bots/:id/login", async (req, res) => {
   try {
     const bot = (await listBots()).find((b) => b.id === req.params.id);
     if (!bot) return res.status(404).json({ error: "机器人实例不存在" });
+    // 设备扫自己的机器人：先把账号认在自己名下（bot 本来就在它自己的空间里），
+    // 再记快照 —— 之后网关下发的真实 id（微信的 xxx-im-bot）也会算它的
+    const dev = res.locals.ocDevice as string | null | undefined;
+    if (dev) {
+      setAccountOwner(bot.channel, bot.accountId, dev);
+      await beginClaimForDevice(bot.channel, res);
+    }
     // 这个 bot 的账号还不在已认证列表里 = 要占一个新槽位，满了就别扫（已认证账号重扫不受限）
     const known = await scanKnownAccounts();
     const isNewSlot = !known.some((a) => a.channel === bot.channel && a.accountId === bot.accountId);
@@ -2244,58 +2571,6 @@ app.post("/api/cards/import-card", async (req, res) => {
   }
 });
 
-// ---------- WeFlow 本机直连（尽力集成，失败则用指引） ----------
-const WEFLOW_BASE = "http://127.0.0.1:5031";
-
-app.post("/api/weflow/probe", async (req, res) => {
-  const token = req.body?.token ?? "";
-  const candidates = ["/api/v1/talkers", "/api/v1/conversations", "/api/v1/chats", "/api/v1/contacts"];
-  const results: { path: string; status: number; hint: string }[] = [];
-  for (const p of candidates) {
-    try {
-      const r = await fetch(`${WEFLOW_BASE}${p}?access_token=${encodeURIComponent(token)}`, {
-        signal: AbortSignal.timeout(5000),
-      });
-      const body = await r.text().catch(() => "");
-      results.push({ path: p, status: r.status, hint: body.slice(0, 120) });
-    } catch (e) {
-      results.push({ path: p, status: 0, hint: String(e).slice(0, 120) });
-    }
-  }
-  res.json({ base: WEFLOW_BASE, results });
-});
-
-app.post("/api/distill/weflow", async (req, res) => {
-  try {
-    const { token, talker, limit, name, role, target, selfNames, blockedWords, model } = req.body ?? {};
-    if (!token || !talker || !name || !role) {
-      return res.status(400).json({ error: "token / talker / name / role 不能为空" });
-    }
-    // 允许指定模型（"提供商::模型"）；不传用默认提供商
-    const chosenModel = typeof model === "string" && model.trim() ? model.trim() : "";
-    const llm = chosenModel
-      ? await resolveChatLLM({ model: { provider: chosenModel.split("::")[0], model: chosenModel.split("::")[1] ?? undefined } })
-      : await resolveChatLLM();
-    if (!llm || !llm.apiKey) return res.status(400).json({ error: "未配置模型 API（API 页）" });
-    const url = `${WEFLOW_BASE}/api/v1/messages?access_token=${encodeURIComponent(token)}&talker=${encodeURIComponent(talker)}&limit=${Number(limit) || 500}`;
-    const r = await fetch(url, { signal: AbortSignal.timeout(30000) });
-    if (!r.ok) return res.status(502).json({ error: `WeFlow 返回 ${r.status}，请确认 WeFlow 已启动且 token 正确` });
-    const data = await r.json();
-    const result = await runDistill({
-      rawJson: data,
-      file: `weflow:${talker}`,
-      name,
-      role,
-      target: target ?? "",
-      selfNames: Array.isArray(selfNames) ? selfNames : [],
-      blockedWords: Array.isArray(blockedWords) ? blockedWords : [],
-      llm,
-    });
-    res.json({ card: result.card, talkers: result.talkers, stats: result.stats });
-  } catch (e) {
-    res.status(500).json({ error: toUserError(e) });
-  }
-});
 
 // ---------- 聊天测试（人设 + 工具 + 记忆 + 思考深度 + ask 审批） ----------
 async function chatCompletions(
@@ -2732,7 +3007,25 @@ app.post("/api/chat", async (req, res) => {
       if (splitRes.count > 1) {
         logInfo("拆条", `${card.name} 回复拆成 ${describeSplit(splitRes)}`);
       }
-      const aEntry = await appendConv(slug, { role: "assistant", content: displayReply, surface: "web", ns, parts: splitRes.parts, images: result.imageMeta ?? [] }).catch(() => null);
+      // 服务器侧只留「（图片：提示词）」，不留图链（用户图片在自己设备上，凭提示词可重现）
+      const imgLine = /已生成图片：\S+/g;
+      const meta = result.imageMeta ?? [];
+      let imgIdx = 0;
+      const storeReply = displayReply.replace(imgLine, () => {
+        const p = meta[imgIdx++]?.prompt ?? "";
+        return p ? `（图片：${p}）` : "（图片）";
+      });
+      const aEntry = await appendConv(slug, {
+        role: "assistant",
+        content: storeReply,
+        surface: "web",
+        ns,
+        parts: splitRes.parts.map((p) => p.replace(imgLine, () => {
+          const q = meta[imgIdx - 1]?.prompt ?? "";
+          return q ? `（图片：${q}）` : "（图片）";
+        })),
+        images: meta,
+      }).catch(() => null);
       if (aEntry) convIds.push(aEntry.id);
       // 滑动分批自动总结记忆（后台执行，不阻塞回复）
       void autoMemorize(slug, card, message, rawReply, ns).catch(() => {});
@@ -2990,9 +3283,10 @@ app.delete("/api/presets/:kind/:groupId/items/:itemId", async (req, res) => {
   }
 });
 
-app.post("/api/presets/reset", async (_req, res) => {
+app.post("/api/presets/reset", async (req, res) => {
   try {
-    res.json(await resetBuiltinPresets());
+    // 设备侧只重置风格：内置档位组（默认）是运营者管的，用户点一下不能把它一起冲回代码默认
+    res.json(await resetBuiltinPresets(res.locals.ocDevice ? "style" : undefined));
   } catch (e) {
     res.status(500).json({ error: toUserError(e) });
   }
@@ -4010,6 +4304,117 @@ app.post("/api/emojis", async (req, res) => {
 });
 
 // 表情导入（二进制直传）：前端跳过 FileReader/base64/JSON，体积省 33%、无大字符串序列化
+/**
+ * 表情包 zip 批量导入。
+ * zip 结构见 src/core/emojiPack.ts（配 `scripts/make-emoji-pack.bat` 生成的包最省事）。
+ * 先 `?dryRun=1` 出一份预览（不落库），前端确认后再正式导入 —— 免得一次吞 100 张才发现名字全错。
+ * 重名自动加序号（大笑 → 大笑2），绝不静默丢图；库满 300 就停下并报告还剩多少没进。
+ */
+app.post(
+  "/api/emojis/import-zip",
+  express.raw({
+    type: ["application/zip", "application/x-zip-compressed", "application/octet-stream"],
+    limit: "60mb",
+  }),
+  async (req, res) => {
+    try {
+      const buf = req.body as Buffer;
+      if (!buf || !buf.length) return res.status(400).json({ error: "没有收到文件" });
+      const dryRun = req.query?.dryRun === "1";
+      const parsed = parseEmojiPack(buf);
+
+      const existing = await listEmojis();
+      const groups = await listGroups();
+      const groupByName = new Map(groups.map((g) => [g.name, g]));
+      const takenNames = new Set(existing.map((e) => e.name));
+      let room = Math.max(0, MAX_EMOJIS - existing.length);
+
+      const plan: { name: string; scene: string; groupId: string; groupName: string; ext: string; data: Buffer; renamedFrom?: string }[] = [];
+      const problems = [...parsed.problems];
+      const groupsToCreate = new Set<string>();
+
+      for (const it of parsed.items) {
+        if (room <= 0) {
+          problems.push({ what: it.path, reason: `表情库已满（上限 ${MAX_EMOJIS}），这个和后面的一律没导入` });
+          continue;
+        }
+        // 重名自动加序号：库里的、以及本次已排进去的都要避让
+        let name = it.name;
+        if (takenNames.has(name)) {
+          const from = name;
+          let k = 2;
+          while (takenNames.has(`${name}${k}`)) k++;
+          name = `${name}${k}`.slice(0, 40);
+          problems.push({ what: it.path, reason: `名字「${from}」库里已有，改叫「${name}」` });
+        }
+        takenNames.add(name);
+        // 分组：zip 里的子文件夹名 → 分组（没有就记下来待建）
+        const gName = it.group || "默认";
+        let g = groupByName.get(gName);
+        if (!g) {
+          groupsToCreate.add(gName);
+          g = { id: `pending:${gName}`, name: gName, builtin: false };
+          groupByName.set(gName, g);
+        }
+        plan.push({ name, scene: it.scene, groupId: g.id, groupName: gName, ext: it.ext, data: it.data, renamedFrom: name !== it.name ? it.name : undefined });
+        room--;
+      }
+
+      const summary = {
+        ok: true,
+        dryRun,
+        count: plan.length,
+        items: plan.map((p) => ({ name: p.name, scene: p.scene, group: p.groupName, renamedFrom: p.renamedFrom })),
+        groupsToCreate: [...groupsToCreate],
+        problems: problems.slice(0, 30),
+        problemCount: problems.length,
+        notes: parsed.notes,
+        remaining: room,
+      };
+      if (dryRun) return res.json(summary);
+
+      // 真正写库：先建分组，再逐个加（跳过逐个的全量同步，最后统一同步一次）
+      const createdGroups: string[] = [];
+      const groupIdByPending = new Map<string, string>();
+      for (const gName of groupsToCreate) {
+        const g = await addGroup(gName);
+        groupIdByPending.set(`pending:${gName}`, g.id);
+        createdGroups.push(gName);
+      }
+      const added: { name: string; group: string }[] = [];
+      for (const p of plan) {
+        const groupId = groupIdByPending.get(p.groupId) ?? p.groupId;
+        try {
+          const item = await addEmoji({
+            name: p.name,
+            explanation: p.scene,
+            imageBase64: p.data.toString("base64"),
+            ext: p.ext,
+            group: groupId,
+            skipChannelSync: true,
+          });
+          added.push({ name: item.name, group: p.groupName });
+        } catch (e) {
+          problems.push({ what: p.name, reason: toUserError(e) });
+        }
+      }
+      // 一次性同步到通道表情目录（QQ/微信发图用的那份）
+      void syncEmojisToChannelMedia().catch(() => {});
+      logInfo("表情", `导入 zip：成功 ${added.length} 个，跳过 ${problems.length} 项` + (createdGroups.length ? `，新建分组 ${createdGroups.join("/")}` : ""));
+      res.json({
+        ...summary,
+        added,
+        skipped: plan.length - added.length,
+        groupsCreated: createdGroups,
+        problems: problems.slice(0, 30),
+        problemCount: problems.length,
+      });
+    } catch (e) {
+      res.status(400).json({ error: toUserError(e) });
+    }
+  }
+);
+
 app.post("/api/emojis/raw", express.raw({ type: "application/octet-stream", limit: "20mb" }), async (req, res) => {
   try {
     const name = String(req.query?.name ?? "").trim();
@@ -4388,15 +4793,42 @@ app.get("/api/image/:id", async (req, res) => {
   res.send(img.buf);
 });
 
+// ---------- 设备管理（管理员）：列出注册设备 / 停用恢复 ----------
+app.get("/api/users", async (_req, res) => {
+  res.json({ devices: listDevices() });
+});
+app.post("/api/users/disable", async (req, res) => {
+  const { id, disabled } = req.body ?? {};
+  const ok = setDeviceDisabled(String(id ?? ""), disabled === true);
+  if (!ok) return res.status(400).json({ error: "设备不存在或 id 不合法" });
+  res.json({ ok: true });
+});
+
 // ---------- 语音合成（TTS）：上游聚合（OpenAI 兼容，可售卖）+ 本地兜底（Edge/SAPI） ----------
-app.get("/api/tts/config", async (_req, res) => {
+/**
+ * 本地语音兜底（Edge 在线免费 / Windows SAPI 离线）是否可用。
+ * 托管形态（服务器）下它只给运营者：SAPI 是 Windows-only 在 Linux 上直接跑不起来，
+ * Edge 走的是运营者的出口与免费额度；用户版一律只走「自己添加的语音上游」。
+ * 单用户模式（用户自己拉代码在本机跑）等于管理员，照旧全部可用。
+ */
+function localTtsAllowed(res: express.Response): boolean {
+  return !HOSTED_MODE || !!res.locals.ocAdmin;
+}
+
+app.get("/api/tts/config", async (req, res) => {
   try {
     const cfg = await getTtsConfig();
+    const allowLocal = localTtsAllowed(res);
+    // 设备侧把 local 从可选项里摘掉；默认值若指向 local 则顺延到第一个上游（没有就空）
+    const def = !allowLocal && cfg.defaultProvider === "local" ? (cfg.providers[0]?.id ?? "") : cfg.defaultProvider;
     res.json({
-      defaultProvider: cfg.defaultProvider,
-      local: { engine: cfg.local.engine, voice: cfg.local.voice, rate: cfg.local.rate, pitch: cfg.local.pitch },
+      defaultProvider: def,
+      local: allowLocal
+        ? { engine: cfg.local.engine, voice: cfg.local.voice, rate: cfg.local.rate, pitch: cfg.local.pitch }
+        : null,
+      allowLocal,
       providers: cfg.providers.map((p) => ({ ...p, key: maskTtsKey(p.key) })),
-      commonVoices: COMMON_EDGE_VOICES,
+      commonVoices: allowLocal ? COMMON_EDGE_VOICES : [],
     });
   } catch (e) {
     res.status(500).json({ error: toUserError(e) });
@@ -4407,17 +4839,22 @@ app.post("/api/tts/config", async (req, res) => {
   try {
     const { defaultProvider, local } = req.body ?? {};
     const cur = await getTtsConfig();
+    const allowLocal = localTtsAllowed(res);
+    const wanted = defaultProvider === "local" && !allowLocal ? undefined : defaultProvider;
     const next = {
       ...cur,
-      defaultProvider: defaultProvider && (defaultProvider === "local" || cur.providers.some((p) => p.id === defaultProvider))
-        ? defaultProvider
+      defaultProvider: wanted && (wanted === "local" || cur.providers.some((p) => p.id === wanted))
+        ? wanted
         : cur.defaultProvider,
-      local: {
-        engine: ["edge", "sapi"].includes(local?.engine) ? local.engine : cur.local.engine,
-        voice: local?.voice ?? cur.local.voice,
-        rate: local?.rate ?? cur.local.rate,
-        pitch: local?.pitch ?? cur.local.pitch,
-      },
+      // 设备侧不改本地设置（表单里也看不到这一块）
+      local: allowLocal
+        ? {
+            engine: ["edge", "sapi"].includes(local?.engine) ? local.engine : cur.local.engine,
+            voice: local?.voice ?? cur.local.voice,
+            rate: local?.rate ?? cur.local.rate,
+            pitch: local?.pitch ?? cur.local.pitch,
+          }
+        : cur.local,
     };
     await saveTtsConfig(next);
     res.json({ ok: true, hint: "已保存。聊天里点「🔊」即可朗读 AI 回复" });
@@ -4482,7 +4919,10 @@ app.delete("/api/tts/providers/:id", async (req, res) => {
     await saveTtsConfig({
       ...cur,
       providers,
-      defaultProvider: cur.defaultProvider === id ? "local" : cur.defaultProvider,
+      // 删掉的是当前生效的那个：管理员回落到本地兜底，用户侧回落到剩下的第一个（没有就留空）
+      defaultProvider: cur.defaultProvider === id
+        ? (localTtsAllowed(res) ? "local" : providers[0]?.id ?? "")
+        : cur.defaultProvider,
     });
     res.json({ ok: true });
   } catch (e) {
@@ -4601,8 +5041,10 @@ app.post("/api/tts/fetch-models", async (req, res) => {
   }
 });
 
-app.get("/api/tts/voices", async (_req, res) => {
+app.get("/api/tts/voices", async (req, res) => {
   try {
+    // Edge 语音列表只服务于本地兜底：用户侧没必要拉（列表接口还会走微软的在线接口）
+    if (!localTtsAllowed(res)) return res.json({ voices: [] });
     res.json({ voices: await listEdgeVoices() });
   } catch (e) {
     res.status(500).json({ error: toUserError(e) });
@@ -4618,7 +5060,7 @@ app.get("/api/tts/presets", async (_req, res) => {
 app.post("/api/tts/test", async (req, res) => {
   try {
     const { target } = req.body ?? {};
-    res.json(await testTts(String(target ?? "")));
+    res.json(await testTts(String(target ?? ""), { allowLocal: localTtsAllowed(res) }));
   } catch (e) {
     res.status(500).json({ error: toUserError(e) });
   }
@@ -4628,7 +5070,7 @@ app.post("/api/tts/synthesize", async (req, res) => {
   const started = Date.now();
   try {
     const { text, providerId, voice, speed } = req.body ?? {};
-    const buf = await synthesizeTts(String(text ?? ""), { providerId, voice, speed });
+    const buf = await synthesizeTts(String(text ?? ""), { providerId, voice, speed, allowLocal: localTtsAllowed(res) });
     // 直接把音频回给浏览器，不落盘：本地 SAPI 输出未压缩 WAV，单次朗读可达数 MB，
     // 存下来只为播一次不值得（想再听就重新合成）。
     // QQ/微信 的语音走 tts-server:17900，那边本来就是 res.send 不落盘，不受这里影响。
@@ -5022,7 +5464,14 @@ await ensureMemorySearchExtraPaths().then((changed) => {
 app.listen(PORT, HOST, () => {
   logInfo("启动", `服务已启动 http://${HOST}:${PORT}`);
   console.log(`卡片目录: ${store["dir"]}`);
-  // 图片自动清理已移除：聊天生图不落盘，无清理对象
+  // 用户数据保留策略（15 天，只作用于设备命名空间）：启动跑一次 + 每 6 小时一次
+  void runRetention()
+    .then((rows) => {
+      const removed = rows.reduce((a, r) => a + r.conversationsRemoved + r.chatlogRemoved + r.memoryRemoved, 0);
+      if (removed) logInfo("保留", `已按 ${RETENTION_DAYS} 天策略清理 ${removed} 条过期用户记录`);
+    })
+    .catch(() => {});
+  setInterval(() => void runRetention().catch(() => {}), 6 * 3600 * 1000);
   // 记忆导出：启动时同步全部卡的记忆到 md（供 OpenClaw memorySearch.extraPaths 索引）
   void exportAllMemoriesToMarkdown().then((slugs) => {
     if (slugs.length) logInfo("记忆", `已导出 ${slugs.length} 张卡的记忆`);

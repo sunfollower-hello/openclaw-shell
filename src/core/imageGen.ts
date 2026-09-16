@@ -6,7 +6,6 @@ import path from "node:path";
 import {
   getImageConfig,
   NAI_GATEWAY_BASE,
-  NAI_GATEWAY_DEFAULT_MODEL,
   rejectForeignKey,
   type ImageConfig,
 } from "./imageConfig.js";
@@ -57,7 +56,6 @@ const NAI_NEGATIVE =
   "{{{deformed}}}, {{{disfigured}}}, {{{mutation}}}, cloned face, poorly drawn face, undetailed eyes, very displeasing, colored inner hair";
 
 // OpenAI 兼容固定默认（配置里未选模型时的兜底）
-const OAI_DEFAULT_MODEL = "agnes-image-2.0-flash";
 const OAI_FALLBACK_SIZE = "1024x1024";
 
 /**
@@ -182,7 +180,8 @@ export async function generateImage(params: GenParams, saveDir?: string, opts?: 
       // 生图模型在中转站里按次计费，请求正文是固定字段行的纯文本，
       // 回复正文是 markdown 图片链接（要再下载一次拿图）。
       // 采样器由模型决定，这里不单独传采样器行。
-      const model = String(cfg.novelai.model || NAI_GATEWAY_DEFAULT_MODEL);
+      const model = String(cfg.novelai.model || "").trim();
+      if (!model) throw new Error("还没选生图模型：到「生图配置」点一次「拉取模型」，选好再试");
       const lines = [
         `提示词:${usedPrompt}`,
         `画师串:`, // 画师串已拼进提示词，这里留空避免重复
@@ -225,11 +224,13 @@ export async function generateImage(params: GenParams, saveDir?: string, opts?: 
       const size = `${w}x${h}`;
       // 不带 response_format：部分兼容端点（如 agnes t2i）不支持 b64_json 参数，
       // 标准 OpenAI 端点默认返回 data[].url，下载即可；个别端点返回 b64_json 也兼容
+      const oaiModel = String(cfg.openai.model || "").trim();
+      if (!oaiModel) throw new Error("还没选生图模型：到「生图配置」点一次「拉取模型」，选好再试");
       const call = (sz: string): Promise<Response> =>
         fetch(`${cfg.openai.baseUrl.replace(/\/+$/, "")}/images/generations`, {
           method: "POST",
           headers: { "Content-Type": "application/json", Authorization: `Bearer ${cfg.openai.key}` },
-          body: JSON.stringify({ model: cfg.openai.model || OAI_DEFAULT_MODEL, prompt: usedPrompt, n: 1, size: sz }),
+          body: JSON.stringify({ model: oaiModel, prompt: usedPrompt, n: 1, size: sz }),
           signal: AbortSignal.timeout(GEN_TIMEOUT),
         });
       let r = await call(size);

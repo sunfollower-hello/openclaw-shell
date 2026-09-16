@@ -38,6 +38,9 @@
         <a href="#/emojis" data-route="emojis" data-icon="message">表情包库</a>
         <a href="#/settings" data-route="settings" data-icon="settings">设置</a>
       </nav>
+      <!-- 管理入口：只对管理员显示（普通用户/设备由 applyAdminLink 整块隐藏）。
+           底部那句「数据保存在本机，不上传」已按要求删掉，这里只留入口本身。 -->
+      <div class="drawer-foot" id="drawer-admin-foot" hidden><a href="#/users" id="drawer-admin-link">管理</a></div>
     </aside>
 
     <main id="view" class="view-main"></main>

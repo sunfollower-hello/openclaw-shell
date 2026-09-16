@@ -173,6 +173,8 @@ export interface AddEmojiInput {
   imageBase64: string;
   ext?: string;
   group?: string; // 目标分组 id，缺省默认分组
+  /** 批量导入用：跳过"每加一个就全量同步到通道目录"，由调用方最后统一同步一次 */
+  skipChannelSync?: boolean;
 }
 
 export async function addEmoji(input: AddEmojiInput): Promise<EmojiItem> {
@@ -197,7 +199,7 @@ export async function addEmoji(input: AddEmojiInput): Promise<EmojiItem> {
     createdAt: new Date().toISOString(),
   };
   await saveLibrary([...emojis, item]);
-    scheduleChannelSync();
+  if (!input.skipChannelSync) scheduleChannelSync();
   return item;
 }
 

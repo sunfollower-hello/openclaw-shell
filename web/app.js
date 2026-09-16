@@ -2,16 +2,68 @@
 const $ = (sel) => document.querySelector(sel);
 const $$ = (sel) => document.querySelectorAll(sel);
 
+// ================= 设备身份（分发形态：无注册无登录） =================
+// 首次启动生成 32 位随机 hex 存 localStorage + cookie（cookie 让 <img> 等子资源也能带上身份）。
+// 服务器按这个 ID 分数据命名空间；删 App/清数据 = 新 ID = 全新空白。
+const OC_DEVICE = (() => {
+  let id = localStorage.getItem("oc_device");
+  if (!id || !/^[a-f0-9]{32}$/.test(id)) {
+    const b = new Uint8Array(16);
+    crypto.getRandomValues(b);
+    id = [...b].map((x) => x.toString(16).padStart(2, "0")).join("");
+    localStorage.setItem("oc_device", id);
+  }
+  document.cookie =
+    "oc_device=" + id + "; path=/; max-age=31536000; SameSite=Lax" + (location.protocol === "https:" ? "; Secure" : "");
+  return id;
+})();
+
+// ================= 运行形态与身份（托管多租户 / 单用户自部署） =================
+// 服务端 /api/admin/me 返回 { admin, hosted }：
+//   hosted=false        → 单用户自部署（用户自己拉代码在本机跑），什么功能都全开
+//   hosted=true & admin → 运营者（管理员设备 / 密码登录 / 运营者的 Basic）
+//   hosted=true & !admin→ 分发用户：管理向功能（运行日志、本地语音兜底、通道/蒸馏/插件）不展示，
+//                          后端对这些端点也直接 403（两边都关才算真关，见 FEATURES 的同一原则）
+// 结果缓存进 localStorage：首屏要同步知道该显示什么，不能为它多等一次网络往返；
+// 后台再刷新一次校正（换了身份/清过 cookie 的情况）。
+let ocMode = (() => {
+  try {
+    const v = JSON.parse(localStorage.getItem("ocs_mode") || "null");
+    return v && typeof v === "object" ? v : null;
+  } catch {
+    return null;
+  }
+})();
+/** 分发用户（托管形态下的普通设备）——管理向功能对它隐藏 */
+function ocIsDevice() {
+  return !!ocMode && ocMode.hosted === true && ocMode.admin !== true;
+}
+/** 抽屉里对分发用户隐藏的条目（后端同名端点也 403，两边一致）
+ *  ⚠️ **通道连接不在里面**：QQ/微信 是用户的核心体验，普通用户照旧能扫码绑自己的机器人
+ *  （隔离靠后端的"账号归属"：用户只看得到、也只能动自己名下的账号）。
+ *  预设页也不在这里 —— 只有内置档位组「默认」不给用户打开，见 presetGroupLocked()。 */
+const OC_DEVICE_HIDDEN_ROUTES = ["plugins", "logs"];
+
+/**
+ * 这个预设组对当前身份是不是"锁住的"：
+ * 内置档位组（对外叫「默认」，id 固定 break）是运营者管的破甲预设 ——
+ * 普通用户只能看到它的名字，点不进去也改不了；管理员照旧能打开查看和编辑。
+ */
+function presetGroupLocked(kind, groupId) {
+  return ocIsDevice() && kind === "tier" && groupId === "break";
+}
+
 // ================= 基础 =================
 // 某些浏览器（如内嵌 webview）打开 URL 内嵌凭据（user:pass@host）时，页面内 fetch 不会自动携带，
 // 首次 401 就用 URL 里的凭据显式重试一次
 async function fetchApi(path, options = {}) {
-  let r = await fetch(path, options);
+  const headers = { "X-Device-Id": OC_DEVICE, ...(options.headers ?? {}) };
+  let r = await fetch(path, { ...options, headers });
   if (r.status === 401 && location.username) {
     const token = btoa(unescape(encodeURIComponent(`${location.username}:${location.password}`)));
     r = await fetch(path, {
       ...options,
-      headers: { ...(options.headers ?? {}), Authorization: "Basic " + token },
+      headers: { ...headers, Authorization: "Basic " + token },
     });
   }
   return r;
@@ -126,7 +178,62 @@ function escapeHtml(s) {
     "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
   }[c]));
 }
+// ---------- 原生壳桥（Android 套壳注入 window.SoulBoxNative；浏览器里不存在） ----------
+// 套壳只加载服务器上的这份网页、不含业务代码，所以这里的写法必须"有桥就用、没桥走老路"：
+// 同一份文件在浏览器 / 微信 / 套壳里行为都不冲突，壳也就永远不用跟着网页改动重打。
+const ocNative = (typeof window !== "undefined" && window.SoulBoxNative) || null;
+const ocHasNative = (m) => !!(ocNative && typeof ocNative[m] === "function");
+/** 原生保存：每个文件弹一次系统「保存到」对话框（可存到任意文件夹） */
+function ocNativeSave(name, mime, base64) {
+  try {
+    ocNative.saveFile(String(name || "soulbox"), String(mime || "application/octet-stream"), String(base64 || ""));
+    return true;
+  } catch (e) {
+    console.warn("原生保存失败：", e);
+    return false;
+  }
+}
+/** Blob → base64（喂原生桥；原生侧 Base64 解码后写文件） */
+function ocBlobToBase64(blob) {
+  return new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => {
+      const s = String(r.result || "");
+      resolve(s.slice(s.indexOf(",") + 1));
+    };
+    r.onerror = reject;
+    r.readAsDataURL(blob);
+  });
+}
+/** data: URL → { mime, base64 }。两种形态都支持：base64 的（图片/音频）与 URI 编码的
+ *  （备份 JSON 走的是 `data:application/json;charset=utf-8,%7B…`）——后者要按 UTF-8 转字节，
+ *  不然中文卡片名进文件就成乱码。 */
+function ocDataUrlToBase64(dataUrl) {
+  const s = String(dataUrl || "");
+  const comma = s.indexOf(",");
+  if (!s.startsWith("data:") || comma < 0) return null;
+  const head = s.slice(5, comma);
+  const mime = (head.split(";")[0] || "application/octet-stream").trim() || "application/octet-stream";
+  const body = s.slice(comma + 1);
+  if (head.includes("base64")) return { mime, base64: body };
+  try {
+    const bytes = new TextEncoder().encode(decodeURIComponent(body));
+    let bin = "";
+    for (let i = 0; i < bytes.length; i += 0x8000) {
+      bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+    }
+    return { mime, base64: btoa(bin) };
+  } catch (e) {
+    console.warn("解析 dataUrl 失败：", e);
+    return null;
+  }
+}
 function downloadDataUrl(dataUrl, filename) {
+  // 套壳里 <a download> 不会触发下载（WebView 不支持 data:/blob: 下载）→ 交给原生保存对话框
+  if (ocHasNative("saveFile")) {
+    const conv = ocDataUrlToBase64(dataUrl);
+    if (conv && ocNativeSave(filename, conv.mime, conv.base64)) return;
+  }
   const a = document.createElement("a");
   a.href = dataUrl; a.download = filename;
   document.body.appendChild(a); a.click(); a.remove();
@@ -401,6 +508,12 @@ function router() {
   // 路由 key 只取路径段：#/chatinfo?slug=xxx 这类带查询串的地址要剥掉 ? 后面的部分，
   // 否则整串当 key 匹配不到任何路由，会静默回落到首页。
   const hash = (location.hash || "").replace(/^#\/?/, "").split("?")[0] || "home";
+  // 分发用户直接粘运营向地址（#/channels 等）进来：改回首页由下一轮 hashchange 渲染，
+  // 不在这里直接当首页渲染——否则地址栏还停在 #/channels，看着像没生效
+  if (ocIsDevice() && OC_DEVICE_HIDDEN_ROUTES.includes(hash)) {
+    location.replace("#/home");
+    return;
+  }
   const route = routes[hash] || routes.home;
   cleanupBeforeRoute();
   $("#view").innerHTML = route.render();
@@ -3775,7 +3888,7 @@ function renderImgGenPage() {
           <input id="ig-oai-url" placeholder="https://api.example.com/v1">
           <label style="margin-top:8px">API Key（留空 = 保留原值）</label>
           <input id="ig-oai-key" type="password" placeholder="sk-...">
-          <label style="margin-top:8px">生图模型（中转站一般不单独放生图模型，从 /models 拉取后选择）</label>
+          <label style="margin-top:8px">生图模型</label>
           <div class="row">
             <select id="ig-oai-model" style="flex:1;min-width:160px"><option value="">（先拉取模型列表）</option></select>
             <button id="ig-oai-models" class="ghost small-btn">拉取模型</button>
@@ -4317,7 +4430,6 @@ function paintProvList() {
       <div class="prov-head">
         ${providerAvatarHTML(p.name)}
         <b>${escapeHtml(p.name)}</b>
-        ${p.name === OFFICIAL_PROVIDER_NAME ? '<span class="chip ok">官方</span>' : ""}
         ${isDefault ? '<span class="chip ok">默认</span>' : ""}
         <span class="prov-btns">
           <button class="ghost small-btn" data-act="edit" data-name="${escapeHtml(p.name)}">编辑</button>
@@ -4461,11 +4573,6 @@ function renderTtsPage() {
         </div>
       </div>
     </div>
-
-    <div class="card-box">
-      <h3>用量统计</h3>
-      <div id="tts-usage" class="hint">加载中…</div>
-    </div>
   </div>`;
 }
 
@@ -4518,7 +4625,6 @@ async function loadTtsConfig() {
     $("#tts-local-rate").value = cfg.local?.rate || "+0%";
     $("#tts-local-pitch").value = cfg.local?.pitch || "+0Hz";
     renderTtsProviders();
-    await loadTtsUsage();
   } catch (e) {
     $("#tts-prov-list").innerHTML = `<div class="card-box muted">读取失败：${escapeHtml(e.message)}</div>`;
   }
@@ -4536,12 +4642,15 @@ function renderTtsProviders() {
   const rows = [];
 
   // 本地条目（Edge/SAPI 也算一个可选项，编辑/试听与普通提供商一致）
-  rows.push(ttsRowHtml({
-    id: "local",
-    name: "本地（" + (ttsState.localEngine === "sapi" ? "Windows SAPI 离线" : "Edge 在线免费") + "）",
-    kind: "local",
-    selected: cur === "local",
-  }));
+  // 分发用户不列它：本地兜底只给管理员/单用户版（后端也拒绝为设备合成，见 localTtsAllowed）
+  if (!ocIsDevice()) {
+    rows.push(ttsRowHtml({
+      id: "local",
+      name: "本地（" + (ttsState.localEngine === "sapi" ? "Windows SAPI 离线" : "Edge 在线免费") + "）",
+      kind: "local",
+      selected: cur === "local",
+    }));
+  }
 
   (ttsState.providers || []).forEach((p) => {
     rows.push(ttsRowHtml({
@@ -4775,14 +4884,6 @@ async function saveTtsProvider() {
   }
 }
 
-async function loadTtsUsage() {
-  try {
-    const u = await api.get("/api/tts/usage");
-    const byProv = (u.byProvider || []).map((x) => `${x.id}(${x.calls}次/${x.chars}字符)`).join("、") || "—";
-    $("#tts-usage").textContent = `共 ${u.total} 次调用（成功 ${u.ok} / 失败 ${u.fail}），成功合成 ${u.totalChars} 字符，24h 内 ${u.last24h} 次。按上游：${byProv}`;
-    $("#tts-usage").className = "status";
-  } catch { /* 用量加载失败不影响其余 */ }
-}
 
 
 // ============================================================
@@ -6568,10 +6669,6 @@ function renderDistill() {
           <div class="row"><button id="btn-distill-run" class="primary">开始蒸馏</button></div>
           <div id="distill-msg" class="status"></div>
         </div>
-        <h3>${icon("zap")} 直连 WeFlow（本机 5031）</h3>
-        <div class="row"><input id="wf-token" placeholder="access_token"><button id="btn-wf-probe" class="ghost small-btn">探测</button></div>
-        <div class="row"><input id="wf-talker" placeholder="talker"><input id="wf-limit" type="number" value="500" style="max-width:80px"><button id="btn-wf-distill" class="primary small-btn">导入蒸馏</button></div>
-        <pre id="wf-out" class="small-out"></pre>
       </div>
       <div class="card-box">
         <h3>蒸馏结果</h3>
@@ -6589,8 +6686,6 @@ function initDistill() {
   $("#btn-distill-run").addEventListener("click", runDistill);
   $("#btn-distill-save").addEventListener("click", saveDistilled);
   $("#btn-distill-export-png").addEventListener("click", () => exportDistillCard("png"));
-  $("#btn-wf-probe").addEventListener("click", probeWeFlow);
-  $("#btn-wf-distill").addEventListener("click", distillFromWeFlow);
   loadDistillProviders();
   $("#distill-provider").addEventListener("change", () => fillDistillModels(false));
 }
@@ -6678,39 +6773,6 @@ async function exportDistillCard(format) {
   } catch (e) { toast("导出失败：" + e.message, false); }
 }
 
-async function probeWeFlow() {
-  const token = $("#wf-token").value.trim();
-  if (!token) return toast("请填 access_token", false);
-  $("#wf-out").textContent = "探测中…";
-  try {
-    const r = await api.send("/api/weflow/probe", { method: "POST", body: JSON.stringify({ token }) });
-    $("#wf-out").textContent = r.results.map((x) => `${x.path} → HTTP ${x.status}`).join("\n");
-  } catch (e) { $("#wf-out").textContent = "失败：" + e.message; }
-}
-
-async function distillFromWeFlow() {
-  const token = $("#wf-token").value.trim();
-  const talker = $("#wf-talker").value.trim();
-  const name = $("#distill-name").value.trim();
-  if (!token || !talker || !name) return toast("请填 token / talker / 名称", false);
-  $("#wf-out").textContent = "拉取并蒸馏中…";
-  try {
-    const r = await api.send("/api/distill/weflow", {
-      method: "POST",
-      body: JSON.stringify({
-        token, talker, limit: Number($("#wf-limit").value) || 500,
-        name, role: $("#distill-role").value,
-        target: $("#distill-target").value.trim() || undefined,
-        selfNames: $("#distill-self").value.split(",").map((s) => s.trim()).filter(Boolean),
-        blockedWords: $("#distill-blocked").value.split(",").map((s) => s.trim()).filter(Boolean),
-        model: distillModelChoice(),
-      }),
-    });
-    lastDistilledCard = r.card;
-    $("#wf-out").textContent = `✓ ${r.card.name}：${r.stats.totalMessages} → ${r.stats.usedMessages} 条`;
-    toast("蒸馏完成，可保存/导出");
-  } catch (e) { $("#wf-out").textContent = "失败：" + e.message; }
-}
 
 // ---- 通道 ----
 function renderChannels() {
@@ -7149,12 +7211,15 @@ const presetRoleLabel = (r) => (r === "user" ? "用户消息" : r === "assistant
 /** 首页：只显示档位/风格组名，不显示内容 */
 function renderPresets() {
   if (presetView) return renderPresetGroupView(presetView.kind, presetView.groupId);
-  const groupCard = (kind, g) => `
-    <div class="preset-group-card" data-kind="${kind}" data-group="${escapeHtml(g.id)}" title="点击查看组内条目">
-      <div class="preset-group-name">${escapeHtml(g.name)}</div>
+  const groupCard = (kind, g) => {
+    const locked = presetGroupLocked(kind, g.id);
+    return `
+    <div class="preset-group-card${locked ? " locked" : ""}" data-kind="${kind}" data-group="${escapeHtml(g.id)}" title="${locked ? "此预设仅管理员可查看" : "点击查看组内条目"}">
+      <div class="preset-group-name">${escapeHtml(g.name)}${locked ? ` ${icon("shield")}` : ""}</div>
       <div class="preset-group-meta">${g.items.length} 条${g.builtin ? " · 内置" : ""}</div>
     </div>`;
-  // 档位区（对外叫「通用基础预设」）：按键只留「添加」，「恢复内置」只在风格区保留
+  };
+  // 档位区（对外叫「通用基础预设」）：按键只留「添加」；「恢复内置」按用户要求只在风格区保留
   const section = (kind, title, hint, groups) => `
     <div class="card-box">
       <h3>${icon("sliders")} ${title}</h3>
@@ -7183,7 +7248,8 @@ function renderPresets() {
 function renderPresetGroupView(kind, groupId) {
   const list = kind === "tier" ? presetStoreData.tiers : presetStoreData.styles;
   const g = list.find((x) => x.id === groupId);
-  if (!g) { presetView = null; return renderPresets(); }
+  // 锁住的组连组内视图都不渲染（正常路径在点组卡那步就挡住了，这里兜底）
+  if (!g || presetGroupLocked(kind, groupId)) { presetView = null; return renderPresets(); }
   return `
   <div class="view">
     <div class="page-head">
@@ -7291,19 +7357,25 @@ function bindPresets() {
     });
   };
 
-  // 首页：点组卡进入组内视图
+  // 首页：点组卡进入组内视图（内置档位组对普通用户锁住：点不动，只提示一句）
   document.querySelectorAll(".preset-group-card").forEach((card) => {
     card.addEventListener("click", () => {
-      presetView = { kind: card.dataset.kind, groupId: card.dataset.group };
+      const kind = card.dataset.kind;
+      const groupId = card.dataset.group;
+      if (presetGroupLocked(kind, groupId)) {
+        toast("这个预设不可编辑", false);
+        return;
+      }
+      presetView = { kind, groupId };
       $("#view").innerHTML = renderPresets();
       bindPresets();
     });
   });
-  // 首页：新增档位/风格组
+  // 首页：添加组（档位区按键叫「添加」，与「通用基础预设」的叫法统一，不再用"档位"这个词）
   document.querySelectorAll(".preset-group-add").forEach((btn) => {
     btn.addEventListener("click", async () => {
       const kind = btn.dataset.kind;
-      const name = prompt(kind === "tier" ? "新预设名称：" : "新风格名称：");
+      const name = prompt("新预设名称：");
       if (!name || !name.trim()) return;
       try {
         presetStoreData = await api.send("/api/presets", { method: "POST", body: JSON.stringify({ kind, name: name.trim() }) });
@@ -7419,14 +7491,20 @@ function renderSettings() {
       </div>
       <span class="sr-chevron">${icon("chevron")}</span>
     </a>`;
+  // 运行日志 / 插件是运营向的（后端对设备 403），分发用户整行不出现——包括分隔与留白
+  const adminRows = ocIsDevice()
+    ? ""
+    : `${row("logs", "clipboard", "运行日志", "聊天 / 通道 / 生图 / 语音 / 记忆的报错记录，出问题先看这里（留最近 500 条）")}
+      `;
+  const pluginRow = ocIsDevice() ? "" : `${row("plugins", "store", "插件", "已安装插件只读列表", "暂未开放")}
+      `;
   return `
   <div class="view">
     <div class="page-head"><h2>设置</h2></div>
     <div class="setting-rows">
-      ${row("logs", "clipboard", "运行日志", "聊天 / 通道 / 生图 / 语音 / 记忆的报错记录，出问题先看这里（留最近 500 条）")}
+      ${adminRows}${row("device", "tool", "我的设备 ID", "记住它：服务器最多保存 15 天聊天记录，删了可凭 ID 恢复")}
       ${row("storage", "database", "本地存储", "图片与语音存放在这台设备上：占用统计 / 保存位置 / 自动保存 / 压缩 / 删除")}
-      ${row("plugins", "store", "插件", "已安装插件只读列表", "暂未开放")}
-      ${row("data", "package", "数据备份与记忆", "全部卡片 + 记忆 + 配置导出为 JSON；查看全部记忆")}
+      ${pluginRow}${row("data", "package", "数据备份与记忆", "全部卡片 + 记忆 + 配置导出为 JSON；查看全部记忆")}
     </div>
   </div>`;
 }
@@ -7633,6 +7711,11 @@ function renderEmojis() {
           <button id="em-add" class="primary">${icon("plus")} 添加到当前分组</button>
           <span id="em-msg" class="status"></span>
         </div>
+        <div class="row" style="margin-top:12px;align-items:center;gap:8px;flex-wrap:wrap">
+          <button id="em-zip" class="ghost small-btn">${icon("package")} 导入表情包 zip</button>
+          <input type="file" id="em-zip-file" accept=".zip,application/zip" hidden>
+          <span class="hint">一整包导入：zip 里放 <b>1.大笑.gif</b>、<b>2.偷笑.gif</b>… 外加一份 <b>说明.txt</b>（按序号填使用场景，留空也行）。图片文件夹用 scripts/make-emoji-pack.bat 一键就能打成这种包。</span>
+        </div>
       </div>
     </div>
     <div class="card-box">
@@ -7650,6 +7733,8 @@ let emojiCurGroup = "default"; // 当前选中分组
 
 function initEmojis() {
   $("#em-add").addEventListener("click", addEmojiToLib);
+  $("#em-zip").addEventListener("click", () => $("#em-zip-file").click());
+  $("#em-zip-file").addEventListener("change", importEmojiZip);
   $("#em-import").addEventListener("click", openEmojiImport);
   loadEmojiList();
 }
@@ -7918,6 +8003,62 @@ function editEmoji(item) {
   });
 }
 
+/**
+ * 表情包 zip 批量导入：先 dryRun 出预览 → 用户确认 → 再真导入。
+ * zip 交后端解析（序号/名字/编码/分组/重名都在那边处理），这里只管确认与报告。
+ */
+async function importEmojiZip() {
+  const input = $("#em-zip-file");
+  const f = input?.files?.[0];
+  if (!f) return;
+  const btn = $("#em-zip");
+  const raw = async (dryRun) => {
+    const r = await fetchApi(`/api/emojis/import-zip${dryRun ? "?dryRun=1" : ""}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/zip" },
+      body: f,
+    });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(data.error || r.statusText);
+    return data;
+  };
+  btn.disabled = true;
+  try {
+    const preview = await raw(true);
+    if (!preview.count) {
+      toast("这个包里没有能导入的表情", false);
+      return;
+    }
+    const renamed = (preview.items || []).filter((x) => x.renamedFrom).length;
+    const lines = [
+      `将导入 ${preview.count} 个表情`,
+      preview.groupsToCreate?.length ? `新建分组：${preview.groupsToCreate.join("、")}` : "",
+      renamed ? `重名自动改名：${renamed} 个` : "",
+      preview.problemCount ? `有问题跳过/改动：${preview.problemCount} 项` : "",
+      "",
+      (preview.items || []).slice(0, 12).map((x) => `${x.name}${x.scene ? "（" + x.scene.slice(0, 16) + "）" : ""}${x.renamedFrom ? " ← 原「" + x.renamedFrom + "」" : ""}`).join("\n"),
+      preview.count > 12 ? `…还有 ${preview.count - 12} 个` : "",
+      "",
+      "确认导入？",
+    ].filter(Boolean);
+    if (!confirm(lines.join("\n"))) return;
+    const done = await raw(false);
+    toast(`✓ 已导入 ${done.added?.length ?? 0} 个表情`);
+    const problems = done.problems || [];
+    if (problems.length) {
+      alert(`导入完成，${done.skipped ?? 0} 个未导入/被改名：\n\n` + problems.slice(0, 12).map((p) => `· ${p.what}：${p.reason}`).join("\n"));
+    }
+    cacheInvalidate("/api/emojis");
+    await loadEmojiLib();
+    await loadEmojiList();
+  } catch (e) {
+    toast("导入失败：" + e.message, false);
+  } finally {
+    btn.disabled = false;
+    input.value = "";
+  }
+}
+
 async function addEmojiToLib() {
   const name = $("#em-name").value.trim();
   const f = $("#em-file").files[0];
@@ -7994,6 +8135,11 @@ const routes = {
   settings: { render: renderSettings, init: initSettings },
   storage: { render: () => ocRenderStoragePage(), init: () => { ocSt.view = "overview"; ocBindStorage(); } },
   imgsave: { render: () => ocRenderImgSave(), init: () => ocInitImgSave() },
+  login: { render: renderAdminLogin, init: initAdminLogin },
+  users: { render: renderUsersPage, init: initUsersPage },
+  usercards: { render: renderUserCards, init: initUserCards },
+  userchats: { render: renderUserChats, init: initUserChats },
+  device: { render: renderDevicePage, init: initDevicePage },
 };
 
 $("#btn-menu").addEventListener("click", openDrawer);
@@ -8207,10 +8353,36 @@ function ocTgl(key, def) {
   const v = localStorage.getItem(key);
   return v === null ? def : v === "1";
 }
-const ocDirSupported = typeof window.showDirectoryPicker === "function";
+const ocDirSupported = typeof window.showDirectoryPicker === "function" || ocHasNative("pickFolder");
+/** 套壳里的保存文件夹是壳用 SAF 选的（授权持久化在壳里，重启依然有效），名字由壳提供 */
+function ocNativeFolderName() {
+  try {
+    return ocHasNative("getFolderName") ? String(ocNative.getFolderName() || "") : "";
+  } catch {
+    return "";
+  }
+}
+/** 壳里选完文件夹会回调这个（原生侧 onActivityResult 里 evaluateJavascript 调用） */
+if (typeof window !== "undefined") {
+  window.soulboxOnFolderPicked = function () {
+    void ocFillDirName();
+    ocStCache = null; // 文件夹变了，存储页统计作废
+  };
+}
 async function ocPickSaveDir() {
   if (!ocDirSupported) {
     toast("这个浏览器不支持选择文件夹，保存会直接进「下载」文件夹", false);
+    return null;
+  }
+  if (ocHasNative("pickFolder")) {
+    // 原生：弹系统文件夹选择器（结果通过 soulboxOnFolderPicked 回调，授权持久化）
+    try {
+      ocNative.pickFolder();
+      toast("选好文件夹就会记住，以后批量保存不再问");
+    } catch (e) {
+      toast("无法打开文件夹选择器", false);
+      console.warn(e);
+    }
     return null;
   }
   try {
@@ -8239,15 +8411,27 @@ async function ocEnsureDirPerm() {
   }
 }
 async function ocWriteToFolder(slug, blob) {
+  const d = new Date();
+  const p2 = (n) => String(n).padStart(2, "0");
+  const ts = `${d.getFullYear()}${p2(d.getMonth() + 1)}${p2(d.getDate())}_${p2(d.getHours())}${p2(d.getMinutes())}${p2(d.getSeconds())}`;
+  const ext = blob.type === "image/webp" ? "webp" : blob.type === "image/jpeg" ? "jpg" : "png";
+  const name = `${ts}_${Math.random().toString(36).slice(2, 6)}.${ext}`;
+  // 套壳：写进壳里已授权的文件夹（按卡建子目录，重名自动加序号），不弹框
+  if (!ocHasNative("saveToFolder") && ocHasNative("pickFolder")) return "";
+  if (ocHasNative("saveToFolder")) {
+    try {
+      const b64 = await ocBlobToBase64(blob);
+      const ok = ocNative.saveToFolder(String(slug || "未分类"), name, blob.type || "image/png", b64);
+      return ok ? `${slug || "未分类"}/${name}` : "";
+    } catch (e) {
+      console.warn("写入原生文件夹失败：", e);
+      return "";
+    }
+  }
   const h = await ocEnsureDirPerm().catch(() => null);
   if (!h) return "";
   try {
     const dir = await h.getDirectoryHandle(String(slug || "未分类"), { create: true });
-    const d = new Date();
-    const p2 = (n) => String(n).padStart(2, "0");
-    const ts = `${d.getFullYear()}${p2(d.getMonth() + 1)}${p2(d.getDate())}_${p2(d.getHours())}${p2(d.getMinutes())}${p2(d.getSeconds())}`;
-    const ext = blob.type === "image/webp" ? "webp" : blob.type === "image/jpeg" ? "jpg" : "png";
-    const name = `${ts}_${Math.random().toString(36).slice(2, 6)}.${ext}`;
     const fh = await dir.getFileHandle(name, { create: true });
     const w = await fh.createWritable();
     await w.write(blob);
@@ -8259,6 +8443,8 @@ async function ocWriteToFolder(slug, blob) {
   }
 }
 async function ocReadSavedFile(rel) {
+  // 套壳的文件夹是 SAF 目录（按名字回读不划算）：这里跳过，显示链会退到"提示词卡片"
+  if (ocHasNative("saveToFolder")) return null;
   const h = await ocMetaGet("dirHandle").catch(() => null);
   if (!h || !rel) return null;
   const parts = String(rel).split("/");
@@ -8273,6 +8459,8 @@ async function ocReadSavedFile(rel) {
   return await fh.getFile();
 }
 async function ocRemoveSavedFile(rel) {
+  // 套壳的 SAF 文件夹：应用不去删用户文件（要在文件管理器里删，或换保存位置）
+  if (ocHasNative("saveToFolder")) return;
   try {
     const h = await ocEnsureDirPerm();
     if (!h || !rel) return;
@@ -8310,8 +8498,16 @@ async function ocToWebp(blob, q = 0.85) {
     return blob;
   }
 }
-/** 下载兜底（没有文件夹权限时）：直接进「下载」文件夹 */
-function ocDownloadBlob(blob, name) {
+/** 下载兜底（没有文件夹权限时）：套壳走原生保存对话框，浏览器直接进「下载」文件夹 */
+async function ocDownloadBlob(blob, name) {
+  if (ocHasNative("saveFile")) {
+    try {
+      const b64 = await ocBlobToBase64(blob);
+      if (ocNativeSave(name, blob.type || "application/octet-stream", b64)) return;
+    } catch (e) {
+      console.warn("原生保存失败，退回浏览器下载：", e);
+    }
+  }
   const u = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = u;
@@ -8343,11 +8539,9 @@ async function ocSaveRecords(records) {
       if (compress) bytes = await ocToWebp(bytes);
       const rel = await ocWriteToFolder(rec.slug || "未分类", bytes);
       if (rel) usedFolder = true;
-      else if (ocDirSupported) {
-        // 有 API 但没授权/没选位置 → 落下载文件夹，保证用户拿到图
-        ocDownloadBlob(bytes, `${rec.slug || "image"}_${(rec.id || "").slice(2, 8)}.${bytes.type === "image/webp" ? "webp" : bytes.type === "image/jpeg" ? "jpg" : "png"}`);
-      } else {
-        ocDownloadBlob(bytes, `${rec.slug || "image"}_${(rec.id || "").slice(2, 8)}.${bytes.type === "image/webp" ? "webp" : bytes.type === "image/jpeg" ? "jpg" : "png"}`);
+      else {
+        // 没有可用文件夹（没选位置/没授权/套壳里没选过）→ 走导出兜底，保证用户拿到图
+        await ocDownloadBlob(bytes, `${rec.slug || "image"}_${(rec.id || "").slice(2, 8)}.${bytes.type === "image/webp" ? "webp" : bytes.type === "image/jpeg" ? "jpg" : "png"}`);
       }
       rec.fileRel = rel;
       rec.savedAt = Date.now();
@@ -8562,6 +8756,12 @@ async function ocFillDirName() {
   if (!el) return;
   if (!ocDirSupported) {
     el.textContent = "";
+    return;
+  }
+  // 套壳：文件夹由壳管理（SAF 持久授权），名字直接问壳
+  if (ocHasNative("getFolderName")) {
+    const n = ocNativeFolderName();
+    el.textContent = n || "未选择";
     return;
   }
   const h = await ocMetaGet("dirHandle").catch(() => null);
@@ -9035,6 +9235,338 @@ async function loadImgSaveList(slug, grid, items, selected, refreshCount) {
 // 公网上这一等就是 1-2s，期间页面只有顶栏 + 背景色（用户看到的「只有 SoulBox 加黄页」）。
 // 资料与表情库改为后台加载，回来后 loadProfile 内部会补昵称头像并刷新首页。
 router();
+// 身份先用缓存同步摆一次（避免管理入口闪一下），再后台校正
+applyModeVisibility();
+applyAdminLink();
 void loadProfile();
+// 身份（管理员/分发用户）决定抽屉里露哪些入口。ocMode 有 localStorage 缓存，本函数负责
+// 后台校正 + 按结果调整可见性（首屏不等它，见文件上方 ocMode 注释）。
+void loadMode();
 // 启动即拉表情库（幂等）：回来后若聊天页已在，顺手把文本兜底的 [表情:名] 升级成图片
 void ensureEmojiLib().then(() => upgradeEmojiFallback($("#chat-log")));
+
+// ==================== 管理员登录（分发形态：用户免登录，管理员用密码） ====================
+// 两条身份路线：设备 ID（用户，各自命名空间）/ 管理员密码（全局数据）。
+// 浏览器可能同时带设备 cookie，所以管理员入口必须是页面内的登录表单，不能只靠 Basic 弹窗。
+function renderAdminLogin() {
+  return `
+  <div class="view">
+    <div class="page-head"><h2>管理员登录</h2></div>
+    <div class="card-box oc-card" style="max-width:420px">
+      <div class="form">
+        <label>账号</label>
+        <input id="adm-user" autocomplete="username" placeholder="管理员账号">
+        <label>密码</label>
+        <input id="adm-pass" type="password" autocomplete="current-password" placeholder="管理员密码">
+        <button id="adm-go" class="small-btn" style="margin-top:12px;width:100%">登录</button>
+      </div>
+      <p class="hint" id="adm-msg"></p>
+    </div>
+  </div>`;
+}
+function initAdminLogin() {
+  const go = async () => {
+    const user = $("#adm-user").value.trim();
+    const pass = $("#adm-pass").value;
+    const r = await fetch("/api/admin/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ user, pass }),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (r.ok && j.ok) {
+      // 登录成功直接进管理页：抽屉底部的管理入口已随「底部文案」一起删掉，
+      // 落地在首页的话管理员进来会找不到入口（只能手输 #/users）。
+      location.hash = "#/users";
+      location.reload();
+      return;
+    }
+    $("#adm-msg").textContent = j.error || "登录失败";
+  };
+  $("#adm-go").addEventListener("click", go);
+  $("#adm-pass").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") go();
+  });
+  $("#adm-user").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") $("#adm-pass").focus();
+  });
+}
+// ---------- 设备管理页（管理员） ----------
+function renderUsersPage() {
+  return `
+  <div class="view">
+    <div class="page-head"><h2>设备管理</h2><button id="u-back" class="ghost small-btn">← 返回</button></div>
+    <div class="card-box oc-card">
+      <div class="u-search-row">
+        <input id="u-search" placeholder="搜索设备 ID（输前几位就行）">
+        <span class="u-count" id="u-count"></span>
+      </div>
+      <div class="oc-rows" id="u-list"><div class="oc-empty">读取中…</div></div>
+    </div>
+  </div>`;
+}
+/** 设备列表快照（搜索在本地过滤，不再打接口） */
+let uDevices = [];
+let uQuery = "";
+/** 注册/最近时间显示到分钟（用户要看"哪台是什么时候来的"） */
+function uFmtTime(s) {
+  const t = Date.parse(s || "");
+  if (!t) return "?";
+  const d = new Date(t);
+  const p = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+/** 排序：管理员置顶；其余按注册时间从早到晚（新设备自然加在列表下面） */
+function uSortedDevices(list) {
+  return list.slice().sort((a, b) => {
+    if (!!a.admin !== !!b.admin) return a.admin ? -1 : 1;
+    const ta = Date.parse(a.createdAt || "") || 0;
+    const tb = Date.parse(b.createdAt || "") || 0;
+    if (ta !== tb) return ta - tb;
+    return String(a.id || "").localeCompare(String(b.id || ""));
+  });
+}
+/** 重建列表（搜索框内容变化时只重画 #u-list） */
+function uRenderRows() {
+  const box = $("#u-list");
+  if (!box) return;
+  const all = uSortedDevices(uDevices);
+  const hit = uQuery ? all.filter((d) => String(d.id || "").toLowerCase().includes(uQuery)) : all;
+  const count = $("#u-count");
+  if (count) count.textContent = uQuery ? `共 ${all.length} 台 · 显示 ${hit.length}` : `共 ${all.length} 台`;
+  if (!hit.length) {
+    box.innerHTML = `<div class="oc-empty">${uQuery ? "没有匹配的设备 ID" : "还没有设备接入"}</div>`;
+    return;
+  }
+  box.innerHTML = "";
+  for (const dev of hit) {
+    const row = document.createElement("div");
+    row.className = "oc-row";
+    const isMe = dev.id === OC_DEVICE;
+    const marks =
+      (isMe ? '<span class="oc-cell-mark">本机</span>' : "") +
+      (dev.admin ? '<span class="oc-cell-mark">管理员</span>' : "") +
+      (dev.disabled ? '<span class="oc-cell-mark">已停用</span>' : "");
+    row.innerHTML = `
+      <span class="oc-bar" style="background:${dev.disabled ? "var(--faint)" : "var(--accent)"}"></span>
+      <span class="u-dev-main">
+        <span class="u-dev-id" title="点击复制完整 ID">${escapeHtml(dev.id || "")}${marks}</span>
+        <span class="u-dev-meta">注册 ${uFmtTime(dev.createdAt)} · 最近 ${uFmtTime(dev.lastSeen)}</span>
+      </span>`;
+    // 完整 ID 点一下即复制（用户要拿它去对"哪台是谁"、贴给用户查记录）
+    row.querySelector(".u-dev-id").addEventListener("click", async () => {
+      try {
+        await navigator.clipboard.writeText(dev.id || "");
+        toast("已复制设备 ID");
+      } catch {
+        toast("复制失败，请手动选中复制", false);
+      }
+    });
+    const look = document.createElement("button");
+    look.className = "ghost small-btn";
+    look.textContent = "查看";
+    look.addEventListener("click", () => {
+      location.hash = "#/usercards?id=" + encodeURIComponent(dev.id);
+    });
+    row.appendChild(look);
+    // 自己这台不给「取消管理员」：点掉就进不了管理端了（要再进来得走 #/login 输密码）
+    if (!(isMe && dev.admin)) {
+      const adm = document.createElement("button");
+      adm.className = "ghost small-btn";
+      adm.textContent = dev.admin ? "取消管理员" : "设为管理员";
+      adm.addEventListener("click", async () => {
+        await api.send("/api/users/admin", { method: "POST", body: JSON.stringify({ id: dev.id, admin: !dev.admin }) });
+        void initUsersPage();
+      });
+      row.appendChild(adm);
+    }
+    const dis = document.createElement("button");
+    dis.className = "ghost small-btn";
+    dis.textContent = dev.disabled ? "恢复" : "停用";
+    if (dev.disabled) dis.classList.add("danger");
+    dis.addEventListener("click", async () => {
+      await api.send("/api/users/disable", { method: "POST", body: JSON.stringify({ id: dev.id, disabled: !dev.disabled }) });
+      void initUsersPage();
+    });
+    row.appendChild(dis);
+    box.appendChild(row);
+  }
+}
+async function initUsersPage() {
+  $("#u-back").addEventListener("click", () => { location.hash = "#/home"; });
+  const me = await fetch("/api/admin/me").then((r) => r.json()).catch(() => ({ admin: false }));
+  uDevices = [];
+  uQuery = "";
+  const box = $("#u-list");
+  const search = $("#u-search");
+  if (!me.admin) {
+    box.innerHTML = `<div class="oc-empty">仅管理员可见。<a href="#/login">去登录</a></div>`;
+    if (search) search.disabled = true;
+    return;
+  }
+  if (search) {
+    search.value = "";
+    search.addEventListener("input", () => {
+      uQuery = search.value.trim().toLowerCase();
+      uRenderRows();
+    });
+  }
+  const d = await api.get("/api/users").catch(() => ({ devices: [] }));
+  uDevices = d.devices || [];
+  uRenderRows();
+}
+// ---------- 管理员查看：某设备的卡库 → 某卡的聊天记录（纯文本，一行一句） ----------
+function renderUserCards() {
+  return `
+  <div class="view">
+    <div class="page-head"><h2>该用户的角色卡</h2><button id="uc-back" class="ghost small-btn">← 返回</button></div>
+    <p class="hint" id="uc-head"></p>
+    <div class="card-box oc-card"><div class="oc-rows" id="uc-list"><div class="oc-empty">读取中…</div></div></div>
+  </div>`;
+}
+async function initUserCards() {
+  const id = new URLSearchParams((location.hash.split("?")[1] || "")).get("id") || "";
+  $("#uc-back").addEventListener("click", () => { location.hash = "#/users"; });
+  const box = $("#uc-list");
+  const d = await api.get("/api/users/" + encodeURIComponent(id) + "/cards").catch(() => null);
+  const cards = (d && d.cards) || [];
+  // 管理员设备的数据存在全局空间（它平时看的就是全局那份），下划线这句省得下次又以为"没数据"
+  const head = $("#uc-head");
+  if (head && d && d.admin) head.textContent = "管理员设备：显示的是全局空间的卡（它平时用的就是这一份）";
+  if (!cards.length) { box.innerHTML = '<div class="oc-empty">这张设备没有卡</div>'; return; }
+  box.innerHTML = "";
+  for (const c of cards) {
+    const row = document.createElement("div");
+    row.className = "oc-row";
+    row.innerHTML = '<span class="oc-bar"></span><span class="oc-row-label">' + escapeHtml(c.name || c.slug) + '</span><span class="oc-row-val">' + String(c.updated_at || "").slice(0, 10) + '</span><span class="oc-chev">›</span>';
+    row.addEventListener("click", () => {
+      location.hash = "#/userchats?id=" + encodeURIComponent(id) + "&slug=" + encodeURIComponent(c.slug);
+    });
+    box.appendChild(row);
+  }
+}
+function renderUserChats() {
+  return `
+  <div class="view">
+    <div class="page-head"><h2>聊天记录</h2><button id="uh-back" class="ghost small-btn">← 返回</button></div>
+    <div class="card-box oc-card"><div class="small-out tall" id="uh-list"><div class="oc-empty">读取中…</div></div></div>
+  </div>`;
+}
+async function initUserChats() {
+  const q = new URLSearchParams((location.hash.split("?")[1] || ""));
+  const id = q.get("id") || "";
+  const slug = q.get("slug") || "";
+  $("#uh-back").addEventListener("click", () => { location.hash = "#/usercards?id=" + encodeURIComponent(id); });
+  const box = $("#uh-list");
+  const d = await api.get("/api/users/" + encodeURIComponent(id) + "/chats/" + encodeURIComponent(slug)).catch(() => null);
+  const rows = (d && d.entries) || [];
+  if (!rows.length) { box.innerHTML = '<div class="oc-empty">没有聊天记录</div>'; return; }
+  box.innerHTML = rows.map((e) => {
+    const who = e.role === "user" ? "用户" : "AI";
+    const src = e.surface === "web" ? "" : "[" + e.surface + "] ";
+    const t = String(e.t || "").slice(5, 16).replace("T", " ");
+    return '<div class="hint" style="margin:3px 0">' + t + " " + src + who + "：" + escapeHtml(String(e.content || "")) + "</div>";
+  }).join("");
+}
+
+// ---------- 设置：我的设备 ID（记住它，删了可恢复） ----------
+function renderDevicePage() {
+  return `
+  <div class="view">
+    <div class="page-head"><h2>我的设备 ID</h2>${settingsBack()}</div>
+    <div class="card-box oc-card">
+      <h3>当前设备 ID</h3>
+      <div class="oc-space-row"><span class="oc-space-val" id="dev-id" style="font-size:13px;word-break:break-all">—</span></div>
+      <button id="dev-copy" class="ghost small-btn">复制</button>
+      <p class="hint">请牢记这个 ID。我们最多保存 15 天且仅有聊天记录，我们不会私自调用您的数据。15 天内遇到不慎删除，凭此 ID 可以恢复聊天记录；记忆和图片我们无能为力（服务器磁盘有限）。</p>
+    </div>
+    <div class="card-box oc-card">
+      <h3>用旧 ID 恢复</h3>
+      <div class="form">
+        <input id="dev-input" placeholder="粘贴以前的设备 ID（32 位十六进制）">
+        <button id="dev-restore" class="small-btn" style="margin-top:10px;width:100%">恢复</button>
+      </div>
+      <p class="hint" id="dev-msg"></p>
+    </div>
+  </div>`;
+}
+function initDevicePage() {
+  const el = $("#dev-id");
+  if (el) el.textContent = OC_DEVICE;
+  $("#dev-copy").addEventListener("click", async () => {
+    try {
+      await navigator.clipboard.writeText(OC_DEVICE);
+      toast("已复制设备 ID");
+    } catch {
+      toast("复制失败，请手动选中复制", false);
+    }
+  });
+  $("#dev-restore").addEventListener("click", () => {
+    const v = String($("#dev-input").value || "").trim().toLowerCase();
+    const msg = $("#dev-msg");
+    if (!/^[a-f0-9]{32}$/.test(v)) { msg.textContent = "格式不对：应为 32 位十六进制"; return; }
+    if (v === OC_DEVICE) { msg.textContent = "这就是当前设备 ID"; return; }
+    localStorage.setItem("oc_device", v);
+    document.cookie = "oc_device=" + v + "; path=/; max-age=31536000; SameSite=Lax" + (location.protocol === "https:" ? "; Secure" : "");
+    msg.textContent = "已切换到该 ID，正在重新载入…";
+    setTimeout(() => location.reload(), 600);
+  });
+}
+
+/**
+ * 按当前身份调整可见性：隐藏运营向入口，并在设备身份下把落在隐藏路由上的访问退回首页
+ * （直接粘 #/channels 这类地址进来的情况）。
+ */
+function applyModeVisibility() {
+  const dev = ocIsDevice();
+  document.querySelectorAll(".drawer-nav a").forEach((a) => {
+    if (OC_DEVICE_HIDDEN_ROUTES.includes(a.dataset.route)) a.hidden = dev;
+  });
+  const cur = (location.hash.replace(/^#\//, "").split("?")[0] || "home").trim();
+  if (dev && OC_DEVICE_HIDDEN_ROUTES.includes(cur)) location.hash = "#/home";
+}
+
+/**
+ * 抽屉底部管理入口：只有「托管形态（服务器）+ 管理员」才显示。
+ * 本地/自部署（无认证 = 单用户模式）一律当普通用户处理 —— 那边没有"多租户设备"这个概念，
+ * 设备管理页永远是空的，所以整块（含上边框）都不出现，避免留一条空横线。
+ * 需要进管理端时手动访问 #/login（与设备身份无关，永远有效）。
+ */
+function applyAdminLink() {
+  const link = $("#drawer-admin-link");
+  const foot = $("#drawer-admin-foot");
+  const sep = $("#drawer-admin-sep");
+  if (!link) return;
+  const show = !!ocMode?.admin && !!ocMode?.hosted;
+  link.hidden = !show;
+  if (foot) foot.hidden = !show;
+  if (sep) sep.hidden = !show;
+  if (show) {
+    link.textContent = "管理";
+    link.setAttribute("href", "#/users");
+  }
+}
+
+/** 拉一次身份（管理员判定沿用服务端 /api/admin/me），缓存并刷新可见性 */
+async function loadMode() {
+  const j = await fetch("/api/admin/me").then((r) => r.json()).catch(() => null);
+  if (!j) {
+    applyAdminLink(); // 网络失败：保留缓存里的身份信息，至少把底部链接按旧结论摆好
+    return;
+  }
+  const next = { hosted: j.hosted === true, admin: j.admin === true };
+  const changed = JSON.stringify(next) !== JSON.stringify(ocMode);
+  ocMode = next;
+  try {
+    localStorage.setItem("ocs_mode", JSON.stringify(next));
+  } catch {
+    /* 隐私模式禁用 localStorage：仅本次会话内存生效 */
+  }
+  if (changed) {
+    applyModeVisibility();
+    // 首屏是在身份未知时画的（ocMode 无缓存 → 按"全开"渲染），身份确定后要把当前视图重画一遍，
+    // 否则首页那些按身份裁剪的入口（蒸馏/通道快捷键）会一直留在页面上。只在身份变化时重画一次。
+    router();
+  }
+  applyAdminLink();
+}

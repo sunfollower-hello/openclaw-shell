@@ -5,7 +5,7 @@ import path from "node:path";
 import os from "node:os";
 import { pathToFileURL } from "node:url";
 
-const accFile = path.join(os.homedir(), ".openclaw", "openclaw-weixin", "accounts", "be1f34aa93f9-im-bot.json");
+const accFile = path.join(os.homedir(), ".openclaw", "openclaw-weixin", "accounts", "<运营者的微信账号id>.json");
 const acc = JSON.parse(await fs.readFile(accFile, "utf8"));
 const dist = "C:/Users/followsun/.openclaw/npm/projects/tencent-weixin-openclaw-weixin-7783ac86ba/node_modules/@tencent-weixin/openclaw-weixin/dist";
 const { uploadFileToWeixin } = await import(pathToFileURL(`${dist}/src/cdn/upload.js`));

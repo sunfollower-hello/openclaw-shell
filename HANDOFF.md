@@ -1,6 +1,7 @@
 # openclaw-shell 项目交接文档（HANDOFF）
 
-> 更新：2026-09-04（**合入异地备份版**：预设 v3 / 表情分组 / 开场白 / AI 主动消息 / 跨端会话镜像 / 记忆整卡通用化，详见 git 提交 a5907e1 + 库内 REPLICATE.md）
+> 更新：**2026-09-17**（新对话**先读 §42 交接速查**；09-16/17 的改动细节看 §43–§50）
+> 历史：2026-09-04 合入异地备份版（预设 v3 / 表情分组 / 开场白 / AI 主动消息 / 跨端会话镜像 / 记忆整卡通用化，详见 git 提交 a5907e1 + 库内 REPLICATE.md）
 > 配套文档：`D:\ai_workspace\未来规划书.md`（未来规划）、项目内 `DESIGN.md`（设计稿）、`README.md`（使用说明）、`REPLICATE.md`（异地复刻/本次大改说明）、`docs/tts-guide.md`（TTS 专项完整指引）
 
 ---
@@ -175,3 +176,401 @@ openclaw-shell/
 31. **本地存储页 v3（2026-09-15，补齐 RP-Hub 分类口径 + 删除墓碑）**：用户指出 v2 抄漏了分类——**必须有「聊天记录 / 角色卡 / 记忆」三类占用**（我们没有群聊与向量，故不列）。① **服务端新增 `GET /api/storage/breakdown`**：按卡返回 `{chat, mem, card, img}`（chat=conversations jsonl+chatlog；mem=.mem/.greeted/.mirror/两个导出 md；card=cards/<slug>/+covers；img=data/images/<slug>/ 的历史图），用递归 `pathBytes()` 统计、软链跳过。**这是"打开存储页显示 0"的根因**——旧图全在服务端，浏览器 IndexedDB 里没有，v2 只统计浏览器侧所以是 0。② **视图层级**：总览分类占用（聊天记录→chats / 角色卡→cards / 记忆→mems）+ 保存设置；**聊天记录列表**按卡显示总占用（服务端+浏览器+文件夹+历史图之和），**每行最右「更多」→ 展开「图片 / 语音」两个按键**（用户点名要求，RP-Hub 原位是图片键）；**图片页**分三段=本机图片（IndexedDB 记录）/ 服务器图片（历史 data/images，可直接 ✕ 删，走 `/api/image/delete`）/ 已保存到文件夹（句柄枚举，✕ 直接删文件）。③ **删除=墓碑**（用户要求）：`ocDeleteImageRecord` 不再真删记录，而是落 `{deleted:true}` 墓碑并清掉 blob 与文件夹文件 → 聊天里那张图**永远显示提示词占位（"图片已删除"+ 提示词 + 复制键），且绝不触发二次生图**；语音同理（`ocAudioDelete` 墓碑保留 text，`speakText` 见到墓碑直接提示「这条语音已删除」，不再重新合成烧钱）。④ **修复两个真 bug（都是真实出图实测出来的）**：**(a) sta1n 的图链没有扩展名**（`/api/images/img_xxx/content`）——服务端只按扩展名正则收图导致图片行根本没写进回复；改为**按「已生成图片：」前缀取 URL**（`executeToolCalls` 里 gen[1] 同时进 imgs 与 imageMeta），前端 `CHAT_IMG_RE` 也加了前缀分支并在渲染时剥前缀。**(b) 会话记录不存生图元数据** → 刷新/换浏览器后历史渲染出来的图没有提示词、URL 失效时卡片空白；`ConvEntry` 加 `images:[{url,prompt}]` 字段（appendConv/readConv 双向透传），前端加载历史时建 `ocUrlPrompt` 映射，hydrate 建记录与回填旧记录都取它。⑤ **实测（真实 NAI 4.5 出图 3 张）**：回复带图链 ✓、图片 832x1216 正常渲染且 URL 不出现在文本里 ✓、历史渲染入库（含提示词回填）✓、删除后聊天显示"图片已删除"+完整提示词 ✓、语音墓碑 playback 置 null ✓。**注意**：小小卡的模型 `agnes/agnes-2.5-flash` 会出现「只嘴上说画好了、从不真正调用 image_gen」——测试时改用支持 function calling 的模型（jiyuan/deepseek-v4-flash-0731）才真出图，这是模型能力问题不是链路问题。
 
 32. **本地存储页 v3.1（2026-09-15，用户三点反馈）**：① **图片页不再分段**——本机记录 / 服务器历史图 / 文件夹文件**混排成一条时间线**（按 createdAt / mtime / File.lastModified 倒序，最新在最前），删掉 v3 的「图片 0 + 服务器图片」两段式（用户："不要区分"）；`ocImgCell(it)` 统一渲染三种来源（角标=状态或大小），`ocDeleteImageRecord` / `/api/image/delete` / 句柄 removeEntry 三种删除各自对接。② **统计改为按需 + 缓存**（用户："不要每次返回和进入都重新统计"）：`ocStData(force)` 命中 `ocStCache` 直接返回；**总览进入时若没缓存只显示「—」不扫描**，点「重新统计」才 `ocFillOverview(true)` 真扫；详情视图用缓存、无缓存才扫一次；**只有删除会作废缓存并原地重算**（`ocStAfterDelete()`）；`#/storage` 的 init 不再清缓存（进出保持结果）。实测：进入 0 请求 → 点按钮 1 请求 → 进出三个视图仍 1 请求。③ 保存设置的两个开关行加 `.oc-row .switch { margin-left: auto; }` 贴右对齐。**顺带修掉一个坑**：缩略图原来用 IntersectionObserver 懒加载，**在 `#view` 这个自滚动容器里实测根本不触发**（表现为空格子、手动赋 src 就正常）→ 改为直接取源，延迟交给 `<img loading="lazy">`（原生懒加载）。
+
+33. **网关规模压测（2026-09-15，实测）**：目的=回答"每用户独立机器人"形态下，一台服务器能挂多少个 agent。方法：`scripts/loadtest-agents.mjs`（保留在仓库里，add/remove 两个命令）向 `~/.openclaw/openclaw.json` 的 `agents.list` 批量写入假 agent（id=loadtest-XXX，空工作区+最小 AGENTS.md，不绑任何凭证），重启网关后测 node 进程 RSS，最后 remove+清目录+还原。**结果**：6 agents=282MB → 31=265MB → 56=265MB → **206=290MB** → 还原 6=279MB。**结论：空闲 agent 的边际内存成本 ≈ 36KB/个（噪音级），网关内存由插件/SDK 基线（~260-290MB）主导，与注册 agent 数无关**——agent 是懒加载的，工作区/会话只在有消息时才载入。这直接验证了"用户注册后不等于常驻消耗"：容量按**活跃会话**算，不按注册数。**两个连带发现**：① `openclaw agents list` 在 206 agents 时耗时 ~150s（6 个时秒回）——CLI 巡检随规模急剧变慢，多租户后管理端的热路径必须改成直读 openclaw.json/缓存，不能 spawn CLI；② 网关启动在 206 agents 下仍正常（QQ bot 照常 ready）。**对服务器结论的影响**：内存维度从"按注册用户"改成"按并发生成"——2核4G 撑 ≤300 注册用户（活跃几十个、并发生成 ≤30）没有问题；磁盘实测每活跃用户每月 1-4MB（5 个 agent 26 天共 14.4MB 会话 + 管理台侧 1.5MB，媒体即发即删不计），50G 是年级别的余量。压测备份：`~/.openclaw/openclaw.json.bak-loadtest`（确认无误后可删）。
+
+34. **多租户地基：设备随机 ID 即身份（2026-09-15，已实施并实测 7/7）**：分发形态的隔离方案（用户拍板：**无注册无登录**，打开就能玩；删除 App 重装 = 全新身份 = 服务端数据清空；用户自己保存到文件夹的文件不删——浏览器机制天然保证，应用内 IndexedDB 卸载自动清）。**机制**：① 前端首启生成 32 位随机 hex（`localStorage.oc_device` + `oc_device` cookie，cookie 让 `<img>` 等子资源也能带身份），`fetchApi` 全部携带 `X-Device-Id`；② 服务端 `src/core/dataRoot.ts` 用 **AsyncLocalStorage** 存请求作用域，`dataDir()` 在设备请求内自动指向 `data/users/<id>/`——**全项目 25+ 个 store 全部经 dataDir() 取路径，一处改全局生效**；③ 管理员（Basic 有效）**永远压过设备身份**（浏览器同时带设备 cookie + Basic，Basic 校验在前并把 `res.locals.ocDevice` 置 null）→ 走全局 `data/`，原有数据零迁移；设备请求免 Basic。④ 设备注册表 `data/users/registry.json`（全局，不在任何命名空间内），管理员端点 `GET /api/users` / `POST /api/users/disable`（列出/停用；被停用设备按未认证处理 → 401）。⑤ **管理员专属端点清单**（设备 403）：`/api/bots /api/channels /api/distill /api/plugins /api/mcp /api/users /api/backup /api/workspace/`。⑥ 按作用域静态：`/img /emojis /covers` 用 `ocScopedStatic()`（每根缓存 express.static 实例）。**实测 7/7**：管理员全局 5 卡不受影响（含"Basic+设备头并存=管理员优先"）；纯设备 A 建卡只自己可见；设备 B 跨读 404；停用 401、恢复 200；磁盘落位 `data/users/<id>/cards/...`，全局 `data/cards` 未动。**注意**：ALS 上下文随 async 链路传播——请求内 `void autoMemorize(...)` 这类延时任务也在设备作用域里写（正确）；而**启动期定时器**（lifeScheduler/mirror）无作用域写全局（也正确，那是运营者数据）。**Phase B（分发前必做）**：机器人/通道按设备归属（botId 前缀防 slug 撞车，`botStore.ts:105` agentId=卡 slug 会跨用户撞）、模型 key 到设备/用户级（各走各的 Soul API token）、远程绑定流程、管理页设备管理 UI。压测脚本 `scripts/loadtest-agents.mjs`（add/remove）保留。
+
+35. **分发服务器已上线（2026-09-16）**：`103.117.138.91`（4核 Xeon 8272CL / 3.8G / 系统盘 30G + 数据盘 50G 挂 `/data` / 30M 不限流量 / CN2 / Ubuntu 24.04.1，40 元/月）。**完整部署手册见仓库 `docs/linux-deploy.md`**（含全部命令与坑位，重装照抄）。要点：① **SSH**：本机别名 `ssh sb`（专用密钥 `id_ed25519_sb`）；商家镜像 `PubkeyAuthentication no` 必须用 `/etc/ssh/sshd_config.d/99-pubkey.conf` 覆盖（与中转站同一个坑）；密码登录尚未关闭。② **systemd 四服务**：`openclaw-shell`（管理台 127.0.0.1:17880）、`openclaw-gateway`（127.0.0.1:18789）、`openclaw-tts`（0.0.0.0:17900，被 ufw 拦）、`caddy`（80/443 反代 17880），全部 enable 开机自启。③ **路径**：程序 `/data/openclaw-shell`（数据同盘）；`/root/.openclaw` → 软链 `/data/openclaw`——**坑：openclaw 首次运行会自建真目录，直接 `ln -s` 会把链接塞进它里面，网关报 "Missing config" 起不来；正确顺序是先建 `/data/openclaw` 再 `rm -rf /root/.openclaw && ln -s`**。④ **npm 11 默认拦安装脚本**：装 openclaw/通道插件必须带 `--allow-scripts=openclaw,@google/genai,koffi,protobufjs,tree-sitter-bash`，否则 tree-sitter/koffi 原生模块不编译。⑤ **公网入口**：Caddy 配 `app.319274.xyz`（**需灰云 A 记录**，套 CF 橙云实测 ACME 签发 401 失败）+ `:80` IP 直连兜底（HTTPS 通后可删这段）；`soulbox.319274.xyz` 指向家里隧道**不要动**。⑥ **验证口径**：公网 IP 访问返回 401（要 Basic）、带凭据 `/api/health` 200、设备身份请求（X-Device-Id）200、无凭据 401、`openclaw doctor` 无误。⑦ **服务器当前是干净起点**：**未迁移任何通道凭证**（QQ/微信还在开发机，避免两个网关抢同一账号），`openclaw.json` 为最小配置（无 providers/channels）；TTS_ALLOW_LOCAL/TTS_FORCE_SILK 这两个本机 hack 未在服务端设置。
+
+36. **身份双轨 + 管理员登录（2026-09-16，已上线 `https://soulbox.319274.xyz`）**：分发形态下**用户零登录**（设备随机 ID），管理员靠密码，两者互不干扰。**关键修正**：原来只有 Basic 认证，而浏览器一旦带上设备 cookie 就再也不弹 Basic 框（设备请求免认证）→ 管理员进不去管理端。现在：① 登录页 `https://<域名>/#/login`（抽屉底部还有「管理登录/退出管理」入口）；② 登录成功下发 `oc_admin` cookie（**HMAC(user:pass) 无状态签名**、HttpOnly、HTTPS 下 Secure、30 天，改密码即全体失效）；③ 认证优先级：Basic 凭据 > `oc_admin` cookie > 设备 ID（前两者都强制走全局 data/）；④ **外壳静态免认证**（`/`、`/index.html`、`/app.js`、`/style.css`、`/assets/*` 与 `/api/admin/*` 在 PUBLIC 清单里）——这是分发的前提，新用户必须先能打开页面才会生成设备 ID（否则会撞 Basic 弹窗，用户根本没密码）。**已知坑**：`/api/admin/me` 也在免认证清单里 → 它读不到 `res.locals.ocAdmin`，必须自己判 cookie/Basic（踩过一次，返回 admin:false 导致"退出管理"按钮不出现）。**安全加固已做**：SSH 密码登录关闭（仅密钥，`sshd -T` 验证 `passwordauthentication no`）、IP:80 由"明文代理应用"改为"跳转域名"。**凭据位置**：管理台账号在服务器 `/data/openclaw-shell/.env`；SSH 别名 `ssh sb`（密钥 `~/.ssh/id_ed25519_sb`）；OpenClaw 网关 token 在 `/data/openclaw/openclaw.json`。**另注意**：跨境 SSH 短时间连太多次会被对端重置（实测连续 5-6 次后开始 Connection reset，等 60 秒恢复）——批量操作要合并成一次连接。
+
+37. **管理员设备机制 + 数据迁移（2026-09-16）**：用户反馈"登录后卡还是空的"——两层根因：① **服务器是新装的，他的 5 张卡在开发机没迁**（迁移=打包 data/{cards,conversations,memory,memory-export,history-export,covers,emojis,presets.json,imageConfig.json,ttsConfig.json,providers.json,user-profile.json,chat-list.json} → 解到服务器全局 data/，工作区/agent-workspaces 不迁（网关按需重建））；② **管理员设备机制**：`users.ts` 设备记录加 `admin` 标记 → 设备中间件识别后走全局作用域免密码（`/api/admin/me` 返回 `{admin:true,via:"device"}`）→ **踩坑：auth 中间件必须显式放行 `res.locals.ocAdmin`，只设标记不放行会 401**。管理端点 `POST /api/users/admin {id,admin}`（把某设备设为管理员——换电脑/新设备迁管理端用）；抽屉对管理员设备显示「管理员（本设备）」无退出概念。**#/login 密码登录保留**作为新设备进管理端的备用通道（用户说"取消登录"指的是不要密码门槛，他的设备已白名单免密）。**数据迁移口径**：开发机=开发环境，服务器=生产；两边数据从此各自演化不同步，改卡要在服务器上改（或再跑一次迁移覆盖）。本地用户数据实测迁移包 13MB。
+
+38. **凭证迁移 + 设备管理页 + 备份体系（2026-09-16）**：① **QQ/微信凭证已迁至服务器**（本地 openclaw.json 全量迁移 + 路径改写：`D:\ai_workspace\openclaw-shell→/data/openclaw-shell`、`C:\Users\followsun\.openclaw→/data/openclaw`，转换脚本 /tmp/fix-paths.cjs 思路=双/单/正斜杠三形态 + /data/ 开头路径残留反斜杠兜底）；**两个 QQ 号（qq-<运营者号1>/qq-<运营者号2>）已在服务器 Gateway ready**；本地网关已停、本地 openclaw.json 通道已 enabled=false（防双网关抢号）。**踩坑三连**：a) tar 上传的文件带开发机 uid → OpenClaw 插件安全检查拦截"suspicious ownership"，`chown -R root:root /data/openclaw-shell /data/openclaw` 解决；b) openclaw 首次运行自建 ~/.openclaw 真目录导致软链失效（见 §35）；c) 迁移的 npm/projects 只是文件，OpenClaw 的安装注册表没跟上 → 必须用官方命令重注册：`openclaw plugins install --link <自研插件路径>` × 2 + `openclaw plugins install npm:@tencent-connect/openclaw-qqbot --force` + `npm:openclaw-weixin --force`。② **设备管理页** `#/users`（管理员可见，/api/users 本身就是设备 403）：每设备一行=创建日期/最近在线/管理员标记 + 「设为/取消管理员」「停用/恢复」；`POST /api/users/admin {id,admin}` 新端点。③ **备份体系**：`scripts/server-backup.sh`（服务器 /data/scripts/）——每日 04:00 cron 打包 data+openclaw+.env → /data/backups/ 留 7 份 + **scp 异地推送到中转站机器**（103.233.254.159:/data/backups-from-soulbox/ 留 7 份；站间密钥 id_ed25519_hkrelay，对端 authorized_keys 已加）。首次备份实测 38MB 全链路通过。异地用加密推 GitHub 的方案可后续再加。
+
+39. **架构分工定型（2026-09-16，用户拍板）**：**GitHub = 纯用户版，运营层永不上传**。
+- **分支**：`main`（GitHub，公开面）= 用户自部署版（当前 = `a857767 图片/语音本地化`）；`prod`（**仅本地，不 push**）= 用户版 + 多租户 + 管理端 + 服务器运维脚本。**所有运营/管理/服务器相关内容只在 prod 分支与服务器上存在**。GitHub main 已强制回退到 a857767（历史里的运营提交在 GitHub 上消失；全量历史兜底 bundle 存于 `D:\ai_workspace\backups\openclaw-shell-full-history-*.bundle`）。
+- **两种运行模式**（`src/server.ts` 顶部判定）：**有 `OPENCLAW_SHELL_UI_USER/PASS` = 托管模式**（设备命名空间隔离 + 管理员 Basic/cookie/白名单）；**无认证 = 单用户模式**（不做设备隔离，全部走全局 `data/`——就像用户自己拉代码在本机跑）。判定常量 `HOSTED_MODE`。
+- **本机（开发机）已改为"普通用户模式"**：`.env` 里的登录凭据已删（备份 .env.bak-*）、**家里隧道已停且禁用**（`config-openclaw.yml` → `.disabled`，start-stack 不再拉起）、通道已 enabled=false、本地网关可不跑。本机 17880 免登录即见自己的卡（单用户全局空间）。
+- **备份口径（用户明确）**：**只备份框架 + 管理员配置，不备份任何用户数据**（用户数据按设计在用户侧/短保留，丢了不影响用户）。服务器 `scripts/server-backup.sh` 现只打包 `.env + openclaw/openclaw.json + split-styles.json + users/registry.json`（**实测 2.8KB**），每日 04:00 cron、留 7 份；**不再推送到中转站**（站间密钥已删、中转站上的备份目录已删）。要拿回本机：`scp sb:/data/backups/soulbox-config-*.tar.gz 本地路径`。
+- **中转站纪律（用户强调）**：103.233.254.159 **只跑中转站**，不要再往上放任何别的东西（本次已清理：删掉我加的备份目录与那行公钥）。
+
+40. **用户数据只留 15 天 + 图片只存提示词 + 管理端查看用户（2026-09-16，全部只在 prod 分支，不进 GitHub）**：
+- **保留策略**（`src/core/retention.ts`）：`RETENTION_DAYS` 默认 **15**（env `OC_RETENTION_DAYS` 可调），**只作用于设备命名空间 `data/users/<id>/`**（运营者自己的全局 data/ 完全不碰——不然他自己的卡与聊天会被清）。到期从最早的消息开始删：`conversations/*.jsonl`（按 `t`）、`memory/*.chatlog.jsonl`、`memory/*.mem`（按 `ts`）。启动跑一次 + 每 6 小时一次；管理员可 `POST /api/users/retention {days,dryRun,id?}` 手动跑/预演（实测预演返回每设备统计）。
+- **图片只存提示词**：服务器写会话时把 `已生成图片：<上游URL>` 换成 `（图片：<提示词>）`（`/api/chat` 的 appendConv，prompt 取自 imageMeta）；保留策略也会把**存量**记录里的图链行一并改成提示词形态（含 parts）。**渲染路线不变**（图上还是走原地址，用户看不到 URL 文本）——用户明确说"不要搞得太严肃"，**已撤销**中途做的 AES token 加密代理方案（`mediaToken.ts` / `/api/img/:token` / 元数据改写全部删除）。
+- **管理端查看用户**：`GET /api/users/:id/cards`（在该设备命名空间里读卡）、`GET /api/users/:id/chats/:slug`（readConv，含 `surface` 区分 web/qq/wx —— **QQ/微信 的聊天也在里面**，因为通道消息本来就镜像进同一份会话日志）。前端：设备管理页每行加「查看」→ `#/usercards`（该设备的卡列表）→ 点卡 → `#/userchats`（**纯文本，一行一句，不做任何气泡/框架渲染**）。
+- **设置 →「我的设备 ID」**（`#/device`）：显示当前 ID + 复制 + **用旧 ID 恢复**输入框（写回 localStorage + cookie 后重载即接回原数据）；提示文案按用户原话：*"请牢记这个 ID。我们最多保存 15 天且仅有聊天记录，我们不会私自调用您的数据。15 天内遇到不慎删除，凭此 ID 可以恢复聊天记录；记忆和图片我们无能为力（服务器磁盘有限）。"* **此页不推 GitHub**（GitHub 是单用户自部署版，设备 ID 是托管形态才需要）。
+- 设备注册表清理：删掉测试设备、把用户自己的 4 台设备都标为 admin（一键查看/管理）。
+
+41. **底部管理入口按身份显示（2026-09-16）**：抽屉底部原来对所有设备都显示「管理登录」（用户看到不该看到的东西）。现改为 **`refreshAdminLink()` 只对管理员显示「管理」入口，普通用户彻底隐藏（连分隔符一起 `hidden`）**——判定走 `/api/admin/me`（管理员设备 via=device / 密码登录 via=cookie/basic 都算）。`web/index.html` 的页脚把分隔符拆成独立 `<span id="drawer-admin-sep">` 便于一起隐藏。**副作用**：换浏览器/清 cookie 后就看不到入口了 → 需要时手动访问 `https://<域名>/#/login` 输管理员密码（这条与设备无关，永远有效；建议加书签）。**只需在 prod 改，GitHub 用户版没有管理概念**。⚠️ **口径已被 §43⑥ 更新**：页脚那个 div 后来被误删又恢复，显示条件补齐为 `admin && hosted`（本地/自部署一律不出现）。
+
+---
+
+## §42 交接速查（**2026-09-17 已更新，新对话先读这段**）
+
+### 一句话
+「魂匣 SoulBox」= 装在自己服务器上、给用户开箱即用的 AI 角色机器人（角色卡 + 蒸馏 + QQ/微信机器人 + 生图 + 语音），商业模式是**自建 API 中转站**（香港 `api.319274.xyz`）赚钱。用户零注册零登录，**设备随机 ID 即身份**。
+
+### 两个版本（**别搞混，这是最容易出事的一条**）
+| 分支 | 内容 | 去处 |
+|---|---|---|
+| `main` | **纯用户版**：自己拉下来配环境就能跑，无任何管理/服务器内容 | GitHub（`git@github.com:sunfollower-hello/openclaw-shell.git`，当前 `7ae26c8`） |
+| `prod` | 用户版 + 多租户 + 管理端 + 运维脚本；**服务器跑的就是它** | **只在本地，永不 push** |
+
+- 服务器和本机跑的是**同一份代码**（tar 传上去），区别只在 `.env` 有没有认证：**有 = 托管多租户**（设备命名空间 + 管理员），**无 = 单用户模式**（等同用户自部署，本机开发机就是这种）。
+- 往 GitHub 推时只能推**共用部分**：prod 的 `web/app.js` 里混着运营代码（`ocIsDevice()` 等），不能整份覆盖，得按 hunk 挑（做法见 §44⑥）。
+
+### 地址与入口
+- 服务器：`ssh sb`（= 103.117.138.91）· 站点 <https://soulbox.319274.xyz>（用户入口，**免登录**）
+- 管理员入口：`https://soulbox.319274.xyz/#/login`（账号 `soulbox`，密码在服务器 `/data/openclaw-shell/.env`）
+- 本机开发：`D:\ai_workspace\openclaw-shell`，`powershell -File scripts/start-stack.ps1` → <http://127.0.0.1:17880>（免登录，单用户模式）
+- **开发机的数据与服务器各自演化、不同步**；改卡/改配置要在服务器上改
+
+### 服务器布局（4核/3.8G/30+50G/30M/CN2，Ubuntu 24.04）
+- 程序 `/data/openclaw-shell`（数据同目录）· 网关家目录 `/root/.openclaw → /data/openclaw`
+- 四个 systemd 服务（都开机自启）：`openclaw-shell`(127.0.0.1:17880 管理台) `openclaw-gateway`(18789) `openclaw-tts`(17900) `caddy`(80/443)
+- 备份：`/data/scripts/server-backup.sh`（每日 04:00）→ `/data/backups/soulbox-config-*.tar.gz`（**只存 .env + openclaw.json + split-styles.json + 设备注册表 ≈3KB**，按用户要求不备份用户数据）
+- 部署手册：`docs/linux-deploy.md`
+
+### 改代码 → 上线（照这个顺序，别跳步）
+1. 本机改（`prod` 分支）→ `npx tsc --noEmit` + `npm run build`
+2. 打包传：`cd /d/ai_workspace && tar -czf /tmp/w.tar.gz openclaw-shell/src openclaw-shell/web && cat /tmp/w.tar.gz | ssh sb "cd /data/openclaw-shell && tar -xzf - --strip-components=1"`
+3. **先校验**：`ssh sb 'cd /data/openclaw-shell && cat web/app.js src/server.ts | md5sum'` 与本机 `cat web/app.js src/server.ts | md5sum` 对齐再继续（大包中途断开会写一半，而 web/ 是线上直接提供的）
+4. 改过 `src` 才需要：`ssh sb 'cd /data/openclaw-shell && npm run build && systemctl restart openclaw-shell'`
+5. **`ssh sb 'chown -R root:root /data/openclaw-shell'`**（不做的话 OpenClaw 插件安全检查会拦 suspicious ownership）
+6. 前端只是文件，不用重启；`index.html` 的 `?v=` 由 mtime+size 自动生成，改完刷新即生效
+
+> ⚠️ **安全铁律**：管理员设备的 32 位 ID 在服务端**等同于管理端密码**（请求头 `X-Device-Id: <该ID>` 直接拿到 admin 身份）——**绝不能写进任何会进仓库/公开的文件**（本次已把 HANDOFF 里的真值脱敏成占位符）。要换电脑时用 `#/login` 密码进管理端，别靠这个 ID。
+
+### 身份与权限（09-16 定稿）
+- **用户**：设备 32 位随机 ID（localStorage+cookie）→ 服务端 `data/users/<id>/` 命名空间（AsyncLocalStorage，全项目 store 都经 `dataDir()` 取路径，一处改全局生效）。删除重装 = 新身份；凭旧 ID 可在「设置 → 我的设备 ID」找回。
+- **管理员**：`#/login` 密码 → `oc_admin` cookie（HMAC 无状态）；或把某设备标 admin（管理页按钮 / `POST /api/users/admin`），标了就走全局 `data/`、免密码。
+- **用户能用的**：做卡 / 卡库 / 预设（内置「默认」档位组**不可打开编辑**，其余随便用）/ 蒸馏 / **通道连接（扫码绑自己的机器人）** / API 与模型 / 生图 / 语音 / 表情包（含 zip 批量导入）/ 本地存储 / 设备 ID。
+- **只给管理员的**：插件、运行日志、模型缓存统计（进程级共用）、`/api/users`、`/api/backup`、微信配对授权。
+- **隔离靠什么**（不是整块 403）：设备命名空间（ALS）+ **渠道账号归属表** `data/channel-owners.json`（没有记录的老账号一律算运营者的，设备看不见也动不了；扫码用"起点快照"认领新账号）+ 预设内置组锁 + `ADMIN_ONLY_PREFIXES`。
+- 用户数据：**服务器只留 15 天且仅聊天记录**（`src/core/retention.ts`，只作用于 `data/users/<id>/`）；图片在记录里只留「（图片：提示词）」，不存上游图链。
+
+### 关键文件（改哪里找哪里）
+| 文件 | 作用 |
+|---|---|
+| `web/app.js` | 前端全部逻辑（路由/聊天/做卡/生图/存储/表情/通道/管理页/AI 壳桥） |
+| `src/server.ts` | 后端全部 `/api/*`（含设备/管理员中间件、通道、导入端点） |
+| `src/core/dataRoot.ts` `users.ts` `channelOwners.ts` | 设备作用域(ALS) / 设备注册表 / **渠道账号归属** |
+| `src/core/compiler.ts` `presets.ts` `splitter.ts` | 人设编译 / 预设 / 拆条（预设文案改动要三处同步，见 §44） |
+| `src/core/emojiStore.ts` `emojiPack.ts` | 表情库 / 表情包 zip 解析 |
+| `src/core/imageConfig.ts` `imageGen.ts` | 生图配置与生成（**模型无默认值，必须先拉取**） |
+| `src/core/conversationStore.ts` `memoryStore.ts` `retention.ts` | 会话 / 记忆 / 15 天保留 |
+| `scripts/make-emoji-pack.bat`+`.ps1` | 表情包打包器（拖文件夹即出包） |
+| `scripts/test-device-isolation.mjs` | 设备级隔离自测（临时 HOME，不碰真实配置） |
+| `apk-build/soulbox/` | 安卓套壳工程（`bash build-soulbox.sh <版本>`，签名密钥要留着） |
+
+### 09-16/17 这一批做完的（细节都在 HANDOFF §43–§50）
+设备级隔离地基（agent 名/模型 key 按设备加前缀，修掉"设备一保存就删空管理员提供商+泄露 Key"两个线上 bug）· 身份门槛（运行日志/本地语音只给管理员）· 预设页改版与两个 store bug 修复 · **重描写括号对换**（`{}`=心理、`（）`=动作，两版共用代码，已推 GitHub）· 设备管理页 v2（完整 32 位 ID + 搜索 + 排序 + 时间到分钟 + 自己那台不给取消管理员 + 管理员设备的「查看」读全局空间）· **通道对用户开放**（账号归属隔离）· **蒸馏对用户开放 + 删掉「直连本机 WeFlow」** · 生图/TTS 五项清理（TTS 用量统计删除、三个画师串做内置、模型不留默认、删两处提示）· **安卓套壳 APK**（纯套壳只 loadUrl 服务器页面，`SoulBox-v2.apk`，附 SAF 文件夹与保存桥）· **表情包 zip 批量导入**（序号配对 + 打包脚本）。
+
+### 还没做的（新对话接得上）
+1. **打开 App 增量同步 QQ/微信记录** —— 用户明确说"先不慌做，我后面把方案发过来参考"，**别自己先动手**。
+2. **GitHub 用户版该推的那部分还没推**：生图配置（三个画师串/模型无默认）、TTS 用量删除、两处提示删除、表情包 zip 导入与打包脚本、括号对换已推的部分 → 这些在共用代码里，推的时候按 hunk 挑（§44⑥ 有做法）。**通道/蒸馏开放、多租户、管理端一律不推。**
+3. 远程绑定流程（用户自己扫码那套 onboarding 的收尾）、Phase B 其余（模型 key 到设备级的完整形态）。
+4. APK：真机验收（用户自己测）、壳自更新（用户说先不做）、可选的「导出表情库为 zip」。
+5. 服务器注册表里目前有 1 个管理员设备 + 几台测试/手机设备，需要时用管理页清理。
+
+### 坑位清单（都是这一两天真踩过的）
+1. **CRLF**：工作区文件是 CRLF，内联 `node -e` 里用 `\n` 精确匹配会静默失败 → 用 `\r?\n` 正则，或直接用 Edit 工具，改完**立刻核对**。
+2. **前端缓存**：静态资源是 immutable（`?v=` 由 mtime+size 生成）；手工测试页若抄了旧的 `?v=` 会**跑旧代码**；hash 导航**不会重新加载文档**，改完必须 `reload()`；临时实例里测试要加 `?nc=<时间戳>`。
+3. **临时实例**：用**临时 HOME + 临时 OPENCLAW_SHELL_DATA**起服务（别碰真实 `~/.openclaw`）；停止用 **TaskStop 或按端口 taskkill**，**绝不能用 MSYS 的 `kill $!`**（实测把开发机三件套一起带走过）。
+4. **数据文件不是代码**：`data/presets.json`（预设文案）、`data/imageConfig.json`（生图）、`data/users/registry.json` 都会**压过代码默认值**，改文案要"代码 + 文件"两处同步（服务器上那份尤其），改前先 `cp` 备份（这三个**不在**每日备份里）。
+5. **PS1 编码**：`.ps1` 必须带 **UTF-8 BOM**（PS5.1 按 GBK 读无 BOM 的 UTF-8，中文必乱）；`.bat/.ps1` 里非 ASCII 只放提示文字。
+6. **zip 编码**：中文压缩包可能是 GBK 且不带 UTF-8 标记 → 条目名与 TXT 内容都要"UTF-8 严格解失败再回退 GBK"。
+7. **SSH**：`Host sb` 已固定 `KexAlgorithms curve25519-sha256`（默认的后量子 KEX 握手包大，跨境会被 reset；换机器就手动加这个参数）。短时间连太多次仍会被 reset，**批量操作合成一次连接**。
+8. **别把测试文件留在 `web/`** 里一起传上去（会公网可访问）。
+9. **prod 有一大批未提交改动**（`git status` 一长串）——切分支/回滚前先 `git stash -u`，回来 `stash pop` 后**记得重新 `npm run build`**（在 main 上构建过就把 dist 写成用户版了）。
+10. 手动清测试设备/账号时，**删注册表记录不等于删数据目录**；反之删目录会真丢数据 —— 先确认目标是什么再动手。
+---
+
+## §43 Phase B 地基 + 管理向功能的身份门槛（2026-09-16，已上线服务器）
+
+**背景**：§42 待办里除「打开 App 增量同步」（用户要求先不做）以外的都做了；另按用户要求把运行日志与本地语音兜底收成"只给管理员"。
+
+**① 机器人按设备归属（agentId 设备前缀）**
+- `botStore.deviceAgentId(slug)`：设备作用域下 agent 名 = `u<设备ID前8位>-<卡slug>`，管理员/单用户作用域保持裸 slug（存量 `bots.json` 里存的就是 agentId，不动 → 完全兼容）。
+- 为什么必须加：`openclaw.json` 的 `agents.list` / `bindings` 与 `split-styles.json` 都是**全局**的，而 agent 的 workspace、`memorySearch.extraPaths` 是按设备目录给的——两台设备各有一张同名卡（slug 都是 grandma）时会是同一个 agentId，后建的顶掉前者（表现为"我的机器人回的是别人的卡"）。
+- 换卡接口 `/api/bots/transfer` 原来硬写 `agentId: card.slug`（绕过 addBot），一并改成 `deviceAgentId`。
+
+**② 模型 Key 到设备级（修掉两个真实线上 bug）**
+- 原来：`~/.openclaw/openclaw.json` 的 `models.providers` 是全局的，而每台设备的 `providers.json` 是各自的。于是 **(a)** 设备侧 `migrateFromOpenclaw` 会把管理员在 openclaw.json 里的提供商（含明文 Key）**复制给任意用户**；**(b)** 设备保存一次提供商，清理逻辑会把"本设备列表里没有"的条目全删 —— 一保存就把管理员的提供商从配置里清空，并顺手改掉全局默认模型。
+- 现在：设备作用域的提供商写成 `u<设备ID前8位>-<原名>`（各自命名空间），清理只删自己前缀下的条目，`agents.defaults.model` 只有管理员作用域能改；迁移逻辑加 `if (currentDeviceId()) return`。设备自己的 `providers.json` 与卡片里存的仍是**原名**，只有写进 openclaw.json 与 agent 的 model 字段才带前缀（`resolveChatLLM` 返回的就是带前缀的网关真名）。
+
+**③ 运行日志 / 模型缓存统计 → 设备不可见**
+- `/api/logs`、`/api/logs/clear`、`/api/llm-usage`、`/api/llm/usage` 进 `ADMIN_ONLY_PREFIXES`（设备 403）。原因：logger 的内存缓冲是**进程级共用**的，给用户看等于摊开别人的活动与上游报错。管理员（管理员设备/密码登录/单用户）照旧能看，排障用。
+
+**④ 本地语音兜底（Edge/SAPI）→ 只给管理员**
+- 新增 `localTtsAllowed(res)`（= 非托管 或 管理员）。设备侧：`/api/tts/config` 回 `local:null, allowLocal:false`（默认通道若指向 local 则顺延到第一个上游）、`/api/tts/voices` 回空、`/api/tts/test` 与 `/api/tts/synthesize` 拒绝 local（`synthesize/testTts` 新增 `allowLocal` 参数承载这条规则）、删上游时的回落目标从 local 改成第一个上游。
+- 理由：托管形态下本地兜底跑在服务器上（SAPI 是 Windows-only，Linux 上根本不可用；Edge 走的是运营者出口与免费额度）。单用户自部署版等于管理员，照旧全开。
+
+**⑤ 前端身份门槛**
+- `/api/admin/me` 增加 `hosted` 字段；前端 `ocMode = {hosted, admin}` 缓存进 `localStorage.ocs_mode`（首屏要同步知道显示什么，不能为它多等一次往返），启动时 `loadMode()` 后台校正。
+- `ocIsDevice()`（hosted && !admin）时隐藏：抽屉的 通道连接/蒸馏工厂、设置里的 运行日志/插件、首页快捷入口的 蒸馏/通道；路由层直接粘 `#/channels` 会被 `location.replace("#/home")` 弹回。
+- **坑**：首屏是在身份未知时渲染的（缓存为空 → 按"全开"画），身份回来后只改抽屉会漏掉首页那些按身份裁剪的按键 → `loadMode` 发现身份变化时补一次 `router()` 重画。实测生产站点首访：抽屉与首页快捷键都正确。
+
+**⑥ 管理端入口（修好一次误删 + 明确"只有服务器才叫管理员"）**
+- **误删**：抽屉页脚的「管理」入口是 09-16 13:46（`4b7d5d6` 管理员登录体系）加的；09-16 17:19（`d4d2d37` 提交信息只写"删除抽屉底部文案"）**把整个 `.drawer-foot` div 一起替换掉了，入口跟着没了** —— 连带删除，不是有意删的。结果是管理员一度没有任何可见入口（只能手输 `#/users` 或走 `#/login`）。已恢复：页脚只留入口本身（底部那句"数据保存在本机，不上传"仍按用户要求保持删除），`#drawer-admin-foot` 整块显隐，不给普通用户留一条空横线。
+- **门槛（用户拍板 09-16）**：`applyAdminLink` 的显示条件是 **`admin && hosted`** —— 托管形态（服务器）+ 管理员才出现。**本地/自部署（无认证 = 单用户模式）一律当普通用户**：那边没有"多租户设备"这个概念，设备管理页永远是空的。三种情形实测：本机单用户 → 无；托管+分发用户 → 无；托管+管理员 → 有。
+- `#/login` 登录成功后直接落 `#/users`（密码登录后不用再找入口）。
+- **曾经加过又撤掉的**（用户判定没用）：设置页的「设备管理」行、"把本机设为管理员"一键引导 —— 权力上本就没新增（设管理员始终只有管理员能调 `POST /api/users/admin`，设备侧 403），而用户自己那台设备早已是管理员，用不到。**别再加回来。**
+- 辨析：服务器与本机跑的是**同一份代码**（prod 分支，tar 传上去，线上 md5 与本机一致），区别只在 `.env` 有没有认证 → 运行时模式不同。所以"看服务器版本"看的就是这份文件，不存在"另一份管理员版"。
+
+**自测与验证**
+- `node scripts/test-device-isolation.mjs`（21 项，临时 HOME + 临时 data 目录，**不碰真实 `~/.openclaw`**）：agent 前缀三例、设备看不到管理员 Key、两设备同名提供商各存各的、删自己的不影响别人、解析出的模型名带前缀、数据落位在自己的命名空间。
+- HTTP 级：临时托管实例（`PORT=17890` + 临时 HOME/data）跑 `curl` 断言设备 403 / 管理员 200 / 设备 tts 全拒；浏览器实测设备视角与管理员视角两套 UI；开发机单用户实例回归（全开、不变）。
+
+**上线**：web 直接传（免重启）· src 改动 → 服务器 `npm run build && systemctl restart openclaw-shell` + `chown -R root:root`。生产验证：设备 `/api/logs` 403、管理员 200、`/api/admin/me` 回 `hosted:true`。
+
+**踩坑（本次真实发生）**：临时实例脚本里用 MSYS `kill $!` 停自己的 node，把开发机的三件套（17880/18789/17900）一起带走了 —— **以后临时实例一律用 `TaskStop` 或按端口 `taskkill //PID` 停，别用跨 shell 的 `kill $!`**；已用 `scripts/start-stack.ps1` 恢复。另：清理测试设备时按前缀删了 3 条注册表记录（含浏览器测试生成的），确认过这些命名空间里都是 0 文件（只是访问过站点、没产生数据），无用户数据受损。
+
+---
+
+## §44 预设页文案改版 + 世界书提示清理（2026-09-16，已上线；用户版已推 GitHub）
+> ⚠️ 本节 ③「预设对用户关门」的**口径已被用户纠正**：只有内置档位组不给用户打开，预设页整体照旧对用户开放（见 ④）；③ 里把通道也一起藏了，已按 §48 对用户开通。
+
+**用户要求**：预设页「破甲改名默认」；普通用户不可打开/编辑（管理员可看）；「档位」改名「通用基础预设」；「新增档位」改名「添加」；删掉档位区的「恢复内置」按键；风格区不动；删掉世界书里那句 AI 生成的三块写作提示；用户版这些一并推 GitHub。
+
+**① 组名改名（三处必须同步，漏一处就白改）**
+- `presets.ts` 内置 `BUILTIN_TIERS[0].name`：`破甲（最高）` → `默认`（id 仍是 `break`，卡片里存的档位 id 不受影响）。
+- **`data/presets.json` 里存过的 name 会压过内置**（`normalizeGroup` 取存储的 name）→ 本机 `data/presets.json` 与**服务器 `/data/openclaw-shell/data/presets.json`** 都已同步改名（服务器上改前先 `cp presets.json presets.json.bak-20260916` 留底；该文件**不在每日备份范围内**，改它要自己留一份）。
+- 注意"默认"只是显示名：那个组的实际内容仍是原来那套（破甲/防神化/防抢话/防跑偏/输出铁律）。
+
+**② 预设页文案与按键**
+- 档位区标题：`档位` → `通用基础预设`；该区按键只剩 `＋ 添加`（组内仍是「新增条目」）。
+- `恢复内置`（走 `/api/presets/reset`）**只在风格区保留**；档位区不再出现。
+- 新增组的 prompt 从「新档位名称：」改成「新预设名称：」（"档位"这个叫法退场）；风格区仍是「新风格名称：」。
+
+**③ 世界书提示删除**：做卡表单里 `<p class="hint" id="cf-book-hint">世界书分三块写：…</p>` 整段删掉（AI 生成、不该给用户看）。全项目只有这一处引用 `cf-book-hint`，无 JS 依赖。
+
+> ⚠️ **注**：本节 ③ 里把「通道连接」也对普通用户藏了 —— 那是错的，用户 09-16 指出通道是核心体验，已按 §48 对用户开通（账号按归属隔离）。
+
+**④ 预设页的权限口径（⚠️ 我第一版做错了，按用户纠正后重做）**
+- **正确口径**：普通用户**照旧用预设页** —— 能新增预设组、新增风格组、改风格、给自建组加条目；只有**内置档位组（对外叫「默认」，id `break`，就是破甲那套）**不给他打开与修改。管理员对那个组照旧能打开查看、能编辑。
+- 我第一版误解成"整页对用户关门"（抽屉隐藏 + 所有写操作 403），被用户当场纠正："只是不能改动之前的破甲预设，他还是能够新增预设，新增风格还有修改风格的"。
+- 前端：`presets` **不在** `OC_DEVICE_HIDDEN_ROUTES` 里（页面照常打开）；`presetGroupLocked(kind, groupId)` = `ocIsDevice() && kind==="tier" && groupId==="break"` → 该组卡加 `.locked` 样式（灰、`cursor:not-allowed`、名字后面带盾牌图标）、点了只弹「这个预设不可编辑」、组内视图也不渲染（兜底）。
+- 后端：只拦"针对内置档位组"的写 —— `isBuiltinTierGroup(kind, groupId)`（`presets.ts` 导出）命中 `POST/PUT/DELETE /api/presets/tier/break...` 一律 403；**其余预设写操作全放行**（新增组、改风格、自建组条目）。GET 从来不拦（卡片高级配置的档位/风格下拉要读它）。
+- `POST /api/presets/reset`（风格区那个「恢复内置」按钮）对设备**只重置风格**（`resetBuiltinPresets("style")`）——不能让用户点一下就把默认档位一起冲回代码默认。判 id 不判名字，免得以后再改名又要跟着改。
+- 实测（临时托管实例 + 生产站点两次）：设备 PUT/POST/DELETE `tier/break*` 全 403；设备新增预设组 201、新增风格组 201、改风格 200、风格加条目 201、改风格条目 200；管理员对 `tier/break` PUT 200；设备 reset 后风格改动回滚、档位不动。
+
+**⑤ 顺手修掉两个预设库真 bug（同一天，两版都已修）**
+1. **新增的组每次读取都被丢掉**：`normalize()` 原来只有 `def.tiers.map(...)` —— 以**内置定义**为唯一来源遍历，文件里 id 不在内置里的组（＝用户自建组）每次 `loadPresets()` 都被过滤掉。表现：点「新增」时内存里 push 进去、界面看着创建成功，**刷新就没了**（生产站点上实测复现，留下的自建组还在文件里但读不出来）。→ 改为「内置组归一化 + 自定义组接在后面」。**副作用（好的）**：以前建过、被悄悄吞掉的自建组会重新出现（数据一直都在文件里）。
+2. **「恢复内置」从来不生效**：`resetBuiltinPresets` 原来是 `normalizeGroup({ ...g, builtin: true }, b)`，而 normalizeGroup 的规则是"文件里已有的同 id 条目原样收下、只用内置补缺失 id" —— 等于把存的东西原样传回去，**从不重置任何文本**（组名也不重置），只补缺失条目。与按钮文案「内置条目的文本会重置为代码默认」不符（就是 §09-11 记的那个坑换了入口）。→ 改为以内置定义为底重建，自定义条目接回去。
+3. 两处都用 `scripts/` 外的临时脚本验过（store 层：自建组建→读→改名→加条目→删全通过；HTTP 层：公网建-删自检）。
+
+**⑥ GitHub 推送（用户版）**
+- 用户版含 ①②③ + ⑤（两个 bug 修复同样影响用户版），**不含 ④**（"设备身份"这个概念只存在于托管形态）。
+- 做法：`git stash push -u`（prod 有一堆未提交改动）→ `git checkout main` → 同法施加 → `npm run build` 验证 → 提交并 `push origin main` → `git checkout prod` → `git stash pop` → **再 `npm run build` 把 dist 还原成 prod 的**（在 main 上构建会把 dist 写成用户版，本机开发实例会跟着变）。
+- **`main` 现在 = `df64eee`**（`f3dc374` = 文案改版那批，`df64eee` = 两个 bug 修复）。
+- 踩坑：检出 main 后文件是 **CRLF**，用 `\n` 精确匹配的字符串替换会失败（本次世界书那段就没删掉）→ 用 `\r?\n` 宽容的正则，或改完立刻核对（`git diff` 逐条看）。
+
+**⑦ 现状**：prod 侧改动仍未提交（等用户点头）；服务器已 build+restart 并验证；**开发机 17880 跑的还是启动时的旧 dist**（要看新后端行为需 `powershell -File scripts/start-stack.ps1` 重启一次）。
+
+---
+
+## §45 设备管理页 v2 + 「看管理员设备」读全局空间（2026-09-16，已上线；用户版不含）
+
+**用户提的问题与要求（原话要点）**：设备只显示 8 位不好找（"别人出了问题找我要聊天记录我怎么找"）；加个搜索框；删掉我测试的设备（"15 台应该只有三四台是正常跑的"）；不要起名字（"我只看 Id"）；排序=管理员在最上面、其他按时间、新的往下面加、注册时间精确到分钟；自己这台不能「取消管理员」（"我自己取消自己不就废了吗"）；"我电脑里明明有角色卡，为啥设备管理里打开我的看不见聊天记录"；最后把除第一个管理员外的号都删掉，他要试"删掉后同一浏览器再进来会不会刷新 Id"。
+
+**① 显示与查找**
+- 每行**完整 32 位 ID**（等宽字体、可选中；**点一下即复制**，方便拿着 ID 去对"哪台是谁"）。
+- 顶部搜索框（输前几位即可）+ 计数「共 N 台 · 显示 M」（本地过滤，不再打接口）。搜索行在 `#u-list` 之外，重画列表不会丢输入焦点。
+- **去掉了 `dev.label` 的展示**：注册表里有 `label` 字段但**没有任何接口能写**（用户也明确说不要起名），原来 `label || "设备 "+id.slice(0,8)` 的兜底正是"只显示 8 位"的由来。
+
+**② 排序与时间**：管理员设备置顶（多于一台时按注册时间），其余按 `createdAt` **从早到晚**（新设备自然加在列表下面）；注册/最近时间都显示到**分钟**（`2026-09-16 19:16`）。
+
+**③ 自己这台不给「取消管理员」**：`isMe && dev.admin` 时该按钮不渲染（点掉就进不了管理端了）。别人的行照旧能取消。注意：本机是"管理员身份"但没被标 admin 设备（走密码登录）时，仍显示「设为管理员」。
+
+**④ 「查看管理员设备」要读全局空间（修掉用户实测的真问题）**
+- 现象：管理员在设备管理里点自己那台的「查看」，卡列表/聊天记录永远是空的。
+- 根因：**管理员设备从不往自己的命名空间写**（管理员请求一律走全局 `data/`），实测 `data/users/3a012510.../` 里只有一个空 `cards/`，而全局有 5 张卡、9 个会话文件、26 个记忆文件。旧的 `GET /api/users/:id/cards` 一律按 `runAsUser(该设备)` 读，对管理员设备必然读到空目录。
+- 修法：端点按 `isDeviceAdmin(id)` 分支 —— **管理员设备读全局**（＝它平时看到的那份），普通设备照旧读自己的命名空间；响应带 `admin` 标记，前端在卡列表页顶加一句"管理员设备：显示的是全局空间的卡"。实测：管理员设备看到 `global-card`、普通设备只看得到自己的卡、两者不串。
+
+**⑤ 设备清理**：按用户要求，注册表只留第一个管理员 `<管理员设备ID：见服务器 registry.json / 本机记忆，不写进仓库>`，其余 14 台（含我测试用的 `aaaa…`/`0000…`/`f1d655a9…` 等）从注册表移除；改前备份 `registry.json.bak-20260916b`。**命名空间目录（`data/users/<id>/`）没动**——删注册表只是让它从列表消失，浏览器再访问会以**同一个 ID** 重新注册，数据也在；要连数据一起清必须另删目录（用户没要求，留着他发话）。
+
+**⑥ 关键事实回答：删掉设备后，同一浏览器再进来 ID 不会变**
+- ID 是**浏览器侧**生成的（`web/app.js` 的 `OC_DEVICE`：读 localStorage，没有/非法才新生成 32 位 hex，同时写 cookie），服务端只是拿它当命名空间名。删注册表记录不碰浏览器 → 同一个浏览器下次访问会被 `ensureDevice` **以同一 ID 重新登记**（`createdAt` 变成这次的时间）。
+- 今天实测两次：`f1d655a9…`（我做测试的浏览器）被我删过，之后访问又原样出现；本次清理前它在列表里就是这个原因。
+- 想让某台"变成新设备"：清该站点的 localStorage + cookie（或换浏览器/无痕窗口）→ 才会生成新 ID。**换 origin 也会**（`127.0.0.1` 与域名、域名与 IP 各自一套存储）——本机开发时容易踩：同一浏览器开 17880 和开生产站是两台"设备"。
+
+**⑦ 新增样式**：`web/style.css` 里 `.u-search-row / .u-count / .u-dev-main / .u-dev-id / .u-dev-meta`（两行式设备块：ID 一行、时间一行）。
+
+**⑧ 验证**：临时托管实例上跑全流程（注册 2 台设备并标一台为管理员 → 全局建卡 + 设备建卡 → 两个「查看」结果互不串）；浏览器里登录管理端实测完整 ID/搜索过滤/计数/排序/时间到分钟/本机无「取消管理员」/别的管理员行仍可取消；生产站点复核设备数=1 且管理员设备的卡列表返回 5 张卡。
+
+
+---
+
+## §46 重描写括号约定对换（2026-09-16，已上线；**用户版已推 GitHub**，`main` = 7ae26c8）
+
+**用户要求**：原来的约定是「小括号（）包裹心理、大括号 {} 包裹动作」，现在**对换**。
+
+**新约定**：**{} 花括号 = 心里想的**（别人看不见的念头/情绪/判断）；**（）全角圆括号 = 身体做的**（能被摄像头拍到的动作）。判断方法那句跟着换成「能拍下来的进（），只在脑子里的进{}」。
+
+**改到的四处（缺一处就新旧混用）**
+1. `src/core/presets.ts` rich 组：`rich-rule`（文风规则全文 + 示例 + ❌✅ 反例）与 `rich-example-ai`（示范对话）——示例里的括号一并换。
+2. `src/core/compiler.ts` 两处说明：`心理用 {} 包裹、动作神态用（）包裹`（第 296 行与第 465 行，编译进 agent 产物/SKILL.md）。
+3. 本机 `data/presets.json`。
+4. **服务器 `data/presets.json`**（存储内容压过代码内置，见 09-11 那个坑；改前备份 `presets.json.bak-bracket-swap`）。
+
+**换的时候踩到的两个坑（下次注意）**
+- **`{split_min}` / `{split_max}` 是模板变量**：机械对换花括号会一起把它们变成圆括号 → 必须先保护哨兵再换（本次脚本第一版就漏了还原，靠通读一遍内容才发现）。
+- **说明性括号不能跟着换**：标题里的「（动作 + 心理）」、「（默认 1~7）」、「（每条 = 一个气泡）」、「（.）」、「（起到停顿、留白的效果）」、「（属于对白）」都改成了直角引号「」；而 **「（）全角圆括号 = …」「{} 花括号 = …」这两行是符号定义本身**，机械对换会把圆括号/花括号的名字标错，必须手写正确。
+
+**同步工具（新增）**：`scripts/sync-preset-text.mjs` —— 从 `src/core/presets.ts` 抽内置文本写进指定的 presets.json（默认只同步 rich-rule + rich-example-ai，其余条目一律不碰），本机与服务器都跑一次：
+```
+node scripts/sync-preset-text.mjs --file data/presets.json
+```
+
+**让改动真正生效**
+- **网页聊天**：实时读 store（预设改动即刻生效，无需重编译）。
+- **QQ/微信**：读的是**编译产物**（agent workspace 里的 SKILL.md/AGENT.md）→ 必须重编译。⚠️ 服务器 `bots.json` 是**空的**（09-16 迁移没带这个文件），所以"存卡自动重编译"那条链（`syncCardToChannel` 里有 `if (!bot) return`）不会触发 → 用 `POST /api/cards/<slug>/compile` 逐张编译（本次 5 张卡全 200；产物校验：含新约定 8 个文件、含旧约定 0 个）。
+- 5 张卡里 3 张是重描写（anxia/persona-mt9xijkd/persona-mtusl05c）、2 张纯对话（chiyingqiu/shenqingwu，纯对话禁括号、本次不受影响）。
+
+**顺带确认的事实**：卡里没有写死这个约定（只有 shenqingwu 的 world book 里有一句"动作神态：她生气时会抱住手臂…"的人物描写，与符号约定无关）；`scripts/sample-check.ts` 里的样本只是拆条测试数据（括号在 splitter 里只当"深度"用，两种括号等价），故未改。
+
+---
+
+## §47 SoulBox 安卓套壳 APK（2026-09-16，v2 已构建待真机验收）
+
+**形态**：**纯套壳**——壳里不放业务，只 `loadUrl(https://soulbox.319274.xyz/)`。网页改完部署即生效，**壳不用跟着重打**（本次就是例子：壳 v2 打完后网页又改了导出编码，只传网页就够了）。服务器连不上时回退到内置的一句话提示页（assets/index.html）。
+
+**工程位置**：`D:\ai_workspace\apk-build\soulbox\`
+
+| 文件 | 说明 |
+|---|---|
+| `AndroidManifest.xml` | 包名 `com.soulbox.app`、应用名 SoulBox、minSdk 24 / targetSdk 35、只申请 INTERNET 权限 |
+| `src/com/soulbox/app/MainActivity.java` | 壳本体（参考 RP-Hub 的 `apk-build/src/com/operit/rphubweb/MainActivity.java` 改） |
+| `res/` | 图标（用户给的 SoulBox 书法图 1920×1920 → 5 档 mipmap）+ AppTheme |
+| `assets/index.html` | 连不上服务器时的兜底提示页 |
+| `build-soulbox.sh` | 六步构建：keystore → aapt2 compile+link → javac → d8 → 组装 → zipalign+签名 |
+| `soulbox.keystore` + `keystore-info.txt` | **签名密钥必须长期保留**（丢了没法覆盖升级，只能卸载重装、设备身份会换） |
+| `native-stub-test.html` | 网页侧原生分支的浏览器测试页（把 `window.SoulBoxNative` 换成打桩实现） |
+
+**构建**：`cd /d/ai_workspace/apk-build/soulbox && bash build-soulbox.sh <版本号>` → `SoulBox-v<版本>.apk`。工具全在本机（不需要 Android Studio）：`/d/Android/Sdk/build-tools/36.1.0` + `android-36` + `/d/Java`。
+
+**壳给网页的原生能力**（`window.SoulBoxNative`；网页里没有它就自动走浏览器老路）：
+
+| 方法 | 作用 |
+|---|---|
+| `saveFile(name, mime, base64)` | 每个文件弹一次系统「保存到」对话框（照搬 RP-Hub 那套，已验证可用） |
+| `pickFolder()` / `getFolderName()` / `clearFolder()` | 选一次文件夹 + **持久化授权**（SAF `ACTION_OPEN_DOCUMENT_TREE` + `takePersistableUriPermission`，存在壳的 SharedPreferences） |
+| `saveToFolder(subdir, name, mime, base64)` | 往已选文件夹**静默写入**，按卡名建子目录，重名自动 `(2)(3)` 不覆盖 → 批量保存不再一个个弹框 |
+| `copyText(text)` / `toast(msg)` / `getInfo()` | 剪贴板 / 原生提示 / 排障信息（WebView 版本等） |
+| （壳侧另做） | 状态栏避让、返回键接管、文件选择器（导入/上传）、下载转发、DOM storage + IndexedDB、免手势音频播放、`<a download>` 兜底拦截（onPageFinished 注入脚本） |
+
+**网页侧对应的分支**（`web/app.js`，全部写成"有桥就用、没桥走老路"，浏览器与 GitHub 用户版行为不变）：
+- 顶部探测 `const ocNative = window.SoulBoxNative || null` + `ocHasNative(m)`；`window.soulboxOnFolderPicked` 回调（壳里选完目录会 evaluateJavascript 调它刷新界面）。
+- `downloadDataUrl`：**两种 dataUrl 都要处理** —— base64 的（图片/音频）与 **URI 编码的**（备份 JSON 是 `data:application/json;charset=utf-8,%7B…`）。第一版只认 base64，实测"下载备份"在套壳里会静默失败 → 补了 `ocDataUrlToBase64`（URI 编码那条按 UTF-8 转字节，否则中文卡片名乱码）。
+- `ocDownloadBlob`（没有文件夹时的兜底）→ 走 `saveFile`；它改成了 async，调用处已 await。
+- `ocDirSupported` 加上 `|| ocHasNative("pickFolder")`；`ocPickSaveDir` 走原生；`ocWriteToFolder` 走 `saveToFolder`（子目录=卡名）；`ocFillDirName` 从壳取名字。
+- **壳里不回读、不删用户文件**：`ocReadSavedFile` 直接返回 null（SAF 按名字回读不划算）→ 显示链退到"提示词卡片"；`ocRemoveSavedFile` 空操作（要删去文件管理器）。
+
+**踩过的坑**
+1. javac 报 `MIME_DIR` 未定义 —— 加了用法忘了常量声明。
+2. 浏览器测网页分支时，手工测试页抄了 index.html 里的 `app.js?v=19`，被 **immutable 缓存**命中旧文件，测了半天是旧代码（§28 同款陷阱）→ 测试页必须用 `?nc=<时间戳>`；而且 hash 导航不会重新加载文档，**改完要 reload**。
+3. 测试页别留在 `web/` 里一起传到服务器（已移出，另存到 shell 目录）。
+
+**安装与升级**
+- 直接装 `SoulBox-v2.apk`（需允许未知来源）。**务必覆盖安装**（同一签名）→ WebView 数据保留、设备 ID 不变。
+- 卸载重装 = 新的设备 ID（服务器上算另一台设备）→ 用「设置 → 我的设备 ID → 用旧 ID 恢复」找回。
+- 壳自身更新没做（用户要求先不做）：以后只有改桥才需要重打 + 覆盖安装。
+
+**待真机验收**（我这边替代不了）：打开能进首页 → 杀进程重开设备 ID 不变、管理端能看到它 → 聊天/生图/表情/语音 → 导出角色卡与下载备份能弹「保存到」并选任意文件夹 → 存储页选一次文件夹后批量保存不再弹框（文件出现在 手机/<所选文件夹>/<卡名>/）→ 导入卡/上传头像能选文件 → 覆盖安装后数据还在。
+
+---
+
+## §48 通道对用户开通（账号归属隔离）+ 生图/TTS 五项清理（2026-09-16，已上线）
+
+### 起因
+用户看到手机（APK = 普通用户）侧键里**没有「通道连接」**，指出"用户最核心的体验就没了"。这是我在 §43 做身份门槛时把 `channels/distill/plugins/logs` 对普通用户一起藏了（当时后端对这些端点一律 403）。用户这句话把悬着的产品决定定了：**通道必须给用户**。于是把当时欠的"绑定隔离"补上。
+
+### 做法（关键是**账号归属**，不是整块 403）
+- **`ADMIN_ONLY_PREFIXES` 去掉 `/api/bots` 与 `/api/channels`** —— 设备能进通道页、能扫码、能绑自己的机器人。`/api/distill /api/plugins /api/logs /api/llm/*` 等仍对设备 403。
+- **新增 `src/core/channelOwners.ts`**：全局归属表 `data/channel-owners.json`（**不在**任何设备命名空间里）
+  - `owners`：`"channel:accountId" → deviceId`；**没有记录 = 运营者的老账号**（保守优先：设备看不见也动不了）
+  - `claims`：扫码待领取快照 —— 设备点扫码时先记下"当前该通道已有哪些账号"，之后**不在快照里的新账号**才算它扫的，所以绝不会把运营者的老账号误判成用户新扫的（微信的真实 id 是登录成功后才下发的，只能这么兜）
+- **`scanKnownAccounts()` 拆两层**：`scanAllAccounts()`（全局原样）+ 带过滤的 `scanKnownAccounts()`（设备只看自己的，并顺手消费待领取）。**全项目读账号都走后者**，一处改全局生效。
+- 三个助手：`filterChannelStatus()`（通道状态接口里的账号列表按归属过滤，缓存是全服共用的所以只在返回前过滤）、`requireOwnedAccount()`（设备不拥有就 403）、`beginClaimForDevice()`（扫码起点快照）。
+- 守卫落点：`accounts/label`、`accounts/delete`（删完 `clearAccountOwner`）、`bots/:id/bind`、`bots` 创建（**自己的 or 全新占位名**才允许，否则 403）、`bots/:id/login`（认领自己的账号 + 记快照）、`channels/*/login`（记快照）、`login/cancel`（收快照）、微信 `pairing*`（运营者 ClawBot 的事，对设备隐藏/拒绝）。
+- `reconcileBotAccount` 里补 `moveAccountOwner`：占位名（`wx-main`）换成网关下发的真实 id 时归属要跟着搬，否则那个账号会变成"无主的运营者账号"、用户自己反而看不见。
+- 前端：`OC_DEVICE_HIDDEN_ROUTES` 去掉 `channels`（保留 distill/plugins/logs）；首页快捷键恢复「通道」（蒸馏仍不对用户显示）。
+
+### 实测（临时托管实例，两设备 + 管理员 + 网关里预置 2 个管理员 QQ + 1 个管理员微信账号）
+设备A/B 看不到运营者的任何账号 ✓ · 设备A 用全新占位名建 bot 通过归属检查 ✓ · 设备A 拿管理员账号建 bot → 403 ✓ · 设备A 删/改管理员账号 → 403 ✓ · 设备A 改自己账号 → 200 ✓ · 设备A 列表里只看到自己那个（槽位也按自己的算 1/5）✓ · 设备B 看不到 A 的 ✓ · 管理员照旧看到全部（含设备的）✓ · 删自己的账号后归属被清 ✓。生产复核：管理员看到 4 个账号（qq-<运营者号1>/qq-<运营者号2>/两个 im-bot），设备看到 0 个，设备 `/api/bots` 与 `/api/channels/connections` 均 200、`/api/logs` 仍 403；生产站点以普通用户身份打开通道页正常、无 403 文案、显示"还没有绑定账号"。
+
+**没验到的**：真实扫码（本机没有网关可用）—— 待真机扫一次；设备端"配对授权"区块对设备是空数据（设计如此）。
+
+### 用户点名的五项清理（同一批上线）
+1. **TTS 用量统计删掉**：`#/tts` 页那块「用量统计」整块移除（含 `loadTtsUsage`）。后端记账**保留**（`tts-usage.jsonl` 是售卖服务的计费依据，删了就丢账）。
+2. **三个画师串做成内置默认**：`经典可爱基底`（ciloranko 主导）/`偶像梦幻感`（yoneyama_mai）/`清透水彩感`（tianliang_duohe_fangdongye），原文取自 09-15 交付那三条（`builtin: true` → 前端不可编辑不可删）。**顺带修一个真 bug**：全新安装/新设备没有 `imageConfig.json` 时，`getImageConfig()` 走 catch 直接返回 DEFAULTS → 画师串列表**是空的**（"默认画师串没放上去"的观感来源之一，现已改为兜底也带内置串）。
+3. **生图模型不再有默认值**：`novelai.model` / `openai.model` 默认清空（`NAI_GATEWAY_DEFAULT_MODEL`、`OAI_DEFAULT_MODEL` 两个常量删除），生成时若没选模型直接报"还没选生图模型：到「生图配置」点一次「拉取模型」，选好再试"。**服务器上已存的旧默认值也清了**（`imageConfig.json` 备份为 `imageConfig.json.bak-modelclear`）→ 以后必须先点「拉取模型」再选。
+4. **OpenAI 那句提示删除**：`生图模型（中转站一般不单独放生图模型，从 /models 拉取后选择）` → 只留 `生图模型`。
+5. **API 页 Soul API 去掉「官方」小标签**：`paintProvList()` 里那个 `chip ok 官方` 删掉；**置顶行为不变**（`ensureOfficialFirst` 仍把它固定在第一位）。
+
+### 部署
+`src + web` 一起传 → 服务器 `npm run build && systemctl restart openclaw-shell` → `chown -R root:root`。线上校验：生图配置返回 6 个画师串（3 旧 + 3 新）、两个模型字段都是空串；设备侧 200/0 账号；管理员侧 4 账号；站点 200。
+
+---
+
+## §49 蒸馏对用户开放 + 删掉「直连本机 WeFlow」（2026-09-16，已上线）
+
+**用户要求**：① 蒸馏也给用户；② 蒸馏页下面那个「直连 WeFlow（本机 5031）」**服务器版和本机版都不要**（"用了还占我自己的服务器"）；③ 本机当服务器的那份要**跟用户用到的版本一模一样**，方便后面测试；④ GitHub 上不用为此单独删（共用代码，随下次推送自然带上）。
+
+**为什么必须去掉「直连本机」**：那条链路是服务器去 `fetch http://127.0.0.1:5031` —— 在部署形态下 127.0.0.1 指的是**跑服务那台机器**（运营者的服务器），等于让用户点一下去连运营者自己的 WeFlow；本机单用户版同理，连的是运营者自己的桌面服务。两版都删干净。
+
+**改动**
+- 后端删掉 `/api/weflow/probe` 与 `/api/distill/weflow` 两个端点（含 `WEFLOW_BASE` 常量），确认全项目再无 weflow 引用。
+- 前端删掉蒸馏页的「直连 WeFlow」整块 UI（token/talker/limit 输入 + 探测/导入按钮 + 输出框）与 `probeWeFlow` / `distillFromWeFlow` 两个处理函数及其绑定。
+- `/api/distill` 从 `ADMIN_ONLY_PREFIXES` 移除 → 用户也能蒸馏。**隔离天然成立**：蒸馏读的是上传的文件/粘贴的文本（不再有本机直连这条路），写出的卡走 `cardStore`（设备命名空间），用的模型走该设备自己的 API 配置（`resolveChatLLM`）——没有任何全局侧写。
+- 前端 `OC_DEVICE_HIDDEN_ROUTES` 去掉 `distill`（`plugins`/`logs` 仍对用户隐藏）；首页快捷键恢复「蒸馏」。
+
+**验证（生产）**：设备 `POST /api/distill` → 400（不再是 403）、`POST /api/weflow/probe` → 404、`POST /api/distill/weflow` → 404；管理员 `POST /api/distill` → 400；设备 `/api/logs`、`/api/plugins/installed` 仍 403。生产站点以普通用户身份：抽屉含 `distill`、首页六个快捷键齐全（做卡/卡库/蒸馏/通道/语音/生图）、蒸馏页只有「上传 WeFlow JSON / 粘贴文本 → 开始蒸馏」，**页面上再无任何 WeFlow 直连字样**。
+
+**现状**：用户侧现在能用 = 做卡 / 卡库 / 预设（内置「默认」组除外）/ 蒸馏 / 通道扫码绑自己的机器人 / API 与模型 / 生图 / 语音 / 表情 / 存储 / 设备 ID；不可见 = 插件、运行日志、模型缓存统计（进程级共用，只给运营者）。
+
+---
+
+## §50 表情包 zip 批量导入 + 打包脚本（2026-09-16，**已上线**）
+
+**用户定的方案**（用户先提"图片 + TXT 两文件"，我建议用文件名配对、用户改成**序号配对**，最终取用户方案）：
+- 图片文件名 = `1.名字.gif`、`2.名字.gif`（**序号 + 名字**，名字取序号后面那段）
+- `说明.txt` 只写使用场景，**按序号对应**：`1.气氛轻松时用` / `2.`（留空＝没场景）
+- 序号配对天然顺序无关（不依赖 zip 时间戳，重压缩/传输不会错配），也不会因为图名重复而串行
+
+**最省事的用法**：图片丢进文件夹 → `scripts/make-emoji-pack.bat`（拖文件夹到它上面或双击）→ 自动按**修改时间从早到晚**编号、打成一个 zip，并塞进一份待填写的「说明.txt」（UTF-8 带 BOM，记事本直接改）。
+
+### 新增文件
+| 文件 | 作用 |
+|---|---|
+| `scripts/make-emoji-pack.ps1` + `.bat` | 打包器（PowerShell + .NET 压缩，零依赖；**.ps1 必须带 UTF-8 BOM**，否则 PS5.1 按 GBK 读中文乱码 —— 老坑） |
+| `src/core/emojiPack.ts` | zip 解析（纯函数、可单测）：条目名解码、说明解析、序号/名字/顺序三路配对、问题报告 |
+| `POST /api/emojis/import-zip` | 导入端点（`?dryRun=1` 出预览不落库；raw body ≤60MB） |
+
+### 解析容错（用户手攒的包什么样都有）
+- 序号前缀认 `1.` `1、` `1)` `1_` `1-` `01 ` 等多种写法；**没有序号的就按名字配**（`大笑.gif` ↔ `大笑 场景`）
+- 说明文件**两种模式自动判**：多数行以数字开头 → 序号模式（只当场景）；否则名字模式（`名字 场景`）
+- 三路配对优先级：序号 → 名字 → **按 zip 内顺序兜底**（剩下的图和剩下的行配对）
+- **编码**：条目名与 TXT 内容都先按 UTF-8 严格解，失败回退 GBK（Windows 压缩包常见）
+- 子文件夹 = 分组（不存在自动建）；`#` 开头是注释；macOS 垃圾条目（`__MACOSX/`、`.DS_Store`）自动跳过
+- 单张 >5MB、非 png/jpg/jpeg/gif/webp、空文件 → 跳过并报告
+
+### 重复与上限（用户明确要求"项目那边得自动学会避免重复"）
+- **重名自动加序号**（大笑 → 大笑2 → 大笑3），库里的和本次已排入的都避让，**绝不静默丢图**，报告里写明「原「大笑」改叫「大笑2」」
+- 库满 300 就停下并报告还剩多少没进
+- 批量导入跳过"每加一个就全量同步通道目录"，**最后统一同步一次**（`addEmoji({skipChannelSync:true})` + 收尾 `syncEmojisToChannelMedia()`）
+
+### 前端
+表情包库页 →「导入表情包 zip」按钮 + 隐藏 file input：**先 dryRun 预览 → `confirm()` 列出「将导入 N 个 / 新建分组 / 重名改名 M 个 / 跳过 K 项」与前 12 个名字 → 确认后才真导入** → 结果用 `alert()` 列问题 → 刷新表情库。
+
+### 实测（临时实例，全链路真跑）
+打包脚本产出的真 zip：预览 3 个 → 导入 3 个 → **再导一次自动变 `大笑2/偷笑2/瞪眼2`** 并在报告里注明；手工造"填好场景 + 子文件夹"的包：场景按序号正确落到对应图、子文件夹「开心」自动建组、`瞪眼3` 落在开心组；GBK 内容的 TXT 回退解码正确（`B4F3 D0A6` → 大笑）。
+
+### 部署状态（已上线）
+本机 tsc/build 全绿 → 上传 → 服务器 build + restart 全通过；生产用**打包脚本产出的真 zip** 跑 dryRun：解析出 3 个（大笑/偷笑/瞪眼）、确认没落库；表情页的「导入表情包 zip」按钮与前缀说明都在。
+
+**⚠️ 本次踩到的真坑（跨境 SSH 反复 Connection reset 的真因）**：不是被 fail2ban 封，也不是服务器挂了（站点一直 200）——是**握手阶段**被中途 reset：OpenSSH 9.6 默认启用后量子 KEX `sntrup761x25519-sha512`，握手包大，跨境线路上会被丢。**解法：固定小 KEX** —— `ssh -o KexAlgorithms=curve25519-sha256 sb` 立刻通；已写进 `~/.ssh/config` 的 `Host sb`（`KexAlgorithms curve25519-sha256`，原文件备份 `config.bak-kex`），**现在裸 `ssh sb` 就能连**。
+**另一个教训**：大包上传中途断开时，`tar -xzf -` 流式解包可能只写了一半（而 `web/app.js` 是线上直接提供的文件！）——本次是**先查线上 md5 + `node --check`** 确认没被写坏，之后改成"上传完先 md5 校验两端一致，再 build/restart"。以后再传大包都照这个顺序。

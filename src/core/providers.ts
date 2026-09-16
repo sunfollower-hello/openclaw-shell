@@ -1,9 +1,10 @@
 // API 提供商管理（对话 + 生图）：多提供商、自动拉取模型、第一个为默认
-// 首次使用自动从 ~/.openclaw/openclaw.json 迁移已有配置
+// 首次使用自动从 ~/.openclaw/openclaw.json 迁移已有配置（仅管理员/单用户，见下）
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { dataDir } from "./cardStore.js";
+import { currentDeviceId, devicePrefix } from "./dataRoot.js";
 
 export type ProviderType = "chat" | "image";
 
@@ -42,6 +43,25 @@ function isBuiltinProvider(name: string): boolean {
   return BUILTIN_CHAT_PROVIDERS.some((b) => b.name === name);
 }
 
+// ---------- 模型 Key 的设备级隔离（Phase B） ----------
+// openclaw.json 的 models.providers 是**全局**的（一台服务器一份配置、一个网关），
+// 而每台设备填的 Key 是各自的。若两台设备都加一个叫「DeepSeek」的商：
+//   ① 后写的直接覆盖先写的（Key 被顶掉，且互相能用量）；
+//   ② 旧的清理逻辑会把"本设备列表里没有"的条目一律删掉 —— 设备一保存就把管理员的
+//      所有提供商从配置里删干净（这是修之前真实存在的线上 bug）。
+// 方案：把提供商名按设备加前缀写进 openclaw.json（u3a012510-DeepSeek），各写各的键、
+// 各清各的条目；agent 的 model 字段引用带前缀的名字（resolveChatLLM 返回的 provider）。
+// 设备自己的 providers.json 里始终存**不带前缀**的原名，卡片里引用的也是原名。
+/** openclaw.json 里带设备前缀的提供商名（前缀形如 u3a012510-） */
+export function namespacedProviderName(name: string): string {
+  return devicePrefix() + name;
+}
+
+/** 是否是「某台设备私有」的提供商键（用于清理时区分归属，管理员的名字不带前缀） */
+export function isDeviceScopedProviderKey(key: string): boolean {
+  return /^u[0-9a-f]{8}-/.test(key);
+}
+
 export function isOfficialProvider(name: string): boolean {
   return name === OFFICIAL_PROVIDER_NAME;
 }
@@ -59,9 +79,14 @@ function openclawConfigPath(): string {
   return path.join(os.homedir(), ".openclaw", "openclaw.json");
 }
 
-/** 从 openclaw.json 迁移已有 providers（仅首次） */
+/**
+ * 从 openclaw.json 迁移已有 providers（仅首次）。
+ * 【只在管理员/单用户作用域跑】openclaw.json 里的提供商是运营者自己的（带明文 Key），
+ * 设备作用域迁移等于把管理员的所有 Key 复制给任意用户 —— 设备一律从空列表开始。
+ */
 async function migrateFromOpenclaw(data: ProvidersFile): Promise<ProvidersFile> {
   if (data.chat.length > 0) return data;
+  if (currentDeviceId()) return data;
   try {
     const cfg = JSON.parse(await fs.readFile(openclawConfigPath(), "utf8"));
     const providers = cfg.models?.providers ?? {};
@@ -250,12 +275,19 @@ export async function fetchModels(baseUrl: string, apiKey: string): Promise<stri
   return [...new Set(ids)].sort();
 }
 
-/** 把 chat 提供商同步到 openclaw.json（第一个 = 默认 API，其第一个模型 = 默认模型） */
+/**
+ * 把 chat 提供商同步到 openclaw.json（第一个 = 默认 API，其第一个模型 = 默认模型）。
+ *
+ * 分作用域写（见文件上方「模型 Key 的设备级隔离」）：
+ *  - 提供商键名加设备前缀，只写/只清**本作用域自己的**条目，别人的一个都不动；
+ *  - `agents.defaults.model`（全局默认模型）只有管理员作用域才改 —— 设备保存一次自己的
+ *    模型就顺手改掉全服默认模型，会把运营者的默认模型带跑偏。
+ */
 export async function syncToOpenclaw(data?: ProvidersFile): Promise<void> {
   const all = data ?? (await listProviders(false));
   // 停用的提供商不写进 openclaw.json（否则通道端仍会用到它）
   const d: ProvidersFile = { chat: all.chat.filter((p) => p.enabled !== false), image: all.image };
-  if (d.chat.length === 0) return;
+  const mine = d.chat.map((p) => namespacedProviderName(p.name));
   let cfg: Record<string, any>;
   try {
     cfg = JSON.parse(await fs.readFile(openclawConfigPath(), "utf8"));
@@ -264,23 +296,33 @@ export async function syncToOpenclaw(data?: ProvidersFile): Promise<void> {
   }
   cfg.models ??= {};
   cfg.models.providers ??= {};
+  // 清理：只删「本作用域拥有」但已不在启用列表里的条目。
+  // 管理员作用域 = 无前缀的条目；设备作用域 = 本设备前缀的条目。
+  const scopePrefix = devicePrefix();
+  const ownsKey = (k: string): boolean => (scopePrefix ? k.startsWith(scopePrefix) : !isDeviceScopedProviderKey(k));
+  // 一个启用的提供商都没有时，原来是直接返回（绝不把配置清空）——只删自己那几条：
+  // 自己名下本来就没有条目就什么都不做（避免无意义地重写配置触发网关重载）
+  if (d.chat.length === 0 && !Object.keys(cfg.models.providers).some(ownsKey)) return;
   for (const k of Object.keys(cfg.models.providers)) {
-    if (!d.chat.some((p) => p.name === k)) delete cfg.models.providers[k];
+    if (ownsKey(k) && !mine.includes(k)) delete cfg.models.providers[k];
   }
   for (const p of d.chat) {
-    cfg.models.providers[p.name] = {
+    cfg.models.providers[namespacedProviderName(p.name)] = {
       baseUrl: p.baseUrl,
       api: "openai-completions",
       apiKey: p.apiKey,
       models: (p.models.length ? p.models : [p.name + "-default"]).map((id) => ({ id, name: id })),
     };
   }
-  const first = d.chat[0];
-  const firstModel = first.models[0];
-  if (firstModel) {
-    cfg.agents ??= {};
-    cfg.agents.defaults ??= {};
-    cfg.agents.defaults.model = { primary: `${first.name}/${firstModel}` };
+  // 默认模型是全局设置：只有运营者（管理员/单用户）作用域能改
+  if (!scopePrefix) {
+    const first = d.chat[0];
+    const firstModel = first?.models[0];
+    if (first && firstModel) {
+      cfg.agents ??= {};
+      cfg.agents.defaults ??= {};
+      cfg.agents.defaults.model = { primary: `${first.name}/${firstModel}` };
+    }
   }
   await fs.writeFile(openclawConfigPath(), JSON.stringify(cfg, null, 2), "utf8");
 }
@@ -288,6 +330,9 @@ export async function syncToOpenclaw(data?: ProvidersFile): Promise<void> {
 /**
  * 解析聊天用的 LLM 配置：卡片单独配置优先，否则第一个「启用中」的 chat 提供商。
  * 卡片指定的提供商若已被停用，同样回落到默认，避免聊天直接失败。
+ *
+ * 返回的 `provider` 是**写给 openclaw.json / 日志用**的名字（设备作用域带前缀），
+ * 网页聊天只用 baseUrl/apiKey/model，卡片里存的仍是提供商原名。
  */
 export async function resolveChatLLM(
   card?: { model?: { provider?: string; model?: string } },
@@ -303,7 +348,7 @@ export async function resolveChatLLM(
     const want = card?.model?.model;
     const model = want && official.models.includes(want) ? want : official.models[0];
     if (!model) return null;
-    return { baseUrl: official.baseUrl, apiKey: official.apiKey, model, provider: official.name };
+    return { baseUrl: official.baseUrl, apiKey: official.apiKey, model, provider: namespacedProviderName(official.name) };
   }
   let p = card?.model?.provider ? usable.find((x) => x.name === card.model?.provider) : undefined;
   let modelId = card?.model?.model;
@@ -314,5 +359,5 @@ export async function resolveChatLLM(
   if (!p || !p.apiKey) return null;
   const model = modelId && p.models.includes(modelId) ? modelId : p.models[0];
   if (!model) return null;
-  return { baseUrl: p.baseUrl, apiKey: p.apiKey, model, provider: p.name };
+  return { baseUrl: p.baseUrl, apiKey: p.apiKey, model, provider: namespacedProviderName(p.name) };
 }

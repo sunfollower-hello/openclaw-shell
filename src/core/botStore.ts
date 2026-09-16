@@ -4,6 +4,7 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { dataDir } from "./cardStore.js";
+import { devicePrefix } from "./dataRoot.js";
 
 // ---------- 两套上限，别混用（2026-09-08 用户拍板） ----------
 // ① 绑卡上限：同时能有几个机器人在跑（bots.json 里的实例数）
@@ -38,6 +39,20 @@ function botsPath(): string {
 /** 每卡独立 agent 的 workspace 目录（与共享 data/workspace 区分） */
 export function agentWorkspaceDir(slug: string): string {
   return path.join(dataDir(), "agent-workspaces", slug);
+}
+
+/**
+ * agent 名（= OpenClaw 里 agents.list 的 id、bindings 的 agentId、侧车拆条表的键）。
+ *
+ * 【为什么必须带设备前缀】这三个地方都是**全局命名空间**（一份 openclaw.json、
+ * 一份 split-styles.json，被所有设备共用），而 agent 的 workspace / memorySearch
+ * extraPaths 却是按设备目录（data/users/<id>/）给出的。两台设备各建一张同名卡
+ * （slug 都是 grandma）时，不加前缀就是同一个 agentId —— 后建的会覆盖前者，
+ * 表现为「我的机器人回的是别人的卡」。管理员（全局作用域）保持原名不加前缀，
+ * 与既有数据完全兼容（存量 bots.json 里存的就是 agentId，不受本函数影响）。
+ */
+export function deviceAgentId(slug: string): string {
+  return devicePrefix() + slug;
 }
 
 export async function listBots(): Promise<BotInstance[]> {
@@ -102,7 +117,7 @@ export async function addBot(input: {
     cardSlug: input.cardSlug,
     channel: input.channel,
     accountId: input.accountId,
-    agentId: input.cardSlug, // agent 名 = 卡 slug（openclaw agents 约束小写字母数字横线，slug 天然满足）
+    agentId: deviceAgentId(input.cardSlug), // 设备作用域下带前缀防跨用户撞名，见 deviceAgentId
     createdAt: new Date().toISOString(),
   };
   kept.push(bot);
