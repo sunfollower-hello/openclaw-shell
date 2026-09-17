@@ -752,7 +752,7 @@ button:disabled { opacity: 0.4; cursor: not-allowed; transform: none; }
   max-width: 85%;
   padding: 9px 13px;
   border-radius: 16px;
-  /* 对话字体大小：设置 → 聊天显示 里调（本机偏好，JS 写 --chat-font-size）；未设置用默认 13.5px */
+  /* 对话字体大小：设置 → 字体设置 里调（本机偏好，JS 写 --chat-font-size）；未设置用默认 13.5px */
   font-size: var(--chat-font-size, 13.5px);
   line-height: 1.55;
   white-space: pre-wrap;
@@ -761,7 +761,7 @@ button:disabled { opacity: 0.4; cursor: not-allowed; transform: none; }
 .bubble.me { align-self: flex-end; background: var(--ink); color: #ffffff; }
 .bubble.bot { align-self: flex-start; background: var(--card); border: 1px solid var(--border); }
 .bubble { position: relative; }
-/* 设置 → 聊天显示：预览气泡（跟着 --chat-font-size 变，所见即所得） */
+/* 设置 → 字体设置：预览气泡（跟着 --chat-font-size 变，所见即所得） */
 .chat-font-preview { max-width: none; margin: 2px 0 4px; }
 .tts-speak-btn {
   position: absolute; top: -8px; right: -8px;

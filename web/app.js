@@ -7757,7 +7757,7 @@ function renderSettings() {
     <div class="page-head"><h2>设置</h2></div>
     <div class="setting-rows">
       ${adminRows}${row("device", "tool", "我的设备 ID", "记住它：服务器最多保存 15 天聊天记录，删了可凭 ID 恢复")}
-      ${row("display", "sliders", "聊天显示", "对话字体大小")}
+      ${row("font", "sliders", "字体设置", "对话字体大小")}
       ${row("storage", "database", "本地存储", "图片与语音存放在这台设备上：占用统计 / 保存位置 / 自动保存 / 压缩 / 删除")}
       ${pluginRow}${row("data", "package", "数据备份与记忆", "全部卡片 + 记忆 + 配置导出为 JSON；查看全部记忆")}
     </div>
@@ -7852,7 +7852,7 @@ async function loadCacheStats() {
   }
 }
 
-// ---- 设置子页：聊天显示（对话字体大小） ----
+// ---- 设置子页：字体设置（对话字体大小） ----
 // 本机偏好（localStorage），写 CSS 变量 --chat-font-size 给 .bubble 用；空值 = 用样式表里的默认 13.5px。
 // 字体族暂不做（等找到差异明显、无版权顾虑的来源再说），这里只管字号。
 const CHAT_FONT_KEY = "ocs_chat_font";
@@ -7875,14 +7875,14 @@ function ocApplyChatFont() {
   else root.style.removeProperty("--chat-font-size");
 }
 
-function renderDisplayPage() {
+function renderFontPage() {
   const cur = ocChatFont();
   const opts = [`<option value="" ${cur ? "" : "selected"}>默认</option>`]
     .concat(CHAT_FONT_SIZES.map((n) => `<option value="${n}" ${cur === n ? "selected" : ""}>${n}px</option>`))
     .join("");
   return `
   <div class="view">
-    <div class="page-head"><h2>${icon("sliders")} 聊天显示</h2>${settingsBack()}</div>
+    <div class="page-head"><h2>${icon("sliders")} 字体设置</h2>${settingsBack()}</div>
     <div class="adv-sec">
       <div class="adv-grid2">
         <label>对话字体大小<select id="chat-font-size">${opts}</select></label>
@@ -7894,7 +7894,7 @@ function renderDisplayPage() {
   </div>`;
 }
 
-function initDisplayPage() {
+function initFontPage() {
   const sel = $("#chat-font-size");
   if (!sel) return;
   sel.addEventListener("change", () => {
@@ -8497,7 +8497,7 @@ const routes = {
   emojis: { render: renderEmojis, init: initEmojis },
   // 设置子页（设置菜单里长条按键跳转过来）
   logs: { render: renderLogsPage, init: initLogsPage },
-  display: { render: renderDisplayPage, init: initDisplayPage },
+  font: { render: renderFontPage, init: initFontPage },
   plugins: { render: renderPluginsPage, init: initPluginsPage },
   data: { render: renderDataPage, init: initDataPage },
   notice: { render: renderNoticePage, init: initNoticePage },
@@ -9848,7 +9848,7 @@ function ocStartSyncLoop() {
 // 原来是 `loadProfile().finally(() => router())`——必须等 /api/profile 回来才画第一屏，
 // 公网上这一等就是 1-2s，期间页面只有顶栏 + 背景色（用户看到的「只有 SoulBox 加黄页」）。
 // 资料与表情库改为后台加载，回来后 loadProfile 内部会补昵称头像并刷新首页。
-// 对话字体大小（设置 → 聊天显示）：本机偏好要先写进 --chat-font-size，再画首屏
+// 对话字体大小（设置 → 字体设置）：本机偏好要先写进 --chat-font-size，再画首屏
 ocApplyChatFont();
 router();
 // 身份先用缓存同步摆一次（避免管理入口闪一下），再后台校正
