@@ -207,7 +207,7 @@ openclaw-shell/
 
 ---
 
-## §42 交接速查（**2026-09-17 第三次更新，新对话先读这段**）
+## §42 交接速查（**2026-09-17 第四次更新，新对话先读这段**）
 
 ### 一句话
 「魂匣 SoulBox」= 装在自己服务器上、给用户开箱即用的 AI 角色机器人（角色卡 + 蒸馏 + QQ/微信机器人 + 生图 + 语音 + 表情包），商业模式是**自建 API 中转站**（香港 `api.319274.xyz`）赚钱。用户零注册零登录，**设备随机 ID 即身份**。
@@ -245,6 +245,9 @@ openclaw-shell/
 4. 改过 `src` 才需要 `ssh sb 'cd /data/openclaw-shell && npm run build && systemctl restart openclaw-shell'`
 5. **必须** `ssh sb 'chown -R root:root /data/openclaw-shell'`（否则插件安全检查拦 suspicious ownership）
 6. 纯前端不用重启；`?v=` 由 mtime+size 自动生成，刷新即生效
+7. **⚠️ 2026-09-17 起跨境 SSH 大包频繁 reset**（整包 tar 与 200KB+ 单文件都会断）→ 改用**逐文件传 + md5 校验**，单个文件仍失败就**分片**：
+   `split -b 40000 -d -a 2 <文件> /tmp/sp3/p-` → 每片单独 `cat | ssh sb "cat > /tmp/pt3/<片名>"` 并 md5 → 服务器侧 `cd /tmp/pt3 && cat $(ls|sort) > /tmp/<file>.new` → 再整体 md5 一致才 `mv` 就位。**每次上线前先 `cp` 备份旧文件**（都在 `/data/backups/pre-sync-20260917/`）。
+8. 改 APK 壳（`apk-build/soulbox/`）→ `bash build-soulbox.sh <版本>`，产物 `SoulBox-v<版本>.apk`（**同一签名，覆盖安装保数据**）
 
 ### 身份与权限（09-16 定稿）
 - **用户**：设备 32 位随机 ID（localStorage+cookie）→ `data/users/<id>/` 命名空间（AsyncLocalStorage，全项目 store 走 `dataDir()`）。删 App 重装=新身份，可凭旧 ID 在「设置 → 我的设备 ID」找回。
@@ -267,19 +270,24 @@ openclaw-shell/
 | `src/core/imageConfig.ts` `imageGen.ts` | 生图（**模型无默认值，必须先拉取**） |
 | `src/core/conversationStore.ts` `memoryStore.ts` `retention.ts` | 会话 / 记忆 / 15 天保留 |
 | `src/core/sessionMirror.ts` | 通道会话观察器（水位游标 + 扫 reset 归档 + 空闲性能门）；§51 改过 |
+| `src/core/openclawCli.ts` | 调 openclaw CLI：**跨平台入口解析** + 扫码登录**必须套 PTY**；§53 改过 |
+| `src/core/greetedStore.ts` | 开场白状态（`<slug>.greeted.json`）；§58 加了 `#first_mes_logged` 一次性标记 |
+| `src/core/users.ts` | 设备注册表（disabled / admin / **label 标记**）；§56 加了 `setDeviceLabel` |
 | `scripts/test-channel-replay.mjs` | 通道复刻自测（App 不开也复刻 / 会话重置补齐 / 增量拉取 / 跨设备不串，15 项） |
 | `scripts/make-emoji-pack.bat`+`.ps1` | 表情包打包器（拖文件夹即出包） |
 | `scripts/test-device-isolation.mjs` | 设备级隔离自测（临时 HOME，不碰真实配置） |
 | `apk-build/soulbox/`（**在仓库外**) | 安卓套壳工程：`bash build-soulbox.sh <版本>`；**签名密钥务必留着** |
 
-### 09-16/17 已完成（细节见 §43–§52）
-设备级隔离地基（agent 名/模型 key 加设备前缀，修掉"设备保存会删空管理员提供商 + 泄露 Key"两个线上 bug）· 管理向功能身份门槛 · 预设页改版 + 两个 store bug 修复 · **重描写括号对换**（`{}`=心理、`（）`=动作）· 设备管理页 v2（完整 32 位 ID / 搜索 / 排序 / 管理员设备「查看」读全局）· **通道对用户开放**（账号归属隔离）· **蒸馏对用户开放 + 删掉「直连本机 WeFlow」** · 生图/TTS 五项清理 · **安卓套壳 APK**（纯套壳只 loadUrl，`SoulBox-v2.apk`）· **表情包 zip 批量导入** · **App 增量同步通道复刻（§51）**：服务端按设备扫描补观察（**App 关着也复刻**）+ 抗会话重置 + App 打开拉进本地永久副本 · **表情包页改版 + 全站原生弹窗清零（§52）**：两个导入入口合一（图片入口也吃 zip，表情名/场合填写项保留）、说明文字只留一行、分组管理改自绘弹窗；**全站 27 处原生 confirm + 2 处 prompt 全部换掉**（原生弹窗会在标题栏露站点地址）· **通道扫码登录修复（§53）**：CLI 入口改跨平台解析（原来只认 Windows 的 `%APPDATA%`，Linux 上拼出 `/root/AppData/...` 直接 MODULE_NOT_FOUND）+ **Linux 交互式登录必须套 PTY**（没 TTY 时 CLI 零输出，二维码永远不出来）。
+### 09-16/17 已完成（细节见 §43–§58）
+设备级隔离地基（agent 名/模型 key 加设备前缀，修掉"设备保存会删空管理员提供商 + 泄露 Key"两个线上 bug）· 管理向功能身份门槛 · 预设页改版 + 两个 store bug 修复 · **重描写括号对换**（`{}`=心理、`（）`=动作）· 设备管理页 v2 · **通道对用户开放**（账号归属隔离）· **蒸馏对用户开放 + 删掉「直连本机 WeFlow」** · 生图/TTS 五项清理 · **安卓套壳 APK** · **表情包 zip 批量导入** · **App 增量同步通道复刻（§51）**（服务端按设备扫描补观察 = App 关着也复刻 + 抗会话重置 + App 打开拉进本地永久副本）· **表情包页改版 + 全站原生弹窗清零（§52）** · **通道扫码登录修复（§53）**（CLI 入口跨平台 + Linux 交互式登录必须 PTY）· **扫码体验三改（§54）**（状态标签带账号数 + 扫码中态、生成过程不外露、**打开通道页预生成二维码**把 15s 静默等待藏起来）· **清空历史账号 + 内置画师串只留三条（§55）**（4 个老账号含隐藏 `default` 全删 + 插件残留/别人 openid/凭证备份全清）· **提权漏洞修复 + 设备标记 + 查看返回保位（§56）** · **模型选择器合成一个「模型」三栏面板 + 输入区加高 1/3（§57）** · **聊天页五连改（§58）**（面板再瘦身 / 键盘不顶走顶栏 / 撤销入输入区 / 「对方正在输入中」上顶栏 / **开场白丢失修复含老卡一次性补写**）。
 
 ### 还没做的
-1. 用户版该补的部分（生图三个画师串/模型无默认、TTS 用量删除、两处提示删除、表情包 zip 与打包脚本）→ 按 hunk 推到 `main`。
-2. 远程绑定流程收尾、Phase B 其余；APK 真机验收、壳自更新（用户说先不做）、可选的「导出表情库为 zip」。
-3. 仓库转私有（用户自己点设置）；`feature/import-backup-0904` 旧分支待清理。
-4. 本次改动（含 §51）**还没进 git**：本机 `prod` 工作区未提交，`main`/`prod` 都没推（用户没确认要不要提交/推）。
+1. **`main`（用户版）落后一大截**：§52–§58 这些用户也受益的改动（表情包页改版 / 原生弹窗清零 / 扫码登录修复 / 面板与输入区 / 开场白修复 / 设备标记除外）**都还没按 hunk 推到 `main`**；更早那批（生图三个画师串、TTS 用量删除、两处提示删除、表情包 zip 与打包脚本）也还在队列里。做法见 §44⑥（prod 的 `web/app.js` 混着运营代码，**不能整份覆盖**）。
+2. **APK v3 待用户安装 + 真机验收**：`apk-build/soulbox/SoulBox-v3.apk`（修了软键盘顶走顶栏）。网页侧已有兜底，不装也能用；装了才是治本。
+3. **一处没验到的**：自造夹具卡走不出「成功回复」路径（schema 不全）→ 「生成中顶栏提示在**成功**时复位」只做了代码核对，真机发一条消息即可确认。
+4. 远程绑定流程收尾、Phase B 其余；壳自更新（用户说先不做）、可选的「导出表情库为 zip」。
+5. 仓库转私有（用户自己点设置）；`feature/import-backup-0904` 旧分支待清理。
+6. 可选的卫生工作：设备注册表里有 ~16 台测试/空壳设备（现在能用「标记」挨个命名，或清理掉）。
 
 ### 坑位清单（都是真踩过的）
 1. **CRLF**：内联 `node -e` 用 `\n` 精确匹配会静默失败 → 用 `\r?\n` 正则或 Edit 工具，改完立刻核对。
@@ -288,11 +296,16 @@ openclaw-shell/
 4. **数据文件不是代码**：`data/presets.json`、`data/imageConfig.json`、`data/users/registry.json` 会**压过代码默认值** → 改文案要"代码 + 本机文件 + 服务器文件"三处同步，改前 cp 备份。
 5. **`.ps1` 必须带 UTF-8 BOM**（PS5.1 无 BOM 按 GBK 读中文必乱）。
 6. **中文 zip 可能是 GBK**：条目名与 TXT 都要"UTF-8 严格解失败即回退 GBK"。
-7. **SSH**：`Host sb` 已固定 `KexAlgorithms curve25519-sha256`（默认后量子 KEX 握手包大，跨境会被 reset）；短时间连太多仍会 reset → **批量操作合成一次连接**。
+7. **SSH**：`Host sb` 已固定 `KexAlgorithms curve25519-sha256`；**大包/多次连接仍会 reset → 分片传（见上线流程第 7 条）**。
 8. **别把测试文件留在 `web/`**（会公网可访问）。
-9. **切分支前 `git stash -u`**，切回来 `stash pop` 后**重新 `npm run build`**（在 main 上构建过就把 dist 写成用户版了）。
-10. **清设备/账号**时记住：删注册表记录 ≠ 删数据目录；删目录是真丢数据，动手前先确认目标。
-11. **公开仓库纪律**：任何凭据（设备 ID / 密码 / key / token）都不进仓库文件；`data/`、`.env`、`apk-build/`（含 keystore）都在 .gitignore 之外/仓库之外，别手动加进去。
+9. **切分支前 `git stash -u`**，切回来 `stash pop` 后**重新 `npm run build`**。
+10. **清设备/账号**：删注册表记录 ≠ 删数据目录；删目录是真丢数据，先确认目标。**删通道账号**要连插件私有目录一起清（见 §55，接口已补）。
+11. **公开仓库纪律**：任何凭据（设备 ID / 密码 / key / token）都不进仓库文件；`data/`、`.env`、`apk-build/`（含 keystore）都在仓库之外。
+12. **🔴 路由注册顺序 = 权限**：`ADMIN_ONLY_PREFIXES` 那道网关注册在哪些路由**之前**才生效；Express 按注册顺序匹配，写在网关后面的 `/api/users/*` 会**整个绕过拦截**（09-17 实测：普通设备可把自己提成管理员、读别人聊天记录）。**新增任何 `/api/users`、`/api/plugins`、`/api/logs` 路由前先看网关位置。**
+13. **`requestAnimationFrame` 在后台标签页不触发**：凡是"渲染后校正"的逻辑（滚动位置等）别只依赖 rAF，用 `setTimeout` 追帧（§56 实测回调一次都没跑）。
+14. **原生弹窗会漏站点地址**：`prompt/confirm/alert` 一律不用（换 `wbConfirm` / `ocInputDialog` / `emojiInfoDialog`）。**注意 `confirm` 是同步的**：换 `await` 时漏一个 `await` 会静默变成"永远确认"（删除类操作不再确认）→ 靠 `node --check`（await 在非 async 函数里是语法错误）+ 自写检查脚本兜底。
+15. **`pkill -f "xxx"` 会自匹配**：你的 SSH 命令行里就含这几个字，会把**自己**杀掉（表现：命令毫无输出）→ 写成 `pkill -f "[x]xx"`。
+16. **自造夹具卡走不通聊天**：卡片 schema 不完整（缺 `voice.tone_rules` / `chat.tone_rules` 等）时 `/api/chat` 直接 500；要验"模型回复类"功能就用真卡或把字段补齐。
 ---
 
 ## §43 Phase B 地基 + 管理向功能的身份门槛（2026-09-16，已上线服务器）
