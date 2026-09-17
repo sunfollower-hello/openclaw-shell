@@ -1041,3 +1041,14 @@ QQ 通道级还留着迁移过来的 `allowFrom: ["F5D0…"]` + `dmPolicy: "allo
 ### 验证
 - `tsc --noEmit` ✅、构建 ✅；部署后以设备身份实测发起微信登录：**进程命令行带 `--account aa0b2928-…`（UUID）✅**，cancel 正常回收 ✅；dist 含新函数 ✅；线上 app.js 含 120_000 ✅；站点 200。
 - **待真机验收**：手机 App 扫微信（应成功绑定，列表出现 d820… 式 bot id，之前三个孤儿凭证已被本次修复前的扫描耗掉不影响）；QQ 重扫一遍验证"成功=列表真出现"。**已知取舍**：微信每次扫码产生新 bot id，同用户旧 bot 由插件自动清；QQ 单槽位=一台服务器同时只有一个 QQ bot 在线（多 QQ bot 需 CLI 多账号路径，未验证）。
+
+### §60 补充（同日晚）：微信"分段/表情依旧 + 回复小小"的真正根因——网关加载的微信插件根本不是修过的那份
+
+用户真机复测：微信聊天回复的是**"小小"**（管理员人设）、分段依旧失败、表情是管理员库的。深挖出两层新根因，均已修复：
+
+1. **🔴 网关加载的微信插件是社区版 3.1.6，§59 修的副本根本没被加载**：`plugins list` 实锤 Source = `/data/openclaw/npm/projects/openclaw-weixin/node_modules/openclaw-weixin/dist/index.js`（v3.1.6，"Community-maintained"，`npm:openclaw-weixin --force` 装的）——**零补丁标记**。而 patch-channels.mjs 的 WX_DIST 指向 `@tencent-weixin/openclaw-weixin`（官方包，本机开发用的），服务器上那份是死副本。QQ 无此问题（`@tencent-connect/openclaw-qqbot` 的 npm 路径恰好与脚本一致，deliver error 日志证明真加载）。**本机好用/服务器不好用的分野就在这**。修复：隔离 3.1.6（mv → `/data/backups/pre-channel-fix-20260917/weixin-3.1.6-unpatched/`）→ loader 落到官方副本——但直接扫描不会发现它（npm 插件是注册制），需 `openclaw plugins install --link <官方副本路径>`。
+2. **--link 被插件安全扫描拦**：副本内 `node_modules/openclaw` 是本机迁移来的悬空 symlink（`/c/Users/followsun/AppData/Roaming/npm/...`）→ 修复为 `/usr/lib/node_modules/openclaw` 后扫描通过。
+3. **官方 2.4.6 副本缺整个 `dist/src/media/` 目录**（mime/媒体下载/silk 转码 6 文件，09-16 迁移丢失）→ send-media.js 报 `Cannot find module '../media/mime.js'` 无法加载 → 从本机完整副本补齐。
+4. **修复后实测**：5 插件加载 ✅、微信**双账号 monitor 明文日志**（`[61e3a1c880b0-im-bot]` 与 `[0320fee91e01-im-bot]` 各一个监听器）✅、零报错 ✅。
+5. **"回复小小"的完整链路（会话文件实锤）**：main agent 会话原文"我是小小呀！主人忘了吗，从二手市场捡回来那个…"。链路 = 用户微信消息进的是 **`61e3a1c880b0-im-bot`（管理员 06:25 登录、落在用户微信里的机器人，唯一活的）** → 该账号绑定指向管理员卡 persona-mt9xijkd……实际落到了 **main agent**（`agents.defaults.model = agnes/agnes-2.0-flash` 吻合）——因为 **bindings 的热加载"检测到但未应用"**（日志：`evaluating reload (agents.list, bindings)` → `applied (agents.list)`，bindings 被跳过），**绑定只在通道重启时生效**；用户 14:44:50 绑卡发生在 14:43:31 通道重启之后 → 绑定悬空 → 消息落 main → main 用共享 workspace 的编译人设"小小"+管理员默认模型。表情同理：main 的 SKILL/共享目录列出的是管理员表情。网关重启后路由快照已刷新，双路由均生效。
+6. **遗留认知**：① 用户微信里有**多个机器人**（每次扫码加一个：09:01/11:21/13:38 三次失败扫描留下的死 bot + 61e3「小小」+ 0320「沈知夏」）——**聊天时认准活的两个**，死的不回复；② patch-channels.mjs 的 WX_DIST 现在指向的正是活路径（tencent-weixin 副本已注册为加载源）✓，但**未来 `plugins install npm:openclaw-weixin` 一旦重装社区版又会覆盖回未打补丁状态**——微信插件升级/重装后必须重跑补丁并核对加载路径；③ 通道表情目录仍是全局共享（管理员与用户表情同池，结构问题待改）。
