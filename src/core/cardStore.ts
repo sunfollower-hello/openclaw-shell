@@ -81,6 +81,15 @@ export class CardStore {
     await this.ensure();
     // 先落盘正式卡（这一步决定用户看到的"保存完成"快慢）
     const prev = await this.get(card.slug).catch(() => null);
+    // 新卡默认风格「纯对话」：只在**首次落盘**（此前这张卡不存在）且卡上没写风格时补一个。
+    // 已存在的卡一律不动 —— 已经用起来的老卡没选风格就保持「无风格」，不能被悄悄改掉
+    // （用户口径 2026-09-17：只影响之后新加的卡）。放在存储层是为了覆盖所有创建路径
+    // （做卡页新建、导入、蒸馏），而不是只盖住某一个入口。
+    if (!prev) {
+      const p = card.presets ?? ({} as NonNullable<PersonaCard["presets"]>);
+      if (p.style === null || p.style === undefined || p.style === "") p.style = "chat";
+      card.presets = p;
+    }
     await fs.mkdir(path.dirname(this.cardPath(card.slug)), { recursive: true });
     await fs.writeFile(this.cardPath(card.slug), JSON.stringify(card, null, 2), "utf8");
     // 版本快照放到后台做，避免拖慢保存

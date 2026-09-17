@@ -3321,11 +3321,9 @@ async function openAdvConfig() {
   const tierOpts = presetStoreData.tiers
     .map((t) => `<option value="${escapeHtml(t.id)}" ${t.id === curTier ? "selected" : ""}>${escapeHtml(t.name)}</option>`)
     .join("");
-  // 风格默认「纯对话」：没选过（或选的组已删）就落到 chat（与档位默认破甲同理，用户忘选也有风格）；
-  // 显式选了「不使用风格」（存 none）才真的不加
-  const curStyle = cardPresets.style === "none"
-    ? "none"
-    : presetStoreData.styles.some((s) => s.id === cardPresets.style) ? cardPresets.style : "chat";
+  // 「不使用风格」用固定值 none：跟"没写过风格"（null/空）区分开——新卡创建时会默认写入
+  // chat（见 cardStore.save），只有明确选了 none 才不会被那个默认值盖掉
+  const curStyle = cardPresets.style && cardPresets.style !== "none" ? cardPresets.style : "none";
   const styleOpts = [`<option value="none" ${curStyle === "none" ? "selected" : ""}>（不使用风格）</option>`]
     .concat(presetStoreData.styles.map((s) => `<option value="${escapeHtml(s.id)}" ${curStyle === s.id ? "selected" : ""}>${escapeHtml(s.name)}</option>`))
     .join("");

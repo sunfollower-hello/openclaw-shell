@@ -585,11 +585,9 @@ export async function resolveCardPresetBlocks(card: PersonaCard): Promise<string
   const blocks: string[] = [];
   // 档位默认「破甲」：卡上没选（或选的组已删）时兜底装上破甲组
   const tier = store.tiers.find((g) => g.id === card.presets?.tier) ?? store.tiers.find((g) => g.id === "break");
-  // 风格默认「纯对话」：没选过（或选的组已删）时兜底装上 chat 组——用户忘了选风格也不会
-  // 得到一张"无风格"的卡；只有卡上显式存了 "none"（选了「不使用风格」）才真的不加。
-  const style =
-    store.styles.find((g) => g.id === card.presets?.style) ??
-    (card.presets?.style === "none" ? undefined : store.styles.find((g) => g.id === "chat"));
+  // 风格**不做解析兜底**：已经用起来的老卡没选风格就一直保持「无风格」，不能被悄悄改掉。
+  // 新卡的默认「纯对话」是在创建那一刻写进卡里的（见 cardStore.ts 的 save）。
+  const style = store.styles.find((g) => g.id === card.presets?.style);
   blocks.push(...resolveGroup(tier).systemBlocks);
   blocks.push(...resolveGroup(style).systemBlocks);
   const tools = card.tools?.enabled ?? [];
@@ -617,10 +615,8 @@ export async function resolveCardPresetBlocks(card: PersonaCard): Promise<string
  */
 export async function resolveCardPresetExamples(card: PersonaCard): Promise<{ role: "user" | "assistant"; content: string }[]> {
   const store = await loadPresets();
-  // 与 resolveCardPresetBlocks 一致：档位默认「破甲」、风格默认「纯对话」
+  // 与 resolveCardPresetBlocks 一致：档位默认「破甲」，风格不兜底（新卡创建时已写入 chat）
   const tier = store.tiers.find((g) => g.id === card.presets?.tier) ?? store.tiers.find((g) => g.id === "break");
-  const style =
-    store.styles.find((g) => g.id === card.presets?.style) ??
-    (card.presets?.style === "none" ? undefined : store.styles.find((g) => g.id === "chat"));
+  const style = store.styles.find((g) => g.id === card.presets?.style);
   return [...resolveGroup(tier).examples, ...resolveGroup(style).examples];
 }
