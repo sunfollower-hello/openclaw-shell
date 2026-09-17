@@ -1236,13 +1236,21 @@ app.post("/api/channels/wechat/login", async (_req, res) => {
       slot,
     });
   }
+  const dev = res.locals.ocDevice as string | null | undefined;
+  const devLabel = dev ? `设备 ${dev.slice(0, 8)}…` : "管理员";
   await beginClaimForDevice("openclaw-weixin", res);
+  logInfo("通道", `扫码登录[微信]：发起（${devLabel}）`);
   // 设备作用域：传一次性临时账号名（UUID 形状 → 微信插件视作"临时会话键"，不落持久别名、不做别名冲突检查）。
   // 不传的话 CLI 会拿通道现有默认账号当请求 alias，与该 alias 已存凭证必然冲突
   // （09-17 实锤：already has credentials for a different bot——每个用户扫码产生的是自己的新 bot）。
   // 凭证最终落在真实 bot hash 名下并登记进账号索引，由认领机制判给发起设备。
-  const dev = res.locals.ocDevice as string | null | undefined;
-  res.json(startChannelLogin("openclaw-weixin", dev ? { cliAccount: crypto.randomUUID() } : undefined));
+  res.json(
+    startChannelLogin("openclaw-weixin", {
+      cliAccount: dev ? crypto.randomUUID() : undefined,
+      onDone: ({ ok, note, elapsedMs }) =>
+        logInfo("通道", `扫码登录[微信]：${ok ? "成功" : "失败"}（${devLabel}，耗时 ${(elapsedMs / 1000).toFixed(0)}s${note ? `，${note}` : ""}）`),
+    })
+  );
 });
 
 // 从 CLI 登录输出里揪出二维码链接（微信 weixin.qq.com/q/xxx，QQ q.qq.com/... 或带 qrcode= 的 URL），
@@ -1320,7 +1328,10 @@ app.get("/api/channels/qq/status", async (req, res) => {
 });
 
 app.post("/api/channels/qq/login", async (_req, res) => {
+  const dev = res.locals.ocDevice as string | null | undefined;
+  const devLabel = dev ? `设备 ${dev.slice(0, 8)}…` : "管理员";
   await beginClaimForDevice("qqbot", res);
+  logInfo("通道", `扫码登录[QQ]：发起（${devLabel}）`);
   const slot = await accountSlotState("qqbot").catch(() => null);
   if (slot?.full) {
     return res.status(400).json({
@@ -1329,12 +1340,26 @@ app.post("/api/channels/qq/login", async (_req, res) => {
       slot,
     });
   }
-  const dev = res.locals.ocDevice as string | null | undefined;
   // 设备作用域：登录成功（CLI exit 0，appId 已写入根槽位）后把槽位判给发起设备，并清理他人残留绑定。
   // 快照差集对 QQ 单槽位是失效的（重扫永远覆盖同一个槽位名 "default"，不算"新账号"）→ 假成功的根源。
-  res.json(
-    startChannelLogin("qqbot", dev ? { deviceId: dev, onOk: () => attributeQqLoginToDevice(dev) } : undefined)
-  );
+  if (dev) {
+    const d: string = dev;
+    res.json(
+      startChannelLogin("qqbot", {
+        deviceId: d,
+        onOk: () => attributeQqLoginToDevice(d),
+        onDone: ({ ok, note, elapsedMs }) =>
+          logInfo("通道", `扫码登录[QQ]：${ok ? "成功" : "失败"}（${devLabel}，耗时 ${(elapsedMs / 1000).toFixed(0)}s${note ? `，${note}` : ""}）`),
+      })
+    );
+  } else {
+    res.json(
+      startChannelLogin("qqbot", {
+        onDone: ({ ok, note, elapsedMs }) =>
+          logInfo("通道", `扫码登录[QQ]：${ok ? "成功" : "失败"}（${devLabel}，耗时 ${(elapsedMs / 1000).toFixed(0)}s${note ? `，${note}` : ""}）`),
+      })
+    );
+  }
 });
 
 app.get("/api/channels/qq/login", async (_req, res) => {

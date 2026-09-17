@@ -245,6 +245,8 @@ export interface ChannelLoginOpts {
   deviceId?: string | null;
   /** CLI 进程成功退出（exit 0，凭证已落盘）后的宿主侧收尾：归属判定 / 他人残留清理 */
   onOk?: () => void | Promise<void>;
+  /** 登录流程结束（成功/失败/超时）后的宿主侧回调：管理台运行日志用。note 只含安全文案（超时等），绝不带 token/链接 */
+  onDone?: (info: { ok: boolean; note?: string; elapsedMs: number }) => void;
 }
 
 /** 发起通道扫码登录；带 accountId 时登录到指定渠道账号（多机器人用），否则登录默认账号 */
@@ -259,6 +261,7 @@ export function startChannelLogin(channel: string, accountIdOrOpts?: string | Ch
   if (opts.cliAccount) args.push("--account", opts.cliAccount);
   const child = spawnOpenclawInteractive(args);
   loginProcs[key] = child;
+  const startedAt = Date.now();
   const append = (d: Buffer | string) => {
     const s = logins[key];
     s.output = (s.output + stripAnsi(d.toString())).slice(-16000);
@@ -274,6 +277,14 @@ export function startChannelLogin(channel: string, accountIdOrOpts?: string | Ch
     s.ok = ok;
     if (note) s.output = (s.output + "\n" + note).slice(-16000);
     loginProcs[key] = null;
+    if (opts.onDone) {
+      // 运行日志回调：note 只含安全文案；output（含 token/二维码链接）绝不外传
+      try {
+        opts.onDone({ ok, note, elapsedMs: Date.now() - startedAt });
+      } catch (e) {
+        console.error("[openclaw-cli] 登录日志回调失败:", e instanceof Error ? e.message : String(e));
+      }
+    }
     if (ok && opts.onOk) {
       // 归属/清理是宿主侧收尾（此刻凭证已落盘），异步执行、不阻塞登录状态返回
       void Promise.resolve()
