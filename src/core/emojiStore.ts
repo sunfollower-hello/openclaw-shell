@@ -7,6 +7,7 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { dataDir } from "./cardStore.js";
+import { currentDeviceId } from "./dataRoot.js";
 
 export interface EmojiItem {
   id: string;
@@ -132,15 +133,27 @@ export function channelMediaDir(): string {
   return path.join(os.homedir(), ".openclaw", "media", "emojis");
 }
 
-/** 把表情库全部表情同步到 ~/.openclaw/media/emojis/（缺什么拷什么，不删孤儿文件） */
+/**
+ * 设备专属的通道表情子目录：u<设备ID前8位>/。设备作用域下同步到这里，
+ * 与其他设备、管理员彻底隔离（重名不撞、互不可见）；
+ * 插件出口按 agentId 前缀推导同名目录查图（u1ba5242d-persona-xxx → u1ba5242d/）。
+ */
+export function channelMediaDirForDevice(deviceId: string): string {
+  return path.join(channelMediaDir(), `u${deviceId.slice(0, 8)}`);
+}
+
+/** 把表情库全部表情同步到通道媒体目录（缺什么拷什么，不删孤儿文件）。
+ *  设备作用域 → 自己的 u<前8位>/ 子目录（隔离）；管理员/单用户 → 全局目录（历史行为不变）。 */
 export async function syncEmojisToChannelMedia(): Promise<string[]> {
   const emojis = await listEmojis();
   const out: string[] = [];
-  await fs.mkdir(channelMediaDir(), { recursive: true }).catch(() => {});
+  const deviceId = currentDeviceId();
+  const targetDir = deviceId ? channelMediaDirForDevice(deviceId) : channelMediaDir();
+  await fs.mkdir(targetDir, { recursive: true }).catch(() => {});
   for (const e of emojis) {
     const src = path.join(emojiDir(), e.file);
     const ext = path.extname(e.file).toLowerCase() || ".png";
-    const dst = path.join(channelMediaDir(), `${safeEmojiName(e.name)}${ext}`);
+    const dst = path.join(targetDir, `${safeEmojiName(e.name)}${ext}`);
     try {
       await fs.access(dst); // 已存在跳过
       continue;

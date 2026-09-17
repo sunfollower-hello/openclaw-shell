@@ -36,11 +36,14 @@ const WX_DIST = path.join(
 // ---------- v9 表情解析（增量插入块，CJS 版；插到 QQ helper 段尾部） ----------
 const EMOJI_HELPER_CJS = String.raw`
 // [openclaw-shell patch v9] 表情指令解析：一次生成内 [表情:名] 直接发图（爱语式，不走工具/保险丝）
+// [openclaw-shell patch v15] 表情按设备目录查图（隔离）：u<prefix> 设备 agent 只查自己的子目录，绝不回退全局
 // v9.1：未命中的 [表情:名] 标签一律剔除（模型幻觉不发给用户）；过滤核心层媒体失败警告文本
 function __ocsEmojiDir() { return require("path").join(require("os").homedir(), ".openclaw", "media", "emojis"); }
-function __ocsFindEmojiFile(name) {
+function __ocsFindEmojiFile(name, agentId) {
   try {
-    var dir = __ocsEmojiDir();
+    // 设备 agent（u<8hex>-slug）→ 只查该设备自己的子目录；全局 agent（管理员的卡）→ 全局目录。互不交叉、零兜底。
+    var m = /^u([0-9a-f]{8})-/.exec(String(agentId || ""));
+    var dir = m ? require("path").join(__ocsEmojiDir(), "u" + m[1]) : __ocsEmojiDir();
     var safe = String(name).replace(/[\\/:*?"<>|\s]+/g, "_");
     var files = require("fs").readdirSync(dir);
     for (var i = 0; i < files.length; i++) {
@@ -51,12 +54,12 @@ function __ocsFindEmojiFile(name) {
   } catch (e) { /* 目录不存在/读失败 → 未命中 */ }
   return null;
 }
-function __ocsExtractEmojiTags(text) {
+function __ocsExtractEmojiTags(text, agentId) {
   var rest = String(text || "");
   // v11：兼容全角方括号【表情:名】（模型常把 [表情:名] 写成全角）
   var re = /\[表情:([^\]]+)\]|【表情:([^】]+)】/g, m, file, paths = [];
   while ((m = re.exec(rest))) {
-    file = __ocsFindEmojiFile((m[1] || m[2] || "").trim());
+    file = __ocsFindEmojiFile((m[1] || m[2] || "").trim(), agentId);
     if (file && paths.length === 0) paths.push(file); // 一次回复最多 1 个表情
   }
   // 无论命中与否都剔除标签：表情名是封闭集合，查不到就是模型幻觉，不该外泄成乱码
@@ -92,11 +95,14 @@ function __ocsExtractMediaLocal(text) {
 // ---------- v9 表情解析（增量插入块，ESM 版；插到微信 helper 段尾部） ----------
 const EMOJI_HELPER_ESM = String.raw`
 // [openclaw-shell patch v9] 表情指令解析：一次生成内 [表情:名] 直接发图（爱语式，不走工具/保险丝）
+// [openclaw-shell patch v15] 表情按设备目录查图（隔离）：u<prefix> 设备 agent 只查自己的子目录，绝不回退全局
 // v9.1：未命中的 [表情:名] 标签一律剔除（模型幻觉不发给用户）；过滤核心层媒体失败警告文本
 function __ocsWxEmojiDir() { return path.join(os.homedir(), ".openclaw", "media", "emojis"); }
-function __ocsWxFindEmojiFile(name) {
+function __ocsWxFindEmojiFile(name, agentId) {
   try {
-    const dir = __ocsWxEmojiDir();
+    // 设备 agent（u<8hex>-slug）→ 只查该设备自己的子目录；全局 agent（管理员的卡）→ 全局目录。互不交叉、零兜底。
+    const m = /^u([0-9a-f]{8})-/.exec(String(agentId || ""));
+    const dir = m ? path.join(__ocsWxEmojiDir(), "u" + m[1]) : __ocsWxEmojiDir();
     const safe = String(name).replace(/[\\/:*?"<>|\s]+/g, "_");
     const files = fs.readdirSync(dir);
     for (const f of files) {
@@ -107,14 +113,14 @@ function __ocsWxFindEmojiFile(name) {
   } catch (e) { /* 目录不存在/读失败 → 未命中 */ }
   return null;
 }
-function __ocsWxExtractEmojiTags(text) {
+function __ocsWxExtractEmojiTags(text, agentId) {
   let rest = String(text || "");
   // v11：兼容全角方括号【表情:名】（模型常把 [表情:名] 写成全角）
   const re = /\[表情:([^\]]+)\]|【表情:([^】]+)】/g;
   let m, file;
   const paths = [];
   while ((m = re.exec(rest))) {
-    file = __ocsWxFindEmojiFile((m[1] || m[2] || "").trim());
+    file = __ocsWxFindEmojiFile((m[1] || m[2] || "").trim(), agentId);
     if (file && paths.length === 0) paths.push(file); // 一次回复最多 1 个表情
   }
   // 无论命中与否都剔除标签：表情名是封闭集合，查不到就是模型幻觉，不该外泄成乱码
@@ -344,7 +350,7 @@ function __ocsWxGenerateImage(prompt) {
 // 注意：替换 pieces 行时必须整段带上 ocsEmoji 声明 + 表情发图段（v12 曾只留 ocsGen 行，
 // 把 ocsEmoji 声明吞掉 → 运行时 ReferenceError: ocsEmoji is not defined，消息全挂）
 const QQ_GEN_PIECES_V12 = `                        // [openclaw-shell patch v9] [表情:名] 指令直接发图（核心层不会为指令投递媒体，无双发风险）
-                        const ocsEmoji = __ocsExtractEmojiTags(ocsMedia.rest);
+                        const ocsEmoji = __ocsExtractEmojiTags(ocsMedia.rest, deliverCtx.agentId);
                         if (ocsEmoji.paths.length) {
                           await forwardMediaUrls({ mediaUrls: ocsEmoji.paths }, deliverCtx, deliveredMediaUrls, dlog);
                         }
@@ -367,7 +373,7 @@ const QQ_GEN_AFTER_V12 = `                          if (ocsI < pieces.length - 1
 // ---------- v12 生图：微信分支两处插入 ----------
 // 同 QQ：pieces 替换必须整段带 ocsEmoji 声明 + 表情发图段（缺了会 ReferenceError）
 const WX_GEN_PIECES_V12 = `                    // [openclaw-shell patch v9] [表情:名] 指令直接发图（核心层不会为指令投递媒体，无双发风险）
-                    const ocsEmoji = __ocsWxExtractEmojiTags(ocsMedia.rest);
+                    const ocsEmoji = __ocsWxExtractEmojiTags(ocsMedia.rest, route.agentId);
                     for (const ocsEmojiPath of ocsEmoji.paths) {
                         await sendWeixinMediaFile({
                             filePath: ocsEmojiPath,
@@ -1155,6 +1161,8 @@ function patchQQ(force = false) {
     // v14-voice：语音段同样按「函数声明」校验——残缺形态（只有调用没有定义）必须进升级分支自愈
     src.includes("function __ocsExtractVoiceCmd") &&
     src.includes("function __ocsSendVoiceCmd") &&
+    // v15：表情按设备目录查图（隔离）——旧文件（全局共享池查图）必须进升级分支升级
+    src.includes("表情按设备目录查图") &&
     !force
   ) return { file, ok: true, reason: "已打过 v14 补丁（跳过）" };
   const v8End = "// ==== [/openclaw-shell patch v8] ====";
@@ -1184,6 +1192,8 @@ function patchQQ(force = false) {
     } else {
       return { file, ok: false, reason: "MEDIA 提取行未找到（文件被手动改过？）" };
     }
+    // v15：表情查图按设备目录隔离（存量调用点带上 agentId；已升级文件为 no-op）
+    out = out.split("__ocsExtractEmojiTags(ocsMedia.rest)").join("__ocsExtractEmojiTags(ocsMedia.rest, deliverCtx.agentId)");
     // v10：入站守卫（未绑定人设卡拒接 + 详细身份日志）
     if (!out.includes("[openclaw-shell] IDENTITY") && out.includes(QQ_GUARD_ANCHOR)) {
       out = out.replace(QQ_GUARD_ANCHOR, QQ_GUARD_V10);
@@ -1305,6 +1315,7 @@ function patchWX(force = false) {
     src.includes("function __ocsWxShellRoot") &&
     src.includes("function __ocsStripCot") &&
     src.includes("function __ocsWxStripVoiceCmd") &&
+    src.includes("表情按设备目录查图") &&
     !force
   ) return { file, ok: true, reason: "已打过 v14 补丁（跳过）" };
   const v8End = "// ==== [/openclaw-shell patch v8] ====";
@@ -1333,6 +1344,8 @@ function patchWX(force = false) {
       return { file, ok: false, reason: "MEDIA 提取行未找到（文件被手动改过？）" };
     }
     if (out.includes(WX_STREAM_ANCHOR)) out = out.replace(WX_STREAM_ANCHOR, WX_STREAM_REPLACEMENT);
+    // v15：表情查图按设备目录隔离（存量调用点带上 agentId；已升级文件为 no-op）
+    out = out.split("__ocsWxExtractEmojiTags(ocsMedia.rest)").join("__ocsWxExtractEmojiTags(ocsMedia.rest, route.agentId)");
     // v10：入站守卫（未绑定人设卡拒接 + 详细身份日志）
     if (!out.includes("[openclaw-shell] IDENTITY") && out.includes(WX_GUARD_ANCHOR)) {
       out = out.replace(WX_GUARD_ANCHOR, WX_GUARD_V10);
@@ -1509,7 +1522,7 @@ async function selftest() {
   if (failed) { console.log(`❌ 自检失败 ${failed} 项`); process.exit(1); }
   // 分支结构自检（防 v12 式回归：吞掉 ocsEmoji 声明 → 运行时 ReferenceError，语法检查查不出）
   const qqFull = fs.readFileSync(QQ_DIST, "utf8");
-  const emojiDeclPos = qqFull.indexOf("const ocsEmoji = __ocsExtractEmojiTags(ocsMedia.rest);");
+  const emojiDeclPos = qqFull.indexOf("const ocsEmoji = __ocsExtractEmojiTags(ocsMedia.rest");
   const genUsePos = qqFull.indexOf("const ocsGen = __ocsExtractGenerateImage(ocsEmoji.rest);");
   if (emojiDeclPos < 0 || genUsePos < 0 || emojiDeclPos > genUsePos) {
     failed++;
@@ -1518,7 +1531,7 @@ async function selftest() {
     console.log("  ✓ QQ 分支结构：ocsEmoji 声明在 ocsGen 使用之前（无 v12 回归）");
   }
   const wxFull = fs.readFileSync(WX_DIST, "utf8");
-  const wxEmojiPos = wxFull.indexOf("const ocsEmoji = __ocsWxExtractEmojiTags(ocsMedia.rest);");
+  const wxEmojiPos = wxFull.indexOf("const ocsEmoji = __ocsWxExtractEmojiTags(ocsMedia.rest");
   const wxGenPos = wxFull.indexOf("const ocsGen = __ocsWxExtractGenerateImage(ocsEmoji.rest);");
   if (wxEmojiPos < 0 || wxGenPos < 0 || wxEmojiPos > wxGenPos) {
     failed++;

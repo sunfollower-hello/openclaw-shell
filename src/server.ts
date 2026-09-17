@@ -5719,10 +5719,22 @@ app.listen(PORT, HOST, () => {
   void exportAllHistoriesToMarkdown().then((slugs) => {
     if (slugs.length) logInfo("记忆", `已导出 ${slugs.length} 张卡的本地聊天记录（通道可检索）`);
   });
-  // 表情库 → 通道媒体目录同步（~/.openclaw/media/emojis/，QQ/微信插件出口按名查图）
+  // 表情库 → 通道媒体目录同步（全局目录=管理员自己的表情池；QQ/微信插件出口按 agentId 查图，设备 agent 查各自隔离子目录）
   void syncEmojisToChannelMedia().then((files) => {
     if (files.length) logInfo("表情", `已同步 ${files.length} 个表情到通道媒体目录`);
   });
+  // v15 表情隔离：各设备空间回填各自的 u<前8位>/ 子目录（旧表情无需用户重新添加即可被通道查到）
+  void (async () => {
+    let backfilled = 0;
+    for (const d of listDevices()) {
+      const devId = String(d?.id ?? "");
+      if (!DEVICE_ID_RE.test(devId) || d.disabled) continue;
+      await runAsUser({ deviceId: devId, root: userRoot(devId) }, async () => {
+        backfilled += (await syncEmojisToChannelMedia().catch(() => [])).length;
+      }).catch(() => {});
+    }
+    if (backfilled) logInfo("表情", `已回填 ${backfilled} 个设备表情到各自隔离目录`);
+  })();
   // 通道会话观察器：网页 ↔ 微信/QQ 互传、通道对话进记忆（每 5 秒）
   startMirrorObserver();
   // 预热通道状态：这条查询要跑 openclaw CLI（冷启动 30s+），

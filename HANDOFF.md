@@ -1052,3 +1052,13 @@ QQ 通道级还留着迁移过来的 `allowFrom: ["F5D0…"]` + `dmPolicy: "allo
 4. **修复后实测**：5 插件加载 ✅、微信**双账号 monitor 明文日志**（`[61e3a1c880b0-im-bot]` 与 `[0320fee91e01-im-bot]` 各一个监听器）✅、零报错 ✅。
 5. **"回复小小"的完整链路（会话文件实锤）**：main agent 会话原文"我是小小呀！主人忘了吗，从二手市场捡回来那个…"。链路 = 用户微信消息进的是 **`61e3a1c880b0-im-bot`（管理员 06:25 登录、落在用户微信里的机器人，唯一活的）** → 该账号绑定指向管理员卡 persona-mt9xijkd……实际落到了 **main agent**（`agents.defaults.model = agnes/agnes-2.0-flash` 吻合）——因为 **bindings 的热加载"检测到但未应用"**（日志：`evaluating reload (agents.list, bindings)` → `applied (agents.list)`，bindings 被跳过），**绑定只在通道重启时生效**；用户 14:44:50 绑卡发生在 14:43:31 通道重启之后 → 绑定悬空 → 消息落 main → main 用共享 workspace 的编译人设"小小"+管理员默认模型。表情同理：main 的 SKILL/共享目录列出的是管理员表情。网关重启后路由快照已刷新，双路由均生效。
 6. **遗留认知**：① 用户微信里有**多个机器人**（每次扫码加一个：09:01/11:21/13:38 三次失败扫描留下的死 bot + 61e3「小小」+ 0320「沈知夏」）——**聊天时认准活的两个**，死的不回复；② patch-channels.mjs 的 WX_DIST 现在指向的正是活路径（tencent-weixin 副本已注册为加载源）✓，但**未来 `plugins install npm:openclaw-weixin` 一旦重装社区版又会覆盖回未打补丁状态**——微信插件升级/重装后必须重跑补丁并核对加载路径；③ 通道表情目录仍是全局共享（管理员与用户表情同池，结构问题待改）。
+
+### §60 补充 2（同日深夜）：表情包按设备彻底隔离（v15）——用户点名"所有 ID 各自独立，零共享"
+
+用户否决了"设备目录 + 全局兜底"方案（兜底=共享池换个形式存在）。最终语义：**设备 agent 只查自己的子目录，零兜底；管理员的卡查管理员自己的全局目录；两边永不交叉**。
+
+1. **emojiStore.ts**：`syncEmojisToChannelMedia()` 按 `currentDeviceId()` 分流——设备作用域同步到 `~/.openclaw/media/emojis/u<设备ID前8位>/`；管理员/单用户同步到全局目录（=管理员自己的池，用户设备绝不读写）。新增 `channelMediaDirForDevice(deviceId)`。
+2. **启动回填**（server.ts app.listen 内）：全局同步之后遍历 `listDevices()` 对每台设备 `runAsUser` 回填各自子目录——旧表情无需用户重新添加。
+3. **插件补丁 v15**（patch-channels.mjs）：`EMOJI_HELPER_CJS/ESM` 的 `__ocsFindEmojiFile(name, agentId)`/`__ocsExtractEmojiTags(text, agentId)` 按 agentId 推导目录（`^u([0-9a-f]{8})-` → `u<8hex>/` 子目录**只查它**；无 u 前缀 = 管理员/全局 agent → 全局目录）；调用点带 agentId（QQ `deliverCtx.agentId`、WX `route.agentId`）；升级分支含**存量调用点升级**（split/join 旧调用文本 → 新带 agentId 文本，幂等）+ skip 判定加 v15 标记（`表情按设备目录查图`）。注意 v15 的 replaceAll 必须放在 emoji 块替换与 gen 重插之后（顺序：emoji 块替换 → v15 调用点升级 → v10 → gen 重插 → …，实测顺序无碍：gen 模板已带新调用点）。
+4. **部署实测**：两份活插件 v15 标记=1、agentId 调用点=1、旧调用点残留=0；隔离子目录 `u1ba5242d/震惊.webp`、`u543987ae/兴奋.gif`、`uee9c5d59/猛.jpg` 回填实锤；设备管理端点仍 403、站点 200。**踩坑一次：部署漏传 emojiStore.ts**（sync 仍写全局 → 全部"已存在跳过"→ 产物空）——多文件改动部署时逐文件核对清单。
+5. **用户侧须知**：表情发图查的是设备子目录，App 里新加表情后需**重存一次卡**（SKILL 清单是编译时固化）才会被模型使用；管理员"小小"的卡用管理员全局池，两池互不可见。
