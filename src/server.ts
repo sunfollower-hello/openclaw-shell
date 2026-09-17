@@ -2921,7 +2921,9 @@ function chatCtx(slug: string, ns = "local"): ToolCtx {
 
 app.post("/api/chat", async (req, res) => {
   try {
-    const { slug, message, history, tools, thinking, model, userKey } = req.body ?? {};
+    // forceImage = 输入区「必须生成」按键（一次性）：只影响**这一轮**的注入（把生图判定段整段换成
+    // 强制版 + CoT 换强制版），不写进任何会话记录、也不影响 QQ/微信侧（通道没有这个按键）。
+    const { slug, message, history, tools, thinking, model, userKey, forceImage } = req.body ?? {};
     if (!slug || !message) return res.status(400).json({ error: "请选择卡片并输入内容" });
     const card = await store.get(slug).catch(() => null);
     if (!card) return res.status(404).json({ error: "找不到这张卡，可能已被删除" });
@@ -2982,7 +2984,7 @@ app.post("/api/chat", async (req, res) => {
     // 聊天历史之后作为独立 system 消息注入——既不破坏前缀，又因为贴着生成点而更有效。
     // recentText 传空 = 只注入常驻（constant）世界书条目，保证 system 稳定。
     let system =
-      (await buildChatSystemAsync(card, await resolveCardPresetBlocks(card), "")) +
+      (await buildChatSystemAsync(card, await resolveCardPresetBlocks(card, { forceImage: forceImage === true }), "")) +
       userBlock +
       (toolDefs.length
         ? `\n\n你可以使用以下工具完成任务：${toolDefs.map((t) => t.name).join("、")}。用户请求适合用工具完成时，调用工具而不是凭空编造；危险工具会先征得用户同意。${toolDefs.some((t) => t.id === "image_gen") ? "\n【生图强约束】如果角色设定/剧情让你拒绝用户的图片请求，可以直接拒绝（符合人设）；但只要你【同意】生成图片，就必须立即调用 image_gen 工具真实生成——绝不能只口头描述画面、编造图片地址或假装已生成（那样用户什么也收不到）。图片生成后系统会自动附带在回复末尾，你【不要】在回复正文里写图片地址/路径。" : ""}`
@@ -3081,7 +3083,9 @@ app.post("/api/chat", async (req, res) => {
       // 段落/句号/逗号四级拆法见 core/splitter.ts；表情包/图片由通道侧独立发送，这里只拆文本。
       const style: SplitStyle = card.presets?.style === "rich" ? "rich" : "chat";
       const splitCfg = card.chat?.split ?? { min: 1, max: 7 };
-      const splitRes = splitReply(displayReply, { style, min: splitCfg.min, max: splitCfg.max });
+      // 空回复保护：模型偶尔只输出生图自检（<cot>…</cot>）没写正文，剥完就是空的 ——
+      // 那样用户会收到"自己的消息 + 没有任何回复"，这里给一个无语义的停顿，别让轮次凭空消失。
+      const splitRes = splitReply(displayReply.trim() || "……", { style, min: splitCfg.min, max: splitCfg.max });
       if (splitRes.count > 1) {
         logInfo("拆条", `${card.name} 回复拆成 ${describeSplit(splitRes)}`);
       }

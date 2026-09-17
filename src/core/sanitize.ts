@@ -18,6 +18,12 @@ const COT_LINE_PREFIXES = [
 const COT_BLOCK_RE = [
   /[（(]\s*(?:让我想想|思考|内心独白|自言自语)[^）)]*[）)]/g,
   /【\s*(?:推理|思考|分析)[：:][^】]*】/g,
+  // 生图自检（CoT）：规则要求模型输出 <cot>…</cot>。成对的先剥；
+  // 模型漏写闭合标签时按「从这里到文末全剥」兜底——否则整条消息都变成思维链发给用户。
+  /<cot>[\s\S]*?<\/cot>\s*/gi,
+  /<cot_protocol>[\s\S]*?<\/cot_protocol>\s*/gi,
+  /<cot>[\s\S]*$/i,
+  /<cot_protocol>[\s\S]*$/i,
 ];
 
 /** 剥离后若文本以连接词开头（所以/总之/因此等），一并去掉残留 */
@@ -30,6 +36,9 @@ const LEADING_RESIDUE_RE = /^[\s\n]*(?:所以|总之|因此|综上所述|好，|
  */
 export function stripCoT(text: string): string {
   if (!text) return text;
+  // 出现过 CoT 标签：剥完以结果为准（哪怕剩空），**不能**回退成原文——
+  // 否则"只输出了自检、没有正文"时会把整段思维链原样发给用户（实测踩到）。
+  const sawTagCot = /<cot/i.test(text);
   let out = text;
   for (const re of COT_BLOCK_RE) out = out.replace(re, "");
   const lines = out.split(/\r?\n/);
@@ -39,6 +48,7 @@ export function stripCoT(text: string): string {
     return !COT_LINE_PREFIXES.some((re) => re.test(t));
   });
   out = kept.join("\n").replace(LEADING_RESIDUE_RE, "").trim();
+  if (sawTagCot) return out;
   return out || text.trim();
 }
 

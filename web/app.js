@@ -1253,6 +1253,8 @@ function renderWorkbench() {
           <button type="button" class="lc-pill" id="lc-opt-pill" title="模型"><span id="lc-opt-label">模型</span><span class="lc-pill-caret">▾</span></button>
           <!-- 撤销：原来在顶栏叫「撤掉上一轮」，2026-09-17 挪到输入区模型右边并改名 -->
           <button type="button" class="lc-pill" id="wb-undo-round" title="撤销最近一问一答（网页与 QQ/微信 上下文一起摘，破甲被拒时用）">撤销</button>
+          <!-- 「必须生成」：一次性——点一次只管下一轮，发出即自动熄灭。只在当前卡开了生图能力时出现 -->
+          <button type="button" class="lc-pill" id="wb-force-image" title="本轮必须生成一张图（点一次管一轮）" hidden>必须生成</button>
         </div>
         <!-- 一个「模型」按键管三件事：模型商 ｜ 模型 ｜ 思考深度（蓝色面板宽度 = 整个输入岛） -->
         <div class="lc-opt-panel" id="lc-opt-pop" hidden>
@@ -1288,6 +1290,11 @@ async function initWorkbench() {
   $("#wb-undo-round").addEventListener("click", () => {
     if (!wbSlug) return toast("先选一张卡", false);
     void wbUndoLastRound();
+  });
+  // 「必须生成」：点亮即下一轮强制出图，发出后由 wbDoSend 自动熄灭（一次性）
+  $("#wb-force-image").addEventListener("click", () => {
+    wbForceImage = !wbForceImage;
+    wbApplyForceImage();
   });
   // 三个点「更多」→ 这张卡的聊天设置页（记忆 / 查找 / 置顶 / 一键删除都在里面，
   // 对齐微信：聊天页右上角进去就是这个会话的设置）
@@ -1817,6 +1824,21 @@ function refreshLcPills() {
     const think = LC_THINKING.find((t) => t[0] === lcModelState.thinking)?.[1] ?? "自动";
     pill.title = [lcModelState.provider || "未选模型商", lcModelState.model || "未选模型", think].join(" · ");
   }
+  wbApplyForceImage();
+}
+
+// ---- 「必须生成」按钮（一次性：点一次只管下一轮，发出即熄灭） ----
+// 只在当前卡的高级配置开了生图能力（tools.enabled 含 image_gen）时出现；换到没开的卡自动熄掉。
+// 它只是一次性请求参数（/api/chat 的 forceImage），不进会话记录、不影响 QQ/微信侧。
+let wbForceImage = false;
+
+function wbApplyForceImage() {
+  const btn = $("#wb-force-image");
+  if (!btn) return;
+  const hasImage = Array.isArray(wbCardObj?.tools?.enabled) && wbCardObj.tools.enabled.includes("image_gen");
+  if (!hasImage) wbForceImage = false;
+  btn.hidden = !hasImage;
+  btn.classList.toggle("on", wbForceImage);
 }
 
 /** 面板外点一下关掉（只注册一次，避免每次进聊天页都叠一个监听） */
@@ -2102,6 +2124,10 @@ async function wbDoSend(msgs) {
     thinking: lcModelState.thinking || wbCardObj?.chat?.thinking || "auto",
     model: lcModelOverride(),
   };
+  // 「必须生成」（一次性）：取当前值后立刻熄灭——只管这一轮，不进会话记录、也不影响 QQ/微信侧
+  const forceImage = wbForceImage;
+  wbForceImage = false;
+  wbApplyForceImage();
   const ctrl = new AbortController();
   wbAbort = ctrl;
   setTypingIndicator(true); // 顶栏名字/头像变「对方正在输入中…」（不再插占位气泡）
@@ -2109,7 +2135,7 @@ async function wbDoSend(msgs) {
     const r = await api.send("/api/chat", {
       method: "POST",
       signal: ctrl.signal,
-      body: JSON.stringify({ slug: wbSlug, message: msgs.join("\n"), history: wbChatHistory.slice(0, -msgs.length), userKey: "local", ...wbLastOpts }),
+      body: JSON.stringify({ slug: wbSlug, message: msgs.join("\n"), history: wbChatHistory.slice(0, -msgs.length), userKey: "local", forceImage, ...wbLastOpts }),
     });
     if (ctrl.signal.aborted) return;
     // 用户可能在等回复期间去看配置了 → 聊天页 DOM 不在，回复要落到快照里而不是丢掉
@@ -7512,7 +7538,7 @@ function renderPresetGroupView(kind, groupId) {
               <span class="preset-badge ${it.builtin ? "builtin" : "custom"}">${it.builtin ? "内置" : "自定义"}</span>
               <span class="preset-badge" style="background:var(--bg-soft)">插入：${presetRoleLabel(it.role || "system")}</span>
               <div class="row" style="margin-left:auto">
-                <button class="ghost small-btn preset-item-edit" title="编辑">${icon("pen")}</button>
+                ${it.id === "image-cot" ? "" : `<button class="ghost small-btn preset-item-edit" title="编辑">${icon("pen")}</button>`}
                 <button class="ghost small-btn preset-item-del" title="删除" ${it.builtin ? "disabled" : ""}>${icon("trash")}</button>
               </div>
             </div>

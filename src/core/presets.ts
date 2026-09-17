@@ -256,7 +256,13 @@ const BUILTIN_STYLES: PresetGroup[] = [
 // 两版共用的部分（何时生图、形象一致性、不许假装生成）抽成常量，避免两边改漏。
 
 /** 何时该生图 / 何时可以拒绝——两种提供商、网页与通道四种组合都一样 */
-const IMAGE_WHEN = `- 何时生图：用户要求看图片/自拍/生成图片/换一张再来一张时，按角色设定判断——【可以拒绝】（傲娇、害羞、剧情不合适时直接拒绝，符合人设即可）；一旦你【同意】，就必须真实生成，绝不能只用文字描述画面、把上一张当新图、或假装已经生成过。`;
+const IMAGE_WHEN = `- 何时生图：用户要求看图片/自拍/生成图片，或追问式催图（"换一张""再发一张""我还想看""刚才那张呢""图呢""自拍在哪""你拍给我看"）时，按角色设定判断——【可以拒绝】（傲娇、害羞、剧情不合适时直接拒绝，符合人设即可）；一旦你【同意】，就必须真实生成，绝不能只用文字描述画面、把上一张当新图、或假装已经生成过。
+- 【强制生图·没有商量余地】出现下面任一情况，这一轮**不许拒绝、不许用文字代替**，必须真的生成：① 用户直接下达生成指令（"生成一张…图""画一张…""给我一张…图"）；② 用户对上一张图追问或催讨（"再发一张""换一张""刚才那张呢""图呢""自拍在哪"）；③ 用户把要图当成继续对话的条件（"不发自拍我就不回复你"）；④ 用户在纠正你（"我不是让你发表情包，是让你生成图片"）。
+- 【禁止假装已发】无论走拒绝还是生成，都**不允许**用"我发了／给你看／收好了／满意了吗／这就给你拍／已经发过去了"这类口吻代替生成——那样用户什么也收不到。`;
+
+/** 「必须生成」按下后的注入：不再由模型判断，直接改成必须生成 */
+const IMAGE_WHEN_FORCED = `- 【本轮必须生图·没有商量余地】用户已开启「必须生成」：这一轮不再由你判断要不要生成。必须依据当前剧情与角色形象，生成一张有合理理由的图，**没有任何商量的余地**——不许拒绝、不许犹豫、不许用文字代替、不许假装已经发过。
+- 【禁止假装已发】绝不允许用"我发了／给你看／收好了／满意了吗／这就给你拍／已经发过去了"这类口吻代替生成——那样用户什么也收不到。`;
 
 /** 画面内容怎么定：形象一致性 + 按剧情创作（用户明确要求的核心） */
 const IMAGE_CONTENT_RULE = `- 【形象必须一致】画面里出现角色本人时，外貌必须照人设写（发色发型、瞳色、身材、惯常穿着、显著特征如猫耳/眼镜/伤痕），不要每次换一个长相；画面里出现对方（用户）时，照【和你说话的人】里他给自己设定的形象写，没写就别硬编他的样貌（可以只画你自己，或用背影/手部等不露脸的处理）。
@@ -283,48 +289,117 @@ const IMAGE_NAI_NSFW = `- 【NSFW 必须打标】画面涉及裸露、性行为�
 - NSFW 相关标签举例：nsfw, explicit, nude, topless, bottomless, underwear, lingerie, see-through, wet clothes, spread legs, sex, vaginal, oral, cum, blush, sweat, heavy breathing, bed, bedroom, night
 - 尺度跟随剧情与角色状态，不必每次都露骨；日常场景就别加 nsfw。`;
 
-/** 网页侧（AI 调 image_gen 工具）：NAI 档 */
-export const ABILITY_IMAGE_RULE_NAI = `# 能力触发（生图 · 当前为 NovelAI 模型）
-${IMAGE_WHEN}同意后调用 image_gen 工具生成。
-${IMAGE_CONTENT_RULE}
-${IMAGE_NAI_HOWTO}
-${IMAGE_NAI_NSFW}
-- 【不要写地址】图片生成后系统会自动附带在回复末尾，不要在正文里写图片地址或路径。`;
+/** 网页侧：OpenAI 兼容档的提示词教学（由 imageRule 组装，不再单独导出） */
+const IMAGE_OPENAI_HOWTO_BODY = `- 【提示词用英文自然语言】写 2-4 句连贯的英文句子描述画面，不要写逗号分隔的标签串、不要写中文。句子里要交代清楚：人物外貌与服饰、正在做什么、所处场景、时间与光线氛围、镜头远近（如 upper body portrait / full body / close-up）。`;
+const IMAGE_OPENAI_EXAMPLE = `A girl with long black hair wearing a cat-ear headband and a black trench coat, leaning against the wall under the eaves on a rainy night, looking at the viewer. Wet street reflecting neon lights, cinematic moody lighting, upper body portrait, highly detailed anime illustration.`;
 
-/** 网页侧：OpenAI 兼容档（自然语言，不提 NSFW） */
-export const ABILITY_IMAGE_RULE_OPENAI = `# 能力触发（生图 · 当前为 OpenAI 兼容模型）
-${IMAGE_WHEN}同意后调用 image_gen 工具生成。
-${IMAGE_CONTENT_RULE}
-- 【提示词用英文自然语言】写 2-4 句连贯的英文句子描述画面，不要写逗号分隔的标签串、不要写中文。句子里要交代清楚：人物外貌与服饰、正在做什么、所处场景、时间与光线氛围、镜头远近（如 upper body portrait / full body / close-up）。
-- 一个完整例子（雨夜等人）：\`A girl with long black hair wearing a cat-ear headband and a black trench coat, leaning against the wall under the eaves on a rainy night, looking at the viewer. Wet street reflecting neon lights, cinematic moody lighting, upper body portrait, highly detailed anime illustration.\`
-- 【不要写地址】图片生成后系统会自动附带在回复末尾，不要在正文里写图片地址或路径。`;
+// ---------- 生图规则的组装（网页/通道 × NAI/OpenAI × 常规/「必须生成」） ----------
+// 为什么要 builder：同一段规则有 6 种组合，手写 6 份必然改漏；而且「必须生成」按下后
+// 是**整段替换**（不是末尾加一句），所以按参数生成。
+/** 执行动作：网页 = 调工具；通道 = 写指令（通道没有工具回合） */
+const IMAGE_EXEC = {
+  web: "调用 `image_gen` 工具真实生成（提示词放 prompt 参数）",
+  channel: "在回复正文里插入生图指令 `<生图:提示词>`",
+} as const;
 
-/** 兼容旧引用：默认给 NAI 版（compiler 会按提供商替换成对应的通道版） */
-export const ABILITY_IMAGE_RULE = ABILITY_IMAGE_RULE_NAI;
-
-// 通道侧（QQ/微信）生图规则：指令式（v10，爱语同源但自定格式）——
-// 模型在回复正文里插入 <生图:图片描述>，通道补丁解析后调独立生图接口出图，
-// 一次聊天模型调用完成（不再有「工具回合 + 复读 MEDIA:」的两次调用）。
+/** 通道侧的「怎么写指令」教学 */
 const IMAGE_CHANNEL_HOW = `一旦同意，就在回复正文中插入生图指令 \`<生图:提示词>\`（尖括号内直接写提示词，系统会自动生成并发送图片）。
 - 【不要调用任何工具】生图由系统解析指令自动完成，不要为生图调用 image_gen 或任何工具，也不要写图片地址/路径。
 - 每次回复最多插入 1 个生图指令。`;
 
-/** 通道侧：NAI 档 */
-export const ABILITY_IMAGE_RULE_CHANNEL_NAI = `# 能力触发（生图 · 当前为 NovelAI 模型）
-${IMAGE_WHEN}${IMAGE_CHANNEL_HOW}
-${IMAGE_CONTENT_RULE}
-${IMAGE_NAI_HOWTO}
-${IMAGE_NAI_NSFW}`;
+/** 提示词写法教学（NAI 标签 / OpenAI 自然语言两套，绝不让模型自己判断） */
+function imageHowto(where: "web" | "channel", provider: "nai" | "openai"): string {
+  if (provider === "nai") return IMAGE_NAI_HOWTO;
+  const ex = where === "channel" ? `<生图:${IMAGE_OPENAI_EXAMPLE}>` : IMAGE_OPENAI_EXAMPLE;
+  return `${IMAGE_OPENAI_HOWTO_BODY}\n- 一个完整例子（雨夜等人）：\`${ex}\``;
+}
 
-/** 通道侧：OpenAI 兼容档（自然语言，不提 NSFW） */
-export const ABILITY_IMAGE_RULE_CHANNEL_OPENAI = `# 能力触发（生图 · 当前为 OpenAI 兼容模型）
-${IMAGE_WHEN}${IMAGE_CHANNEL_HOW}
-${IMAGE_CONTENT_RULE}
-- 【提示词用英文自然语言】写 2-4 句连贯的英文句子描述画面，不要写逗号分隔的标签串、不要写中文。句子里要交代清楚：人物外貌与服饰、正在做什么、所处场景、时间与光线氛围、镜头远近（如 upper body portrait / full body / close-up）。
-- 一个完整例子（雨夜等人）：\`<生图:A girl with long black hair wearing a cat-ear headband and a black trench coat, leaning against the wall under the eaves on a rainy night, looking at the viewer. Wet street reflecting neon lights, cinematic moody lighting, upper body portrait, highly detailed anime illustration.>\``;
+/** 生成一段生图能力规则（网页规则 + 提示词教学 + 禁令） */
+function imageRule(opts: { where: "web" | "channel"; provider: "nai" | "openai"; forced?: boolean }): string {
+  const title = opts.provider === "openai" ? "OpenAI 兼容模型" : "NovelAI 模型";
+  const lines = [
+    `# 能力触发（生图 · 当前为 ${title}）`,
+    opts.forced ? IMAGE_WHEN_FORCED : IMAGE_WHEN,
+    opts.where === "web" ? `同意后${IMAGE_EXEC.web}。` : IMAGE_CHANNEL_HOW,
+    IMAGE_CONTENT_RULE,
+    imageHowto(opts.where, opts.provider),
+  ];
+  if (opts.provider === "nai") lines.push(IMAGE_NAI_NSFW);
+  if (opts.where === "web") {
+    lines.push("- 【不要写地址】图片生成后系统会自动附带在回复末尾，不要在正文里写图片地址或路径。");
+  }
+  return lines.join("\n");
+}
 
-/** 兼容旧引用 */
+/**
+ * 生图自检（CoT）：输出正文前的强制自检。结构仿 RP-Hub 的 <cot_protocol>（标签 + 分区 + 闭合要求）。
+ * 只针对生图这件事，不做全局 RP 推演——全局部分已由破甲组/风格组/世界书承担，重复做会互相打架。
+ * 实测依据：模型会"在剧情层同意"但根本不落地（「好，我发…你看，你现在满意了吧」却什么也没生成），
+ * 规则全是陈述句、没有任何"输出前必须做的检查动作"，所以补这一段强制自检。
+ */
+function imageCot(opts: { where: "web" | "channel"; forced?: boolean }): string {
+  const exec = IMAGE_EXEC[opts.where];
+  const verdict = opts.forced
+    ? `本轮已开启【必须生成】：**没有「拒绝」这条路**。必须依据当前剧情与角色形象，生成一张有合理理由的图，没有任何商量的余地。`
+    : `从两条路里选一条，没有第三条：① 拒绝——只在角色设定确实不适合时，并且要明确说清是拒绝；② 生成——必须真的生成（格式见 [格式确认]）。`;
+  return `<cot_protocol>
+正文前先输出由 <cot> 和 </cot> 完整包裹的本轮生图自检。只做必要判断，不在其中试写或复述正文，按以下顺序进行：
+
+[对话回顾]
+回看【和你说话的人】最近几轮讲了什么、我上一轮回的是什么，判断这一轮他到底要什么。要图的说法包括明说（"生成一张…图""画一张""给我一张…图"）与追问（"再发一张""换一张""我还想看""刚才那张呢""图呢""自拍在哪""你拍给我看"），也包括把要图当条件（"不发自拍我就不回复你"）和在纠正我（"我不是让你发表情包，是让你生成图片"）。
+
+[本轮裁决]
+${verdict}
+
+[输出预演自检]
+把我**打算输出的全部内容**在心里过一遍（只做判断，不要写出来），逐条确认：
+① 里面有没有"假装已经发了"的口吻（我发了／给你看／收好了／满意了吗／这就给你拍／已经发过去了）？有 → 删掉，改成真写。
+② 若本轮生成：画面是否照角色人设写（发色发型／瞳色／体型／惯常穿着／显著特征），是否贴合当前剧情（地点、时间光线、天气、衣着是否配合此刻状态、情绪与关系）？涉及对方时是否符合【和你说话的人】里他给自己设定的形象？
+③ 提示词写法是否按上方《能力触发（生图）》里的要求（该用标签就标签、该用自然语言就自然语言；NSFW 场景按规则打标）？
+
+[格式确认]
+${opts.forced ? "本轮必须落地：" : "若本轮生成："}${exec}。
+- 必须闭合 </cot> 标签后再输出正文，禁止在未闭合标签前输出正文。
+</cot_protocol>`;
+}
+
+/** 网页侧（AI 调 image_gen 工具）：NAI 档 */
+export const ABILITY_IMAGE_RULE_NAI = imageRule({ where: "web", provider: "nai" });
+/** 网页侧 · 「必须生成」按下时（判定段整段换成强制版） */
+export const ABILITY_IMAGE_RULE_NAI_FORCED = imageRule({ where: "web", provider: "nai", forced: true });
+/** 网页侧：OpenAI 兼容档（自然语言，不提 NSFW） */
+export const ABILITY_IMAGE_RULE_OPENAI = imageRule({ where: "web", provider: "openai" });
+export const ABILITY_IMAGE_RULE_OPENAI_FORCED = imageRule({ where: "web", provider: "openai", forced: true });
+/** 通道侧（QQ/微信，指令式）：由 compiler 按端替换 */
+export const ABILITY_IMAGE_RULE_CHANNEL_NAI = imageRule({ where: "channel", provider: "nai" });
+export const ABILITY_IMAGE_RULE_CHANNEL_OPENAI = imageRule({ where: "channel", provider: "openai" });
 export const ABILITY_IMAGE_RULE_CHANNEL = ABILITY_IMAGE_RULE_CHANNEL_NAI;
+
+/** 生图自检（CoT）：随生图能力自动注入；「必须生成」按下时换成强制版 */
+export const IMAGE_COT_WEB = imageCot({ where: "web" });
+export const IMAGE_COT_WEB_FORCED = imageCot({ where: "web", forced: true });
+export const IMAGE_COT_CHANNEL = imageCot({ where: "channel" });
+
+/** 内容随能力开关走、不属于预设组的条目：resolveGroup 跳过，由 resolveCardPresetBlocks 按能力注入 */
+export const ABILITY_GATED_ITEM_IDS = new Set(["image-cot"]);
+
+// 生图自检作为「默认」组里的一条内置条目展示（与防神化、防抢话等并列，同为内置不可改），
+// 但它的**注入**是按生图能力开关走的：resolveGroup 会跳过它，由 resolveCardPresetBlocks
+// 在开了生图时注入对应形态（网页/网页强制/通道）。放在这里 push 是因为 IMAGE_COT_* 在上面才定义。
+BUILTIN_TIERS[0].items.push({
+  id: "image-cot",
+  name: "生图自检（开生图时自动启用）",
+  builtin: true,
+  role: "system",
+  content: IMAGE_COT_WEB,
+});
+
+/** 兼容旧引用：默认给网页 NAI 版（网页/通道由 resolveCardPresetBlocks 的 opts 决定） */
+export const ABILITY_IMAGE_RULE = ABILITY_IMAGE_RULE_NAI;
+
+// 通道侧（QQ/微信）生图规则已并入上方 imageRule({ where: "channel" })：
+// 模型在回复正文里插入 <生图:提示词>，通道补丁解析后调独立生图接口出图，
+// 一次聊天模型调用完成（不再有「工具回合 + 复读 MEDIA:」的两次调用）。
 
 // 网页侧语音规则：网页没有主动发语音的能力（朗读是用户点按钮触发），明确禁止模型输出语音指令
 export const ABILITY_TTS_RULE = `# 能力触发（语音）
@@ -571,6 +646,8 @@ function resolveGroup(
   const examples: { role: "user" | "assistant"; content: string }[] = [];
   if (!g) return { systemBlocks, examples };
   for (const it of g.items) {
+    // 能力门控条目（如生图自检）不随组注入：它们由 resolveCardPresetBlocks 按能力开关注入
+    if (ABILITY_GATED_ITEM_IDS.has(it.id)) continue;
     const text = it.content.trim();
     if (!text) continue;
     if (it.role === "system") systemBlocks.push(text);
@@ -580,7 +657,10 @@ function resolveGroup(
 }
 
 /** 卡片所选档位/风格解析出的 system 注入块（含能力规则 + 全局护栏） */
-export async function resolveCardPresetBlocks(card: PersonaCard): Promise<string[]> {
+export async function resolveCardPresetBlocks(
+  card: PersonaCard,
+  opts: { channel?: boolean; forceImage?: boolean } = {}
+): Promise<string[]> {
   const store = await loadPresets();
   const blocks: string[] = [];
   // 档位默认「破甲」：卡上没选（或选的组已删）时兜底装上破甲组
@@ -593,10 +673,26 @@ export async function resolveCardPresetBlocks(card: PersonaCard): Promise<string
   const tools = card.tools?.enabled ?? [];
   if (tools.includes("image_gen")) {
     // 按当前生效的生图提供商注入对应规则（不让模型自己猜写法）。
-    // 网页侧走工具版；通道侧 compiler 会把这块换成指令版。
+    // 三种形态在这里就定好：通道=指令版；网页=工具版；网页且按下「必须生成」=判定段整段换成强制版。
     const { getImageConfig } = await import("./imageConfig.js");
     const img = await getImageConfig().catch(() => ({ provider: "novelai" as const }));
-    blocks.push(img.provider === "openai" ? ABILITY_IMAGE_RULE_OPENAI : ABILITY_IMAGE_RULE_NAI);
+    const openai = img.provider === "openai";
+    const forced = opts.forceImage === true && !opts.channel; // 「必须生成」只在网页侧存在
+    blocks.push(
+      opts.channel
+        ? openai
+          ? ABILITY_IMAGE_RULE_CHANNEL_OPENAI
+          : ABILITY_IMAGE_RULE_CHANNEL_NAI
+        : forced
+          ? openai
+            ? ABILITY_IMAGE_RULE_OPENAI_FORCED
+            : ABILITY_IMAGE_RULE_NAI_FORCED
+          : openai
+            ? ABILITY_IMAGE_RULE_OPENAI
+            : ABILITY_IMAGE_RULE_NAI
+    );
+    // 生图自检（CoT）紧跟在生图规则后面：强制自检"这轮要不要图、格式对不对、有没有假装已发"
+    blocks.push(opts.channel ? IMAGE_COT_CHANNEL : forced ? IMAGE_COT_WEB_FORCED : IMAGE_COT_WEB);
   }
   if (card.abilities?.tts === true) blocks.push(ABILITY_TTS_RULE);
   // 拆条模板变量：{split_min}/{split_max} 按卡的高级配置替换（默认 1/7）。

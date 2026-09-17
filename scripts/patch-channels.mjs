@@ -405,6 +405,20 @@ const WX_GEN_AFTER_V12 = `                    logger.info(\`outbound: text sent 
                     }
                 }`;
 
+// ---------- v14：出口剥离「生图自检（CoT）」 ----------
+// 生图 CoT 让模型在正文前输出 <cot>…</cot> 的本轮自检；那是给它自己看的内部推理，
+// **绝不能发给用户**。两个抽取函数（QQ/WX）是所有出口的第一站，剥离挂在那里一处生效。
+// 成对先剥，再兜底剥未闭合的：模型漏写 </cot> 时按"从这里到文末全剥"，否则整条消息都变成思维链。
+const COT_STRIP_HELPER = String.raw`/* [openclaw-shell patch v14] 出口剥离生图自检（CoT）：内部推理不发给用户 */
+function __ocsStripCot(text) {
+  var s = String(text || "");
+  s = s.replace(/<cot>[\s\S]*?<\/cot>\s*/gi, "");
+  s = s.replace(/<cot_protocol>[\s\S]*?<\/cot_protocol>\s*/gi, "");
+  s = s.replace(/<cot>[\s\S]*$/i, "");
+  s = s.replace(/<cot_protocol>[\s\S]*$/i, "");
+  return s;
+}`;
+
 // ---------- 全新安装的完整基线：QQ helper（v8 增强 + v9 表情） ----------
 const QQ_HELPER_FULL = String.raw`
 // ==== [openclaw-shell patch v9] 活人感拆条 + MEDIA/[表情] 转媒体：发送前拦截 ====
@@ -485,7 +499,9 @@ function __ocsSplitHumanLike(text, style) {
 // 提取文本里的 MEDIA: 指令行（模型可能复读工具返回的 MEDIA: 路径，且可能在同一行后粘别的文字；
 // block 管线不解析 MEDIA:，这里按扩展名截断提取路径，剩余文字保留继续发送）
 const __ocsMediaPathRe = /^\s*MEDIA:\s*(?:\`([^\`]+?\.(?:png|jpe?g|gif|webp|bmp|silk|mp3|amr|wav|ogg|flac|aac|m4a|mp4|mov|avi|mkv|webm|flv|wmv))\`|([^\s\`]+?\.(?:png|jpe?g|gif|webp|bmp|silk|mp3|amr|wav|ogg|flac|aac|m4a|mp4|mov|avi|mkv|webm|flv|wmv)))/i;
+${COT_STRIP_HELPER}
 function __ocsExtractMediaDirectives(text) {
+  text = __ocsStripCot(text);
   var rawLines = String(text || "").split("\n"), paths = [], kept = [], i, m, line;
   for (i = 0; i < rawLines.length; i++) {
     line = rawLines[i];
@@ -673,7 +689,9 @@ function __ocsWxSplitHumanLike(text, style) {
 // 提取文本里的 MEDIA: 指令行（模型可能复读工具返回的 MEDIA: 路径，且可能在同一行后粘别的文字；
 // block 管线不解析 MEDIA:，这里按扩展名截断提取路径，剩余文字保留继续发送）
 const __ocsWxMediaPathRe = /^\s*MEDIA:\s*(?:\`([^\`]+?\.(?:png|jpe?g|gif|webp|bmp|silk|mp3|amr|wav|ogg|flac|aac|m4a|mp4|mov|avi|mkv|webm|flv|wmv))\`|([^\s\`]+?\.(?:png|jpe?g|gif|webp|bmp|silk|mp3|amr|wav|ogg|flac|aac|m4a|mp4|mov|avi|mkv|webm|flv|wmv)))/i;
+${COT_STRIP_HELPER}
 function __ocsWxExtractMediaDirectives(text) {
+  text = __ocsStripCot(text);
   const rawLines = String(text || "").split("\n");
   const paths = [];
   const kept = [];
@@ -1046,8 +1064,10 @@ function patchQQ(force = false) {
     src.includes("function __ocsShellRoot") &&
     src.includes("function __ocsGroupRecall") &&
     src.includes(QQ_GROUP_NEW_MARK) &&
+    // v14 出口剥离生图自检：缺它就还得跑一遍升级分支（否则新版本只会"跳过"，新加的东西永远装不上）
+    src.includes("function __ocsStripCot") &&
     !force
-  ) return { file, ok: true, reason: "已打过 v13.1 补丁（跳过）" };
+  ) return { file, ok: true, reason: "已打过 v14 补丁（跳过）" };
   const v8End = "// ==== [/openclaw-shell patch v8] ====";
   if (src.includes(v8End) || src.includes("__ocsConsumeStalePendingMedia")) {
     let out = src;
@@ -1137,6 +1157,13 @@ function patchQQ(force = false) {
       if (!out.includes(QQ_GROUP_JOIN_ANCHOR)) return { file, ok: false, reason: "进群事件锚点未找到（上游结构变了）" };
       out = out.replace(QQ_GROUP_JOIN_ANCHOR, QQ_GROUP_JOIN_V13);
     }
+    // v14：出口剥离生图自检（CoT）——已打过补丁的安装也要补上这道闸（幂等：有 __ocsStripCot 就跳过）
+    if (!out.includes("__ocsStripCot")) {
+      const fnAnchor = "function __ocsExtractMediaDirectives(text) {";
+      if (!out.includes(fnAnchor)) return { file, ok: false, reason: "生图自检剥离锚点未找到（文件被手动改过？）" };
+      out = out.replace(fnAnchor, () => `${COT_STRIP_HELPER}\n${fnAnchor}`);
+      out = out.replace(`${fnAnchor}\n`, () => `${fnAnchor}\n  text = __ocsStripCot(text);\n`);
+    }
     fs.writeFileSync(file, out, "utf8");
     return { file, ok: true, reason: "v13.1 升级完成（群聊入站 TDZ 修复）" };
   }
@@ -1158,7 +1185,8 @@ function patchWX(force = false) {
   const file = WX_DIST;
   if (!fs.existsSync(file)) return { file, ok: false, reason: "微信插件文件不存在（可能升级换路径了）" };
   let src = fs.readFileSync(file, "utf8").replace(/\r\n/g, "\n");
-  if (src.includes("__ocsWxExtractMediaLocal") && src.includes("一次回复最多 1 个表情") && src.includes("v9.5") && src.includes("[openclaw-shell] IDENTITY") && src.includes("【表情:") && src.includes("__ocsWxExtractGenerateImage") && !force) return { file, ok: true, reason: "已打过 v12 补丁（跳过）" };
+  // v14 出口剥离生图自检：缺它也照样要跑升级分支（否则新加的东西永远装不上）
+  if (src.includes("__ocsWxExtractMediaLocal") && src.includes("一次回复最多 1 个表情") && src.includes("v9.5") && src.includes("[openclaw-shell] IDENTITY") && src.includes("【表情:") && src.includes("__ocsWxExtractGenerateImage") && src.includes("function __ocsStripCot") && !force) return { file, ok: true, reason: "已打过 v14 补丁（跳过）" };
   const v8End = "// ==== [/openclaw-shell patch v8] ====";
   if (src.includes(v8End) || src.includes("__ocsWxConsumeStalePendingMedia")) {
     let out = src;
@@ -1222,6 +1250,13 @@ function patchWX(force = false) {
       const genBlockStart = "                    // [openclaw-shell patch v12] 生图执行：文本先发，再异步出图；失败只发「生图失败」（不丢提示词）";
       const genBlock = WX_GEN_AFTER_V12.slice(WX_GEN_AFTER_V12.indexOf(genBlockStart), WX_GEN_AFTER_V12.lastIndexOf("\n                }"));
       out = out.slice(0, closeIdx) + "\n" + genBlock + out.slice(closeIdx);
+    }
+    // v14：出口剥离生图自检（CoT）——同上，幂等
+    if (!out.includes("__ocsStripCot")) {
+      const fnAnchor = "function __ocsWxExtractMediaDirectives(text) {";
+      if (!out.includes(fnAnchor)) return { file, ok: false, reason: "生图自检剥离锚点未找到（微信侧，文件被手动改过？）" };
+      out = out.replace(fnAnchor, () => `${COT_STRIP_HELPER}\n${fnAnchor}`);
+      out = out.replace(`${fnAnchor}\n`, () => `${fnAnchor}\n  text = __ocsStripCot(text);\n`);
     }
     fs.writeFileSync(file, out, "utf8");
     return { file, ok: true, reason: "v9.5 → v12 升级完成" };

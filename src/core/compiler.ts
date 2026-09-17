@@ -12,7 +12,7 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import type { PersonaCard } from "./schema.js";
 import { RELATION_ROLES } from "./schema.js";
-import { resolveCardPresetBlocks, resolveCardPresetExamples, ABILITY_IMAGE_RULE, ABILITY_IMAGE_RULE_NAI, ABILITY_IMAGE_RULE_OPENAI, ABILITY_IMAGE_RULE_CHANNEL, ABILITY_IMAGE_RULE_CHANNEL_NAI, ABILITY_IMAGE_RULE_CHANNEL_OPENAI, ABILITY_TTS_RULE, ABILITY_VOICE_RULE_CHANNEL } from "./presets.js";
+import { resolveCardPresetBlocks, resolveCardPresetExamples, ABILITY_TTS_RULE, ABILITY_VOICE_RULE_CHANNEL } from "./presets.js";
 import { applyMacros, userName, userBio, type MacroValues } from "./macros.js";
 import { buildEmojiPrompt } from "./emojiStore.js";
 import { readEntries, evtRangeText } from "./memoryStore.js";
@@ -496,17 +496,11 @@ export async function compileCard(card: PersonaCard, workspace: string): Promise
   const macros: MacroValues = { user: await userName(), char: card.name };
   const c = macroDeep(card, macros);
 
-  const presetBlocks = (await resolveCardPresetBlocks(c)).map((b) => applyMacros(b, macros));
-  // 通道侧生图规则换指令版：模型输出 <生图:描述> 由插件补丁解析出图，
-  // 不引导调用 image_gen 工具（避免「工具回合 + 收尾」两次聊天模型调用）。
-  // 按当前生图提供商挑 NAI 标签版或 OpenAI 自然语言版（两者不让模型自己判断）。
-  // 通道侧语音规则同理换指令版（v14）：模型输出 [语音!:文字] 由 QQ 补丁合成直发语音条
+  // 通道侧生图规则/生图自检：在 resolveCardPresetBlocks 里就按 {channel:true} 生成为**指令版**
+  // （模型输出 <生图:提示词>，由插件补丁解析后出图，不引导调用 image_gen 工具，避免「工具回合 + 收尾」
+  // 两次聊天模型调用）。所以这里只剩语音规则要换指令版（v14）：[语音!:文字] 由 QQ 补丁合成直发。
+  const presetBlocks = (await resolveCardPresetBlocks(c, { channel: true })).map((b) => applyMacros(b, macros));
   for (let i = 0; i < presetBlocks.length; i++) {
-    if (presetBlocks[i] === ABILITY_IMAGE_RULE_NAI || presetBlocks[i] === ABILITY_IMAGE_RULE) {
-      presetBlocks[i] = ABILITY_IMAGE_RULE_CHANNEL_NAI;
-    } else if (presetBlocks[i] === ABILITY_IMAGE_RULE_OPENAI) {
-      presetBlocks[i] = ABILITY_IMAGE_RULE_CHANNEL_OPENAI;
-    }
     if (presetBlocks[i] === ABILITY_TTS_RULE) presetBlocks[i] = ABILITY_VOICE_RULE_CHANNEL;
   }
   // 破甲示范对话（few-shot 锚定，AGENTS.md 与 SKILL.md 共用）

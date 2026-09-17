@@ -1663,6 +1663,9 @@ body.lc-fullscreen .lc-root { height: var(--app-h, 100dvh); }
   max-width: 130px; white-space: nowrap;
 }
 .lc-pill:hover { border-color: var(--accent); color: var(--accent); }
+/* 「必须生成」点亮态（一次性：发出后自动熄灭） */
+.lc-pill.on { background: var(--accent); border-color: var(--accent); color: #ffffff; }
+.lc-pill.on:hover { background: var(--accent); border-color: var(--accent); color: #ffffff; }
 .lc-pill-caret { font-size: 9px; color: var(--muted); }
 
 /* =====「模型」按键弹出的大面板：三栏竖线分隔（模型商 ｜ 模型 ｜ 思考深度）======
