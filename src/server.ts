@@ -1170,6 +1170,47 @@ async function beginClaimForDevice(channel: BotChannel, res: express.Response): 
   beginLoginClaim(channel, dev, known);
 }
 
+/**
+ * QQ 登录成功后的归属判定（事件驱动，替代快照差集）：
+ * 官方 bot 的 appId 写在 channels.qqbot 根 = 单槽位 "default"，谁扫码谁所有。
+ * 快照差集在这个槽位上失效（重扫覆盖同一个槽位名，永远不算"新账号"→ 之前"App 提示成功但列表空"的根源），
+ * 所以登录成功（凭证已落盘）时直接把槽位判给发起设备。
+ */
+async function attributeQqLoginToDevice(deviceId: string): Promise<void> {
+  setAccountOwner("qqbot", "default", deviceId);
+  const cleaned = await cleanupForeignQqBots("default", deviceId);
+  invalidateChannelStatus();
+  logInfo("通道", `QQ 登录归属完成：default → 设备 ${deviceId.slice(0, 8)}…${cleaned.length ? `；清理他人残留 bot ${cleaned.length} 个` : ""}`);
+}
+
+/**
+ * 清理其他设备/管理员名下绑在 qqbot:<accountId> 上的僵尸 bot 并解除路由：
+ * 设备重新扫码会覆盖根槽位凭证，旧主人的 bot 记录与路由若不清理，
+ * 新用户的私聊会被路由进旧主人的卡（跨用户串话）。
+ * 只动 bot 记录与路由绑定（直写 openclaw.json，毫秒级），不删对方 agent（卡的运行时保留）。
+ */
+async function cleanupForeignQqBots(accountId: string, newOwnerId: string): Promise<string[]> {
+  const removed: string[] = [];
+  const cleanScope = async (label: string, remove: (id: string) => Promise<unknown>) => {
+    for (const b of await listBots().catch(() => [])) {
+      if (b.channel !== "qqbot" || b.accountId !== accountId) continue;
+      await unbindAccountDirect("qqbot", accountId).catch(() => null);
+      await remove(b.id).catch(() => null);
+      removed.push(`${label}:${b.agentId}`);
+    }
+  };
+  await cleanScope("全局", (id) => removeBot(id));
+  for (const d of listDevices()) {
+    const devId = String(d?.id ?? "");
+    if (!DEVICE_ID_RE.test(devId) || devId === newOwnerId || d.disabled) continue;
+    await runAsUser({ deviceId: devId, root: userRoot(devId) }, async () => {
+      await cleanScope(devId.slice(0, 8), (id) => removeBot(id));
+    }).catch(() => {});
+  }
+  invalidateBindingsCache();
+  return removed;
+}
+
 // ---------- 通道：微信 ----------
 app.get("/api/channels/wechat/status", async (req, res) => {
   try {
@@ -1196,7 +1237,12 @@ app.post("/api/channels/wechat/login", async (_req, res) => {
     });
   }
   await beginClaimForDevice("openclaw-weixin", res);
-  res.json(startChannelLogin("openclaw-weixin"));
+  // 设备作用域：传一次性临时账号名（UUID 形状 → 微信插件视作"临时会话键"，不落持久别名、不做别名冲突检查）。
+  // 不传的话 CLI 会拿通道现有默认账号当请求 alias，与该 alias 已存凭证必然冲突
+  // （09-17 实锤：already has credentials for a different bot——每个用户扫码产生的是自己的新 bot）。
+  // 凭证最终落在真实 bot hash 名下并登记进账号索引，由认领机制判给发起设备。
+  const dev = res.locals.ocDevice as string | null | undefined;
+  res.json(startChannelLogin("openclaw-weixin", dev ? { cliAccount: crypto.randomUUID() } : undefined));
 });
 
 // 从 CLI 登录输出里揪出二维码链接（微信 weixin.qq.com/q/xxx，QQ q.qq.com/... 或带 qrcode= 的 URL），
@@ -1283,7 +1329,12 @@ app.post("/api/channels/qq/login", async (_req, res) => {
       slot,
     });
   }
-  res.json(startChannelLogin("qqbot"));
+  const dev = res.locals.ocDevice as string | null | undefined;
+  // 设备作用域：登录成功（CLI exit 0，appId 已写入根槽位）后把槽位判给发起设备，并清理他人残留绑定。
+  // 快照差集对 QQ 单槽位是失效的（重扫永远覆盖同一个槽位名 "default"，不算"新账号"）→ 假成功的根源。
+  res.json(
+    startChannelLogin("qqbot", dev ? { deviceId: dev, onOk: () => attributeQqLoginToDevice(dev) } : undefined)
+  );
 });
 
 app.get("/api/channels/qq/login", async (_req, res) => {

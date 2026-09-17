@@ -7074,7 +7074,7 @@ async function startLogin(channelPath, qrSel, msgSel, refreshCb, statusSel) {
 // CLI 从启动到出码要十几秒，而且这段全在它内部静默等待（实测无网络连接、日志也无输出），
 // 我们没法让它更快 —— 但可以在用户**打开通道页**时就把登录进程起起来：
 // 等他看完说明点「开始扫码绑定」时，二维码通常已经好了（同一进程会被复用，不会重复生成）。
-// 代价是后台挂一个登录进程，所以限时 90 秒没人点就自动取消。
+// 代价是后台挂一个登录进程，所以限时 120 秒没人点就自动取消。
 let qrPrefetchTimer = null;
 let qrPrefetchUsed = false;
 async function prefetchQrLogin() {
@@ -7090,7 +7090,7 @@ async function prefetchQrLogin() {
     qrPrefetchTimer = null;
     if (qrPrefetchUsed) return; // 用户已经点了扫码：交给正常流程
     void api.send("/api/channels/qq/login/cancel", { method: "POST" }).catch(() => {});
-  }, 90_000);
+  }, 120_000);
 }
 
 function initChannels() {

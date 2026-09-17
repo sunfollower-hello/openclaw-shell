@@ -233,14 +233,30 @@ function clearLoginTimer(key: string): void {
   loginTimers[key] = null;
 }
 
+/** 发起通道扫码登录的选项 */
+export interface ChannelLoginOpts {
+  /** 传给 CLI 的 --account 值。仅作用于本次进程，**不参与**登录状态的轮询键（前端轮询不带它）。
+   *  微信设备登录传一次性 UUID：微信插件视其为"临时会话键"，不落持久别名、不做别名冲突检查，
+   *  凭证最终落在真实 bot hash 名下——否则 CLI 会拿通道现有默认账号当请求 alias，与已有凭证必然冲突。 */
+  cliAccount?: string;
+  /** 登录状态轮询键的账号段（bot 级登录传 bot.accountId；通道页登录省略 → "default"） */
+  keyAccount?: string;
+  /** 发起设备（设备作用域登录时由路由传入；管理员/单用户为空 → 不做归属收尾） */
+  deviceId?: string | null;
+  /** CLI 进程成功退出（exit 0，凭证已落盘）后的宿主侧收尾：归属判定 / 他人残留清理 */
+  onOk?: () => void | Promise<void>;
+}
+
 /** 发起通道扫码登录；带 accountId 时登录到指定渠道账号（多机器人用），否则登录默认账号 */
-export function startChannelLogin(channel: string, accountId?: string): ChannelLoginState {
-  const key = loginKey(channel, accountId);
+export function startChannelLogin(channel: string, accountIdOrOpts?: string | ChannelLoginOpts): ChannelLoginState {
+  const opts: ChannelLoginOpts =
+    typeof accountIdOrOpts === "string" ? { keyAccount: accountIdOrOpts, cliAccount: accountIdOrOpts } : accountIdOrOpts ?? {};
+  const key = loginKey(channel, opts.keyAccount);
   const proc = loginProcs[key];
   if (proc && !proc.killed) return { ...logins[key] };
   logins[key] = { running: true, done: false, ok: false, output: "" };
   const args = ["channels", "login", "--channel", channel];
-  if (accountId) args.push("--account", accountId);
+  if (opts.cliAccount) args.push("--account", opts.cliAccount);
   const child = spawnOpenclawInteractive(args);
   loginProcs[key] = child;
   const append = (d: Buffer | string) => {
@@ -258,6 +274,12 @@ export function startChannelLogin(channel: string, accountId?: string): ChannelL
     s.ok = ok;
     if (note) s.output = (s.output + "\n" + note).slice(-16000);
     loginProcs[key] = null;
+    if (ok && opts.onOk) {
+      // 归属/清理是宿主侧收尾（此刻凭证已落盘），异步执行、不阻塞登录状态返回
+      void Promise.resolve()
+        .then(opts.onOk)
+        .catch((e) => console.error("[openclaw-cli] 登录成功收尾失败:", e instanceof Error ? e.message : String(e)));
+    }
   };
   child.on("close", (code) => finish(code === 0));
   child.on("error", () => finish(false));

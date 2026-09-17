@@ -1021,3 +1021,23 @@ QQ 通道级还留着迁移过来的 `allowFrom: ["F5D0…"]` + `dmPolicy: "allo
 - 沙箱测试法：脚本副本 `os.homedir()` 替换成沙箱目录，对服务器拉下来的**残缺文件**跑 → 自愈 ✅ / 符号 ✅ / 幂等（二跑跳过）✅ / 与合并文件 diff 仅布局差异 ✅。
 - **已知保留**：① 通道表情媒体目录 `~/.openclaw/media/emojis/` 全局共享（多用户同名互覆、跨用户可发）——结构性问题待改按 agentId→设备查图；② `patch-channels.mjs` 的**全新安装路径**（上游原始文件分支）自 v12 起缺 gen 群聊 CoT voice 的插入步骤，且 QQ_DIST/WX_DIST 硬编码 2.0.3 目录名（插件升级换目录脚本就找不到文件）——插件升级时应走升级流程或人工核对，升级路径（现网文件重打）已完整；③ `[表情:生气]` 是模型编造（用户卡列表只有"兴奋"，SKILL 已禁仍编）——修好插件后未命中标签会被剔除不发，但不发图。
 - **待用户真机验收**：QQ 发一条带换行回复看拆条、发 `[表情:兴奋]` 看图（QQ 通道现已 READY）；中转站 `Kimi-K2.6` 渠道（用户自查，500 可用渠道不存在）。
+
+---
+
+## §60 扫码链路多租户修复：微信一次性 UUID 账号 + QQ 登录成功事件归属 + 预生成 120s（2026-09-17，已上线）
+
+§59 收尾后用户真机（App 用户版，设备 1ba5242d）继续报障，深挖出扫码链路两个根因，全部修复。
+
+### 根因
+1. **微信扫码 100% 失败 = alias 凭证槽冲突**：CLI `channels login` 省略 `--account` 时传下去的不是 "default" 哨兵，而是**通道现有默认账号**（=运营者的 `61e3a1c880b0-im-bot`）；而微信机器人平台**每次扫码都下发一个新 bot**（用户三次扫码在插件私有目录留下三个孤儿凭证 `745e…/50c5…/d820…`）→ `persistWeixinLoginAccounts` → `assertAliasCredentialCompatible` 发现该 alias 已有别的 bot 凭证 → 抛 `already has credentials for a different bot` → 保存失败、CLI 非零退出、accounts.json 不登记 → App 里"连接失败"。用户其实**每次都拿到了有效凭证**，死在登记一步。
+2. **QQ"假成功" = 归属认领快照对单槽位失效**：QQ 官方 bot 的 appId 写在 channels.qqbot 根 = 单槽位 "default"，重扫永远覆盖同一个槽位名，**快照差集永远不算"新账号"** → CLI exit 0（appId 确实写入、前端弹"扫码成功，已绑定！"）但归属没判给发起设备 → 列表空 = "实际没成功"。另有跨用户串话风险：新用户覆盖凭证后，旧主人的路由绑定若不清理，新用户的私聊会进旧主人的卡。
+
+### 修复
+1. **微信：设备登录传一次性 UUID**（`server.ts` wechat login 路由）：`startChannelLogin("openclaw-weixin", { cliAccount: crypto.randomUUID() })` → CLI `--account <uuid>`；微信插件 `resolveLoginAccountAlias` 对 UUID 形状（临时会话键）直接返回 null——**不落持久别名、不做冲突检查**，凭证照常落到真实 bot hash 并登记进 accounts.json 索引 → 认领机制判给发起设备。同微信用户重扫时插件 `clearStaleAccountsForUserId` 自动清掉旧 bot（索引不堆积）。管理员登录不传 UUID（保持原重绑语义）。
+2. **QQ：登录成功事件驱动归属**（`server.ts` qq login 路由 + 新增 `attributeQqLoginToDevice` / `cleanupForeignQqBots`）：`startChannelLogin` 重构为 opts（`cliAccount`=仅本次进程的 --account、`keyAccount`=轮询键账号段、`deviceId`+`onOk`=成功收尾）；CLI exit 0 时把 `default` 槽位 `setAccountOwner` 给发起设备，并 `cleanupForeignQqBots` 清理其他设备/管理员名下绑在同槽位的僵尸 bot（`unbindAccountDirect` 直写解除路由 + `removeBot` 删记录，**不删对方 agent**）+ `invalidateBindingsCache`。字符串实参兼容旧调用（bot 级登录 `startChannelLogin(bot.channel, bot.accountId)` 行为不变）。
+3. **预生成 90s → 120s**（`web/app.js` prefetchQrLogin）。
+4. 观测补充发现：管理台对登录事件零日志（本次靠插件私有目录文件时间戳反推）；`os.homedir()` 直跑 `channels status` 必须 HOME=/root 否则空 JSON。
+
+### 验证
+- `tsc --noEmit` ✅、构建 ✅；部署后以设备身份实测发起微信登录：**进程命令行带 `--account aa0b2928-…`（UUID）✅**，cancel 正常回收 ✅；dist 含新函数 ✅；线上 app.js 含 120_000 ✅；站点 200。
+- **待真机验收**：手机 App 扫微信（应成功绑定，列表出现 d820… 式 bot id，之前三个孤儿凭证已被本次修复前的扫描耗掉不影响）；QQ 重扫一遍验证"成功=列表真出现"。**已知取舍**：微信每次扫码产生新 bot id，同用户旧 bot 由插件自动清；QQ 单槽位=一台服务器同时只有一个 QQ bot 在线（多 QQ bot 需 CLI 多账号路径，未验证）。
