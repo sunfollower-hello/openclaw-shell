@@ -2947,23 +2947,23 @@ async function startBotLogin(botId) {
   try { await api.send(`/api/bots/${botId}/login`, { method: "POST" }); } catch (e) { msg.textContent = "发起失败：" + e.message; return; }
   botLoginBotId = botId; // 记下来，关窗时取消登录进程
   msg.textContent = "二维码生成中…";
+  // 生成过程不露 CLI 原始输出（banner/ASCII 码/ANSI 碎片），给转圈提示；二维码好了直接上图
+  if (qrImg) { qrImg.innerHTML = `<div class="conn-loading">大约十几秒…</div>`; qrImg.style.display = "block"; }
+  if (qr) qr.style.display = "none";
   if (botLoginTimer) clearInterval(botLoginTimer);
   // 二维码出现前用 300ms 快轮询抢首帧，拿到码后降到 1.5s 省资源
   let gotQr = false;
   const poll = async () => {
     try {
       const s = await api.get(`/api/bots/${botId}/login`);
-      // 优先用后端渲染的高清二维码图片；拿不到 URL 再退回终端 ASCII 码
+      // 只认后端渲染的高清二维码图片；终端 ASCII 不再作为正常展示路径
       if (s.qrDataUrl && qrImg) {
         qrImg.innerHTML = `<img src="${s.qrDataUrl}" alt="扫码二维码">`;
         qrImg.style.display = "block";
-        qr.style.display = "none";
+        if (qr) qr.style.display = "none";
         if (qrLink && s.qrUrl) { qrLink.href = s.qrUrl; qrLink.style.display = "block"; }
-      } else if (s.output) {
-        qr.textContent = s.output;
-        qr.style.display = "block";
       }
-      if ((s.qrDataUrl || s.output) && !gotQr) {
+      if (s.qrDataUrl && !gotQr) {
         gotQr = true;
         msg.textContent = "请用手机扫码";
         clearInterval(botLoginTimer);
@@ -2971,7 +2971,10 @@ async function startBotLogin(botId) {
       }
       if (s.done) {
         clearInterval(botLoginTimer); botLoginTimer = null;
-        msg.textContent = s.ok ? "扫码成功，账号已绑定，已立即生效" : "未成功，检查输出后重试";
+        msg.textContent = s.ok ? "扫码成功，账号已绑定，已立即生效" : "未成功，下面是终端输出，可对照平台侧排查：";
+        if (!s.ok && qr) { qr.textContent = s.output || "（没有输出）"; qr.style.display = "block"; }
+        if (qrImg) { qrImg.innerHTML = ""; qrImg.style.display = "none"; }
+        if (qrLink) qrLink.style.display = "none";
         refreshBots();
       }
     } catch { /* 轮询失败忽略 */ }
@@ -6896,46 +6899,105 @@ function renderChannels() {
 }
 
 const loginTimers = {};
-async function startLogin(channelPath, qrSel, msgSel, refreshCb) {
+
+/**
+ * 扫码登录。三点讲究（2026-09-17 用户反馈后改）：
+ * ① **生成过程不露出 CLI 的原始输出**——里面有 banner、ASCII 二维码、ANSI 碎片，用户看到只会一脸问号；
+ *    改成转圈提示，二维码好了直接上图；只有**失败时**才把原始输出铺出来给人排障。
+ * ② 扫码期间把通道状态标签切成「扫码中…」。原来标签一直写着「已连接 ✓」（它的意思是
+ *    "这个通道已经有 N 个账号"），用户正在扫新号时看到它，会以为"我还没扫怎么就连接了"。
+ * ③ 成功后强制刷一次状态（状态有 5 分钟缓存，不强制的话刚扫的账号不会立刻出现在列表里）。
+ */
+async function startLogin(channelPath, qrSel, msgSel, refreshCb, statusSel) {
   const imgSel = qrSel + "-img", linkSel = qrSel + "-link";
+  const showWaiting = () => {
+    if ($(qrSel)) $(qrSel).style.display = "none";
+    if ($(linkSel)) $(linkSel).style.display = "none";
+    if ($(imgSel)) {
+      $(imgSel).innerHTML = `<div class="conn-loading">二维码生成中，大约十几秒…</div>`;
+      $(imgSel).style.display = "block";
+    }
+    $(msgSel).textContent = "";
+    if (statusSel && $(statusSel)) { $(statusSel).textContent = "扫码中…"; $(statusSel).className = "chip"; }
+  };
   try {
+    showWaiting(); // 点下去立刻有反馈（POST 本身也要几百毫秒）
     await api.send(channelPath, { method: "POST" });
-    $(msgSel).textContent = "二维码生成中…";
     if (loginTimers[channelPath]) clearInterval(loginTimers[channelPath]);
+    let gotQr = false;
     loginTimers[channelPath] = setInterval(async () => {
       try {
         const s = await api.get(channelPath);
-        // 优先高清图片二维码，退回终端 ASCII
+        // 高清图片二维码（生成中不再退化成终端 ASCII 输出）
         if (s.qrDataUrl && $(imgSel)) {
+          if (!gotQr) { gotQr = true; $(msgSel).textContent = "请用手机扫码"; }
           $(imgSel).innerHTML = `<img src="${s.qrDataUrl}" alt="扫码二维码">`;
           $(imgSel).style.display = "block";
-          $(qrSel).style.display = "none";
+          if ($(qrSel)) $(qrSel).style.display = "none";
           if ($(linkSel) && s.qrUrl) { $(linkSel).href = s.qrUrl; $(linkSel).style.display = "block"; }
-        } else if (s.output) {
-          $(qrSel).textContent = s.output; $(qrSel).style.display = "block";
         }
         if (!s.running && s.done) {
           clearInterval(loginTimers[channelPath]);
           loginTimers[channelPath] = null;
-          $(msgSel).textContent = s.ok ? "扫码成功，已绑定！" : "未成功，检查平台侧后重试";
-          refreshCb && refreshCb();
+          if (s.ok) {
+            $(msgSel).textContent = "扫码成功，已绑定！";
+          } else {
+            // 失败才露原始输出（否则生成过程一律不露）
+            $(msgSel).textContent = "未成功，下面是终端输出，可对照平台侧排查：";
+            if ($(qrSel)) { $(qrSel).textContent = s.output || "（没有输出）"; $(qrSel).style.display = "block"; }
+          }
+          if ($(imgSel)) { $(imgSel).innerHTML = ""; $(imgSel).style.display = "none"; }
+          if ($(linkSel)) $(linkSel).style.display = "none";
+          refreshCb && refreshCb(!!s.ok); // 回调按 ok 决定要不要再强制刷一次（见 initChannels）
         }
-      } catch { /* 忽略 */ }
+      } catch { /* 单次轮询失败忽略 */ }
     }, 800);
   } catch (e) {
     // 账号槽位满：后端拒绝生成二维码，把原因原样告诉用户（要先彻底删一个账号）
     $(msgSel).textContent = e.message || "启动失败";
     if (/存满/.test(e.message || "")) toast(e.message, false);
+    refreshCb && refreshCb(false);
   }
 }
 
+// ---------- 二维码预生成（把 CLI 那十几秒藏起来）----------
+// CLI 从启动到出码要十几秒，而且这段全在它内部静默等待（实测无网络连接、日志也无输出），
+// 我们没法让它更快 —— 但可以在用户**打开通道页**时就把登录进程起起来：
+// 等他看完说明点「开始扫码绑定」时，二维码通常已经好了（同一进程会被复用，不会重复生成）。
+// 代价是后台挂一个登录进程，所以限时 90 秒没人点就自动取消。
+let qrPrefetchTimer = null;
+let qrPrefetchUsed = false;
+async function prefetchQrLogin() {
+  try {
+    const s = await api.get("/api/channels/qq/status");
+    if (!s.pluginInstalled) return; // 插件都没装，谈不上扫码
+    await api.send("/api/channels/qq/login", { method: "POST" });
+  } catch {
+    return; // 槽位满 / 其它原因：静默放弃，用户点按钮时还会再试一次
+  }
+  if (qrPrefetchTimer) clearTimeout(qrPrefetchTimer);
+  qrPrefetchTimer = setTimeout(() => {
+    qrPrefetchTimer = null;
+    if (qrPrefetchUsed) return; // 用户已经点了扫码：交给正常流程
+    void api.send("/api/channels/qq/login/cancel", { method: "POST" }).catch(() => {});
+  }, 90_000);
+}
+
 function initChannels() {
-  $("#btn-wx-login").addEventListener("click", () => startLogin("/api/channels/wechat/login", "#wx-qr", "#wx-login-msg", () => { refreshWechat(); refreshPairing(); }));
+  // 状态有 5 分钟缓存：扫码流程一结束先用缓存把标签复位（快），成功后 0.8s 再强制刷一次拿新账号
+  const refreshWx = (ok) => { refreshWechat(); refreshPairing(); if (ok) setTimeout(() => refreshWechat(true), 800); };
+  const refreshQq = (ok) => { refreshQQ(); if (ok) setTimeout(() => refreshQQ(true), 800); };
+  $("#btn-wx-login").addEventListener("click", () => startLogin("/api/channels/wechat/login", "#wx-qr", "#wx-login-msg", refreshWx, "#wx-status"));
   $("#btn-wx-refresh").addEventListener("click", () => { refreshWechat(true); refreshConnections(); });
   $("#btn-pair-approve").addEventListener("click", approvePairing);
-  $("#btn-qq-login").addEventListener("click", () => startLogin("/api/channels/qq/login", "#qq-qr", "#qq-login-msg", refreshQQ));
+  $("#btn-qq-login").addEventListener("click", () => {
+    qrPrefetchUsed = true; // 标记用户已主动发起，预生成的收尾定时器别再取消它
+    if (qrPrefetchTimer) { clearTimeout(qrPrefetchTimer); qrPrefetchTimer = null; }
+    startLogin("/api/channels/qq/login", "#qq-qr", "#qq-login-msg", refreshQq, "#qq-status");
+  });
   $("#btn-qq-refresh").addEventListener("click", () => { refreshQQ(true); refreshConnections(); });
   refreshWechat(); refreshPairing(); refreshQQ(); refreshConnections();
+  void prefetchQrLogin();
 }
 let connCardsCache = null; // 卡片列表（渲染换卡下拉用，变动少，缓存一份省一次请求
 const connBusy = new Set(); // 正在换卡中的 bot id：该行渲染成「更换中…」转圈，防止后台静默重绘把它跳回老卡
@@ -7194,13 +7256,15 @@ async function refreshQQ(force = false) {
   try {
     const s = await api.get("/api/channels/qq/status" + (force ? "?refresh=1" : ""));
     const el = $("#qq-status");
-    el.textContent = s.connected ? "已连接 ✓" : "未连接";
+    // 带上账号数，免得用户把「已连接 ✓」误会成"我刚扫的码已经好了"（它说的是这个通道已有几个账号）
+    const accs = s.accounts ?? [];
+    el.textContent = s.connected ? (accs.length ? `已连接 ✓（${accs.length} 个账号）` : "已连接 ✓") : "未连接";
     el.className = "chip " + (s.connected ? "ok" : "");
     // 已绑定的账号列出来，让用户知道扫的码到底落到哪个号上了
     $("#qq-out").textContent = !s.pluginInstalled
       ? "还没装 QQ 官方插件，装好后再来扫码"
-      : s.accounts?.length
-        ? "已绑定账号：" + s.accounts.join("、")
+      : accs.length
+        ? "已绑定账号：" + accs.join("、")
         : "还没有绑定账号，点上方按钮扫码";
   } catch { $("#qq-status").textContent = "检测失败"; }
 }
