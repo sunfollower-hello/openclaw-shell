@@ -48,25 +48,10 @@ export const BUILTIN_ARTISTS: ArtistPreset[] = [
     // 上游工作台的「动漫同人风」预设原文：纯风格词、无画师名（站方按自家模型调的，稳定）
     content: "masterpiece, best quality, very aesthetic, modern Japanese anime, official anime art, anime key visual, anime screencap, soft cel shading, soft anime coloring, smooth color transitions, natural skin tones, restrained color palette, slightly desaturated, muted colors, soft ambient lighting, gentle contrast, subtle gradients, subtle bloom, detailed anime background",
   },
-  // ---- 可爱粉彩偶像系三候选（09-15 交付，用户要留作默认；未实测，效果以实际出图为准）----
-  {
-    name: "经典可爱基底",
-    builtin: true,
-    // ciloranko 主导：粉彩肤色软萌基底（ciloranko/sho=粉彩、tianliang=透明感、kani_biimu/aki99=可爱脸型）
-    content: "5::best quality, amazing quality, masterpiece::, 1.4::artist:ciloranko::, 1.2::artist:sho_(sho_lwlw)::, 1.1::artist:tianliang_duohe_fangdongye::, 0.8::artist:baku-p::, 0.9::artist:kani_biimu::, 0.8::artist:aki99::, 0.7::artist:kedama_milk::, year_2026, year_2025, year_2024, newest",
-  },
-  {
-    name: "偶像梦幻感",
-    builtin: true,
-    // yoneyama_mai 主导：透亮偶像感／梦境光（mika_pikazo=高饱和流行色、hanekoto/meyoco=空气感柔光）
-    content: "5::best quality, amazing quality, masterpiece::, 1.3::artist:yoneyama_mai::, 1.2::artist:mika_pikazo::, 1.1::artist:ciloranko::, 0.9::artist:hanekoto::, 0.8::artist:meyoco::, 0.8::artist:puuzaki_puuna::, 0.7::artist:hayana_neru::, 0.7::artist:rokita::, year_2026, year_2025, year_2024, newest",
-  },
-  {
-    name: "清透水彩感",
-    builtin: true,
-    // tianliang_duohe_fangdongye 主导：水彩透明感（creayus=渐变配色、ke-ta=压饱和）
-    content: "5::best quality, amazing quality, masterpiece::, 1.5::artist:tianliang_duohe_fangdongye::, 1.2::artist:creayus::, 1.1::artist:ke-ta::, 0.9::artist:huanxiang_heitu::, 0.8::artist:haneru::, 0.8::artist:sasa_onigiri::, 0.7::artist:kanzakietc::, year_2026, year_2025, year_2024, newest",
-  },
+  // 【2026-09-17 用户删】原「可爱粉彩偶像系三候选」（经典可爱基底 / 偶像梦幻感 / 清透水彩感）已移除：
+  // 用户明确"默认画师串只留前三个（2.5D写实 / 超写实二次元 / 同人风），其他三个都是不要的"。
+  // 内置串是「代码里定义 + 读写时合并」，从这张表删掉即所有设备/所有配置里都不再出现，无需数据迁移
+  // （normalize 会把同名的用户条目丢掉，activeArtist 指向已删条目时自动清空）。
 ];
 
 const BUILTIN_NAMES = new Set(BUILTIN_ARTISTS.map((a) => a.name));

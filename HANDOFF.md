@@ -748,3 +748,41 @@ script -qec "node /usr/lib/node_modules/openclaw/openclaw.mjs channels login --c
 
 ### 另记：排查时踩的坑
 `pkill -f "channels login"` 会**把自己这条 SSH 命令一起杀掉**（我的命令行里就含这几个字，正则自匹配）→ 表现是"命令毫无输出"。要写成 `pkill -f "[c]hannels login"`。
+---
+
+## §55 清空历史账号 + 内置画师串只留三条（2026-09-17，**已上线**）
+
+**用户原话**：「QQ微信原来自带的账号全部解绑再删掉，我不希望我自己的号影响到全局使用，后面我自己会跟普通用户一样再连一次，我不希望别人的号被我的这个号所影响」+「把画师串删一下，我的默认画师串只留前三个（2.5D写实、超写实二次元、同人风），其他三个都是不要的」。
+
+### 一、那些账号是哪来的（结论：电脑当服务器那阵绑的，跟着数据搬过来的）
+- 账号实体在**共享网关家目录** `~/.openclaw`（服务器 `/data/openclaw`）下，不是按设备分开的 —— 设备隔离靠的是**账号归属表** `data/channel-owners.json` + 命名空间，凭证本身是同一份。
+- 时间戳证据：`qqbot/qq-6eht`、`qqbot/qq-xj5u`、`qqbot/default` 三个目录**同秒创建于 2026-09-16 06:34**（数据搬迁那一刻），而其中 `default` 的内容 mtime 还是 **2026-08-25 18:25** —— 典型的"带时间戳拷贝"：这些是 8 月 25 号在**电脑**（当时电脑当服务器）上绑的账号。
+- 它们在共享 `openclaw.json` 里的路由（本次已解绑）：
+  - `persona-mt9xijkd ← openclaw-weixin:be1f34aa93f9-im-bot`
+  - `anxia ← qqbot:qq-xj5u`
+  - `persona-mtusl05c ← qqbot:qq-6eht`
+- 可见性实测（同一时刻三个设备身份）：App 设备 `1ba5242d…` → `accounts=[]`；测试设备 → `[]`；**标了 admin 的设备 → 看得见全部**。所以"看到两个账号"只可能发生在管理员/全局视角，普通设备本来就看不见、也删不了。
+
+### 二、清空步骤（先备份、再解绑、最后删）
+1. **备份**（仅 root 可读）：`/data/backups/legacy-accounts-20260917/`（`openclaw.json`、`qqbot/`、`openclaw-weixin/`、`channel-owners.json`，另存 `openclaw.json.before-wx-clean`）。**要回滚就从这个目录捞凭证回来**。
+2. **解绑**：`openclaw agents unbind --agent <id> --bind <channel[:accountId]>` ×3 → `agents bindings` 变成 `No routing bindings.`
+3. **删账号**：走 shell 自己的 `POST /api/channels/accounts/delete {channel, accountId}`（管理员身份）×4 —— 它会跑 `agents delete` + `channels remove --delete` + 清插件残留 + 释放槽位 + 清归属。结果：`qq-xj5u`、`qq-6eht`、`be1f34aa93f9-im-bot`、`f41317d1b1e5-im-bot` 全部删除成功。
+4. **发现一条界面删不到的黑账号**：`channels list` 还剩 `QQ Bot default` —— 那是插件第一次登录时自动建的兜底账号，**shell 的账号列表不显示它**，只能走 CLI 删：`openclaw channels remove --channel qqbot --account default --delete`。删完 `channels list` 报 **`no configured chat channels`**。
+5. **清插件私有残留**（CLI 与 shell 都不管的部分，含**别人跟你老机器人聊过的东西**）：
+   - `qqbot/data/qq-6eht/`、`qqbot/data/qq-xj5u/` 的 `ref-index.jsonl`（30KB / 258KB 消息索引）
+   - `qqbot/data/known-users.json` 里 3 条 **别人的 openid**（`F5D0…`/`FCAF…`/群 `853C…`，都挂在被删的两个账号上）
+   - `qqbot/data/credential-backup/current.json`（**存着 qq-6eht 的 appId 与 clientSecret**）
+   - `qqbot/default/`（空壳目录）
+6. **重启网关**（`systemctl restart openclaw-gateway`）让运行态丢掉老账号；核实：状态接口 `connected=false, accounts=[]`（QQ 与微信都是）、网关日志无报错、站点 200。
+
+### 三、删除接口的两个漏项（本次已修，`src/server.ts`）
+1. **微信的 per-account 配置条目不会被清**：`channels remove --delete` 只清微信插件的 `accounts.json` 索引与账号态文件，**`openclaw.json` 里 `channels["openclaw-weixin"].accounts[<acc>]` 会一直留着**（实测留下两条残壳）。现在跟 QQ 分支一样按 key 删掉。
+2. **QQ 的插件私有目录没清**：原来只删 `~/.openclaw/qqbot/<acc>`，没删 `qqbot/data/<acc>`（消息索引）、`qqbot/data/known-users.json` 里该账号的记录、`qqbot/data/credential-backup/current.json`。现在按 accountId 一并清，并在 `notes` 里报出清了几条。
+
+### 四、内置画师串只留三条（`src/core/imageConfig.ts`）
+`BUILTIN_ARTISTS` 里原有 6 条：2.5D写实 / 超写实二次元 / 同人风 + 09-15 交付的「可爱粉彩偶像系三候选」（经典可爱基底 / 偶像梦幻感 / 清透水彩感）。按用户要求**删掉后三条**，现在正好三条。
+内置串是"代码里定义 + 读写时合并"，所以从表里删掉就**在所有设备、所有配置里一起消失，不需要数据迁移**（normalize 会丢掉同名的用户条目；`activeArtist` 指向已删条目时自动清空）。线上核实：管理员视角与设备视角都是 `2.5D写实 / 超写实二次元 / 同人风`，`activeArtist` 仍为 `2.5D写实`。
+> 注意这条改动**也在用户版（main）的范围里**：推到 `main` 时三个候选会一起从用户版消失（用户已确认不要）。
+
+### 五、留了一条没动的（等用户决定）
+QQ 通道级还留着迁移过来的 `allowFrom: ["F5D0…"]` + `dmPolicy: "allowlist"`（老机器人时代允许跟你聊天的 openid 白名单）。账号没了它目前是惰性的，但它会影响**以后新绑的机器人谁能聊天**（新号 openid 不同就可能被挡）。语义我不确定（清空白名单 + allowlist 可能变成"谁都不能聊"），所以没敢自作主张，留给用户定。

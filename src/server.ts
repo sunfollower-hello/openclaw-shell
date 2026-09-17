@@ -1578,8 +1578,9 @@ app.post("/api/channels/accounts/delete", async (req, res) => {
     if (rm && rm.code === 0) notes.push("已删除通道账号配置");
 
     // ③ 清残留：CLI 对插件私有目录不负责，不清会被 scanKnownAccounts 再扫出来
+    const ocHome = path.join(os.homedir(), ".openclaw");
     if (channel === "openclaw-weixin") {
-      const base = path.join(os.homedir(), ".openclaw", "openclaw-weixin");
+      const base = path.join(ocHome, "openclaw-weixin");
       const idxPath = path.join(base, "accounts.json");
       try {
         const list = JSON.parse(await fs.readFile(idxPath, "utf8"));
@@ -1594,9 +1595,20 @@ app.post("/api/channels/accounts/delete", async (req, res) => {
       for (const f of await fs.readdir(accDir).catch(() => [] as string[])) {
         if (f.startsWith(acc)) await fs.rm(path.join(accDir, f), { force: true }).catch(() => {});
       }
+      // openclaw.json 里的账号条目：CLI 的 channels remove 不动微信这一段（2026-09-17 实测漏了，
+      // 不清的话配置里永远留着一条 per-account 残壳），跟 QQ 分支一样按 key 删掉
+      const wxCfg = path.join(ocHome, "openclaw.json");
+      try {
+        const conf = JSON.parse(await fs.readFile(wxCfg, "utf8"));
+        if (conf?.channels?.["openclaw-weixin"]?.accounts?.[acc]) {
+          delete conf.channels["openclaw-weixin"].accounts[acc];
+          await fs.writeFile(wxCfg, JSON.stringify(conf, null, 2), "utf8");
+          notes.push("已从配置移除微信账号");
+        }
+      } catch { /* 配置读不到就跳过 */ }
     } else {
       // QQ：openclaw.json 里的账号条目 + ~/.openclaw/qqbot/<acc> 目录
-      const cfgPath = path.join(os.homedir(), ".openclaw", "openclaw.json");
+      const cfgPath = path.join(ocHome, "openclaw.json");
       try {
         const conf = JSON.parse(await fs.readFile(cfgPath, "utf8"));
         if (conf?.channels?.qqbot?.accounts?.[acc]) {
@@ -1605,7 +1617,30 @@ app.post("/api/channels/accounts/delete", async (req, res) => {
           notes.push("已从配置移除 QQ 账号");
         }
       } catch { /* 配置读不到就跳过 */ }
-      await fs.rm(path.join(os.homedir(), ".openclaw", "qqbot", acc), { recursive: true, force: true }).catch(() => {});
+      // 插件私有目录：<acct> 的账号态 + data/<acct> 的消息索引（实测能到几百 KB）
+      await fs.rm(path.join(ocHome, "qqbot", acc), { recursive: true, force: true }).catch(() => {});
+      await fs.rm(path.join(ocHome, "qqbot", "data", acc), { recursive: true, force: true }).catch(() => {});
+      // 跟这个账号聊过的人（别人 openid 躺在 known-users.json 里）+ 该账号的凭证备份
+      // —— 用户明确"不希望自己的号影响到别处"，这两样必须一起清
+      const kuPath = path.join(ocHome, "qqbot", "data", "known-users.json");
+      try {
+        const raw = JSON.parse(await fs.readFile(kuPath, "utf8"));
+        if (Array.isArray(raw)) {
+          const next = raw.filter((x) => String((x as { accountId?: unknown })?.accountId ?? "") !== acc);
+          if (next.length !== raw.length) {
+            await fs.writeFile(kuPath, JSON.stringify(next, null, 2), "utf8");
+            notes.push(`已清 ${raw.length - next.length} 条该账号的 known-users 记录`);
+          }
+        }
+      } catch { /* 没有这个文件 */ }
+      const cbPath = path.join(ocHome, "qqbot", "data", "credential-backup", "current.json");
+      try {
+        const cb = JSON.parse(await fs.readFile(cbPath, "utf8"));
+        if (String((cb as { accountId?: unknown })?.accountId ?? "") === acc) {
+          await fs.rm(cbPath, { force: true }).catch(() => {});
+          notes.push("已删除该账号的凭证备份");
+        }
+      } catch { /* 没有备份文件 */ }
     }
 
     await removeAccountLabel(channel, acc).catch(() => {});
