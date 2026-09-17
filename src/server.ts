@@ -70,7 +70,7 @@ import {
 } from "./core/lifeScheduler.js";
 import { TOOL_REGISTRY, toolsToOpenAI, resolveInSandbox, type ToolDef, type ToolCtx } from "./tools/registry.js";
 import { FEATURES, filterDisabledTools } from "./core/features.js";
-import { runAsUser, userRoot, DEVICE_ID_RE, currentDeviceId } from "./core/dataRoot.js";
+import { runAsUser, userRoot, DEVICE_ID_RE, currentDeviceId, devicePrefix } from "./core/dataRoot.js";
 import { ensureDevice, isDeviceAdmin, listDevices, setDeviceAdmin, setDeviceDisabled } from "./core/users.js";
 import {
   accountOwner,
@@ -185,7 +185,7 @@ import {
   roundKeyOf,
   evtRangeText,
 } from "./core/memoryStore.js";
-import { appendConv, readConv, readConvSrcIds, deleteConvByIds, clearConv, type ConvSurface } from "./core/conversationStore.js";
+import { appendConv, readConv, readConvSrcIds, deleteConvByIds, clearConv, type ConvSurface, type ConvEntry } from "./core/conversationStore.js";
 import { readChatListState, setPinned, forgetChatListEntry } from "./core/chatListStore.js";
 import { recallChatSnippets } from "./core/chatRecall.js";
 import {
@@ -203,11 +203,13 @@ import { exportHistoryToMarkdown, exportAllHistoriesToMarkdown, readRecentLocalC
 import { readConfigState, recordConfigChange, buildConfigChangeReminder, buildConfigSectionForUserMd } from "./core/configState.js";
 import {
   pollSessionTurns,
+  commitObserveCursor,
   findSession,
   sessionKeyOf,
   listAgentSessionUsers,
   clearObserveCursor,
   type MirrorTurn,
+  type SessionInfo,
 } from "./core/sessionMirror.js";
 
 // 加载项目 .env（仅补环境变量空缺，如 OPENCLAW_SHELL_UI_USER/PASS）
@@ -3702,35 +3704,42 @@ async function writeMirrorState(slug: string, s: { openid?: string; sessionId?: 
  * 不依赖 QQ known-users.json（openid 大写与会话 key 小写不一致）和微信 accounts.json
  * （里面是账号 id 不是用户）——会话索引的 origin.from/label 是权威来源。
  */
-async function mirrorTargetOf(bot: BotInstance): Promise<{ openid: string } | null> {
+async function mirrorTargetOf(bot: BotInstance): Promise<{ openid: string; session: SessionInfo | null } | null> {
   const state = await readMirrorState(bot.cardSlug);
   if (state.openid) {
     // 校验旧 openid 是否仍对应当前会话（换绑/换渠道后旧值会失配——曾出现 QQ 时代的
     // openid 残留导致微信消息一直同步不到网页）
     const stillValid = await findSession(bot.agentId, bot.accountId, state.openid).catch(() => null);
-    if (stillValid) return { openid: state.openid };
+    // 顺手把查到的会话带出去：pollSessionTurns 就不用再读一遍 sessions.json（扫描器每 5 秒轮一遍）
+    if (stillValid) return { openid: state.openid, session: stillValid };
     await writeMirrorState(bot.cardSlug, { sessionId: "", lastSyncAt: "" }).catch(() => {});
   }
   const users = await listAgentSessionUsers(bot.agentId, bot.accountId);
   if (!users.length) return null;
   users.sort((a, b) => b.updatedAt - a.updatedAt);
-  return { openid: users[0].openid };
+  return { openid: users[0].openid, session: null };
 }
 
-/** 观察一张卡的通道会话：增量同步进统一日志 + 喂自动记忆。返回新增轮次数。 */
-async function observeCard(slug: string): Promise<number> {
+/** 观察一张卡的通道会话：增量同步进统一日志 + 喂自动记忆。
+ *  返回本轮真正写进日志的条目（App 打开时的增量拉取直接用它们回填本地副本）。
+ *
+ *  两条纪律（都是「App 没开就不复刻」踩出来的）：
+ *  ① **游标在写盘之后才推进**（commitObserveCursor）——中途失败只会下一轮重读，
+ *     重读的按来源消息 id 去重丢掉，绝不静默漏；
+ *  ② 同一张卡同时只跑一次（服务端定时扫描与网页轮询会撞车，撞车就有重复导入风险）。 */
+async function observeCard(slug: string): Promise<{ added: number; entries: ConvEntry[] }> {
   const bot = await getBotByCard(slug);
-  if (!bot) return 0;
+  if (!bot) return { added: 0, entries: [] };
   const target = await mirrorTargetOf(bot);
-  if (!target) return 0;
+  if (!target) return { added: 0, entries: [] };
   const ns = `${nsOfChannel(bot.channel)}:${target.openid}`;
-  const { sessionId, turns } = await pollSessionTurns(slug, bot, target.openid);
-  if (!turns.length) return 0;
+  const { sessionId, turns, sessionIds } = await pollSessionTurns(slug, bot, target.openid, target.session);
+  if (!turns.length) return { added: 0, entries: [] };
   // 按来源消息 id 去重：游标重置（会话文件重建/截断）会把整段会话当新消息返回，
   // 不去重的话同一批消息会被反复追加进日志（网页端出现重复气泡）
   const seen = await readConvSrcIds(slug);
   const fresh = turns.filter((t) => !t.id || !seen.has(t.id));
-  if (!fresh.length) return 0;
+  const written: ConvEntry[] = [];
   for (const t of fresh) {
     // 通道回合在 OpenClaw 会话里被合并成一条 assistant 消息（含换行）——网页端按换行拆回多条气泡，
     // 还原通道端逐条发送的消息边界；【表情:名】全角标签统一转半角（网页端只认 [表情:名]）
@@ -3739,12 +3748,17 @@ async function observeCard(slug: string): Promise<number> {
     if (t.role === "assistant" && normed.includes("\n")) {
       const parts = normed.split(/\n+/).map((s) => s.trim()).filter(Boolean);
       for (const p of parts) {
-        void appendConv(slug, { role: "assistant", content: p, surface: surfaceOfChannel(bot.channel), ns, srcId: t.id || undefined }).catch(() => {});
+        const e = await appendConv(slug, { role: "assistant", content: p, surface: surfaceOfChannel(bot.channel), ns, srcId: t.id || undefined }).catch(() => null);
+        if (e) written.push(e);
       }
     } else {
-      void appendConv(slug, { role: t.role, content: normed, surface: surfaceOfChannel(bot.channel), ns, srcId: t.id || undefined }).catch(() => {});
+      const e = await appendConv(slug, { role: t.role, content: normed, surface: surfaceOfChannel(bot.channel), ns, srcId: t.id || undefined }).catch(() => null);
+      if (e) written.push(e);
     }
   }
+  // 写盘成功才推进水位（写失败就不推进，下一轮重来；重来的会被上面的 srcId 去重挡掉）
+  await commitObserveCursor(slug, fresh, sessionIds).catch(() => {});
+  if (!fresh.length) return { added: 0, entries: [] };
   // 配对 user/assistant 喂自动记忆（assistant 与前一条 user 组成一轮；单条不配对等下一批）
   const card = await store.get(slug).catch(() => null);
   let pendingUser = "";
@@ -3761,7 +3775,19 @@ async function observeCard(slug: string): Promise<number> {
   }
   // 通道有新消息 → 刷新 USER.md（当前配置/变更提醒/记忆随每轮注入，及时反映最新设置）
   void syncAgentUserMemory(slug).catch(() => {});
-  return fresh.length;
+  return { added: fresh.length, entries: written };
+}
+
+/** 同卡去重锁：扫描器与网页轮询可能同时观察到同一张卡。
+ *  锁键带设备前缀——不同设备命名空间里可以有同名卡，不能互相挡住。 */
+const observeInflight = new Map<string, Promise<{ added: number; entries: ConvEntry[] }>>();
+function observeCardLocked(slug: string): Promise<{ added: number; entries: ConvEntry[] }> {
+  const key = `${devicePrefix()}${slug}`;
+  const running = observeInflight.get(key);
+  if (running) return running;
+  const p = observeCard(slug).finally(() => observeInflight.delete(key));
+  observeInflight.set(key, p);
+  return p;
 }
 
 /** 解析 `openclaw agent --json` 输出里的回复文本（实测结构：result.payloads[].text /
@@ -4068,6 +4094,52 @@ app.post("/api/cards/:slug/conversation/undo", async (req, res) => {
   }
 });
 
+// ---------- App 打开时的增量拉取：把服务器的记录灌进 App 本地（永久副本） ----------
+// 场景：用户在 QQ/微信里跟机器人聊天，App 根本没开。服务器那头 sweepMirrors 一直在补观察，
+// 记录已经攒在服务端；App 一打开就来这里拉「游标之后的所有新消息」（**所有卡**，不只当前
+// 打开的那张），写进浏览器 IndexedDB。服务器只留 RETENTION_DAYS 天，用户自己的完整聊天
+// 历史留在用户自己设备上 —— 与「本地真源 + 服务器短保留」同一思路。
+const PULL_PAGE = 800; // 单次最多返回多少条（历史很长时前端按 more 连着拉，避免一次几 MB）
+app.post("/api/sync/pull", async (req, res) => {
+  try {
+    const since = String(req.body?.since ?? "");
+    const sinceTs = since ? Date.parse(since) || 0 : 0;
+    // ① 先补观察：把 App 关着期间通道里发生的对话从 OpenClaw 会话补进日志
+    //    （不依赖用户是否停在某张卡上——这正是「App 没开就不复刻」的修法）
+    for (const bot of await listBots().catch(() => [])) {
+      if (!bot.channel) continue;
+      await observeCardLocked(bot.cardSlug).catch(() => {});
+    }
+    // ② 汇总所有卡（不只绑了通道的）里游标之后的条目，按时间升序分页返回。
+    //    按 conversations/*.jsonl 枚举而不是按卡片列表：卡被删/改名时日志还在，
+    //    按卡枚举会静默漏掉那部分记录（自测里就是「卡不存在 → 一条都拉不到」）。
+    const entries: (ConvEntry & { slug: string })[] = [];
+    const convDir = path.join(dataDir(), "conversations");
+    for (const f of await fs.readdir(convDir).catch(() => [] as string[])) {
+      if (!f.endsWith(".jsonl")) continue;
+      const slug = f.slice(0, -".jsonl".length);
+      for (const e of await readConv(slug).catch(() => [])) {
+        if (sinceTs && (Date.parse(e.t) || 0) < sinceTs) continue;
+        entries.push({ ...e, slug });
+      }
+    }
+    entries.sort((a, b) => String(a.t).localeCompare(String(b.t)));
+    const page = entries.slice(0, PULL_PAGE);
+    res.json({
+      entries: page,
+      cursor: page.length ? String(page[page.length - 1].t) : since,
+      count: page.length,
+      more: entries.length > page.length,
+      retentionDays: RETENTION_DAYS,
+      // 保留期起点：本地副本靠它区分「这条服务器已按策略清掉」（保留展示）与
+      // 「这条还在窗口内却不在服务器上 = 被删过」（不复活），见前端 ocMergeConvEntries
+      horizon: new Date(Date.now() - RETENTION_DAYS * 86400_000).toISOString(),
+    });
+  } catch (e) {
+    res.status(500).json({ error: toUserError(e) });
+  }
+});
+
 // 镜像状态（前端判断「已联通」与显示提示用）
 app.get("/api/cards/:slug/mirror/status", async (req, res) => {
   try {
@@ -4094,8 +4166,8 @@ app.get("/api/cards/:slug/mirror/status", async (req, res) => {
 // 手动触发一次观察同步（前端轮询/打开页面时用）
 app.post("/api/cards/:slug/mirror/sync", async (req, res) => {
   try {
-    const added = await observeCard(req.params.slug);
-    res.json({ ok: true, added });
+    const r = await observeCardLocked(req.params.slug);
+    res.json({ ok: true, added: r.added, entries: r.entries });
   } catch (e) {
     res.status(500).json({ error: toUserError(e) });
   }
@@ -5423,21 +5495,46 @@ async function syncAgentUserMemory(slug: string): Promise<void> {
   await fs.writeFile(userMd, base + memSection + "\n", "utf8");
 }
 
-/** 通道会话观察器：每 5 秒把绑定卡的通道新对话同步进统一日志与记忆（网页可见） */
+/**
+ * 通道会话观察器：每 5 秒把绑定卡的通道新对话同步进统一日志与记忆（网页可见）。
+ *
+ * **必须连各设备命名空间一起扫**（2026-09-17 修）：原来只扫运营者的全局卡，用户那边的
+ * QQ/微信消息只有「用户正打开网页停在那张卡上」时才由前端轮询补进来 —— App 关着期间
+ * 发生的对话就永远进不了记录。现在服务端按设备作用域轮流补观察，用户下次打开 App
+ * 时记录已经攒好了（`/api/sync/pull` 再把它拉进 App 本地）。
+ */
 let mirrorTimer: ReturnType<typeof setInterval> | null = null;
+let mirrorSweeping = false;
+async function sweepMirrors(): Promise<void> {
+  if (mirrorSweeping) return; // 上一轮还没跑完（设备多/上游慢）就跳过这一拍，别堆积
+  mirrorSweeping = true;
+  try {
+    // ① 运营者自己的全局卡
+    for (const bot of await listBots().catch(() => [])) {
+      if (!bot.channel) continue;
+      await observeCardLocked(bot.cardSlug).catch(() => {});
+    }
+    // ② 每个已注册设备的卡（进各自命名空间）。超过保留期没露过面的设备跳过：
+    //    它的记录按保留策略本来就要清掉，不必再花 IO 补。
+    const aliveAfter = Date.now() - RETENTION_DAYS * 86400_000;
+    for (const d of listDevices()) {
+      const id = String(d?.id ?? "");
+      if (!DEVICE_ID_RE.test(id) || d.disabled) continue;
+      if (d.lastSeen && (Date.parse(d.lastSeen) || 0) < aliveAfter) continue;
+      await runAsUser({ deviceId: id, root: userRoot(id) }, async () => {
+        for (const bot of await listBots().catch(() => [])) {
+          if (!bot.channel) continue;
+          await observeCardLocked(bot.cardSlug).catch(() => {});
+        }
+      }).catch(() => {});
+    }
+  } finally {
+    mirrorSweeping = false;
+  }
+}
 function startMirrorObserver(): void {
   if (mirrorTimer) return;
-  mirrorTimer = setInterval(() => {
-    void (async () => {
-      for (const bot of await listBots().catch(() => [])) {
-        try {
-          await observeCard(bot.cardSlug);
-        } catch {
-          /* 单卡观察失败不影响其他 */
-        }
-      }
-    })();
-  }, 5000);
+  mirrorTimer = setInterval(() => void sweepMirrors(), 5000);
   if (mirrorTimer.unref) mirrorTimer.unref();
 }
 

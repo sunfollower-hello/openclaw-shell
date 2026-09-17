@@ -714,7 +714,7 @@ function bindCardForm(card, mode) {
   autoGrow($("#cf-first"));
 }
 
-function cardFormDelHandler(e) {
+async function cardFormDelHandler(e) {
   const container = e.target.closest('#cf-book, #cf-regex');
   if (!container) return;
   if (!e.target.closest('[data-act="del"]')) return;
@@ -724,7 +724,8 @@ function cardFormDelHandler(e) {
     toast('世界书至少保留一条条目', false);
     return;
   }
-  if (!confirm('删除这条' + (container.id === 'cf-book' ? '条目' : '正则') + '？')) return;
+  const what = container.id === 'cf-book' ? '条目' : '正则';
+  if (!(await wbConfirm({ title: `删除这条${what}？` }))) return;
   row.remove();
 }
 
@@ -1441,10 +1442,17 @@ async function wbReloadHistoryInner() {
   wbLastMsgTime = null; // 时间戳基准重置：重画后的第一条消息显示自己的时间
   $("#chat-log").innerHTML = "";
   const conv = await api.get(`/api/cards/${encodeURIComponent(wbSlug)}/conversation`).catch(() => ({ entries: [] }));
-  wbAllEntries = conv.entries ?? [];
-  // 上下文（发给模型的 history）始终要完整的；但 DOM 只画最近 WB_RENDER_ROUNDS 轮，
-  // 更早的消息等用户上翻时由 wbPrependOlderBatch 补（懒渲染，见顶部说明）
-  for (const e of wbAllEntries) {
+  const serverEntries = conv.entries ?? [];
+  // 本地永久副本：先去服务器补一次增量（App 关着期间通道里聊的都在这一下补齐），
+  // 再把服务器记录与本地副本合并渲染 —— 过了服务器保留期的老消息从本地取，用户看到的历史是完整的。
+  await ocSyncPull().catch(() => {});
+  await ocMsgPutMany(wbSlug, serverEntries);
+  await ocEnsureHorizon();
+  const localEntries = await ocMsgLoadAll(wbSlug).catch(() => []);
+  wbAllEntries = ocMergeConvEntries(serverEntries, localEntries);
+  // 上下文（发给模型的 history）只用服务器那份：本地副本里有 15 天前的老记录，
+  // 全塞给模型会白白涨 token（渲染与上下文两者在这里分开，是有意的）
+  for (const e of serverEntries) {
     if (e.surface === "web") wbChatHistory.push({ role: e.role, content: e.content });
     // 生图元数据（url→提示词）：历史渲染建记录时带上提示词，URL 失效后卡片能显示出来
     if (Array.isArray(e.images)) for (const im of e.images) if (im?.url) ocUrlPrompt.set(im.url, im.prompt || "");
@@ -1619,6 +1627,8 @@ async function wbRemoveRowsByIds(removedIds) {
     wbAllEntries = wbAllEntries.filter((e) => !idSet.has(e.id));
     if (wbRenderedFrom > wbAllEntries.length) wbRenderedFrom = wbAllEntries.length;
   }
+  // 本地永久副本同步删除（并留墓碑）：不然刷新后「服务器 + 本地副本」合并会把删掉的消息又翻出来
+  void ocMsgDeleteByIds(wbSlug, [...idSet]);
 }
 
 /** 撤掉上一轮（破甲被拒时最常用）：一问一答从网页与通道两边一起摘掉 */
@@ -1686,6 +1696,7 @@ async function wbMirrorSync(slug) {
     }
     setLcDot("on", "已联通，通道消息同步中");
     const conv = await api.get(`/api/cards/${encodeURIComponent(slug)}/conversation`).catch(() => ({ entries: [] }));
+    void ocMsgPutMany(slug, conv.entries ?? []); // 顺手进本地永久副本（见「打开 App 增量同步」段）
     for (const e of conv.entries ?? []) {
       if (e.surface === "web") continue; // 本地消息走 wbChatHistory，不重复渲染
       if (wbRenderedIds.has(e.id)) continue;
@@ -2218,6 +2229,43 @@ function wbConfirm({ title = "确认操作", lead = "", points = [], note = "", 
   });
 }
 
+/**
+ * 文本输入弹窗（通用）。返回输入内容 —— **空串是有效值**（用于「留空 = 清除」这类语义），
+ * 取消返回 null。
+ * 为什么不用浏览器原生 prompt/confirm/alert：原生弹窗会把站点地址显示在标题栏上
+ * （用户明确要求不要露网址），套壳 WebView 里尤其明显。
+ */
+function ocInputDialog({ title, label = "", value = "", placeholder = "", okText = "确定" }) {
+  return new Promise((resolve) => {
+    const ov = document.createElement("div");
+    ov.className = "bot-overlay";
+    ov.innerHTML = `<div class="bot-dialog" style="max-width:380px">
+      <div class="bot-dialog-head">
+        <h3>${escapeHtml(title)}</h3>
+        <button class="ghost small-btn" data-x>${icon("x")}</button>
+      </div>
+      <div class="form">
+        ${label ? `<label>${escapeHtml(label)}</label>` : ""}
+        <input id="oc-input-value" maxlength="40" placeholder="${escapeHtml(placeholder)}" value="${escapeHtml(value)}">
+        <div class="row" style="justify-content:flex-end;margin-top:12px">
+          <button class="ghost small-btn" data-x>取消</button>
+          <button class="primary small-btn" data-ok>${escapeHtml(okText)}</button>
+        </div>
+      </div>
+    </div>`;
+    document.body.appendChild(ov);
+    const input = ov.querySelector("#oc-input-value");
+    const done = (v) => { ov.remove(); resolve(v); };
+    const submit = () => done(input.value.trim());
+    setTimeout(() => { input.focus(); input.select(); }, 30);
+    input.addEventListener("keydown", (e) => { if (e.key === "Enter") submit(); });
+    ov.addEventListener("click", (e) => {
+      if (e.target === ov || e.target.closest("[data-x]")) return done(null);
+      if (e.target.closest("[data-ok]")) submit();
+    });
+  });
+}
+
 function wbModal(title, fieldsHtml, onOk) {
   const ov = document.createElement("div");
   ov.className = "wb-modal-overlay";
@@ -2276,8 +2324,8 @@ function wbUpload(e) {
   reader.readAsDataURL(file);
 }
 
-function wbDelete(p) {
-  if (!confirm(`删除 ${p}？不可恢复。`)) return;
+async function wbDelete(p) {
+  if (!(await wbConfirm({ title: `删除 ${p}`, note: "此操作不可恢复" }))) return;
   api.send("/api/workspace/delete", { method: "POST", body: JSON.stringify({ slug: wbSlug, path: p }) })
     .then(() => { toast("✓ 已删除"); wbLoadFiles(); })
     .catch((e) => toast("删除失败：" + e.message, false));
@@ -2598,7 +2646,13 @@ async function applyAdvAccountBinding() {
   const curName = editingCard.name || editingCard.slug;
   if (acct?.boundCardSlug) {
     // 被别的卡占用 → 确认后换卡
-    if (!confirm(`账号「${acctName}」当前绑定的是「${acct.boundCardName ?? acct.boundCardSlug}」。\n\n确认换到「${curName}」吗？换卡后旧卡不再接收该账号消息（凭证复用，不用重新扫码）。`)) {
+    if (!(await wbConfirm({
+      title: `换到「${curName}」？`,
+      lead: `账号「${acctName}」当前绑定的是「${acct.boundCardName ?? acct.boundCardSlug}」。`,
+      points: ["换卡后旧卡不再接收该账号消息", "凭证复用，不用重新扫码"],
+      okText: "换绑",
+      danger: false,
+    }))) {
       return "账号未改动";
     }
     await api.send("/api/bots/transfer", { method: "POST", body: JSON.stringify({ botId: acct.boundBotId, toCardSlug: editingCard.slug }) });
@@ -2727,7 +2781,13 @@ function renderBotBody(bot) {
           const acctName = accountText(acct) || acc;
           if (acct?.boundCardSlug && acct.boundCardSlug !== botDialogSlug) {
             // 该账号已绑定别的卡 → 二次确认换卡
-            if (!confirm(`账号「${acctName}」当前已绑定「${acct.boundCardName ?? acct.boundCardSlug}」这张卡。\n\n确认把它换到当前卡「${curCardName}」吗？换卡后旧卡不再接收该账号消息（凭证复用，不重新扫码）。`)) {
+            if (!(await wbConfirm({
+              title: `换到当前卡「${curCardName}」？`,
+              lead: `账号「${acctName}」当前已绑定「${acct.boundCardName ?? acct.boundCardSlug}」这张卡。`,
+              points: ["换卡后旧卡不再接收该账号消息", "凭证复用，不用重新扫码"],
+              okText: "换绑",
+              danger: false,
+            }))) {
               btn.disabled = false; btn.textContent = "连接 / 创建";
               return;
             }
@@ -2768,7 +2828,13 @@ function renderBotBody(bot) {
         if (/占用/.test(e.message)) {
           const conn = await fetchConnections();
           const occupier = conn?.bots?.find((b) => b.channel === chan && b.accountId === acc);
-          if (occupier && confirm(`该账号已被「${occupier.cardName ?? occupier.cardSlug}」占用。一键转移：把账号从旧卡顶到当前卡？（凭证复用，不重新扫码）`)) {
+          if (occupier && (await wbConfirm({
+            title: `从「${occupier.cardName ?? occupier.cardSlug}」顶到当前卡？`,
+            lead: `该账号已被「${occupier.cardName ?? occupier.cardSlug}」占用。`,
+            points: ["凭证复用，不重新扫码"],
+            okText: "转移",
+            danger: false,
+          }))) {
             try {
               await api.send("/api/bots/transfer", { method: "POST", body: JSON.stringify({ botId: occupier.id, toCardSlug: botDialogSlug }) });
               toast("✓ 已转移");
@@ -2839,7 +2905,13 @@ function renderBotBody(bot) {
     try {
       if (acct?.boundCardSlug && acct.boundCardSlug !== botDialogSlug) {
         // 账号被别的卡占用：问一句，确定后自动把旧卡顶掉换过来
-        if (!confirm(`账号「${accName}」现绑「${acct.boundCardName ?? acct.boundCardSlug}」这张卡。\n\n确定把它换到当前卡吗？旧卡上的绑定会解除（凭证复用，不重新扫码）。`)) {
+        if (!(await wbConfirm({
+          title: "换到当前卡？",
+          lead: `账号「${accName}」现绑「${acct.boundCardName ?? acct.boundCardSlug}」这张卡。`,
+          points: ["旧卡上的绑定会解除", "凭证复用，不重新扫码"],
+          okText: "换绑",
+          danger: false,
+        }))) {
           sel.value = ""; sel.disabled = false;
           return;
         }
@@ -2847,7 +2919,7 @@ function renderBotBody(bot) {
         toast("✓ 已换到当前卡");
       } else {
         // 空闲账号：本卡 agent 直接换绑到它
-        if (!confirm(`把当前卡换绑到账号「${accName}」？`)) {
+        if (!(await wbConfirm({ title: `把当前卡换绑到账号「${accName}」？`, okText: "换绑", danger: false }))) {
           sel.value = ""; sel.disabled = false;
           return;
         }
@@ -3401,7 +3473,7 @@ async function saveCard() {
 
 /** 卡库卡片上的删除（分条式，直接在卡上操作） */
 async function deleteCardBySlug(slug, name) {
-  if (!confirm(`确定删除「${name}」？不可恢复。`)) return;
+  if (!(await wbConfirm({ title: `确定删除「${name}」？`, note: "此操作不可恢复" }))) return;
   try {
     await api.send(`/api/cards/${slug}`, { method: "DELETE" });
     toast("已删除");
@@ -4143,9 +4215,9 @@ function closeArtistEdit() {
   artistEditing = null;
   $("#ig-artist-edit").style.display = "none";
 }
-function deleteArtist(i) {
+async function deleteArtist(i) {
   const a = imgState.artists[i];
-  if (!a || !confirm(`删除画师串「${a.name}」？`)) return;
+  if (!a || !(await wbConfirm({ title: `删除画师串「${a.name}」？` }))) return;
   imgState.artists.splice(i, 1);
   if (imgState.activeArtist === a.name) imgState.activeArtist = "";
   closeArtistEdit(); // 从编辑框里删的，删完顺手收起
@@ -4349,7 +4421,7 @@ async function loadImgGallery() {
       </div>`).join("");
     box.querySelectorAll("[data-del]").forEach((b) =>
       b.addEventListener("click", async () => {
-        if (!confirm("删除这张图片？")) return;
+        if (!(await wbConfirm({ title: "删除这张图片？" }))) return;
         const r = await api.send("/api/image/delete", { method: "POST", body: JSON.stringify({ url: b.dataset.del }) });
         if (r.ok) { toast("已删除"); loadImgGallery(); } else toast("删除失败：" + (r.error ?? ""), false);
       })
@@ -4443,7 +4515,7 @@ function paintProvList() {
       const name = b.dataset.name;
       if (b.dataset.act === "edit") location.hash = `#/apiprovider?name=${encodeURIComponent(name)}`;
       else if (b.dataset.act === "del") {
-        if (!confirm(`删除提供商 ${name}？`)) return;
+        if (!(await wbConfirm({ title: `删除提供商 ${name}？` }))) return;
         await api.send("/api/providers/delete", { method: "POST", body: JSON.stringify({ type: provState.type, name }) });
         await refreshProvCache();
         paintProvList();
@@ -4688,7 +4760,7 @@ function renderTtsProviders() {
         }
       } else if (act === "del") {
         const p = ttsState.providers.find((x) => x.id === b.dataset.target);
-        if (!p || !confirm(`删除提供商「${p.name}」？`)) return;
+        if (!p || !(await wbConfirm({ title: `删除提供商「${p.name}」？` }))) return;
         await api.send(`/api/tts/providers/${p.id}`, { method: "DELETE" });
         toast("✓ 已删除");
         loadTtsConfig();
@@ -5643,7 +5715,7 @@ function initChatWb() {
       const d = row.querySelector(".cw-detail");
       d.hidden = !d.hidden;
     } else if (act === "del") {
-      if (!confirm(`删除条目「${entry.comment || entry.name || "未命名"}」？`)) return;
+      if (!(await wbConfirm({ title: `删除条目「${entry.comment || entry.name || "未命名"}」？` }))) return;
       entries.splice(idx, 1);
       if (!(await save())) { draw(); return; }
       draw();
@@ -5797,7 +5869,7 @@ function initChatRx() {
       const d = row.querySelector(".cw-detail");
       d.hidden = !d.hidden;
     } else if (act === "del") {
-      if (!confirm(`删除正则「${s.scriptName || "未命名"}」？`)) return;
+      if (!(await wbConfirm({ title: `删除正则「${s.scriptName || "未命名"}」？` }))) return;
       scripts.splice(idx, 1);
       if (!(await save())) { draw(); return; }
       draw();
@@ -5943,6 +6015,8 @@ async function ciWipeAll(slug) {
   if (!again) return;
   try {
     await api.send(`/api/cards/${encodeURIComponent(slug)}/reset`, { method: "POST", body: "{}" });
+    // 本地永久副本一并清掉（服务器那边已清空，本地留着就白占了）
+    void ocMsgClearSlug(slug);
     // 本地聊天页的状态一起清掉（否则回聊天页还会看到旧气泡）
     if (wbSlug === slug) {
       wbChatHistory = [];
@@ -6105,7 +6179,11 @@ async function onMemGroupClick(ev) {
   if (!btn || !memCard) return;
   const gid = btn.dataset.gid;
   if (btn.dataset.act === "del") {
-    if (!confirm("删除机器人在这个群的全部聊天记录？\n只影响这个群，单聊/网页记忆不受影响，此操作不可恢复。")) return;
+    if (!(await wbConfirm({
+      title: "删除这个群的全部聊天记录？",
+      points: ["只影响这个群", "单聊 / 网页记忆不受影响"],
+      note: "此操作不可恢复",
+    }))) return;
     await api.send(`/api/groupchat/${memCard.slug}/${encodeURIComponent(gid)}/delete`, { method: "POST", body: "{}" });
     await loadMemGroups();
     toast("✓ 已删除该群记录");
@@ -6245,7 +6323,7 @@ async function onMemRowClick(ev) {
   const id = btn.dataset.id;
   const row = btn.closest(".mem-row");
   if (btn.dataset.act === "del") {
-    if (!confirm("删除这条记忆？")) return;
+    if (!(await wbConfirm({ title: "删除这条记忆？" }))) return;
     await api.send(`/api/memory/${memCard.slug}/delete`, { method: "POST", body: JSON.stringify({ id }) });
     loadMemEntries();
     toast("✓ 已删除");
@@ -6281,7 +6359,7 @@ async function saveMemRounds() {
 }
 
 async function clearMem() {
-  if (!memCard || !confirm(`清空 ${memCard.name} 的全部记忆？`)) return;
+  if (!memCard || !(await wbConfirm({ title: `清空 ${memCard.name} 的全部记忆？` }))) return;
   await api.send("/api/memory/clear", { method: "POST", body: JSON.stringify({ slug: memCard.slug }) });
   openMemDetail(memCard.slug);
   toast("✓ 已清空");
@@ -6945,7 +7023,7 @@ async function renderConnections(connData) {
     // 事件
     box.querySelectorAll("[data-conn-del]").forEach((b) =>
       b.addEventListener("click", async () => {
-        if (!confirm("解绑这个机器人实例？（账号凭证保留，可复用）")) return;
+        if (!(await wbConfirm({ title: "解绑这个机器人实例？", points: ["账号凭证保留，可复用"], okText: "解绑", danger: false }))) return;
         const r = await api.send(`/api/bots/${b.dataset.connDel}`, { method: "DELETE" });
         toast("已解绑");
         await syncAfterBotChange();
@@ -6957,7 +7035,13 @@ async function renderConnections(connData) {
         const [channel, accountId] = b.dataset.accRename.split("|");
         const cur = (conn.accounts ?? []).find((a) => a.channel === channel && a.accountId === accountId);
         const now = cur?.hasLabel ? cur.label : "";
-        const next = prompt(`给账号起个昵称（留空恢复显示原编号）\n原编号：${accountId}`, now);
+        const next = await ocInputDialog({
+          title: "给账号起昵称",
+          label: `留空则恢复显示原编号：${accountId}`,
+          value: now,
+          placeholder: "昵称",
+          okText: "保存",
+        });
         if (next === null) return;
         try {
           await api.send("/api/channels/accounts/label", {
@@ -6975,7 +7059,11 @@ async function renderConnections(connData) {
         const [channel, accountId] = b.dataset.accDel.split("|");
         const cur = (conn.accounts ?? []).find((a) => a.channel === channel && a.accountId === accountId);
         const nm = accountText(cur) || accountId;
-        if (!confirm(`彻底删除账号「${nm}」？\n\n会删掉它的登录凭证和会话数据（不可恢复，要再用必须重新扫码），并释放一个账号槽位。\n平台侧（QQ 开放平台 / 微信）的机器人本身不受影响。`)) return;
+        if (!(await wbConfirm({
+          title: `彻底删除账号「${nm}」？`,
+          points: ["会删掉登录凭证和会话数据，要再用必须重新扫码", "释放一个账号槽位", "平台侧（QQ 开放平台 / 微信）的机器人本身不受影响"],
+          note: "此操作不可恢复",
+        }))) return;
         b.disabled = true; b.textContent = "删除中…";
         try {
           const r = await api.send("/api/channels/accounts/delete", {
@@ -6996,7 +7084,12 @@ async function renderConnections(connData) {
         // 下拉默认选中当前卡，选回自己不算换卡
         if (!sel.value || sel.value === sel.dataset.cur) return;
         const targetName = sel.options[sel.selectedIndex]?.textContent ?? sel.value;
-        if (!confirm(`把该账号换到「${targetName}」？原来的卡会被顶掉，账号凭证复用不重新扫码。`)) {
+        if (!(await wbConfirm({
+          title: `把该账号换到「${targetName}」？`,
+          points: ["原来的卡会被顶掉", "账号凭证复用，不重新扫码"],
+          okText: "换绑",
+          danger: false,
+        }))) {
           sel.value = sel.dataset.cur; // 取消就还原选中项
           return;
         }
@@ -7027,7 +7120,13 @@ async function renderConnections(connData) {
         const occ = (conn.bots ?? []).find((b) => b.cardSlug === sel.value);
         const targetName = sel.options[sel.selectedIndex]?.textContent ?? sel.value;
         if (occ) {
-          if (!confirm(`「${targetName}」已绑定「${occ.accountLabel || occ.accountId}」。\n\n确定换成账号「${accName}」吗？原绑定会解除（凭证保留）。`)) {
+          if (!(await wbConfirm({
+            title: `换成账号「${accName}」？`,
+            lead: `「${targetName}」已绑定「${occ.accountLabel || occ.accountId}」。`,
+            points: ["原绑定会解除（凭证保留）"],
+            okText: "换绑",
+            danger: false,
+          }))) {
             sel.value = "";
             return;
           }
@@ -7375,8 +7474,8 @@ function bindPresets() {
   document.querySelectorAll(".preset-group-add").forEach((btn) => {
     btn.addEventListener("click", async () => {
       const kind = btn.dataset.kind;
-      const name = prompt("新预设名称：");
-      if (!name || !name.trim()) return;
+      const name = await ocInputDialog({ title: "新建预设", placeholder: "预设名", okText: "创建" });
+      if (!name) return;
       try {
         presetStoreData = await api.send("/api/presets", { method: "POST", body: JSON.stringify({ kind, name: name.trim() }) });
         refreshPresetView();
@@ -7387,7 +7486,12 @@ function bindPresets() {
   // 首页：恢复内置
   document.querySelectorAll(".preset-reset-all").forEach((btn) => {
     btn.addEventListener("click", async () => {
-      if (!confirm("恢复内置预设？自定义条目保留，内置条目的文本会重置为代码默认。")) return;
+      if (!(await wbConfirm({
+        title: "恢复内置预设？",
+        points: ["自定义条目保留", "内置条目的文本会重置为代码默认"],
+        okText: "恢复",
+        danger: false,
+      }))) return;
       try {
         presetStoreData = await api.send("/api/presets/reset", { method: "POST" });
         refreshPresetView();
@@ -7411,7 +7515,7 @@ function bindPresets() {
   });
   // 组内：条目编辑/删除
   document.querySelectorAll(".preset-item-edit, .preset-item-del").forEach((btn) => {
-    btn.addEventListener("click", (e) => {
+    btn.addEventListener("click", async (e) => {
       e.stopPropagation();
       const row = btn.closest(".preset-item");
       if (!row) return;
@@ -7422,7 +7526,7 @@ function bindPresets() {
       if (btn.classList.contains("preset-item-edit")) {
         openItemEditor(presetView.kind, presetView.groupId, item, false);
       } else {
-        if (!confirm("删除条目「" + item.name + "」？")) return;
+        if (!(await wbConfirm({ title: `删除条目「${item.name}」？` }))) return;
         api.send("/api/presets/" + presetView.kind + "/" + presetView.groupId + "/items/" + itemId, { method: "DELETE" })
           .then((data) => { presetStoreData = data; refreshPresetView(); toast("已删除"); })
           .catch((err) => toast("删除失败：" + err.message, false));
@@ -7559,7 +7663,7 @@ function initLogsPage() {
     logQTimer = setTimeout(loadLogs, 300);
   });
   $("#log-clear").addEventListener("click", async () => {
-    if (!confirm("清空运行日志？")) return;
+    if (!(await wbConfirm({ title: "清空运行日志？" }))) return;
     try {
       await api.send("/api/logs/clear", { method: "POST" });
       toast("✓ 日志已清空");
@@ -7699,29 +7803,25 @@ function renderEmojis() {
       <div class="emoji-groups" id="em-groups"></div>
     </div>
     <div class="card-box">
-      <h3>添加表情 <span class="hint" id="em-cur-group-hint"></span></h3>
+      <h3>添加表情</h3>
       <div class="form">
         <div class="cf-grid2">
           <div><label>表情名</label><input id="em-name" placeholder="如：得意、无语、抱抱"></div>
           <div><label>什么场合用</label><input id="em-exp" placeholder="如：调皮得意，占了上风的时候"></div>
         </div>
-        <label>图片（png / jpg / gif / webp）</label>
-        <input type="file" id="em-file" accept=".png,.jpg,.jpeg,.gif,.webp">
         <div class="row">
-          <button id="em-add" class="primary">${icon("plus")} 添加到当前分组</button>
+          <button id="em-add" class="primary">${icon("plus")} 添加表情</button>
           <span id="em-msg" class="status"></span>
         </div>
-        <div class="row" style="margin-top:12px;align-items:center;gap:8px;flex-wrap:wrap">
-          <button id="em-zip" class="ghost small-btn">${icon("package")} 导入表情包 zip</button>
-          <input type="file" id="em-zip-file" accept=".zip,application/zip" hidden>
-          <span class="hint">一整包导入：zip 里放 <b>1.大笑.gif</b>、<b>2.偷笑.gif</b>… 外加一份 <b>说明.txt</b>（按序号填使用场景，留空也行）。图片文件夹用 scripts/make-emoji-pack.bat 一键就能打成这种包。</span>
-        </div>
+        <!-- 一个入口吃两种文件：图片（可多选）直接加，zip 走整包导入 -->
+        <input type="file" id="em-file" accept=".png,.jpg,.jpeg,.gif,.webp,.zip,application/zip" multiple hidden>
+        <p class="hint">图片可多选；选 zip 就是整包导入。</p>
       </div>
     </div>
     <div class="card-box">
-      <div class="row" style="justify-content:space-between;align-items:center">
-        <h3 style="margin:0">「<span id="em-group-title">默认</span>」里的表情 <span id="em-count" class="hint"></span></h3>
-        <button id="em-import" class="ghost small-btn" title="把其他分组的表情复制到当前分组（共用同一张图，不重复存文件）">${icon("download")} 从其他分组导入</button>
+      <div class="em-list-head">
+        <h3>「<span id="em-group-title">默认</span>」<span id="em-count" class="hint"></span></h3>
+        <button id="em-import" class="ghost small-btn">${icon("download")} 从其他分组</button>
       </div>
       <div id="em-list" class="emoji-grid"></div>
     </div>
@@ -7730,13 +7830,79 @@ function renderEmojis() {
 
 let emojiGroups = [];        // 分组列表
 let emojiCurGroup = "default"; // 当前选中分组
+let emojiMax = 300;          // 库上限（服务器给的 max，用于「N / 300」计数）
 
 function initEmojis() {
-  $("#em-add").addEventListener("click", addEmojiToLib);
-  $("#em-zip").addEventListener("click", () => $("#em-zip-file").click());
-  $("#em-zip-file").addEventListener("change", importEmojiZip);
+  // 一个按钮吃两种文件：图片 = 添加（多选即批量），zip = 整包导入，按扩展名自动分流
+  $("#em-add").addEventListener("click", () => $("#em-file").click());
+  $("#em-file").addEventListener("change", async (e) => {
+    const files = [...(e.target.files ?? [])];
+    e.target.value = "";
+    await addEmojiFiles(files);
+  });
   $("#em-import").addEventListener("click", openEmojiImport);
   loadEmojiList();
+}
+
+/** 添加表情（图片，可多选）/ 导入表情包（zip）——同一个按钮，按扩展名分流。
+ *  表情名与「什么场合用」照旧由上面两个输入框填：图片用它们（名字留空则用文件名），
+ *  zip 走包内自带的序号名字与说明.txt（那两个框对它不生效）。 */
+async function addEmojiFiles(files) {
+  if (!files?.length) return;
+  const btn = $("#em-add");
+  const wantName = ($("#em-name")?.value ?? "").trim();
+  const wantExp = ($("#em-exp")?.value ?? "").trim();
+  const isImg = (n) => /\.(png|jpe?g|gif|webp)$/i.test(n);
+  const isZip = (n) => /\.zip$/i.test(n);
+  const imgs = files.filter((f) => isImg(f.name));
+  const zips = files.filter((f) => isZip(f.name));
+  const bad = files.filter((f) => !isImg(f.name) && !isZip(f.name));
+  if (btn) btn.disabled = true;
+  let added = 0;
+  let cancelled = 0;
+  const problems = bad.map((f) => `${f.name}：不是图片也不是 zip`);
+  try {
+    for (const f of imgs) {
+      try {
+        // 名字/场合用输入框里填的；名字留空则退回文件名（多选时用同一个名字会被自动加序号）
+        const name = wantName || f.name.replace(/\.[^.]+$/, "").trim() || "表情";
+        const ext = (f.name.split(".").pop() || "png").toLowerCase();
+        const q = new URLSearchParams({ name, ext, exp: wantExp, group: emojiCurGroup }).toString();
+        const r = await fetchApi("/api/emojis/raw?" + q, {
+          method: "POST",
+          headers: { "Content-Type": "application/octet-stream" },
+          body: f,
+        });
+        const data = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(data.error || r.statusText);
+        added++;
+      } catch (e) {
+        problems.push(`${f.name}：${e.message}`);
+      }
+    }
+    for (const f of zips) {
+      const r = await importEmojiZipFile(f);
+      if (!r) { cancelled++; continue; }   // 用户在预览里点了取消
+      added += r.added;
+      problems.push(...(r.problems ?? []));
+    }
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+  if (added) {
+    // 加完清空两个输入框（与原「添加到当前分组」行为一致），免得下一批误用同一个名字
+    if ($("#em-name")) $("#em-name").value = "";
+    if ($("#em-exp")) $("#em-exp").value = "";
+    cacheInvalidate("/api/emojis");
+    await loadEmojiList();
+  }
+  if (problems.length) {
+    await emojiInfoDialog("导入结果", [`已导入 ${added} 个`, ...problems.slice(0, 8)]);
+  } else if (!added && !cancelled) {
+    toast("没有能导入的表情", false);
+  } else if (added) {
+    toast(`✓ 已添加 ${added} 个`);
+  }
 }
 
 /** 从其他分组导入：选来源分组 → 勾选表情 → 路径复用导入当前分组（不复制图片文件） */
@@ -7756,7 +7922,6 @@ function openEmojiImport() {
       ${others.map((g) => `<option value="${escapeHtml(g.id)}">${escapeHtml(g.name)}</option>`).join("")}
     </select>
     <div id="emoji-import-pool" class="emoji-grid" style="margin-top:10px;max-height:300px;overflow-y:auto"></div>
-    <p class="hint" id="emoji-import-tip" style="margin-top:6px">点击图片勾选；导入共用原图不重复存文件，重名会自动加序号</p>
     <div class="row" style="justify-content:flex-end;margin-top:6px">
       <span class="muted" id="emoji-import-count">已选 0 个</span>
       <button class="ghost small-btn" id="emoji-import-cancel">取消</button>
@@ -7802,7 +7967,50 @@ function openEmojiImport() {
   });
 }
 
-/** 渲染分组标签栏 */
+/** 信息弹窗（自绘，替代原生 alert——原生弹窗会把站点地址显示在标题上） */
+function emojiInfoDialog(title, lines) {
+  return new Promise((resolve) => {
+    const ov = document.createElement("div");
+    ov.className = "bot-overlay";
+    ov.innerHTML = `<div class="bot-dialog" style="max-width:420px">
+      <div class="bot-dialog-head"><h3>${escapeHtml(title)}</h3></div>
+      <div class="em-info-lines">${(lines || []).map((l) => `<div>${escapeHtml(l)}</div>`).join("")}</div>
+      <div class="row" style="justify-content:flex-end;margin-top:12px">
+        <button class="primary small-btn" data-ok>知道了</button>
+      </div>
+    </div>`;
+    document.body.appendChild(ov);
+    const done = () => { ov.remove(); resolve(); };
+    ov.addEventListener("click", (e) => { if (e.target === ov || e.target.closest("[data-ok]")) done(); });
+  });
+}
+
+/** 当前分组的设置菜单（重命名 / 删除）；返回动作名或 null */
+function emojiGroupMenuDialog(g) {
+  return new Promise((resolve) => {
+    const ov = document.createElement("div");
+    ov.className = "bot-overlay";
+    ov.innerHTML = `<div class="bot-dialog" style="max-width:340px">
+      <div class="bot-dialog-head">
+        <h3>${escapeHtml(g.name)}</h3>
+        <button class="ghost small-btn" data-x>${icon("x")}</button>
+      </div>
+      <div class="em-menu">
+        <button class="em-menu-item" data-act="rename">${icon("pen")} 重命名分组</button>
+        <button class="em-menu-item danger" data-act="delete">${icon("trash")} 删除分组</button>
+      </div>
+    </div>`;
+    document.body.appendChild(ov);
+    const done = (v) => { ov.remove(); resolve(v); };
+    ov.addEventListener("click", (e) => {
+      if (e.target === ov || e.target.closest("[data-x]")) return done(null);
+      const act = e.target.closest("[data-act]")?.dataset.act;
+      if (act) done(act);
+    });
+  });
+}
+
+/** 渲染分组标签栏：选中那个才带「⋯」设置入口，管理动作走自绘弹窗 */
 function renderEmojiGroups() {
   const box = $("#em-groups");
   if (!box) return;
@@ -7810,55 +8018,56 @@ function renderEmojiGroups() {
   for (const e of emojiLib) countByGroup[e.group] = (countByGroup[e.group] ?? 0) + 1;
   const tabs = emojiGroups
     .map((g) => {
-      const cnt = countByGroup[g.id] ?? 0;
-      const extra = g.builtin
-        ? ""
-        : `<span class="g-rename" title="重命名分组" data-gr="${escapeHtml(g.id)}">${icon("pen")}</span>
-           <span class="g-del" title="删除分组（组内表情移回默认）" data-gd="${escapeHtml(g.id)}">${icon("trash")}</span>`;
-      return `<span class="emoji-group-tab${g.id === emojiCurGroup ? " on" : ""}" data-g="${escapeHtml(g.id)}">
-        ${escapeHtml(g.name)}<span class="g-count">${cnt}</span>${extra}
+      const on = g.id === emojiCurGroup;
+      const more = on && !g.builtin ? `<span class="g-more" data-gm="${escapeHtml(g.id)}" title="分组设置">⋯</span>` : "";
+      return `<span class="emoji-group-tab${on ? " on" : ""}" data-g="${escapeHtml(g.id)}">
+        ${escapeHtml(g.name)}<span class="g-count">${countByGroup[g.id] ?? 0}</span>${more}
       </span>`;
     })
     .join("");
   box.innerHTML = tabs + `<button class="emoji-group-add" id="em-group-add">＋ 新建分组</button>`;
   box.querySelectorAll("[data-g]").forEach((t) =>
     t.addEventListener("click", (e) => {
-      if (e.target.closest("[data-gr]") || e.target.closest("[data-gd]")) return; // 管理按钮不切分组
+      if (e.target.closest("[data-gm]")) return; // 「⋯」不切分组
       emojiCurGroup = t.dataset.g;
       renderEmojiGroups();
       renderEmojiList();
     })
   );
-  box.querySelectorAll("[data-gr]").forEach((b) =>
-    b.addEventListener("click", async () => {
-      const g = emojiGroups.find((x) => x.id === b.dataset.gr);
+  box.querySelectorAll("[data-gm]").forEach((b) =>
+    b.addEventListener("click", async (e) => {
+      e.stopPropagation();
+      const g = emojiGroups.find((x) => x.id === b.dataset.gm);
       if (!g) return;
-      const name = prompt("分组名", g.name);
-      if (!name || name === g.name) return;
-      try {
-        await api.send(`/api/emojis/groups/${g.id}`, { method: "PUT", body: JSON.stringify({ name }) });
-        toast("✓ 已重命名");
-        cacheInvalidate("/api/emojis");
-        await loadEmojiList();
-      } catch (e) { toast(e.message, false); }
-    })
-  );
-  box.querySelectorAll("[data-gd]").forEach((b) =>
-    b.addEventListener("click", async () => {
-      const g = emojiGroups.find((x) => x.id === b.dataset.gd);
-      if (!g) return;
-      if (!confirm(`删除分组「${g.name}」？组内表情会移回「默认」分组。`)) return;
-      try {
-        await api.send(`/api/emojis/groups/${g.id}`, { method: "DELETE" });
-        if (emojiCurGroup === g.id) emojiCurGroup = "default";
-        toast("✓ 已删除");
-        cacheInvalidate("/api/emojis");
-        await loadEmojiList();
-      } catch (e) { toast(e.message, false); }
+      const act = await emojiGroupMenuDialog(g);
+      if (act === "rename") {
+        const name = await ocInputDialog({ title: "重命名分组", value: g.name, placeholder: "分组名", okText: "保存" });
+        if (!name || name === g.name) return;
+        try {
+          await api.send(`/api/emojis/groups/${g.id}`, { method: "PUT", body: JSON.stringify({ name }) });
+          toast("✓ 已重命名");
+          cacheInvalidate("/api/emojis");
+          await loadEmojiList();
+        } catch (err) { toast(err.message, false); }
+      } else if (act === "delete") {
+        const ok = await wbConfirm({
+          title: `删除分组「${g.name}」`,
+          lead: "组里的表情会移回「默认」分组，不会被删掉。",
+          okText: "删除分组",
+        });
+        if (!ok) return;
+        try {
+          await api.send(`/api/emojis/groups/${g.id}`, { method: "DELETE" });
+          if (emojiCurGroup === g.id) emojiCurGroup = "default";
+          toast("✓ 已删除");
+          cacheInvalidate("/api/emojis");
+          await loadEmojiList();
+        } catch (err) { toast(err.message, false); }
+      }
     })
   );
   $("#em-group-add").addEventListener("click", async () => {
-    const name = prompt("新分组名");
+    const name = await ocInputDialog({ title: "新建分组", placeholder: "分组名", okText: "创建" });
     if (!name) return;
     try {
       await api.send("/api/emojis/groups", { method: "POST", body: JSON.stringify({ name }) });
@@ -7877,11 +8086,7 @@ async function loadEmojiList() {
     const r = await cachedGet("/api/emojis");
     emojiLib = r.emojis ?? [];
     emojiGroups = r.groups ?? [];
-    if ($("#em-count")) {
-      const cnt = emojiLib.filter((e) => e.group === emojiCurGroup).length;
-      $("#em-count").textContent = `${cnt} / ${r.max ?? 300}`;
-    }
-    if ($("#em-group-title")) $("#em-group-title").textContent = emojiGroups.find((g) => g.id === emojiCurGroup)?.name ?? "默认";
+    emojiMax = r.max ?? 300;
     renderEmojiGroups();
     renderEmojiList();
   } catch (e) {
@@ -7893,8 +8098,11 @@ function renderEmojiList() {
   const box = $("#em-list");
   if (!box) return;
   const items = emojiLib.filter((e) => e.group === emojiCurGroup);
+  // 标题与计数跟当前分组走（原来只在整页加载时更新一次，切分组时标题会停在旧分组）
+  if ($("#em-group-title")) $("#em-group-title").textContent = emojiGroups.find((g) => g.id === emojiCurGroup)?.name ?? "默认";
+  if ($("#em-count")) $("#em-count").textContent = `${items.length} / ${emojiMax}`;
   if (!items.length) {
-    box.innerHTML = '<div class="muted">这个分组还没有表情，上面添加第一个</div>';
+    box.innerHTML = '<div class="muted">这个分组还没有表情</div>';
     return;
   }
   // 紧凑格子：只显示图 + 名字；点击弹出单个表情的放大详情（含解释与全部操作）
@@ -8004,15 +8212,12 @@ function editEmoji(item) {
 }
 
 /**
- * 表情包 zip 批量导入：先 dryRun 出预览 → 用户确认 → 再真导入。
- * zip 交后端解析（序号/名字/编码/分组/重名都在那边处理），这里只管确认与报告。
+ * 表情包 zip 整包导入。zip 交后端解析（序号/名字/编码/分组/重名都在那边处理）。
+ * 一切正常就直接导入，不拿弹窗烦用户；只有要新建分组 / 有重名改名 / 有条目进不来时，
+ * 才弹一次摘要让人看一眼。返回 { added, problems }；用户取消返回 null。
  */
-async function importEmojiZip() {
-  const input = $("#em-zip-file");
-  const f = input?.files?.[0];
-  if (!f) return;
-  const btn = $("#em-zip");
-  const raw = async (dryRun) => {
+async function importEmojiZipFile(f) {
+  const call = async (dryRun) => {
     const r = await fetchApi(`/api/emojis/import-zip${dryRun ? "?dryRun=1" : ""}`, {
       method: "POST",
       headers: { "Content-Type": "application/zip" },
@@ -8022,76 +8227,34 @@ async function importEmojiZip() {
     if (!r.ok) throw new Error(data.error || r.statusText);
     return data;
   };
-  btn.disabled = true;
-  try {
-    const preview = await raw(true);
-    if (!preview.count) {
-      toast("这个包里没有能导入的表情", false);
-      return;
-    }
-    const renamed = (preview.items || []).filter((x) => x.renamedFrom).length;
-    const lines = [
-      `将导入 ${preview.count} 个表情`,
-      preview.groupsToCreate?.length ? `新建分组：${preview.groupsToCreate.join("、")}` : "",
-      renamed ? `重名自动改名：${renamed} 个` : "",
-      preview.problemCount ? `有问题跳过/改动：${preview.problemCount} 项` : "",
-      "",
-      (preview.items || []).slice(0, 12).map((x) => `${x.name}${x.scene ? "（" + x.scene.slice(0, 16) + "）" : ""}${x.renamedFrom ? " ← 原「" + x.renamedFrom + "」" : ""}`).join("\n"),
-      preview.count > 12 ? `…还有 ${preview.count - 12} 个` : "",
-      "",
-      "确认导入？",
-    ].filter(Boolean);
-    if (!confirm(lines.join("\n"))) return;
-    const done = await raw(false);
-    toast(`✓ 已导入 ${done.added?.length ?? 0} 个表情`);
-    const problems = done.problems || [];
-    if (problems.length) {
-      alert(`导入完成，${done.skipped ?? 0} 个未导入/被改名：\n\n` + problems.slice(0, 12).map((p) => `· ${p.what}：${p.reason}`).join("\n"));
-    }
-    cacheInvalidate("/api/emojis");
-    await loadEmojiLib();
-    await loadEmojiList();
-  } catch (e) {
-    toast("导入失败：" + e.message, false);
-  } finally {
-    btn.disabled = false;
-    input.value = "";
-  }
-}
-
-async function addEmojiToLib() {
-  const name = $("#em-name").value.trim();
-  const f = $("#em-file").files[0];
-  if (!name) return toast("请填表情名", false);
-  if (!f) return toast("请选择图片", false);
-  const btn = $("#em-add");
-  btn.disabled = true;
-  try {
-    // 二进制直传：跳过 FileReader/base64/JSON，大图导入更快
-    const ext = (f.name.split(".").pop() || "png").toLowerCase();
-    const q = new URLSearchParams({ name, ext, exp: $("#em-exp").value.trim(), group: emojiCurGroup }).toString();
-    const r = await fetchApi("/api/emojis/raw?" + q, {
-      method: "POST",
-      headers: { "Content-Type": "application/octet-stream" },
-      body: f,
+  const preview = await call(true);
+  if (!preview.count) return { added: 0, problems: [`${f.name}：包里没有能导入的表情`] };
+  const renamed = (preview.items || []).filter((x) => x.renamedFrom).length;
+  const newGroups = preview.groupsToCreate ?? [];
+  if (renamed || newGroups.length || preview.problemCount) {
+    const ok = await wbConfirm({
+      title: "导入表情包",
+      lead: `将导入 ${preview.count} 个表情`,
+      points: [
+        newGroups.length ? `新建分组 ${newGroups.join("、")}` : "",
+        renamed ? `${renamed} 个与已有的重名，会自动加序号` : "",
+        preview.problemCount ? `${preview.problemCount} 项会跳过或改动` : "",
+      ].filter(Boolean),
+      okText: "导入",
+      danger: false,
     });
-    const data = await r.json().catch(() => ({}));
-    if (!r.ok) throw new Error(data.error || r.statusText);
-    $("#em-name").value = "";
-    $("#em-exp").value = "";
-    $("#em-file").value = "";
-    toast("✓ 已添加");
-    cacheInvalidate("/api/emojis");
-    await loadEmojiList();
-  } catch (e) {
-    toast("添加失败：" + e.message, false);
-  } finally {
-    btn.disabled = false;
+    if (!ok) return null;
   }
+  const done = await call(false);
+  return {
+    added: done.added?.length ?? 0,
+    problems: (done.problems ?? []).map((p) => `${p.what}：${p.reason}`),
+  };
 }
 
 async function delEmoji(item) {
-  if (!confirm(`删除表情「${item.name}」？`)) return;
+  const ok = await wbConfirm({ title: `删除表情「${item.name}」`, okText: "删除" });
+  if (!ok) return;
   try {
     await api.send(`/api/emojis/${item.id}`, { method: "DELETE" });
     toast("✓ 已删除");
@@ -8164,7 +8327,7 @@ let ocDbPromise = null;
 function ocMediaDB() {
   if (ocDbPromise) return ocDbPromise;
   ocDbPromise = new Promise((resolve, reject) => {
-    const req = indexedDB.open(OC_DB_NAME, 1);
+    const req = indexedDB.open(OC_DB_NAME, 2);
     req.onupgradeneeded = () => {
       const db = req.result;
       if (!db.objectStoreNames.contains("images")) {
@@ -8177,6 +8340,11 @@ function ocMediaDB() {
         s.createIndex("by-slug", "slug", { unique: false });
       }
       if (!db.objectStoreNames.contains("meta")) db.createObjectStore("meta", { keyPath: "k" });
+      // v2：聊天记录本地永久副本（服务器只留 15 天，用户自己那份留在这台设备上）
+      if (!db.objectStoreNames.contains("messages")) {
+        const s = db.createObjectStore("messages", { keyPath: "k" }); // k = `${slug}|${条目id}`
+        s.createIndex("by-slug", "slug", { unique: false });
+      }
     };
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => reject(req.error);
@@ -8977,7 +9145,7 @@ async function ocFillImgCard() {
   grid.innerHTML = "";
   for (const it of items) grid.appendChild(ocImgCell(it));
   $("#oc-del-all")?.addEventListener("click", async () => {
-    if (!confirm(`删除「${ocSt.name || ocSt.slug}」的 ${items.length} 张图片？`)) return;
+    if (!(await wbConfirm({ title: `删除「${ocSt.name || ocSt.slug}」的 ${items.length} 张图片？` }))) return;
     for (const it of items) {
       if (it.kind === "record") await ocDeleteImageRecord(it.rec);
       else if (it.kind === "legacy") await api.send("/api/image/delete", { method: "POST", body: JSON.stringify({ url: it.legacy.url }) }).catch(() => {});
@@ -9002,7 +9170,7 @@ function ocImgCell(it) {
   cell.append(img, mark, del);
   const guard = (fn) => async (e) => {
     e.stopPropagation();
-    if (!confirm("删除这张图片？")) return;
+    if (!(await wbConfirm({ title: "删除这张图片？" }))) return;
     await fn();
     void ocStAfterDelete();
   };
@@ -9081,7 +9249,7 @@ async function ocFillAuCard() {
     box.appendChild(row);
   }
   $("#oc-del-all-au")?.addEventListener("click", async () => {
-    if (!confirm(`删除「${ocSt.name || ocSt.slug}」的 ${items.length} 条语音？`)) return;
+    if (!(await wbConfirm({ title: `删除「${ocSt.name || ocSt.slug}」的 ${items.length} 条语音？` }))) return;
     for (const it of items) await ocAudioDelete(it.id, it.slug, it.text);
     void ocStAfterDelete();
   });
@@ -9229,6 +9397,244 @@ async function loadImgSaveList(slug, grid, items, selected, refreshCount) {
 }
 
 
+// ==================== 聊天记录本地永久副本 + 打开 App 增量同步 ====================
+// 为什么要有这一层（用户 2026-09-17 点名的问题）：
+//   用户平时在 QQ / 微信里跟机器人聊，App 经常是关着的。服务器侧由观察器定时补观察
+//   （关着也攒，见 sweepMirrors），这里负责「打开 App 就把服务器上**全部卡**的增量拉下来，
+//   写进本机 IndexedDB」。这样：
+//     · 服务器只帮用户留 15 天（保留策略），用户自己的完整聊天历史留在用户自己设备上；
+//     · App 会不会开、开得勤不勤，都不影响记录被复刻进来（打开就补齐）。
+// 游标是时间水位（ISO），存在 meta 里；同一条消息按 id 去重，重复拉不会重复显示。
+const OC_MSG_STORE = "messages";
+let ocSyncCursor = null;      // 拉取游标（ISO），null = 还没从 meta 读过
+let ocSyncHorizonTs = 0;      // 服务器保留期起点（epoch ms）；0 = 未知
+let ocSyncBusy = false;       // 单飞：别让定时器/回前台/打开卡片三处同时打
+let ocSyncMetaLoaded = false;
+let ocSyncTimer = null;
+let ocDeletedIds = new Set(); // 本地删除墓碑：已删掉的老消息不因本地副本「复活」
+
+/** 本地记录：整条会话条目的副本（键里带 slug，同一卡按消息 id 天然去重） */
+function ocMsgRecord(slug, e) {
+  return {
+    k: `${slug}|${e.id}`,
+    slug,
+    id: String(e.id),
+    role: e.role,
+    content: e.content,
+    surface: e.surface,
+    ns: e.ns,
+    t: e.t,
+    ...(Array.isArray(e.parts) && e.parts.length ? { parts: e.parts } : {}),
+    ...(Array.isArray(e.images) && e.images.length ? { images: e.images } : {}),
+  };
+}
+
+async function ocMsgPutMany(slug, entries) {
+  const list = (Array.isArray(entries) ? entries : []).filter((e) => e && e.id);
+  if (!list.length) return 0;
+  try {
+    const db = await ocMediaDB();
+    return await new Promise((resolve) => {
+      const tx = db.transaction([OC_MSG_STORE], "readwrite");
+      const store = tx.objectStore(OC_MSG_STORE);
+      for (const e of list) {
+        try {
+          store.put(ocMsgRecord(slug, e));
+        } catch {
+          /* 单条坏数据跳过，别拖垮整批 */
+        }
+      }
+      tx.oncomplete = () => resolve(list.length);
+      tx.onerror = () => resolve(0);
+      tx.onabort = () => resolve(0);
+    });
+  } catch {
+    return 0; // 隐私模式/配额满：退回「只用服务器记录」，不影响正常聊天
+  }
+}
+
+/** 读某卡的全部本地记录（按时间升序） */
+async function ocMsgLoadAll(slug) {
+  const out = [];
+  try {
+    const db = await ocMediaDB();
+    await new Promise((resolve) => {
+      const req = db
+        .transaction([OC_MSG_STORE], "readonly")
+        .objectStore(OC_MSG_STORE)
+        .index("by-slug")
+        .openCursor(IDBKeyRange.only(slug));
+      req.onsuccess = () => {
+        const c = req.result;
+        if (!c) return resolve();
+        out.push(c.value);
+        c.continue();
+      };
+      req.onerror = () => resolve();
+    });
+  } catch {
+    /* 读不到就当没有本地副本 */
+  }
+  return out.sort((a, b) => String(a.t || "").localeCompare(String(b.t || "")));
+}
+
+/** 本地删消息（服务器删了，本地副本也要删；同时记墓碑，防过保留期的老消息在合并时复活） */
+async function ocMsgDeleteByIds(slug, ids) {
+  const list = (Array.isArray(ids) ? ids : []).map(String).filter(Boolean);
+  if (!list.length || !slug) return;
+  for (const id of list) ocDeletedIds.add(id);
+  void ocMetaPut("msgDeleted", [...ocDeletedIds].slice(-800)).catch(() => {});
+  try {
+    const db = await ocMediaDB();
+    await new Promise((resolve) => {
+      const tx = db.transaction([OC_MSG_STORE], "readwrite");
+      const store = tx.objectStore(OC_MSG_STORE);
+      for (const id of list) store.delete(`${slug}|${id}`);
+      tx.oncomplete = resolve;
+      tx.onerror = resolve;
+      tx.onabort = resolve;
+    });
+  } catch {
+    /* 删不掉不影响：合并时墓碑照样挡住 */
+  }
+}
+
+/** 清空某卡的本地记录（「一键删除」走这里） */
+async function ocMsgClearSlug(slug) {
+  if (!slug) return;
+  try {
+    const db = await ocMediaDB();
+    await new Promise((resolve) => {
+      const tx = db.transaction([OC_MSG_STORE], "readwrite");
+      const req = tx.objectStore(OC_MSG_STORE).index("by-slug").openCursor(IDBKeyRange.only(slug));
+      req.onsuccess = () => {
+        const c = req.result;
+        if (!c) return;
+        c.delete();
+        c.continue();
+      };
+      tx.oncomplete = resolve;
+      tx.onerror = resolve;
+      tx.onabort = resolve;
+    });
+  } catch {
+    /* 忽略 */
+  }
+}
+
+async function ocLoadSyncMeta() {
+  if (ocSyncMetaLoaded) return;
+  ocSyncMetaLoaded = true;
+  try {
+    const c = await ocMetaGet("msgCursor");
+    if (typeof c === "string") ocSyncCursor = c;
+    const h = await ocMetaGet("msgHorizon");
+    if (typeof h === "string") ocSyncHorizonTs = Date.parse(h) || 0;
+    const d = await ocMetaGet("msgDeleted");
+    if (Array.isArray(d)) ocDeletedIds = new Set(d.map(String));
+  } catch {
+    /* 读不到就当首次同步 */
+  }
+}
+
+async function ocEnsureHorizon() {
+  if (ocSyncHorizonTs) return ocSyncHorizonTs;
+  await ocLoadSyncMeta();
+  return ocSyncHorizonTs;
+}
+
+/**
+ * 合并「服务器记录」与「本地永久副本」。
+ * 规则（关键是别把用户删过的消息又翻出来）：
+ *   · 本地条目早于服务器保留期起点 → 服务器已按策略清掉，保留展示（这就是本地副本的价值）；
+ *   · 本地条目还在保留期内、服务器却没有 → 是被删过的 → 不复活（墓碑 + 这条规则双保险）；
+ *   · 服务器记录一律优先（它有最新的 parts / images 元数据）。
+ */
+function ocMergeConvEntries(serverEntries, localEntries) {
+  const horizon = ocSyncHorizonTs;
+  const byId = new Map();
+  if (horizon) {
+    for (const e of localEntries || []) {
+      if (!e || !e.id) continue;
+      if (ocDeletedIds.has(String(e.id))) continue;
+      if ((Date.parse(e.t) || 0) >= horizon) continue; // 窗口内的以服务器为准
+      byId.set(e.id, e);
+    }
+  }
+  for (const e of serverEntries || []) if (e && e.id) byId.set(e.id, e);
+  return [...byId.values()].sort((a, b) => String(a.t || "").localeCompare(String(b.t || "")));
+}
+
+/**
+ * 拉一次增量：① 让服务器把 App 关着期间通道里的对话补进日志（覆盖本设备**所有卡**，
+ * 不只当前打开那张）；② 取游标之后的条目写进本地永久副本。返回本轮落库条数。
+ */
+async function ocSyncPull() {
+  if (ocSyncBusy) return 0;
+  ocSyncBusy = true;
+  let total = 0;
+  try {
+    await ocLoadSyncMeta();
+    for (let round = 0; round < 5; round++) {
+      const r = await api.send("/api/sync/pull", {
+        method: "POST",
+        body: JSON.stringify({ since: ocSyncCursor || "" }),
+      }).catch(() => null);
+      if (!r) break;
+      if (r.horizon) {
+        ocSyncHorizonTs = Date.parse(r.horizon) || 0;
+        void ocMetaPut("msgHorizon", r.horizon).catch(() => {});
+      }
+      const bySlug = new Map();
+      for (const e of r.entries ?? []) {
+        if (!e || !e.slug || !e.id) continue;
+        if (!bySlug.has(e.slug)) bySlug.set(e.slug, []);
+        bySlug.get(e.slug).push(e);
+      }
+      for (const [slug, list] of bySlug) total += await ocMsgPutMany(slug, list);
+      if (r.cursor && r.cursor !== ocSyncCursor) {
+        ocSyncCursor = String(r.cursor);
+        void ocMetaPut("msgCursor", ocSyncCursor).catch(() => {});
+      }
+      if (!r.more) break; // 一次拉不完（老账号首次同步）就接着拉
+    }
+  } finally {
+    ocSyncBusy = false;
+  }
+  return total;
+}
+
+/** 增量拉取后：正在聊天页就把新到的通道消息补画上（不整页重载，滚动位置不动） */
+async function ocAfterSync() {
+  if (!wbSlug || location.hash.split("?")[0] !== "#/chat") return;
+  const conv = await api.get(`/api/cards/${encodeURIComponent(wbSlug)}/conversation`).catch(() => null);
+  if (!conv) return;
+  const server = conv.entries ?? [];
+  await ocMsgPutMany(wbSlug, server);
+  wbAllEntries = ocMergeConvEntries(server, await ocMsgLoadAll(wbSlug));
+  for (const e of server) {
+    if (e.surface === "web") continue; // 本地发出的消息本来就在页面上
+    if (wbRenderedIds.has(e.id)) continue;
+    wbRenderedIds.add(e.id);
+    addChatBubble(e.role === "assistant" ? "bot" : "user", e.content, undefined, undefined, e.t);
+  }
+}
+
+/** 打开就补一次；回前台/重新聚焦再补；页面开着时每分钟一次（都是增量，没新消息就是空响应） */
+function ocStartSyncLoop() {
+  const tick = () => {
+    void ocSyncPull().then((n) => {
+      if (n > 0) void ocAfterSync();
+    });
+  };
+  tick();
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") tick();
+  });
+  window.addEventListener("focus", tick);
+  if (!ocSyncTimer) ocSyncTimer = setInterval(() => { if (document.visibilityState === "visible") tick(); }, 60_000);
+}
+
 // ==================== 启动（必须放在文件末尾：本地媒体库的 const 状态需先初始化） ====================
 // 立刻渲染首屏，不等任何网络请求。
 // 原来是 `loadProfile().finally(() => router())`——必须等 /api/profile 回来才画第一屏，
@@ -9244,6 +9650,8 @@ void loadProfile();
 void loadMode();
 // 启动即拉表情库（幂等）：回来后若聊天页已在，顺手把文本兜底的 [表情:名] 升级成图片
 void ensureEmojiLib().then(() => upgradeEmojiFallback($("#chat-log")));
+// 打开 App 就补齐聊天记录（含 App 关着期间在 QQ/微信里聊的那些）——见上方「本地永久副本」段
+ocStartSyncLoop();
 
 // ==================== 管理员登录（分发形态：用户免登录，管理员用密码） ====================
 // 两条身份路线：设备 ID（用户，各自命名空间）/ 管理员密码（全局数据）。

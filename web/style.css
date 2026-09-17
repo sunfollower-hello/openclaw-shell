@@ -1097,10 +1097,25 @@ button:disabled { opacity: 0.4; cursor: not-allowed; transform: none; }
 .emoji-group-tab:hover { border-color: var(--accent); }
 .emoji-group-tab.on { background: var(--accent); border-color: var(--accent); color: #fff; }
 .emoji-group-tab .g-count { font-size: 11px; opacity: .7; }
-.emoji-group-tab .g-del, .emoji-group-tab .g-rename { opacity: .55; font-size: 12px; padding: 0 2px; }
-.emoji-group-tab .g-del:hover, .emoji-group-tab .g-rename:hover { opacity: 1; color: var(--danger, #e05); }
+/* 分组管理入口只出现在选中那个标签上（原来每个标签挂两个小图标，太碎） */
+.emoji-group-tab .g-more { opacity: .75; font-size: 14px; line-height: 1; padding: 0 1px; }
+.emoji-group-tab .g-more:hover { opacity: 1; }
 .emoji-group-add { border: 1px dashed var(--border); background: transparent; color: var(--muted); padding: 5px 12px; border-radius: 999px; cursor: pointer; font-size: 13px; }
 .emoji-group-add:hover { border-color: var(--accent); color: var(--accent); }
+/* 表情包库：列表头 + 分组设置菜单 / 信息弹窗（自绘，不用浏览器原生弹窗——原生弹窗会显示站点地址） */
+.em-list-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin: 2px 0 12px; }
+.em-list-head h3 { margin: 0; font-size: 15px; font-weight: 600; }
+/* 分组设置菜单 / 信息弹窗（自绘，不用浏览器原生弹窗——原生弹窗会显示站点地址） */
+.em-menu { display: flex; flex-direction: column; gap: 8px; }
+.em-menu-item {
+  display: flex; align-items: center; gap: 8px; width: 100%; text-align: left;
+  border: 1px solid var(--border); background: var(--card); color: var(--text);
+  padding: 11px 12px; border-radius: var(--radius-sm); cursor: pointer; font-size: 14px;
+}
+.em-menu-item:hover { border-color: var(--accent); }
+.em-menu-item.danger { color: var(--danger); }
+.em-menu-item.danger:hover { border-color: var(--danger); }
+.em-info-lines { font-size: 13px; line-height: 1.7; color: var(--muted); word-break: break-all; }
 /* 聊天气泡里的表情图：QQ/微信 正常表情大小（此前 44px 太小，用户点名） */
 .chat-emoji { max-width: 110px; max-height: 110px; vertical-align: middle; margin: 0 2px; border-radius: 6px; }
 /* 独立成气泡的表情（一条就是一个表情）再大一档 */
