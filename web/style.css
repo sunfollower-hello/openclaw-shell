@@ -1192,6 +1192,7 @@ button:disabled { opacity: 0.4; cursor: not-allowed; transform: none; }
 /* ---- 底部输入浮岛 ---- */
 .lc-dock { flex-shrink: 0; padding: 8px 14px 14px; }
 .lc-island {
+  position: relative; /* 「模型」面板要按输入岛整宽定位（left:0;right:0） */
   border: 1px solid var(--border);
   background: var(--card);
   border-radius: 18px;
@@ -1225,16 +1226,16 @@ button:disabled { opacity: 0.4; cursor: not-allowed; transform: none; }
 .lc-model-chip select { max-width: 190px; }
 @media (max-width: 600px) { .lc-model-chip select { max-width: 130px; } }
 
-/* 输入行：自适应高度 textarea + 圆形发送键 */
-.lc-input-row { display: flex; align-items: flex-end; gap: 8px; }
+/* 输入行：自适应高度 textarea + 圆形发送键（2026-09-17 用户要求整体 +1/3 高） */
+.lc-input-row { display: flex; align-items: flex-end; gap: 10px; }
 .lc-input-row textarea {
   flex: 1; min-width: 0;
-  min-height: 42px; max-height: 160px;
-  padding: 10px 12px;
+  min-height: 56px; max-height: 210px;
+  padding: 14px 16px;
   border: 1px solid var(--border);
-  border-radius: 14px;
+  border-radius: 18px;
   background: var(--bg);
-  font-size: 13.5px; line-height: 1.5;
+  font-size: 14.5px; line-height: 1.5;
   resize: none; overflow-y: auto;
   font-family: inherit;
   transition: border-color 0.15s, background 0.15s;
@@ -1242,26 +1243,26 @@ button:disabled { opacity: 0.4; cursor: not-allowed; transform: none; }
 .lc-input-row textarea:focus { border-color: var(--accent); background: var(--card); outline: none; }
 .lc-send {
   flex-shrink: 0;
-  width: 42px; height: 42px; padding: 0;
-  border-radius: 14px;
+  width: 56px; height: 56px; padding: 0;
+  border-radius: 18px;
   background: var(--ink); color: #ffffff;
   border: none;
   display: flex; align-items: center; justify-content: center;
 }
 .lc-send:hover { background: var(--accent); color: #fff; }
 .lc-send:disabled { opacity: 0.45; }
-.lc-send .ic { width: 17px; height: 17px; }
+.lc-send .ic { width: 22px; height: 22px; }
 
 /* 本地聊天：纯图标开关（高亮=开启，无文字） */
 .lc-icon-btn {
-  width: 30px; height: 30px; padding: 0;
+  width: 40px; height: 40px; padding: 0;
   border-radius: 50%;
   border: 1px solid var(--border);
   background: var(--panel); color: var(--muted);
   display: inline-flex; align-items: center; justify-content: center;
   flex-shrink: 0;
 }
-.lc-icon-btn .ic { width: 15px; height: 15px; }
+.lc-icon-btn .ic { width: 20px; height: 20px; }
 .lc-icon-btn:hover { border-color: var(--accent); color: var(--accent); }
 .lc-icon-btn.on { background: var(--accent); border-color: var(--accent); color: #fff; }
 .lc-icon-btn.on:hover { background: var(--accent-dark); color: #fff; }
@@ -1599,24 +1600,24 @@ body.lc-fullscreen .lc-root { height: 100dvh; }
 .lc-who-text .lc-sub { display: none; }
 
 /* 单行输入岛：搜索 / 思考深度 / 输入 / 发送（RP-Hub 式） */
-/* 输入行：表情 / 输入 / 发送（高度比 RP-Hub 基准缩约 1/3） */
-.lc-input-row { display: flex; align-items: flex-end; gap: 6px; }
+/* 输入行：表情 / 输入 / 发送（2026-09-17 用户要求整体 +1/3 高：30 → 40） */
+.lc-input-row { display: flex; align-items: flex-end; gap: 8px; }
 .lc-input-row textarea {
   flex: 1; min-width: 0;
-  min-height: 30px; max-height: 120px;
-  border-radius: 14px; padding: 6px 12px;
-  font-size: 13.5px; line-height: 1.45;
+  min-height: 40px; max-height: 160px;
+  border-radius: 18px; padding: 9px 14px;
+  font-size: 14px; line-height: 1.45;
 }
 .lc-input-row .lc-icon-btn {
-  width: 30px; height: 30px; border-radius: 50%;
+  width: 40px; height: 40px; border-radius: 50%;
   display: flex; align-items: center; justify-content: center;
   color: var(--muted); flex-shrink: 0;
 }
 .lc-input-row .lc-icon-btn:hover { color: var(--accent); }
 .lc-send {
-  width: 30px !important; height: 30px !important; border-radius: 11px !important;
+  width: 40px !important; height: 40px !important; border-radius: 14px !important;
 }
-.lc-send .ic { width: 13px !important; height: 13px !important; }
+.lc-send .ic { width: 17px !important; height: 17px !important; }
 
 /* ===== 长按多选删除 ===== */
 #chat-log.selecting .bubble-row[data-conv-id] { cursor: pointer; }
@@ -1646,38 +1647,54 @@ body.lc-fullscreen .lc-root { height: 100dvh; }
 
 /* ===== 输入岛上排按键（模型商/模型/思考深度，RP-Hub 式弹层） ===== */
 .lc-tools-row { display: flex; align-items: center; gap: 6px; margin-bottom: 6px; padding: 0 2px; }
-.lc-pop-wrap { position: relative; }
 .lc-pill {
   display: inline-flex; align-items: center; gap: 4px;
-  height: 26px; padding: 0 10px;
-  border: 1px solid var(--border); border-radius: 13px;
+  height: 28px; padding: 0 12px;
+  border: 1px solid var(--border); border-radius: 14px;
   background: var(--bg); color: var(--text);
-  font-size: 12px; font-weight: 600; cursor: pointer;
+  font-size: 12.5px; font-weight: 600; cursor: pointer;
   max-width: 130px; white-space: nowrap;
 }
 .lc-pill:hover { border-color: var(--accent); color: var(--accent); }
 .lc-pill-caret { font-size: 9px; color: var(--muted); }
-.lc-pop {
-  position: absolute; bottom: calc(100% + 8px); left: 0; z-index: 60;
-  min-width: 150px; max-width: 240px; max-height: 260px; overflow-y: auto;
-  background: var(--card); border: 1px solid var(--border); border-radius: 14px;
+
+/* =====「模型」按键弹出的大面板：三栏竖线分隔（模型商 ｜ 模型 ｜ 思考深度）======
+   宽度 = 整个输入岛（left/right:0 挂在 .lc-island 上）；占比 模型 > 模型商 > 思考深度；
+   长名字一律省略号（完整名字看 title）；面板里不放任何说明文字。 */
+.lc-opt-panel {
+  position: absolute; left: 0; right: 0; bottom: calc(100% + 8px); z-index: 60;
+  display: flex; align-items: stretch; max-height: 44vh; overflow: hidden;
+  background: var(--card); border: 1px solid var(--border); border-radius: 16px;
   box-shadow: 0 12px 40px rgba(0, 0, 0, 0.16);
-  padding: 5px; display: flex; flex-direction: column; gap: 2px;
 }
-.lc-pop-right { left: auto; right: 0; }
-.lc-pop-item {
-  display: flex; align-items: center; justify-content: space-between; gap: 8px;
-  width: 100%; padding: 7px 10px; border: none; border-radius: 10px;
-  background: transparent; color: var(--text);
-  font-size: 12.5px; font-weight: 600; text-align: left; cursor: pointer;
+.lc-opt-panel[hidden] { display: none; } /* hidden 必须压过 display:flex */
+.lc-opt-col { min-width: 0; overflow-y: auto; overscroll-behavior: contain; padding: 6px; }
+.lc-opt-col + .lc-opt-col { border-left: 1px solid var(--border); }
+.lc-opt-prov { flex: 1.1 1 0; }
+.lc-opt-models { flex: 1.7 1 0; }
+.lc-opt-think {
+  flex: 0 0 62px; padding: 8px 6px;
+  display: flex; flex-direction: column; align-items: center; gap: 6px;
+}
+.lc-opt-item {
+  display: block; width: 100%; padding: 8px 10px;
+  border: none; border-radius: 10px; background: transparent; color: var(--text);
+  font-size: 13px; font-weight: 600; text-align: left; cursor: pointer;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
-.lc-pop-item:hover { background: var(--bg); }
-.lc-pop-item.on { background: var(--accent-soft); color: var(--accent-dark); }
-.lc-pop-check { color: var(--accent); font-weight: 700; }
-.lc-pop-empty { padding: 10px; font-size: 12px; color: var(--muted); text-align: center; }
-/* hidden 属性必须压过 .lc-pop 的 display:flex（否则隐藏弹层照样渲染并挡住按键） */
-.lc-pop[hidden] { display: none; }
+.lc-opt-item:hover { background: var(--bg); }
+.lc-opt-item.on { background: var(--accent-soft); color: var(--accent-dark); }
+/* 思考深度：一列圆形小按键，键面就是它代表的档位 */
+.lc-think-btn {
+  width: 40px; height: 40px; flex: 0 0 auto; padding: 0;
+  border: 1px solid var(--border); border-radius: 50%;
+  background: var(--panel); color: var(--muted);
+  font-size: 10.5px; line-height: 1.05; font-weight: 600; cursor: pointer;
+  display: flex; align-items: center; justify-content: center; text-align: center;
+  transition: border-color 0.15s, background 0.15s, color 0.15s;
+}
+.lc-think-btn:hover { border-color: var(--accent); color: var(--accent); }
+.lc-think-btn.on { background: var(--accent); border-color: var(--accent); color: #fff; }
 
 /* 图片加载失败的灰色提示 */
 .chat-img-fail {

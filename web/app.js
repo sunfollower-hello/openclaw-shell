@@ -1229,19 +1229,13 @@ function renderWorkbench() {
     <div class="lc-dock">
       <div class="lc-island">
         <div class="lc-tools-row">
-          <div class="lc-pop-wrap">
-            <button type="button" class="lc-pill" id="lc-prov-pill" title="模型商"><span id="lc-prov-label">模型商</span><span class="lc-pill-caret">▾</span></button>
-            <div class="lc-pop" id="lc-prov-pop" hidden></div>
-          </div>
-          <div class="lc-pop-wrap">
-            <button type="button" class="lc-pill" id="lc-model-pill" title="模型">模型<span class="lc-pill-caret">▾</span></button>
-            <div class="lc-pop" id="lc-model-pop" hidden></div>
-          </div>
-          <span style="flex:1"></span>
-          <div class="lc-pop-wrap">
-            <button type="button" class="lc-pill" id="lc-think-pill" title="思考深度"><span id="lc-think-label">自动</span><span class="lc-pill-caret">▾</span></button>
-            <div class="lc-pop lc-pop-right" id="lc-think-pop" hidden></div>
-          </div>
+          <button type="button" class="lc-pill" id="lc-opt-pill" title="模型"><span id="lc-opt-label">模型</span><span class="lc-pill-caret">▾</span></button>
+        </div>
+        <!-- 一个「模型」按键管三件事：模型商 ｜ 模型 ｜ 思考深度（蓝色面板宽度 = 整个输入岛） -->
+        <div class="lc-opt-panel" id="lc-opt-pop" hidden>
+          <div class="lc-opt-col lc-opt-prov" id="lc-opt-providers"></div>
+          <div class="lc-opt-col lc-opt-models" id="lc-opt-models"></div>
+          <div class="lc-opt-col lc-opt-think" id="lc-opt-thinks"></div>
         </div>
         <div class="lc-input-row">
           <button type="button" id="wb-emoji" class="lc-icon-btn" title="表情包">${icon("emoji")}</button>
@@ -1717,7 +1711,7 @@ function lcModelOverride() {
 /** 输入框随内容长高（上限 160px） */
 function wbAutoGrow(el) {
   el.style.height = "auto";
-  el.style.height = Math.min(el.scrollHeight, 160) + "px";
+  el.style.height = Math.min(el.scrollHeight, 190) + "px"; // 上限跟着输入框变大（原 160）
 }
 
 // 双击回车发送：420ms 内连按两次算发送，单击只换行
@@ -1761,97 +1755,136 @@ function saveWbChatOpts() {
   }));
 }
 
-/** 用当前状态刷新三个按键的文字 */
+/**
+ * 上排唯一按键「模型」的文字：**固定写「模型」**，当前选择放在 title 里
+ * （用户要求面板里看得见、按键上不占地方，空间有限）。
+ */
 function refreshLcPills() {
-  const prov = $("#lc-prov-label"), think = $("#lc-think-label");
-  if (prov) prov.textContent = lcModelState.provider || "模型商";
-  if (think) think.textContent = LC_THINKING.find((t) => t[0] === lcModelState.thinking)?.[1] ?? "自动";
+  const pill = $("#lc-opt-pill"), label = $("#lc-opt-label");
+  if (label) label.textContent = "模型";
+  if (pill) {
+    const think = LC_THINKING.find((t) => t[0] === lcModelState.thinking)?.[1] ?? "自动";
+    pill.title = [lcModelState.provider || "未选模型商", lcModelState.model || "未选模型", think].join(" · ");
+  }
 }
 
-/** 上排三个按键的弹层（RP-Hub 式：模型商列表 / 模型列表 / 思考深度竖排） */
+/** 面板外点一下关掉（只注册一次，避免每次进聊天页都叠一个监听） */
+let lcOptDocBound = false;
+
+/**
+ * 上排唯一按键「模型」的弹层：一个面板三栏、竖线分隔 —— 模型商 ｜ 模型 ｜ 思考深度。
+ * 面板宽度 = 整个输入岛宽（`left:0;right:0` 挂在 .lc-island 上），三栏按"模型 > 模型商 > 思考深度"
+ * 分宽度；名字过长一律省略号（完整名字看 title）。面板里**没有任何说明文字**（空间有限）。
+ * 点选即时生效并各自按卡记住（saveLcModelPick = 手动选过的标记）；面板不自动关，点外面才关，
+ * 这样三件事可以在同一个面板里连着调。
+ */
 function bindLcPopovers() {
   let providers = [];
-  const closeAll = () => { $("#lc-prov-pop").hidden = true; $("#lc-model-pop").hidden = true; $("#lc-think-pop").hidden = true; };
-  const toggle = async (popId, fill) => {
-    const pop = $(popId);
-    const wasHidden = pop.hidden;
-    closeAll();
-    if (wasHidden) { await fill(); pop.hidden = false; }
+  let shownFor = ""; // 当前面板里展示的是哪个模型商（点左侧即时切换，不必等保存）
+  const panel = () => $("#lc-opt-pop");
+  const commit = () => {
+    refreshLcPills();
+    saveWbChatOpts();
+    saveLcModelPick(wbSlug, lcModelState.provider, lcModelState.model);
   };
-  document.addEventListener("click", (e) => {
-    if (!e.target.closest(".lc-pop-wrap")) closeAll();
-  });
-  const item = (label, active) =>
-    `<button type="button" class="lc-pop-item${active ? " on" : ""}">${escapeHtml(label)}${active ? '<span class="lc-pop-check">✓</span>' : ""}</button>`;
 
-  // 模型商：全部已启用的提供商
-  $("#lc-prov-pill").addEventListener("click", () => toggle("#lc-prov-pop", async () => {
+  const renderProviders = () => {
+    const box = $("#lc-opt-providers");
+    if (!box) return;
+    box.innerHTML = providers
+      .map(
+        (p) =>
+          `<button type="button" class="lc-opt-item${p.name === shownFor ? " on" : ""}" data-prov="${escapeHtml(p.name)}" title="${escapeHtml(p.name)}">${escapeHtml(p.name)}</button>`
+      )
+      .join("");
+    box.querySelectorAll("[data-prov]").forEach((b) =>
+      b.addEventListener("click", () => {
+        lcModelState.provider = b.dataset.prov;
+        // 换模型商后模型归零到该商的第一个（沿用原行为）
+        lcModelState.model = providers.find((x) => x.name === lcModelState.provider)?.models?.[0] ?? "";
+        shownFor = lcModelState.provider;
+        commit();
+        renderProviders();
+        renderModels();
+      })
+    );
+  };
+
+  const renderModels = () => {
+    const box = $("#lc-opt-models");
+    if (!box) return;
+    const models = providers.find((x) => x.name === shownFor)?.models ?? [];
+    box.innerHTML = models
+      .map(
+        (m) =>
+          `<button type="button" class="lc-opt-item${m === lcModelState.model ? " on" : ""}" data-model="${escapeHtml(m)}" title="${escapeHtml(m)}">${escapeHtml(m)}</button>`
+      )
+      .join("");
+    box.querySelectorAll("[data-model]").forEach((b) =>
+      b.addEventListener("click", () => {
+        lcModelState.model = b.dataset.model;
+        commit();
+        renderModels();
+      })
+    );
+  };
+
+  const renderThinks = () => {
+    const box = $("#lc-opt-thinks");
+    if (!box) return;
+    box.innerHTML = LC_THINKING.map(
+      ([v, label]) =>
+        `<button type="button" class="lc-think-btn${v === lcModelState.thinking ? " on" : ""}" data-think="${v}" title="${escapeHtml(label)}">${escapeHtml(label)}</button>`
+    ).join("");
+    box.querySelectorAll("[data-think]").forEach((b) =>
+      b.addEventListener("click", () => {
+        lcModelState.thinking = b.dataset.think;
+        commit();
+        renderThinks();
+      })
+    );
+  };
+
+  const openPanel = async () => {
     if (!providers.length) {
       try {
         const r = await cachedGet("/api/providers");
         providers = (r.chat ?? []).filter((p) => p.enabled !== false);
-      } catch { providers = []; }
+      } catch {
+        providers = [];
+      }
     }
-    $("#lc-prov-pop").innerHTML = providers.length
-      ? providers.map((p) => item(p.name, p.name === lcModelState.provider).replace(
-          'class="lc-pop-item', `data-prov="${escapeHtml(p.name)}" class="lc-pop-item`
-        )).join("")
-      : '<div class="lc-pop-empty">没有启用的模型商</div>';
-    $("#lc-prov-pop").querySelectorAll("[data-prov]").forEach((b) =>
-      b.addEventListener("click", () => {
-        lcModelState.provider = b.dataset.prov;
-        // 换模型商后模型重置为该商的第一个
-        const p = providers.find((x) => x.name === lcModelState.provider);
-        lcModelState.model = p?.models?.[0] ?? "";
-        refreshLcPills();
-        saveWbChatOpts();
-        saveLcModelPick(wbSlug, lcModelState.provider, lcModelState.model); // 手动选择按卡记住
-        closeAll();
-      })
-    );
-  }));
-
-  // 模型：当前模型商下的模型（按键只写「模型」，点开看得见选了啥）
-  $("#lc-model-pill").addEventListener("click", () => toggle("#lc-model-pop", async () => {
-    if (!providers.length) {
-      try {
-        const r = await api.get("/api/providers");
-        providers = (r.chat ?? []).filter((p) => p.enabled !== false);
-      } catch { providers = []; }
+    shownFor = lcModelState.provider || providers[0]?.name || "";
+    // 没选过模型商：只在面板里按第一个展示（不写本地存储，所以不算"手动选过"，换卡仍跟随卡配置）
+    if (!lcModelState.provider && shownFor) {
+      lcModelState.provider = shownFor;
+      lcModelState.model = providers[0]?.models?.[0] ?? "";
     }
-    const p = providers.find((x) => x.name === lcModelState.provider);
-    const models = p?.models ?? [];
-    $("#lc-model-pop").innerHTML = models.length
-      ? models.map((m) => item(m, m === lcModelState.model).replace(
-          'class="lc-pop-item', `data-model="${escapeHtml(m)}" class="lc-pop-item`
-        )).join("")
-      : '<div class="lc-pop-empty">先在左边选一个模型商</div>';
-    $("#lc-model-pop").querySelectorAll("[data-model]").forEach((b) =>
-      b.addEventListener("click", () => {
-        lcModelState.model = b.dataset.model;
-        refreshLcPills();
-        saveWbChatOpts();
-        saveLcModelPick(wbSlug, lcModelState.provider, lcModelState.model); // 手动选择按卡记住
-        closeAll();
-      })
-    );
-  }));
+    renderProviders();
+    renderModels();
+    renderThinks();
+    refreshLcPills();
+  };
 
-  // 思考深度：竖排选择
-  $("#lc-think-pill").addEventListener("click", () => toggle("#lc-think-pop", async () => {
-    $("#lc-think-pop").innerHTML = LC_THINKING.map(([v, label]) =>
-      item(label, v === lcModelState.thinking).replace(
-        'class="lc-pop-item', `data-think="${v}" class="lc-pop-item`
-      )).join("");
-    $("#lc-think-pop").querySelectorAll("[data-think]").forEach((b) =>
-      b.addEventListener("click", () => {
-        lcModelState.thinking = b.dataset.think;
-        refreshLcPills();
-        saveWbChatOpts();
-        closeAll();
-      })
-    );
-  }));
+  $("#lc-opt-pill").addEventListener("click", async (e) => {
+    e.stopPropagation();
+    const p = panel();
+    if (!p) return;
+    if (p.hidden) {
+      await openPanel();
+      p.hidden = false;
+    } else {
+      p.hidden = true;
+    }
+  });
+  panel()?.addEventListener("click", (e) => e.stopPropagation());
+  if (!lcOptDocBound) {
+    lcOptDocBound = true;
+    document.addEventListener("click", () => {
+      const p = $("#lc-opt-pop");
+      if (p) p.hidden = true;
+    });
+  }
   refreshLcPills();
 }
 
