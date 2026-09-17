@@ -2143,6 +2143,14 @@ body.lc-fullscreen .lc-root { height: 100dvh; }
 .u-dev-main { display: flex; flex-direction: column; gap: 3px; min-width: 0; flex: 1; }
 .u-dev-id { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12.5px; word-break: break-all; cursor: copy; }
 .u-dev-id .oc-cell-mark { margin-left: 6px; font-family: var(--font); }
+/* 设备标记：管理员自己用的"昵称"，只为方便搜索；点一下就能改 */
+.u-label {
+  display: inline-block; margin-right: 6px; padding: 0 7px; border-radius: 999px;
+  font-family: var(--font); font-size: 11.5px; cursor: pointer;
+  background: var(--accent-soft, #eef3ff); color: var(--accent); border: 1px solid transparent;
+}
+.u-label:hover { border-color: var(--accent); }
+.u-label.empty { background: transparent; color: var(--muted); border: 1px dashed var(--border); }
 .u-dev-meta { font-size: 11.5px; color: var(--muted); font-variant-numeric: tabular-nums; }
 .oc-empty { padding: 26px 0; text-align: center; font-size: 12.5px; color: var(--faint); }
 

@@ -100,3 +100,20 @@ export function setDeviceDisabled(id: string, disabled: boolean): boolean {
   save(reg);
   return true;
 }
+
+/**
+ * 设备标记（管理员用的"昵称"，只为方便在列表里搜索；可为空 = 取消标记）。
+ * 存在注册表里，而注册表只经 `/api/users`（管理员专属端点）返回 —— **设备端拿不到**，
+ * 所以这个标记不会传给任何用户，也不会进仓库（data/ 在 .gitignore 里）。
+ */
+export function setDeviceLabel(id: string, label: string): boolean {
+  if (!DEVICE_ID_RE.test(id)) return false;
+  const reg = load();
+  const rec = reg.devices.find((d) => d.id === id);
+  if (!rec) return false;
+  const v = String(label ?? "").trim().slice(0, 40);
+  if (v) rec.label = v;
+  else delete rec.label;
+  save(reg);
+  return true;
+}

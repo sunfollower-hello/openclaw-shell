@@ -71,7 +71,7 @@ import {
 import { TOOL_REGISTRY, toolsToOpenAI, resolveInSandbox, type ToolDef, type ToolCtx } from "./tools/registry.js";
 import { FEATURES, filterDisabledTools } from "./core/features.js";
 import { runAsUser, userRoot, DEVICE_ID_RE, currentDeviceId, devicePrefix } from "./core/dataRoot.js";
-import { ensureDevice, isDeviceAdmin, listDevices, setDeviceAdmin, setDeviceDisabled } from "./core/users.js";
+import { ensureDevice, isDeviceAdmin, listDevices, setDeviceAdmin, setDeviceDisabled, setDeviceLabel } from "./core/users.js";
 import {
   accountOwner,
   setAccountOwner,
@@ -334,6 +334,31 @@ if (UI_USER && UI_PASS) {
   });
 }
 
+// ⚠️ 管理员专属前缀的拦截**必须在所有 /api/users/* 路由之前**注册。
+// 【2026-09-17 修】原来这段写在 /api/users/admin、/api/users/retention、/api/users/:id/cards(和 chats)
+// 的后面，而 Express 是按注册顺序匹配的 → 那几条路由**整个绕过了拦截**。实测：
+//   · 设备带头 POST /api/users/admin {id: 自己的id, admin:true} → 200，**任何用户都能把自己提成管理员**
+//     （提成后设备中间件会把它当管理员设备，走全局作用域 = 能看到所有人的卡与聊天记录）；
+//   · 设备带头 GET /api/users/<别人的id>/chats/<slug> → 200，能读别人的聊天记录；
+//   · /api/users/retention 能让设备去删别的设备的过期数据。
+// 这类"写在网关前面"的路由以后新增也可能重犯，所以把网关提到最前面（认证/身份中间件之后）。
+const ADMIN_ONLY_PREFIXES = [
+  "/api/plugins",
+  "/api/mcp",
+  "/api/users",
+  "/api/backup",
+  "/api/workspace/",
+  "/api/logs",
+  "/api/llm-usage",
+  "/api/llm/usage",
+];
+app.use((req, res, next) => {
+  if (res.locals.ocDevice && ADMIN_ONLY_PREFIXES.some((p) => req.path === p || req.path.startsWith(p))) {
+    return res.status(403).json({ error: "该功能不在此版本开放" });
+  }
+  next();
+});
+
 // 管理员登录/登出/状态（免认证，见 isPublicPath）
 app.post("/api/admin/login", (req, res) => {
   if (!UI_USER || !UI_PASS) return res.json({ ok: true, admin: true, hint: "未启用认证" });
@@ -377,12 +402,15 @@ app.get("/api/users/:id/cards", async (req, res) => {
   const id = String(req.params.id ?? "").toLowerCase();
   if (!DEVICE_ID_RE.test(id)) return res.status(400).json({ error: "设备 ID 不合法" });
   const admin = isDeviceAdmin(id);
+  // 顺手带上标记：管理员在这一页也想看到"这是谁"（同样只在管理员端点返回）
+  const label = listDevices().find((d) => d.id === id)?.label ?? "";
   try {
     const list = admin
       ? await store.list()
       : await runAsUser({ deviceId: id, root: userRoot(id) }, () => store.list());
     res.json({
       admin,
+      label,
       cards: list.map((c) => ({ slug: c.slug, name: c.name, updated_at: c.updated_at, avatar: c.avatar })),
     });
   } catch (e) {
@@ -428,33 +456,19 @@ app.post("/api/users/admin", (req, res) => {
   res.json({ ok: true });
 });
 
+// 设备标记（管理员的"昵称"，只为方便搜索）：存在全局注册表里，只有管理员能读写。
+// 设备端根本触达不到这个端点（/api/users 在 ADMIN_ONLY_PREFIXES 里），也不会从任何用户接口漏出去。
+app.post("/api/users/label", (req, res) => {
+  const { id, label } = req.body ?? {};
+  const ok = setDeviceLabel(String(id ?? ""), String(label ?? ""));
+  if (!ok) return res.status(400).json({ error: "设备不存在或 id 不合法" });
+  res.json({ ok: true, label: String(label ?? "").trim().slice(0, 40) });
+});
+
 // 设备请求包进用户作用域（此后所有 dataDir() 都指向 data/users/<id>/）
 app.use((req, res, next) => {
   const dev = res.locals.ocDevice;
   if (dev) return runAsUser({ deviceId: dev, root: userRoot(dev) }, () => next());
-  next();
-});
-
-// 管理员专属端点：设备（分发用户）不可触达
-// ⚠️ `/api/bots` 与 `/api/channels` **不在**这个名单里：通道是用户的核心体验，
-// 设备也要能扫码绑自己的机器人 —— 隔离靠"账号归属"（channelOwners.ts）+ 各端点里的
-// ownsAccount 检查，而不是靠整块 403。运行日志/模型用量是进程级共用的，仍然只给管理员。
-// 蒸馏对**用户也开放**（上传自己的聊天记录做人设是核心流程，写进的就是它自己的设备空间）；
-// 唯一不给的是「直连本机 WeFlow」那条 —— 那会让服务器去连跑服务那台机器上的本地服务。
-const ADMIN_ONLY_PREFIXES = [
-  "/api/plugins",
-  "/api/mcp",
-  "/api/users",
-  "/api/backup",
-  "/api/workspace/",
-  "/api/logs",
-  "/api/llm-usage",
-  "/api/llm/usage",
-];
-app.use((req, res, next) => {
-  if (res.locals.ocDevice && ADMIN_ONLY_PREFIXES.some((p) => req.path === p || req.path.startsWith(p))) {
-    return res.status(403).json({ error: "该功能不在此版本开放" });
-  }
   next();
 });
 

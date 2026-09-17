@@ -9770,7 +9770,7 @@ function renderUsersPage() {
     <div class="page-head"><h2>设备管理</h2><button id="u-back" class="ghost small-btn">← 返回</button></div>
     <div class="card-box oc-card">
       <div class="u-search-row">
-        <input id="u-search" placeholder="搜索设备 ID（输前几位就行）">
+        <input id="u-search" placeholder="搜索设备 ID 或标记（输前几位就行）">
         <span class="u-count" id="u-count"></span>
       </div>
       <div class="oc-rows" id="u-list"><div class="oc-empty">读取中…</div></div>
@@ -9780,6 +9780,35 @@ function renderUsersPage() {
 /** 设备列表快照（搜索在本地过滤，不再打接口） */
 let uDevices = [];
 let uQuery = "";
+/** 从「查看」退回来时要不要保留搜索框与滚动位置（用户反馈：点查看再退出会跳回顶部，来回找很烦） */
+let uKeepState = false;
+
+/**
+ * 管理端"设备 → 角色卡 → 聊天记录"来回看时记住 `#view` 的滚动位置。
+ * 路由切页会把 `#view` 的内容整块换掉，滚回顶部是必然的；这里只在"从列表点进去"时记一次，
+ * 退回时恢复一次（读完就删，下次新进来仍从顶部开始，免得停在半路让人莫名）。
+ */
+const viewScrollMemo = new Map();
+function rememberViewScroll(key) {
+  const v = $("#view");
+  viewScrollMemo.set(key, v ? v.scrollTop : 0);
+}
+function restoreViewScroll(key) {
+  const y = viewScrollMemo.get(key);
+  viewScrollMemo.delete(key);
+  if (!y) return;
+  let tries = 0;
+  const apply = () => {
+    const v = $("#view");
+    if (!v) return;
+    v.scrollTo({ top: y, behavior: "instant" });
+    // 列表是异步取回才画的：内容落定前赋值会被顶回顶部，追几帧直到稳定。
+    // 用定时器而不是 requestAnimationFrame —— 后台标签页里 rAF 不触发，会静默失效（实测踩到）。
+    if (++tries < 8 && Math.abs(v.scrollTop - y) > 4) setTimeout(apply, 60);
+  };
+  apply();
+  setTimeout(apply, 0);
+}
 /** 注册/最近时间显示到分钟（用户要看"哪台是什么时候来的"） */
 function uFmtTime(s) {
   const t = Date.parse(s || "");
@@ -9803,7 +9832,14 @@ function uRenderRows() {
   const box = $("#u-list");
   if (!box) return;
   const all = uSortedDevices(uDevices);
-  const hit = uQuery ? all.filter((d) => String(d.id || "").toLowerCase().includes(uQuery)) : all;
+  // 搜索同时匹配设备 ID 与标记（标记就是给"以后我还认得出这是谁"用的）
+  const hit = uQuery
+    ? all.filter(
+        (d) =>
+          String(d.id || "").toLowerCase().includes(uQuery) ||
+          String(d.label || "").toLowerCase().includes(uQuery)
+      )
+    : all;
   const count = $("#u-count");
   if (count) count.textContent = uQuery ? `共 ${all.length} 台 · 显示 ${hit.length}` : `共 ${all.length} 台`;
   if (!hit.length) {
@@ -9822,9 +9858,33 @@ function uRenderRows() {
     row.innerHTML = `
       <span class="oc-bar" style="background:${dev.disabled ? "var(--faint)" : "var(--accent)"}"></span>
       <span class="u-dev-main">
-        <span class="u-dev-id" title="点击复制完整 ID">${escapeHtml(dev.id || "")}${marks}</span>
+        <span class="u-dev-id" title="点击复制完整 ID"
+          ><span class="u-label${dev.label ? "" : " empty"}" title="${
+            dev.label ? "标记（只有管理员可见）· 点击修改" : "加个标记，方便以后搜索（只有管理员可见）"
+          }">${dev.label ? escapeHtml(dev.label) : "＋标记"}</span>${escapeHtml(dev.id || "")}${marks}</span
+        >
         <span class="u-dev-meta">注册 ${uFmtTime(dev.createdAt)} · 最近 ${uFmtTime(dev.lastSeen)}</span>
       </span>`;
+    // 标记：点一下就能改/取消。只写进管理员的设备注册表，任何用户接口都不返回它
+    row.querySelector(".u-label").addEventListener("click", async (e) => {
+      e.stopPropagation(); // 别连带触发"复制 ID"
+      const next = await ocInputDialog({
+        title: "设备标记",
+        label: "只有你能看到，用来方便搜索；留空 = 取消标记",
+        value: dev.label || "",
+        placeholder: "如：老王 / 我的手机",
+        okText: "保存",
+      });
+      if (next === null) return;
+      try {
+        await api.send("/api/users/label", { method: "POST", body: JSON.stringify({ id: dev.id, label: next }) });
+        dev.label = next.trim();
+        uRenderRows();
+        toast(next.trim() ? `✓ 已标记为「${next.trim()}」` : "已取消标记");
+      } catch (err) {
+        toast("标记失败：" + err.message, false);
+      }
+    });
     // 完整 ID 点一下即复制（用户要拿它去对"哪台是谁"、贴给用户查记录）
     row.querySelector(".u-dev-id").addEventListener("click", async () => {
       try {
@@ -9838,6 +9898,9 @@ function uRenderRows() {
     look.className = "ghost small-btn";
     look.textContent = "查看";
     look.addEventListener("click", () => {
+      // 记住搜索与滚动位置，退回来时原地不动（原来会跳回顶部，来回定位很烦）
+      rememberViewScroll("users");
+      uKeepState = true;
       location.hash = "#/usercards?id=" + encodeURIComponent(dev.id);
     });
     row.appendChild(look);
@@ -9867,8 +9930,13 @@ function uRenderRows() {
 async function initUsersPage() {
   $("#u-back").addEventListener("click", () => { location.hash = "#/home"; });
   const me = await fetch("/api/admin/me").then((r) => r.json()).catch(() => ({ admin: false }));
-  uDevices = [];
-  uQuery = "";
+  // 从「查看」退回来：保留搜索内容与滚动位置（原样复位成空 = 用户得重新搜、重新往下翻）
+  const keep = uKeepState;
+  uKeepState = false;
+  if (!keep) {
+    uDevices = [];
+    uQuery = "";
+  }
   const box = $("#u-list");
   const search = $("#u-search");
   if (!me.admin) {
@@ -9877,7 +9945,7 @@ async function initUsersPage() {
     return;
   }
   if (search) {
-    search.value = "";
+    search.value = keep ? uQuery : "";
     search.addEventListener("input", () => {
       uQuery = search.value.trim().toLowerCase();
       uRenderRows();
@@ -9886,6 +9954,7 @@ async function initUsersPage() {
   const d = await api.get("/api/users").catch(() => ({ devices: [] }));
   uDevices = d.devices || [];
   uRenderRows();
+  if (keep) restoreViewScroll("users");
 }
 // ---------- 管理员查看：某设备的卡库 → 某卡的聊天记录（纯文本，一行一句） ----------
 function renderUserCards() {
@@ -9902,9 +9971,14 @@ async function initUserCards() {
   const box = $("#uc-list");
   const d = await api.get("/api/users/" + encodeURIComponent(id) + "/cards").catch(() => null);
   const cards = (d && d.cards) || [];
-  // 管理员设备的数据存在全局空间（它平时看的就是全局那份），下划线这句省得下次又以为"没数据"
+  // 标一句：标记（管理员看"这是谁"）+ 管理员设备的数据在全局空间（省得下次又以为"没数据"）
   const head = $("#uc-head");
-  if (head && d && d.admin) head.textContent = "管理员设备：显示的是全局空间的卡（它平时用的就是这一份）";
+  if (head) {
+    head.textContent = [
+      d?.label ? `标记：${d.label}` : "",
+      d?.admin ? "管理员设备：显示的是全局空间的卡（它平时用的就是这一份）" : "",
+    ].filter(Boolean).join(" · ");
+  }
   if (!cards.length) { box.innerHTML = '<div class="oc-empty">这张设备没有卡</div>'; return; }
   box.innerHTML = "";
   for (const c of cards) {
@@ -9912,10 +9986,12 @@ async function initUserCards() {
     row.className = "oc-row";
     row.innerHTML = '<span class="oc-bar"></span><span class="oc-row-label">' + escapeHtml(c.name || c.slug) + '</span><span class="oc-row-val">' + String(c.updated_at || "").slice(0, 10) + '</span><span class="oc-chev">›</span>';
     row.addEventListener("click", () => {
+      rememberViewScroll("usercards:" + id); // 看完聊天记录退回来时，卡片列表也停在原处
       location.hash = "#/userchats?id=" + encodeURIComponent(id) + "&slug=" + encodeURIComponent(c.slug);
     });
     box.appendChild(row);
   }
+  restoreViewScroll("usercards:" + id);
 }
 function renderUserChats() {
   return `
