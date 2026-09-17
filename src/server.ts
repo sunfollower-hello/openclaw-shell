@@ -700,6 +700,8 @@ app.get("/api/cards/:slug", async (req, res) => {
 // ---------- 开场白：领取 / 查询 / 清除（避免冷场 + 不重复触发） ----------
 // userKey 由调用方传：本地聊天用 "local"，通道侧用 "qq:<openid>" / "wx:<openid>"。
 // claim = 原子领取：首次返回 first_mes 并标记已开场；已开场过返回 null（前端不再显示）。
+// 这个特殊 key 记录"开场白已经写进过会话日志"，用于老数据的一次性补写（不是真实对话方，不会撞）。
+const FIRST_MES_LOGGED_KEY = "#first_mes_logged";
 app.post("/api/cards/:slug/greeting/claim", async (req, res) => {
   try {
     const { userKey } = req.body ?? {};
@@ -707,15 +709,31 @@ app.post("/api/cards/:slug/greeting/claim", async (req, res) => {
     const card = await store.get(req.params.slug);
     const firstMes = card.sillytavern_v2?.first_mes?.trim() ?? "";
     const text = await claimGreeting(card.slug, key, firstMes);
-    if (text === null) return res.json({ greeted: false, text: null });
-    // 【2026-09-17 修】开场白同时写进统一会话日志：原来只置了个"已开场"标记，
-    // 前端把气泡画在 wbReloadHistory 之前、被随后清空聊天区吃掉 → 用户永远看不到开场白，
-    // 而标记已置位以后也不会再出现（用户反馈"开场白没发出、开场冷场"）。
-    // 只对网页本地会话（userKey=local）写；通道侧的 userKey 是 qq:/wx:，那边由主动推送与镜像负责。
-    const entry = key === "local"
-      ? await appendConv(card.slug, { role: "assistant", content: text, surface: "web", ns: "local" }).catch(() => null)
-      : null;
-    res.json({ greeted: true, text, entry });
+    if (text !== null) {
+      // 【2026-09-17 修】开场白同时写进统一会话日志：原来只置了个"已开场"标记，
+      // 前端把气泡画在 wbReloadHistory 之前、被随后清空聊天区吃掉 → 用户永远看不到开场白。
+      // 只对网页本地会话（userKey=local）写；通道侧 userKey 是 qq:/wx:，由主动推送与镜像负责。
+      const entry = key === "local"
+        ? await appendConv(card.slug, { role: "assistant", content: text, surface: "web", ns: "local" }).catch(() => null)
+        : null;
+      if (key === "local") await markGreeted(card.slug, FIRST_MES_LOGGED_KEY).catch(() => {});
+      return res.json({ greeted: true, text, entry });
+    }
+    // 已经开场过（老版本遗留：标记置了、日志里却没有开场白）→ **一次性补写**，让老卡也能看到开场白。
+    // 用专门的一次性标记兜住，避免"用户手动删掉开场白后又每次都被翻出来"。
+    if (key === "local" && firstMes) {
+      const done = await isGreeted(card.slug, FIRST_MES_LOGGED_KEY).catch(() => true);
+      if (!done) {
+        await markGreeted(card.slug, FIRST_MES_LOGGED_KEY).catch(() => {});
+        const entries = await readConv(card.slug).catch(() => []);
+        const already = entries.some((e) => e.role === "assistant" && String(e.content ?? "").trim() === firstMes);
+        if (!already) {
+          const entry = await appendConv(card.slug, { role: "assistant", content: firstMes, surface: "web", ns: "local" }).catch(() => null);
+          if (entry) return res.json({ greeted: true, text: firstMes, entry, backfilled: true });
+        }
+      }
+    }
+    res.json({ greeted: false, text: null });
   } catch (e) {
     res.status(500).json({ error: toUserError(e) });
   }

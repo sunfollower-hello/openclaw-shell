@@ -896,6 +896,15 @@ QQ 通道级还留着迁移过来的 `allowFrom: ["F5D0…"]` + `dmPolicy: "allo
 - 前端删掉那句手动画气泡，交给随后的 `wbReloadHistory()` 正常渲染。
 **验证**：临时实例放一张带 `first_mes` 的卡 → 进聊天页 → 聊天区出现开场白气泡 ✓（改前是空的）。附带好处：开场白现在真的是历史的一部分，模型上下文里也有了（服务端原本只在"前端无历史"时补注入，现在天然不缺）。
 
+### ⑤-b 补丁：**老卡也看不到开场白**（同一天追加修复）
+上一版只修了"新开场"这一半：`claimGreeting` 对**已经开场过**的卡直接返回 null（用户此前已经开过场的卡都算），所以用户的卡还是看不到开场白。
+**修法（一次性补写）**：`/greeting/claim` 在"已开场过"分支里，检查会话日志里到底有没有这段 first_mes —— 没有就补写一条并返回；用一个专用标记 `#first_mes_logged`（存在 greeted 文件里，不是真实对话方 key，不会撞）保证**只补一次**，这样"用户手动删掉开场白"不会被反复翻出来；整卡重置（`clearGreeted(slug)` 清整个文件）会把标记一起清掉，重置后能重新开场。
+**验证**：夹具造一张"已开场过、日志为空"的老卡 → 第一次 claim 返回 `{greeted:true, backfilled:true}` 并写入日志 ✓；第二次 claim `{greeted:false}` ✓；greeted 文件里 `local` 与 `#first_mes_logged` 并存 ✓。已上线（备份 `server.ts.bak6`）。
+
+### ⑤-c 关于"要不要装新 APK"
+网页侧兜底（`--app-h` + `interactive-widget`）**已经上线且对旧壳生效**，所以"升键盘顶走顶栏"这个现象在旧壳上就会明显好转 —— 用户实测确认已不再被顶走。
+区别在于：**旧壳靠 JS 补偿**（系统仍在平移窗口，键盘动画过程中可能有一瞬跳动；页面滚动或键盘很高时仍可能偏），**v3 是治本**（窗口真被 resize + 键盘高度当原生 padding，不依赖 JS、任何页面都对）。所以：不装也能用，方便时再装（覆盖安装保数据）。
+
 ### 部署与验证
 - 前端 `app.js` / `style.css` / `index.html` + 服务端 `server.ts`（build + restart）；线上首页引用 `app.js?v=0k`，交付内容含 `对方正在输入中`、`撤销`、`bindVisualViewport`，`index.html` 含 `interactive-widget`；站点 200、服务 active。备份：`app.js.bak7`、`style.css.bak6`、`index.html.bak`、`server.ts.bak5`。
 - **一处没验到的**：用自造夹具卡（该卡没有完整 schema，缺 `voice.tone_rules` 等）走不出**成功回复**路径，所以"成功时复位提示"是靠代码核对（与已实测的错误路径是同一处调用）；真机上发一条消息即可确认。
