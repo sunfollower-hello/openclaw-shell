@@ -45,7 +45,7 @@ body {
 *::-webkit-scrollbar-thumb:hover { background: var(--faint); background-clip: padding-box; }
 *::-webkit-scrollbar-track { background: transparent; }
 
-#app { display: flex; flex-direction: column; height: 100vh; height: 100dvh; }
+#app { display: flex; flex-direction: column; height: 100vh; height: var(--app-h, 100dvh); }
 
 /* ============ 顶栏 ============ */
 .topbar {
@@ -1168,6 +1168,10 @@ button:disabled { opacity: 0.4; cursor: not-allowed; transform: none; }
 .lc-avatar img { width: 100%; height: 100%; object-fit: cover; display: block; }
 .lc-who-text { min-width: 0; }
 .lc-name { font-weight: 700; font-size: 14.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* 「对方正在输入中…」：名字直接变提示（微信式），头像轻微呼吸；不再往聊天里插占位气泡 */
+.lc-name.typing { color: var(--muted); font-weight: 600; }
+.lc-who.typing .lc-avatar { animation: lc-typing-pulse 1.2s ease-in-out infinite; }
+@keyframes lc-typing-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
 .lc-sub { font-size: 11.5px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .lc-top-actions { display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
 .lc-top-actions button.reset { color: var(--danger); }
@@ -1579,7 +1583,7 @@ button:disabled { opacity: 0.4; cursor: not-allowed; transform: none; }
 
 /* ===== 本地聊天 RP-Hub 式接管：隐藏 SoulBox 顶栏，对话占满整页 ===== */
 body.lc-fullscreen .topbar { display: none; }
-body.lc-fullscreen .lc-root { height: 100dvh; }
+body.lc-fullscreen .lc-root { height: var(--app-h, 100dvh); }
 .lc-dot {
   width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0;
   background: #fff; border: 1px solid var(--border-strong); margin-left: 2px;
@@ -1660,36 +1664,39 @@ body.lc-fullscreen .lc-root { height: 100dvh; }
 
 /* =====「模型」按键弹出的大面板：三栏竖线分隔（模型商 ｜ 模型 ｜ 思考深度）======
    宽度 = 整个输入岛（left/right:0 挂在 .lc-island 上）；占比 模型 > 模型商 > 思考深度；
-   长名字一律省略号（完整名字看 title）；面板里不放任何说明文字。 */
+   长名字一律省略号（完整名字看 title）；面板里不放任何说明文字。
+   2026-09-17 二次调整（用户要求）：思考深度整体再瘦 1/4 以上（列 62→46、圆键 40→32、字号 10.5→9.5）、
+   模型商缩约 1/6（1.1→1.0），腾出的宽度全部给模型（1.7→2.1）；面板最高高度 44vh→36vh，
+   行距与字号同步收紧；两栏都超出时各自上下滑动（overflow-y:auto 见 .lc-opt-col）。 */
 .lc-opt-panel {
   position: absolute; left: 0; right: 0; bottom: calc(100% + 8px); z-index: 60;
-  display: flex; align-items: stretch; max-height: 44vh; overflow: hidden;
+  display: flex; align-items: stretch; max-height: 36vh; overflow: hidden;
   background: var(--card); border: 1px solid var(--border); border-radius: 16px;
   box-shadow: 0 12px 40px rgba(0, 0, 0, 0.16);
 }
 .lc-opt-panel[hidden] { display: none; } /* hidden 必须压过 display:flex */
-.lc-opt-col { min-width: 0; overflow-y: auto; overscroll-behavior: contain; padding: 6px; }
+.lc-opt-col { min-width: 0; overflow-y: auto; overscroll-behavior: contain; padding: 5px; }
 .lc-opt-col + .lc-opt-col { border-left: 1px solid var(--border); }
-.lc-opt-prov { flex: 1.1 1 0; }
-.lc-opt-models { flex: 1.7 1 0; }
+.lc-opt-prov { flex: 1 1 0; }
+.lc-opt-models { flex: 2.1 1 0; }
 .lc-opt-think {
-  flex: 0 0 62px; padding: 8px 6px;
-  display: flex; flex-direction: column; align-items: center; gap: 6px;
+  flex: 0 0 46px; padding: 6px 4px;
+  display: flex; flex-direction: column; align-items: center; gap: 5px;
 }
 .lc-opt-item {
-  display: block; width: 100%; padding: 8px 10px;
+  display: block; width: 100%; padding: 7px 9px;
   border: none; border-radius: 10px; background: transparent; color: var(--text);
-  font-size: 13px; font-weight: 600; text-align: left; cursor: pointer;
+  font-size: 12.5px; font-weight: 600; text-align: left; cursor: pointer;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 .lc-opt-item:hover { background: var(--bg); }
 .lc-opt-item.on { background: var(--accent-soft); color: var(--accent-dark); }
 /* 思考深度：一列圆形小按键，键面就是它代表的档位 */
 .lc-think-btn {
-  width: 40px; height: 40px; flex: 0 0 auto; padding: 0;
+  width: 32px; height: 32px; flex: 0 0 auto; padding: 0;
   border: 1px solid var(--border); border-radius: 50%;
   background: var(--panel); color: var(--muted);
-  font-size: 10.5px; line-height: 1.05; font-weight: 600; cursor: pointer;
+  font-size: 9.5px; line-height: 1.05; font-weight: 600; cursor: pointer;
   display: flex; align-items: center; justify-content: center; text-align: center;
   transition: border-color 0.15s, background 0.15s, color 0.15s;
 }

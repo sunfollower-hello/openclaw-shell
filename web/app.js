@@ -1144,7 +1144,7 @@ async function refreshLcCardObj(slug) {
       ? `<img src="${escapeHtml(c.identity.avatar)}" alt="">`
       : `<span>${escapeHtml(String(c.name ?? "?").slice(0, 1))}</span>`;
   }
-  if (nameEl) nameEl.textContent = middleEllipsis(c.name ?? slug, 16);
+  if (nameEl) { setTypingIndicator(false); nameEl.textContent = middleEllipsis(c.name ?? slug, 16); }
 }
 
 /** 用快照秒开聊天页：贴回 DOM 与上下文，不发任何请求 */
@@ -1170,7 +1170,7 @@ function restoreLcSnapshot() {
       ? `<img src="${escapeHtml(c.identity.avatar)}" alt="">`
       : `<span>${escapeHtml(String(c?.name ?? "?").slice(0, 1))}</span>`;
   }
-  if (nameEl) nameEl.textContent = middleEllipsis(c?.name ?? wbSlug, 16);
+  if (nameEl) { setTypingIndicator(false); nameEl.textContent = middleEllipsis(c?.name ?? wbSlug, 16); }
   setLcDot(lcSnap.dot.cls, lcSnap.dot.title);
   // 滚动位置还原（instant：容器 CSS 是 smooth，平滑动画会被后续渲染打断）
   log.scrollTo({ top: lcSnap.scrollTop, behavior: "instant" });
@@ -1178,11 +1178,8 @@ function restoreLcSnapshot() {
   upgradeEmojiFallback(log);
   // 从搜索页点命中跳回来的：快照秒开不走 wbReloadHistory，这里也要消费定位
   void wbFocusPendingHit();
-  // 正在生成中就把占位气泡接回来（切页期间请求没断，见 wbDoSend）
-  if (wbAbort && !$("#chat-log .lc-pending-row")) {
-    wbThinkingBubble = addChatBubble("bot", "（正在输出… 发新消息可截断重来）", undefined, undefined, null);
-    wbThinkingBubble?.classList.add("lc-pending-row");
-  }
+  // 正在生成中：把顶栏的「对方正在输入中…」接回来（切页期间请求没断，见 wbDoSend）
+  if (wbAbort) setTypingIndicator(true);
   // 联通模式：重新挂上轮询（定时器在离开时被 cleanup 清掉了）
   if (wbMirror?.slug === wbSlug && !wbMirrorTimer) {
     wbMirrorTimer = setInterval(() => wbMirrorSync(wbSlug), 3000);
@@ -1202,6 +1199,31 @@ function setLcDot(cls, title) {
   if (dotEl) { dotEl.className = "lc-dot " + cls; dotEl.title = title; }
 }
 
+/**
+ * 「对方正在输入中…」：AI 开始思考/生成时，**顶栏的名字（和头像区）直接变成提示**，
+ * 不再往聊天里插一个"（正在输出…）"占位气泡（用户要求：微信/QQ 那样只看顶栏）。
+ * 关闭时把名字还原成进入前的值。
+ */
+let lcNameBeforeTyping = null;
+function setTypingIndicator(on) {
+  const nameEl = $("#lc-name");
+  const who = $("#lc-who");
+  if (!nameEl) return;
+  if (on) {
+    if (lcNameBeforeTyping === null) lcNameBeforeTyping = nameEl.textContent || "";
+    nameEl.textContent = "对方正在输入中...";
+    nameEl.classList.add("typing");
+    who?.classList.add("typing");
+  } else {
+    if (lcNameBeforeTyping !== null) {
+      nameEl.textContent = lcNameBeforeTyping;
+      lcNameBeforeTyping = null;
+    }
+    nameEl.classList.remove("typing");
+    who?.classList.remove("typing");
+  }
+}
+
 function renderWorkbench() {
   return `
   <div class="lc-root">
@@ -1216,7 +1238,6 @@ function renderWorkbench() {
         <span class="lc-dot" id="lc-dot" title="联通状态：绿=已联通 红=联通异常 白=本地"></span>
       </div>
       <div class="lc-top-actions">
-        <button id="wb-undo-round" class="ghost small-btn" title="撤掉最近一问一答（网页与 QQ/微信 上下文一起摘，破甲被拒时用）">撤掉上一轮</button>
         <!-- 三个点=更多：进这张卡的聊天设置页（记忆/查找/置顶/一键删除都在里面） -->
         <button id="wb-more" class="lc-more-btn" title="更多（聊天设置）" aria-label="更多">⋯</button>
       </div>
@@ -1230,6 +1251,8 @@ function renderWorkbench() {
       <div class="lc-island">
         <div class="lc-tools-row">
           <button type="button" class="lc-pill" id="lc-opt-pill" title="模型"><span id="lc-opt-label">模型</span><span class="lc-pill-caret">▾</span></button>
+          <!-- 撤销：原来在顶栏叫「撤掉上一轮」，2026-09-17 挪到输入区模型右边并改名 -->
+          <button type="button" class="lc-pill" id="wb-undo-round" title="撤销最近一问一答（网页与 QQ/微信 上下文一起摘，破甲被拒时用）">撤销</button>
         </div>
         <!-- 一个「模型」按键管三件事：模型商 ｜ 模型 ｜ 思考深度（蓝色面板宽度 = 整个输入岛） -->
         <div class="lc-opt-panel" id="lc-opt-pop" hidden>
@@ -1379,7 +1402,7 @@ async function wbPickCard(slug) {
         ? `<img src="${c.identity.avatar}" alt="">`
         : `<span>${escapeHtml((c?.name ?? "?").slice(0, 1))}</span>`;
     }
-    if (nameEl) nameEl.textContent = middleEllipsis(c?.name ?? slug, 16);
+    if (nameEl) { setTypingIndicator(false); nameEl.textContent = middleEllipsis(c?.name ?? slug, 16); }
     void loadLcModelDefaults(); // 模型默认选中这张卡配置的
     // 跨端会话：绑定（联通）→ 网页聊天 = 通道会话（互传，记录相同）；未绑定 → 本地聊天
     wbMirror = null;
@@ -1395,21 +1418,20 @@ async function wbPickCard(slug) {
     } else {
       setLcDot("", "本地聊天（未联通通道）");
     }
-    // 开场白（网页版默认直接放上去）：本地没开场过就领取并显示（联通与否都显示）
+    // 开场白：本地没开场过就领取。**领取时后端会把它写进统一会话日志**，下面 wbReloadHistory 一并渲染。
+    // 原来是在这里 addChatBubble 画一条，紧接着的 wbReloadHistory 会清空聊天区把它吃掉 ——
+    // 结果是"已开场"标记置位了、用户却永远看不到开场白（线上实测踩到，用户反馈开场冷场）。
     const first = c?.sillytavern_v2?.first_mes?.trim();
     if (first) {
-      try {
-        const g = await api.send(`/api/cards/${encodeURIComponent(slug)}/greeting/claim`, {
-          method: "POST",
-          body: JSON.stringify({ userKey: "local" }),
-        });
-        if (g.greeted && g.text) addChatBubble("bot", g.text);
-      } catch { /* 领取失败不阻塞选卡 */ }
+      await api.send(`/api/cards/${encodeURIComponent(slug)}/greeting/claim`, {
+        method: "POST",
+        body: JSON.stringify({ userKey: "local" }),
+      }).catch(() => null);
     }
     // 恢复历史（网页消息回填 wbChatHistory 并渲染，重进不再丢历史；通道消息只在联通时渲染）
     await wbReloadHistory();
   } else {
-    if (nameEl) nameEl.textContent = "选择角色卡";
+    if (nameEl) { setTypingIndicator(false); nameEl.textContent = "选择角色卡"; }
     setLcDot("", "本地聊天（未联通通道）");
     if (avEl) avEl.innerHTML = "";
   }
@@ -1643,7 +1665,7 @@ async function wbUndoLastRound() {
   if (wbAbort) {
     try { wbAbort.abort(); } catch { /* 已结束 */ }
     wbAbort = null;
-    if (wbThinkingBubble) { wbThinkingBubble.closest(".bubble-row")?.remove(); wbThinkingBubble = null; }
+    setTypingIndicator(false);
     wbPendingUserRows.splice(0).forEach((row) => row?.remove());
     wbChatHistory.pop(); // 本轮只有用户消息入了上下文（回复还没返回）
   }
@@ -1712,6 +1734,35 @@ function lcModelOverride() {
 function wbAutoGrow(el) {
   el.style.height = "auto";
   el.style.height = Math.min(el.scrollHeight, 190) + "px"; // 上限跟着输入框变大（原 160）
+}
+
+/**
+ * 手机软键盘：让"升键盘只顶起输入区、顶栏（头像/名字）留在原位"（用户反馈：我们这里是整页被顶上去，
+ * 头像名字都看不见了）。两个原因一起治：
+ *   ① APK 的 WebView 默认按 adjustPan 把整个窗口往上推 —— 清单里改成 adjustResize（见 apk-build 的 manifest）；
+ *   ② 就算 resize，100dvh 在部分浏览器也不跟着键盘变 —— 这里用 visualViewport 的真实可视高度
+ *      写进 CSS 变量 --app-h，由 #app / .lc-root 使用，键盘弹起时正好缩到可视区，顶栏自然留在顶部。
+ * 顺带：输入框聚焦（键盘刚弹起）时把聊天滚到底，光标不会被挡；用户上翻看历史时不动它。
+ */
+function bindVisualViewport() {
+  const apply = () => {
+    const vv = window.visualViewport;
+    const h = Math.round(vv ? vv.height : window.innerHeight);
+    if (h > 0) document.documentElement.style.setProperty("--app-h", h + "px");
+    const input = $("#wb-input");
+    if (input && document.activeElement === input) {
+      const log = $("#chat-log");
+      if (log) log.scrollTo({ top: log.scrollHeight, behavior: "instant" });
+    }
+  };
+  const vv = window.visualViewport;
+  if (vv) {
+    vv.addEventListener("resize", apply);
+    vv.addEventListener("scroll", apply);
+  }
+  window.addEventListener("resize", apply);
+  window.addEventListener("orientationchange", () => setTimeout(apply, 150));
+  apply();
 }
 
 // 双击回车发送：420ms 内连按两次算发送，单击只换行
@@ -2008,7 +2059,6 @@ function sendEmojiFromPanel(name) {
 let wbSendTimer = null;
 let wbSendQueue = [];
 let wbAbort = null;          // 当前 /api/chat 请求的 AbortController（截断用）
-let wbThinkingBubble = null; // "正在输出"占位气泡
 let wbPendingUserRows = [];  // 本轮已渲染、还没拿到统一日志 id 的用户气泡
 
 async function wbSend() {
@@ -2025,7 +2075,7 @@ async function wbSend() {
   if (wbAbort) {
     wbAbort.abort();
     wbAbort = null;
-    if (wbThinkingBubble) { wbThinkingBubble.closest(".bubble-row")?.remove(); wbThinkingBubble = null; }
+    setTypingIndicator(false);
     addChatBubble("bot", "（已截断上一条输出，将结合你的新消息重新生成）", undefined, undefined, null);
   }
 
@@ -2054,9 +2104,7 @@ async function wbDoSend(msgs) {
   };
   const ctrl = new AbortController();
   wbAbort = ctrl;
-  wbThinkingBubble = addChatBubble("bot", "（正在输出… 发新消息可截断重来）", undefined, undefined, null);
-  // 打标记：切页存快照时要能认出这条占位并在回复到达时替换掉它
-  wbThinkingBubble?.classList.add("lc-pending-row");
+  setTypingIndicator(true); // 顶栏名字/头像变「对方正在输入中…」（不再插占位气泡）
   try {
     const r = await api.send("/api/chat", {
       method: "POST",
@@ -2066,7 +2114,7 @@ async function wbDoSend(msgs) {
     if (ctrl.signal.aborted) return;
     // 用户可能在等回复期间去看配置了 → 聊天页 DOM 不在，回复要落到快照里而不是丢掉
     if (!$("#chat-log")) { stashReplyToSnapshot(sendSlug, r); return; }
-    if (wbThinkingBubble) { wbThinkingBubble.closest(".bubble-row")?.remove(); wbThinkingBubble = null; }
+    setTypingIndicator(false);
     // 先挂 id 再播动画（撤掉上一轮在气泡逐条冒出的几秒内也可能被点）：
     // 合并发送的多条用户消息共用一条日志 → 都挂 ids[0]；bot 气泡由 addBotReplyHumanLike 逐条挂 ids[1]
     const ids = Array.isArray(r.convIds) ? r.convIds : [];
@@ -2089,7 +2137,7 @@ async function wbDoSend(msgs) {
       stashReplyToSnapshot(sendSlug, { type: "error", message: e.message });
       return;
     }
-    if (wbThinkingBubble) { wbThinkingBubble.closest(".bubble-row")?.remove(); wbThinkingBubble = null; }
+    setTypingIndicator(false);
     addChatBubble("bot", "⚠ " + e.message, undefined, undefined, null);
   } finally {
     if (wbAbort === ctrl) wbAbort = null;
@@ -9749,6 +9797,8 @@ void loadMode();
 void ensureEmojiLib().then(() => upgradeEmojiFallback($("#chat-log")));
 // 打开 App 就补齐聊天记录（含 App 关着期间在 QQ/微信里聊的那些）——见上方「本地永久副本」段
 ocStartSyncLoop();
+// 手机键盘：用 visualViewport 驱动 --app-h，升键盘时顶栏不被顶走（见 bindVisualViewport 注释）
+bindVisualViewport();
 
 // ==================== 管理员登录（分发形态：用户免登录，管理员用密码） ====================
 // 两条身份路线：设备 ID（用户，各自命名空间）/ 管理员密码（全局数据）。

@@ -703,10 +703,19 @@ app.get("/api/cards/:slug", async (req, res) => {
 app.post("/api/cards/:slug/greeting/claim", async (req, res) => {
   try {
     const { userKey } = req.body ?? {};
+    const key = String(userKey ?? "");
     const card = await store.get(req.params.slug);
     const firstMes = card.sillytavern_v2?.first_mes?.trim() ?? "";
-    const text = await claimGreeting(card.slug, String(userKey ?? ""), firstMes);
-    res.json({ greeted: text !== null, text });
+    const text = await claimGreeting(card.slug, key, firstMes);
+    if (text === null) return res.json({ greeted: false, text: null });
+    // 【2026-09-17 修】开场白同时写进统一会话日志：原来只置了个"已开场"标记，
+    // 前端把气泡画在 wbReloadHistory 之前、被随后清空聊天区吃掉 → 用户永远看不到开场白，
+    // 而标记已置位以后也不会再出现（用户反馈"开场白没发出、开场冷场"）。
+    // 只对网页本地会话（userKey=local）写；通道侧的 userKey 是 qq:/wx:，那边由主动推送与镜像负责。
+    const entry = key === "local"
+      ? await appendConv(card.slug, { role: "assistant", content: text, surface: "web", ns: "local" }).catch(() => null)
+      : null;
+    res.json({ greeted: true, text, entry });
   } catch (e) {
     res.status(500).json({ error: toUserError(e) });
   }
