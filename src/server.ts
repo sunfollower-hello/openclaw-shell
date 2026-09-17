@@ -169,7 +169,7 @@ import {
   roundKeyOf,
   evtRangeText,
 } from "./core/memoryStore.js";
-import { appendConv, readConv, readConvSrcIds, deleteConvByIds, clearConv, type ConvSurface } from "./core/conversationStore.js";
+import { appendConv, readConv, readConvSrcIds, deleteConvByIds, clearConv, type ConvSurface, type ConvEntry } from "./core/conversationStore.js";
 import { readChatListState, setPinned, forgetChatListEntry } from "./core/chatListStore.js";
 import { recallChatSnippets } from "./core/chatRecall.js";
 import {
@@ -187,11 +187,13 @@ import { exportHistoryToMarkdown, exportAllHistoriesToMarkdown, readRecentLocalC
 import { readConfigState, recordConfigChange, buildConfigChangeReminder, buildConfigSectionForUserMd } from "./core/configState.js";
 import {
   pollSessionTurns,
+  commitObserveCursor,
   findSession,
   sessionKeyOf,
   listAgentSessionUsers,
   clearObserveCursor,
   type MirrorTurn,
+  type SessionInfo,
 } from "./core/sessionMirror.js";
 
 // 加载项目 .env（仅补环境变量空缺，如 OPENCLAW_SHELL_UI_USER/PASS）
@@ -3408,35 +3410,42 @@ async function writeMirrorState(slug: string, s: { openid?: string; sessionId?: 
  * 不依赖 QQ known-users.json（openid 大写与会话 key 小写不一致）和微信 accounts.json
  * （里面是账号 id 不是用户）——会话索引的 origin.from/label 是权威来源。
  */
-async function mirrorTargetOf(bot: BotInstance): Promise<{ openid: string } | null> {
+async function mirrorTargetOf(bot: BotInstance): Promise<{ openid: string; session: SessionInfo | null } | null> {
   const state = await readMirrorState(bot.cardSlug);
   if (state.openid) {
     // 校验旧 openid 是否仍对应当前会话（换绑/换渠道后旧值会失配——曾出现 QQ 时代的
     // openid 残留导致微信消息一直同步不到网页）
     const stillValid = await findSession(bot.agentId, bot.accountId, state.openid).catch(() => null);
-    if (stillValid) return { openid: state.openid };
+    // 顺手把查到的会话带出去：pollSessionTurns 就不用再读一遍 sessions.json
+    if (stillValid) return { openid: state.openid, session: stillValid };
     await writeMirrorState(bot.cardSlug, { sessionId: "", lastSyncAt: "" }).catch(() => {});
   }
   const users = await listAgentSessionUsers(bot.agentId, bot.accountId);
   if (!users.length) return null;
   users.sort((a, b) => b.updatedAt - a.updatedAt);
-  return { openid: users[0].openid };
+  return { openid: users[0].openid, session: null };
 }
 
-/** 观察一张卡的通道会话：增量同步进统一日志 + 喂自动记忆。返回新增轮次数。 */
-async function observeCard(slug: string): Promise<number> {
+/** 观察一张卡的通道会话：增量同步进统一日志 + 喂自动记忆。
+ *  返回本轮真正写进日志的条目。
+ *
+ *  两条纪律（都是「会话被重置就丢一段」踩出来的）：
+ *  ① **游标在写盘之后才推进**（commitObserveCursor）——中途失败只会下一轮重读，
+ *     重读的按来源消息 id 去重丢掉，绝不静默漏；
+ *  ② 同一张卡同时只跑一次（定时扫描与网页轮询会撞车，撞车就有重复导入风险）。 */
+async function observeCard(slug: string): Promise<{ added: number; entries: ConvEntry[] }> {
   const bot = await getBotByCard(slug);
-  if (!bot) return 0;
+  if (!bot) return { added: 0, entries: [] };
   const target = await mirrorTargetOf(bot);
-  if (!target) return 0;
+  if (!target) return { added: 0, entries: [] };
   const ns = `${nsOfChannel(bot.channel)}:${target.openid}`;
-  const { sessionId, turns } = await pollSessionTurns(slug, bot, target.openid);
-  if (!turns.length) return 0;
+  const { sessionId, turns, sessionIds } = await pollSessionTurns(slug, bot, target.openid, target.session);
+  if (!turns.length) return { added: 0, entries: [] };
   // 按来源消息 id 去重：游标重置（会话文件重建/截断）会把整段会话当新消息返回，
   // 不去重的话同一批消息会被反复追加进日志（网页端出现重复气泡）
   const seen = await readConvSrcIds(slug);
   const fresh = turns.filter((t) => !t.id || !seen.has(t.id));
-  if (!fresh.length) return 0;
+  const written: ConvEntry[] = [];
   for (const t of fresh) {
     // 通道回合在 OpenClaw 会话里被合并成一条 assistant 消息（含换行）——网页端按换行拆回多条气泡，
     // 还原通道端逐条发送的消息边界；【表情:名】全角标签统一转半角（网页端只认 [表情:名]）
@@ -3445,12 +3454,17 @@ async function observeCard(slug: string): Promise<number> {
     if (t.role === "assistant" && normed.includes("\n")) {
       const parts = normed.split(/\n+/).map((s) => s.trim()).filter(Boolean);
       for (const p of parts) {
-        void appendConv(slug, { role: "assistant", content: p, surface: surfaceOfChannel(bot.channel), ns, srcId: t.id || undefined }).catch(() => {});
+        const e = await appendConv(slug, { role: "assistant", content: p, surface: surfaceOfChannel(bot.channel), ns, srcId: t.id || undefined }).catch(() => null);
+        if (e) written.push(e);
       }
     } else {
-      void appendConv(slug, { role: t.role, content: normed, surface: surfaceOfChannel(bot.channel), ns, srcId: t.id || undefined }).catch(() => {});
+      const e = await appendConv(slug, { role: t.role, content: normed, surface: surfaceOfChannel(bot.channel), ns, srcId: t.id || undefined }).catch(() => null);
+      if (e) written.push(e);
     }
   }
+  // 写盘成功才推进水位（写失败就不推进，下一轮重来；重来的会被上面的 srcId 去重挡掉）
+  await commitObserveCursor(slug, fresh, sessionIds).catch(() => {});
+  if (!fresh.length) return { added: 0, entries: [] };
   // 配对 user/assistant 喂自动记忆（assistant 与前一条 user 组成一轮；单条不配对等下一批）
   const card = await store.get(slug).catch(() => null);
   let pendingUser = "";
@@ -3467,7 +3481,18 @@ async function observeCard(slug: string): Promise<number> {
   }
   // 通道有新消息 → 刷新 USER.md（当前配置/变更提醒/记忆随每轮注入，及时反映最新设置）
   void syncAgentUserMemory(slug).catch(() => {});
-  return fresh.length;
+  return { added: fresh.length, entries: written };
+}
+
+/** 同卡去重锁：定时扫描与网页轮询可能同时观察到同一张卡。
+ *  （自部署是单用户单命名空间，卡 slug 本身即唯一键。） */
+const observeInflight = new Map<string, Promise<{ added: number; entries: ConvEntry[] }>>();
+function observeCardLocked(slug: string): Promise<{ added: number; entries: ConvEntry[] }> {
+  const running = observeInflight.get(slug);
+  if (running) return running;
+  const p = observeCard(slug).finally(() => observeInflight.delete(slug));
+  observeInflight.set(slug, p);
+  return p;
 }
 
 /** 解析 `openclaw agent --json` 输出里的回复文本（实测结构：result.payloads[].text /
@@ -3800,8 +3825,8 @@ app.get("/api/cards/:slug/mirror/status", async (req, res) => {
 // 手动触发一次观察同步（前端轮询/打开页面时用）
 app.post("/api/cards/:slug/mirror/sync", async (req, res) => {
   try {
-    const added = await observeCard(req.params.slug);
-    res.json({ ok: true, added });
+    const r = await observeCardLocked(req.params.slug);
+    res.json({ ok: true, added: r.added, entries: r.entries });
   } catch (e) {
     res.status(500).json({ error: toUserError(e) });
   }
@@ -4989,7 +5014,7 @@ function startMirrorObserver(): void {
     void (async () => {
       for (const bot of await listBots().catch(() => [])) {
         try {
-          await observeCard(bot.cardSlug);
+          await observeCardLocked(bot.cardSlug);
         } catch {
           /* 单卡观察失败不影响其他 */
         }
