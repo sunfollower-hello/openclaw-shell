@@ -60,6 +60,24 @@ function restoreUrls(parts: string[], urls: string[]): string[] {
 /** 切分点句号：只认全角「。」——英文句点/小数点（URL 扩展名、3.5 数字）不触发分段 */
 const PERIOD_RE = /。/;
 
+// ---------- 机器输出（API 报错 / JSON / 堆栈）不拆条 ----------
+// 用户反馈：API 报错常是一堆英文、还分好几行，被「换行必分」拆成十几个气泡，根本没法看。
+// 判据（任一条命中即整段一条，不再拆）：
+//   ① 整段不含任何非 ASCII 字符 —— 即「全是英文/数字/半角符号」，正常角色扮演的回复不会长这样；
+//   ② 含明确的 API 报错特征词（夹带中文也算，如「请求失败：invalid api key」）。
+// 命中后整段原样输出（保留内部换行：报错/堆栈按行看才清楚），气泡是 pre-wrap 显示不会压成一行。
+const ASCII_ONLY_RE = /^[\t\n\r\x20-\x7e]*$/;
+const API_ERROR_RE =
+  /invalid[\s_-]?request|invalid[\s_-]?api[\s_-]?key|incorrect[\s_-]?api[\s_-]?key|insufficient[\s_-]?(?:quota|balance|funds)|rate[\s_-]?limit|quota[\s_-]?exceeded|unauthorized|authentication[\s_-]?error|permission[\s_-]?denied|bad[\s_-]?gateway|service[\s_-]?unavailable|gateway[\s_-]?timeout|internal[\s_-]?server[\s_-]?error|upstream[\s_-]?(?:error|request)|status[\s_-]?code|http\s*[45]\d\d|no[\s_-]?available[\s_-]?channel|model[\s_-]?not[\s_-]?found|context[\s_-]?length|fetch[\s_-]?failed|ECONNRESET|ETIMEDOUT|ENOTFOUND|socket[\s_-]?hang[\s_-]?up|请求失败|上游|报错|错误码|接口返回/i;
+
+/** 是否属于「机器输出」——是则整段放一个气泡、不拆条（判据见上） */
+export function isMachineOutput(text: string): boolean {
+  const t = String(text ?? "").trim();
+  if (!t) return false;
+  if (API_ERROR_RE.test(t)) return true;
+  return ASCII_ONLY_RE.test(t);
+}
+
 /** 句号切点后紧跟的语气标点（并入本条，保持情绪完整：「真好。！」→「真好！」） */
 const FOLLOW_RUN_RE = /[！？…]/;
 
@@ -143,6 +161,11 @@ export function splitReply(text: string, opts: SplitOptions): SplitResult {
 
   const raw = String(text ?? "").trim();
   if (!raw) return { parts: [], count: 0, totalChars: 0, truncated: false };
+
+  // -1) 机器输出（API 报错/JSON/堆栈）整段一条：不拆、不去句号、保留内部换行
+  if (isMachineOutput(raw)) {
+    return { parts: [raw], count: 1, totalChars: raw.replace(/\s/g, "").length, truncated: false };
+  }
 
   // 0) URL/图片路径保护：句号切分不能切开 ".png" 这类扩展名（切完还原）
   const { text: protectedText, urls } = protectUrls(raw);

@@ -41,7 +41,7 @@ import { runDistill } from "./distiller/pipeline.js";
 import { parsePlainText } from "./distiller/parser.js";
 import { RELATION_ROLES } from "./core/schema.js";
 import { buildChatSystemAsync, selectTriggeredWorldbook } from "./core/chatPrompt.js";
-import { splitReply, describeSplit, type SplitStyle } from "./core/splitter.js";
+import { splitReply, describeSplit, isMachineOutput, type SplitStyle } from "./core/splitter.js";
 import {
   listPresets,
   addGroup as addPresetGroup,
@@ -3821,7 +3821,9 @@ async function observeCard(slug: string): Promise<{ added: number; entries: Conv
     // 还原通道端逐条发送的消息边界；【表情:名】全角标签统一转半角（网页端只认 [表情:名]）
     const raw = String(t.content ?? "");
     const normed = raw.replace(/【表情:([^】]+)】/g, "[表情:$1]");
-    if (t.role === "assistant" && normed.includes("\n")) {
+    // 机器输出（API 报错/JSON/堆栈）不按换行拆气泡：与拆条引擎同口径（isMachineOutput），
+    // 否则一条多行报错会被拆成一串气泡
+    if (t.role === "assistant" && normed.includes("\n") && !isMachineOutput(normed)) {
       const parts = normed.split(/\n+/).map((s) => s.trim()).filter(Boolean);
       for (const p of parts) {
         const e = await appendConv(slug, { role: "assistant", content: p, surface: surfaceOfChannel(bot.channel), ns, srcId: t.id || undefined }).catch(() => null);
