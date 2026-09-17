@@ -997,3 +997,27 @@ QQ 通道级还留着迁移过来的 `allowFrom: ["F5D0…"]` + `dmPolicy: "allo
 - CoT 每轮多一段推理 → **通道侧每条消息都付这个成本**。短版影响可控；若以后写长要重新评估。
 - 「可以拒绝」这条许可仍保留（除了按下「必须生成」与命中强制信号清单时）。想连"随口说想看"也不许拒绝，可再加一个「生图不许拒绝」开关。
 - CoT 只是**事前预防**，不能保证 100%；**事后兜底**（出口检测到"假装已发但没生成"就重试一次）还没做，留在下一步。
+
+---
+
+## §59 通道插件 v14-voice 补丁半截修复 + 通道状态语义修正 + 残留归属清理（2026-09-17，已上线）
+
+用户报障：QQ 分段失败（有换行不拆条）、表情变纯文字、通道页"还没连账号却显示已连接"、扫码 QQ 显示已连接但 App 说没绑定、迁移残留账号删除后归属混乱。全部定位到实锤并修复，逐项如下。
+
+### 根因三个（互相独立，全撞在同一天）
+1. **🔴 通道插件 v14 语音段"只有调用没有定义"**：语音指令（QQ `[语音!:文字]` 直发 / 微信剔除防漏原文）当年是**手改进 dist** 的，`patch-channels.mjs` 一直没这段 → 服务器重打补丁后 QQ 出口在语音指令行抛 `__ocsExtractVoiceCmd is not defined`（网关日志 09:08:17 实锤）→ **拆条循环没跑、表情发图没跑**，文本由流式路径原文吐出 = 分段失败 + `[表情:名]` 纯文字。微信侧缺 3 个定义（`__ocsWxExtractGenerateImage`/`__ocsWxGenerateImage`/`__ocsWxStripVoiceCmd`）→ **微信出口同样全断**（10:21 有入站有会话记录但 outbound 零日志）。**本机文件也没有 CoT 段**（CoT 只打在服务器）→ 两份文件互缺对方一块，**不能整份互相覆盖**，最终以服务器文件为底合并（保 CoT + 补语音定义）。
+2. **"已连接 ✓"≠有账号**：`channelUsable()` = `configured||connected||accounts.length`，设备作用域过滤只清 `accounts`、不碰通道级 `configured`（qqbot `enabled:true` 即真）→ 零账号设备也显示"已连接 ✓"，与下方"还没有绑定账号，点上方按钮扫码"并存（矛盾 UI）。
+3. **WX 升级分支两处判据用裸标识符**：`out.includes("__ocsWxExtractGenerateImage")`（gen helper 插入判据）与 WX skip 判定——调用点也命中 → 残缺文件被误判"已打完"，永远不自愈（QQ 侧 skip 判定已是函数声明级，WX 漏改；gen 插入判据两边都漏）。
+
+### 修复内容
+1. **插件文件合并**：`srv 文件 + 本机语音定义块`（QQ 插在 `[/openclaw-shell patch v12 gen]` 后 35 行；WX 插在 `==== [/v8] ====` 前 gen+voice 块 43 行）→ 符号自检/语法/两侧 diff 三验 → gz 分片上传（备份 `/data/backups/pre-channel-fix-20260917/`）→ 网关重启。
+2. **`patch-channels.mjs` 补 v14-voice 段（治本）**：`QQ_VOICE_HELPER_CJS`/`QQ_VOICE_PIECES_V14`/`QQ_GEN_AFTER_V12_VOICE`/`WX_VOICE_HELPER_ESM`/`WX_VOICE_PIECES_V14`，QQ 三步（定义块/调用点/执行块）+ WX 两步各自幂等（定义查函数声明、调用点查 `ocsVoice` 变量）→ 残缺文件可自愈、完整文件不重复插。**新增 `symbolsMissing()` 符号自检**（patch 写盘前 + `--selftest`）：所有 `__ocs*` 引用必须有定义，缺一个拒绝写盘。**三处判据改函数声明级**：QQ skip 补 voice、WX skip 全改声明、WX gen 插入判据修正。
+3. **网关加 `OPENCLAW_SHELL_ROOT=/data/openclaw-shell`**（drop-in `/etc/systemd/system/openclaw-gateway.service.d/override.conf`）：`__ocsShellRoot()` 原探测路径（`~/ai_workspace/...`、`D:/...`）在服务器都不存在，语音/生图动态 import 拿不到根目录。
+4. **`filterChannelStatus` 设备作用域**：无自有账号时 `configured`/`connected` 一并压掉 → 矛盾 UI 消除（三视角实测：有账号设备=已连接+账号数；无账号设备=未连接；管理员照旧全可见）。
+5. **归属表清理**：`openclaw-weixin:wx-main`、`61e3a1c880b0-im-bot`、`qqbot:qq-3fxx` 三条迁移残留归属删除（"无记录=运营者"兜底生效，管理员重新可见自己的微信账号）+ claims 清空 + `openclaw.json` 微信 accounts 里的 `wx-main` 幽灵条目删除（插件真实索引 `accounts.json` 本来就没有它）。
+
+### 过程要点
+- **用户期间自行重扫 QQ 成功**（新 appId、allowFrom 5A24B690…、归属正当认领给设备 `1ba5242d`，保留未动）；12:52 网关重启后 QQ websocket 即 READY。之前 10:44 那次扫码超时失败（CLI 挂满 9 分钟没落盘），重启前旧进程的 `appid invalid` 刷屏是旧配置尾部噪音。
+- 沙箱测试法：脚本副本 `os.homedir()` 替换成沙箱目录，对服务器拉下来的**残缺文件**跑 → 自愈 ✅ / 符号 ✅ / 幂等（二跑跳过）✅ / 与合并文件 diff 仅布局差异 ✅。
+- **已知保留**：① 通道表情媒体目录 `~/.openclaw/media/emojis/` 全局共享（多用户同名互覆、跨用户可发）——结构性问题待改按 agentId→设备查图；② `patch-channels.mjs` 的**全新安装路径**（上游原始文件分支）自 v12 起缺 gen 群聊 CoT voice 的插入步骤，且 QQ_DIST/WX_DIST 硬编码 2.0.3 目录名（插件升级换目录脚本就找不到文件）——插件升级时应走升级流程或人工核对，升级路径（现网文件重打）已完整；③ `[表情:生气]` 是模型编造（用户卡列表只有"兴奋"，SKILL 已禁仍编）——修好插件后未命中标签会被剔除不发，但不发图。
+- **待用户真机验收**：QQ 发一条带换行回复看拆条、发 `[表情:兴奋]` 看图（QQ 通道现已 READY）；中转站 `Kimi-K2.6` 渠道（用户自查，500 可用渠道不存在）。

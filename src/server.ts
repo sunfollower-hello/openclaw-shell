@@ -1147,7 +1147,10 @@ function channelUsable(st?: ChannelStatus): boolean {
 function filterChannelStatus(channel: string, st: ChannelStatus | undefined, dev: string | null | undefined): ChannelStatus | undefined {
   if (!dev || !st) return st;
   const mine = (st.accounts ?? []).filter((id) => ownsAccount(channel, id, dev));
-  return { ...st, accounts: mine, connected: mine.length > 0 ? st.connected : false };
+  const has = mine.length > 0;
+  // 设备作用域下，通道级 configured 是"服务器装没装这个通道"，不代表"你有账号"——
+  // 不按账号数压掉的话会出现「已连接 ✓」与「还没有绑定账号，点上方按钮扫码」并存的矛盾 UI（09-17 线上实锤）
+  return { ...st, accounts: mine, connected: has ? st.connected : false, configured: has ? st.configured : false };
 }
 
 /** 设备作用域下必须拥有该账号才能操作；返回 false 时已经写过 403 响应 */

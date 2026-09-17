@@ -1037,6 +1037,92 @@ const QQ_GROUP_NEW_MARK = QQ_GROUP_NEW_ANCHOR + "\n  // [openclaw-shell patch v1
 const V9_MARKER = "[openclaw-shell patch v9]";
 
 /** 在已打 v8 补丁的文件上做 v9 增量：helper 段尾插表情函数 + 分支锚点行替换（保留外部增强） */
+// ---------- v14-voice：语音指令段（2026-09-17 补录进脚本） ----------
+// 历史：语音指令（QQ [语音!:文字] 直发语音条 / 微信剔除防漏原文）当时是手改进 dist 的，补丁脚本一直缺失
+// → 服务器重打补丁后插件只剩调用没有定义，QQ 出口 ReferenceError（拆条/表情发图全断，2026-09-17 线上实锤）。
+// 两段各自幂等：定义块查「函数声明」、调用点查「ocsVoice 变量」——残缺文件（只有调用没有定义）也能自愈。
+const QQ_VOICE_HELPER_CJS = String.raw`// [openclaw-shell patch v14] 语音指令解析：[语音!:文字]（！与表情 [表情:名] 区分；合成走独立接口不是聊天模型 → 只耗一次聊天调用）
+function __ocsExtractVoiceCmd(text) {
+  var rest = String(text || "");
+  var re = /\[语音\s*[!！]\s*[:：]([^\]]+)\]/g, m, say = "";
+  while ((m = re.exec(rest))) {
+    var t = (m[1] || "").trim();
+    if (!say && t) say = t; // 一次回复最多 1 条语音
+  }
+  if (say || /\[语音\s*[!！]\s*[:：]/.test(rest)) rest = rest.replace(/\[语音\s*[!！]\s*[:：][^\]]+\]/g, "");
+  return { text: say, rest: rest.trim() };
+}
+// 合成 + silk 转码 + QQ 官方两步式直发语音条（收件人直接用 deliverCtx 的真实会话上下文，比插件工具猜得准）
+function __ocsSendVoiceCmd(text, ctx) {
+  var root = __ocsShellRoot();
+  if (!root) return Promise.resolve({ ok: false, error: "openclaw-shell 根目录未找到" });
+  var ttsEntry = "file:///" + require("path").join(root, "dist", "core", "ttsConfig.js").replace(/\\/g, "/");
+  var qqEntry = "file:///" + require("path").join(root, "dist", "core", "qqVoice.js").replace(/\\/g, "/");
+  return Promise.all([import(ttsEntry), import(qqEntry)]).then(function (mods) {
+    var tts = mods[0], qq = mods[1];
+    return tts.synthesize(text).then(function (raw) {
+      return tts.convertAudio(raw, "silk").then(function (silk) {
+        return qq.sendVoice({
+          accountId: ctx.accountId,
+          scope: ctx.chatScope === "group" ? "group" : "c2c",
+          targetId: ctx.qualifiedTarget,
+          silk: silk,
+          msgId: ctx.replyToId
+        }).then(function (r) {
+          return { ok: true, kb: silk.length / 1024, messageId: r && r.messageId };
+        });
+      });
+    });
+  }).catch(function (e) { return { ok: false, error: String((e && e.message) || e) }; });
+}
+// [/openclaw-shell patch v14 voice]`;
+
+// QQ 调用点：v12 gen pieces 链的拆条行前插语音提取行（拆条源换成 ocsVoice.rest）
+const QQ_VOICE_PIECES_V14 = QQ_GEN_PIECES_V12.replace(
+  "const pieces = __ocsSplitHumanLike(ocsGen.rest, __ocsSplitStyle(deliverCtx.agentId));",
+  "// [openclaw-shell patch v14] [语音!:文字] 指令：剔除后拆条，文本发完再直发语音条\n" +
+  "                        const ocsVoice = __ocsExtractVoiceCmd(ocsGen.rest);\n" +
+  "                        const pieces = __ocsSplitHumanLike(ocsVoice.rest, __ocsSplitStyle(deliverCtx.agentId));"
+);
+
+// QQ 执行块：紧跟 v12 生图执行块之后（文本条发完再直发语音条）
+const QQ_VOICE_EXEC_V14 = `                        // [openclaw-shell patch v14] 语音执行：合成→silk→QQ 官方直发；失败只发「语音发送失败」
+                        if (ocsVoice.text) {
+                          const ocsVoiceRes = await __ocsSendVoiceCmd(ocsVoice.text, deliverCtx);
+                          if (!(ocsVoiceRes && ocsVoiceRes.ok)) {
+                            dlog?.error(\`[openclaw-shell] voice cmd failed: \${ocsVoiceRes && ocsVoiceRes.error}\`);
+                            await deliverReply({ ...payload, text: "语音发送失败" }, info, deliverCtx);
+                          } else {
+                            dlog?.info(\`[openclaw-shell] voice sent \${(ocsVoiceRes.kb || 0).toFixed(1)}KB msgId=\${ocsVoiceRes.messageId ?? "-"}\`);
+                          }
+                        }`;
+const QQ_GEN_AFTER_V12_VOICE = QQ_GEN_AFTER_V12.replace(
+  "                      } else {",
+  () => QQ_VOICE_EXEC_V14 + "\n                      } else {"
+);
+
+const WX_VOICE_HELPER_ESM = String.raw`// [openclaw-shell patch v14] [语音!:文字] 指令剔除（微信插件发不了原生语音条，只防指令漏成原文；QQ 侧由 qqbot 补丁直发语音条）
+function __ocsWxStripVoiceCmd(text) {
+  let rest = String(text || "");
+  if (/\[语音\s*[!！]\s*[:：]/.test(rest)) rest = rest.replace(/\[语音\s*[!！]\s*[:：][^\]]+\]/g, "");
+  return rest.trim();
+}`;
+
+// 微信调用点：拆条源从 ocsGen.rest 换成剔除后的 ocsVoiceStripped
+const WX_VOICE_PIECES_V14 = WX_GEN_PIECES_V12.replace(
+  "const pieces = __ocsWxSplitHumanLike(ocsGen.rest, __ocsWxSplitStyle(route.agentId));",
+  "// [openclaw-shell patch v14] [语音!:文字] 指令剔除（微信无原生语音条，防漏原文）\n" +
+  "                    const ocsVoiceStripped = __ocsWxStripVoiceCmd(ocsGen.rest);\n" +
+  "                    const pieces = __ocsWxSplitHumanLike(ocsVoiceStripped, __ocsWxSplitStyle(route.agentId));"
+);
+
+// ---------- 符号自检：所有 __ocs* 引用必须有定义 ----------
+// 防"只有调用没有定义"的残缺形态上线（运行时 ReferenceError，语法检查查不出；v12/v14 各栽过一次）
+function symbolsMissing(src) {
+  const used = [...new Set(src.match(/__ocs[A-Za-z0-9_]*/g) || [])];
+  return used.filter((fn) => !new RegExp("function\\s+" + fn + "\\b|(?:const|var|let)\\s+" + fn + "\\s*=").test(src));
+}
+
 function incrementalUpgrade(src, helperEndTag, emojiBlock, piecesAnchor, piecesV9) {
   if (src.includes(V9_MARKER)) return { ok: true, reason: "已打过 v9 补丁（跳过）", src };
   if (!src.includes(helperEndTag)) return { ok: false, reason: `helper 段尾标记 ${helperEndTag} 未找到（结构变了？）` };
@@ -1066,6 +1152,9 @@ function patchQQ(force = false) {
     src.includes(QQ_GROUP_NEW_MARK) &&
     // v14 出口剥离生图自检：缺它就还得跑一遍升级分支（否则新版本只会"跳过"，新加的东西永远装不上）
     src.includes("function __ocsStripCot") &&
+    // v14-voice：语音段同样按「函数声明」校验——残缺形态（只有调用没有定义）必须进升级分支自愈
+    src.includes("function __ocsExtractVoiceCmd") &&
+    src.includes("function __ocsSendVoiceCmd") &&
     !force
   ) return { file, ok: true, reason: "已打过 v14 补丁（跳过）" };
   const v8End = "// ==== [/openclaw-shell patch v8] ====";
@@ -1164,8 +1253,26 @@ function patchQQ(force = false) {
       out = out.replace(fnAnchor, () => `${COT_STRIP_HELPER}\n${fnAnchor}`);
       out = out.replace(`${fnAnchor}\n`, () => `${fnAnchor}\n  text = __ocsStripCot(text);\n`);
     }
+    // v14-voice：语音指令段（定义插到 v12 gen 段尾之后；调用点/执行块各自独立幂等，
+    // 残缺文件——只有调用没有定义——只会补定义，不会重复插调用）
+    if (!out.includes("function __ocsExtractVoiceCmd")) {
+      const genEndTag = "// [/openclaw-shell patch v12 gen]";
+      if (!out.includes(genEndTag)) return { file, ok: false, reason: "v14 voice 定义锚点（v12 gen 段尾）未找到（结构变了？）" };
+      out = out.replace(genEndTag, () => `${genEndTag}\n${QQ_VOICE_HELPER_CJS}`);
+    }
+    if (!out.includes("const ocsVoice = __ocsExtractVoiceCmd")) {
+      if (!out.includes(QQ_GEN_PIECES_V12)) return { file, ok: false, reason: "v14 voice 调用点锚（v12 pieces 行）未找到（文件被手动改过？）" };
+      out = out.replace(QQ_GEN_PIECES_V12, () => QQ_VOICE_PIECES_V14);
+    }
+    if (!out.includes("语音执行：合成")) {
+      if (!out.includes(QQ_GEN_AFTER_V12)) return { file, ok: false, reason: "v14 voice 执行块锚（v12 生图执行块）未找到（文件被手动改过？）" };
+      out = out.replace(QQ_GEN_AFTER_V12, () => QQ_GEN_AFTER_V12_VOICE);
+    }
+    // 符号自检：宁可报错也不能把"只有调用没有定义"的残缺文件写回去
+    const qqMissing = symbolsMissing(out);
+    if (qqMissing.length) return { file, ok: false, reason: `符号自检失败（缺定义）: ${qqMissing.join(", ")}` };
     fs.writeFileSync(file, out, "utf8");
-    return { file, ok: true, reason: "v13.1 升级完成（群聊入站 TDZ 修复）" };
+    return { file, ok: true, reason: "升级完成（含 v14-voice 补录与符号自检）" };
   }
   // 全新安装（上游原始）
   if (!src.includes(QQ_HELPER_ANCHOR)) return { file, ok: false, reason: "文件头锚点不匹配（上游结构变了）" };
@@ -1185,8 +1292,21 @@ function patchWX(force = false) {
   const file = WX_DIST;
   if (!fs.existsSync(file)) return { file, ok: false, reason: "微信插件文件不存在（可能升级换路径了）" };
   let src = fs.readFileSync(file, "utf8").replace(/\r\n/g, "\n");
-  // v14 出口剥离生图自检：缺它也照样要跑升级分支（否则新加的东西永远装不上）
-  if (src.includes("__ocsWxExtractMediaLocal") && src.includes("一次回复最多 1 个表情") && src.includes("v9.5") && src.includes("[openclaw-shell] IDENTITY") && src.includes("【表情:") && src.includes("__ocsWxExtractGenerateImage") && src.includes("function __ocsStripCot") && !force) return { file, ok: true, reason: "已打过 v14 补丁（跳过）" };
+  // 跳过判定必须校验「函数声明」而非标识符（QQ 侧同款教训）：标识符在调用点也算命中，
+  // 残缺文件（只有调用没有定义）会被误判为已打完，永远不自愈 → 09-17 线上微信出口全挂的根因之一
+  if (
+    src.includes("function __ocsWxExtractMediaLocal") &&
+    src.includes("一次回复最多 1 个表情") &&
+    src.includes("v9.5") &&
+    src.includes("[openclaw-shell] IDENTITY") &&
+    src.includes("【表情:") &&
+    src.includes("function __ocsWxExtractGenerateImage") &&
+    src.includes("function __ocsWxGenerateImage") &&
+    src.includes("function __ocsWxShellRoot") &&
+    src.includes("function __ocsStripCot") &&
+    src.includes("function __ocsWxStripVoiceCmd") &&
+    !force
+  ) return { file, ok: true, reason: "已打过 v14 补丁（跳过）" };
   const v8End = "// ==== [/openclaw-shell patch v8] ====";
   if (src.includes(v8End) || src.includes("__ocsWxConsumeStalePendingMedia")) {
     let out = src;
@@ -1223,7 +1343,8 @@ function patchWX(force = false) {
     out = out.replace("const pc = pieces[ocsI];\n                        // 网关 final 会重复投递已发文本（微信无 kind 区分）→ 60s 内容去重",
       "const pc = pieces[ocsI];\n                        if (!pc.trim()) { continue; } // v9.5：空文本不发（微信 ret=-2 invalid arguments）\n                        // 网关 final 会重复投递已发文本（微信无 kind 区分）→ 60s 内容去重");
     // v12：生图指令（helper 尾插 + pieces 行替换 + logger 行后插执行块）
-    if (!out.includes("__ocsWxExtractGenerateImage")) {
+    // 判据必须是「函数声明」：裸标识符会被调用点命中（残缺文件：有调用没定义），helper 永远插不进去
+    if (!out.includes("function __ocsWxExtractGenerateImage")) {
       const genStart = out.indexOf("// [/openclaw-shell patch v9 emoji]");
       if (genStart < 0) return { file, ok: false, reason: "v9 emoji 段尾标记未找到（结构变了？）" };
       out = out.slice(0, genStart) + GEN_HELPER_ESM + "\n" + out.slice(genStart);
@@ -1258,8 +1379,21 @@ function patchWX(force = false) {
       out = out.replace(fnAnchor, () => `${COT_STRIP_HELPER}\n${fnAnchor}`);
       out = out.replace(`${fnAnchor}\n`, () => `${fnAnchor}\n  text = __ocsStripCot(text);\n`);
     }
+    // v14-voice：语音指令剔除段（定义插到 v12 gen 段尾之后；调用点独立幂等）
+    if (!out.includes("function __ocsWxStripVoiceCmd")) {
+      const genEndTag = "// [/openclaw-shell patch v12 gen]";
+      if (!out.includes(genEndTag)) return { file, ok: false, reason: "v14 voice 定义锚点（v12 gen 段尾）未找到（微信侧，结构变了？）" };
+      out = out.replace(genEndTag, () => `${genEndTag}\n${WX_VOICE_HELPER_ESM}`);
+    }
+    if (!out.includes("const ocsVoiceStripped = __ocsWxStripVoiceCmd")) {
+      if (!out.includes(WX_GEN_PIECES_V12)) return { file, ok: false, reason: "v14 voice 调用点锚（v12 pieces 行）未找到（微信侧，文件被手动改过？）" };
+      out = out.replace(WX_GEN_PIECES_V12, () => WX_VOICE_PIECES_V14);
+    }
+    // 符号自检：宁可报错也不能把"只有调用没有定义"的残缺文件写回去
+    const wxMissing = symbolsMissing(out);
+    if (wxMissing.length) return { file, ok: false, reason: `符号自检失败（缺定义）: ${wxMissing.join(", ")}` };
     fs.writeFileSync(file, out, "utf8");
-    return { file, ok: true, reason: "v9.5 → v12 升级完成" };
+    return { file, ok: true, reason: "升级完成（含 v12 gen 补插与 v14-voice 补录）" };
   }
   // 全新安装（上游原始）
   if (src.includes(WX_IMPORT_ADD)) {
@@ -1392,6 +1526,13 @@ async function selftest() {
   } else {
     console.log("  ✓ 微信分支结构：ocsEmoji 声明在 ocsGen 使用之前（无 v12 回归）");
   }
+  // 符号自检：所有 __ocs* 引用必须有定义（防"只有调用没有定义"的残缺形态，语法检查查不出）
+  const qqMiss = symbolsMissing(qqFull);
+  if (qqMiss.length) { failed++; console.log(`  ✗ QQ 符号自检：缺定义 ${qqMiss.join(", ")}`); }
+  else console.log("  ✓ QQ 符号自检：全部 __ocs* 引用有定义");
+  const wxMiss = symbolsMissing(wxFull);
+  if (wxMiss.length) { failed++; console.log(`  ✗ 微信符号自检：缺定义 ${wxMiss.join(", ")}`); }
+  else console.log("  ✓ 微信符号自检：全部 __ocs* 引用有定义");
   if (failed) { console.log(`❌ 自检失败 ${failed} 项`); process.exit(1); }
   console.log("✅ 插件补丁内嵌拆条与本地引擎一致，MEDIA/表情/生图提取正常，分支结构完好");
 }
