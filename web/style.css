@@ -760,6 +760,16 @@ button:disabled { opacity: 0.4; cursor: not-allowed; transform: none; }
 }
 .bubble.me { align-self: flex-end; background: var(--ink); color: #ffffff; }
 .bubble.bot { align-self: flex-start; background: var(--card); border: 1px solid var(--border); }
+/* 卡片正则气泡皮肤（[[bubble:ai]] / [[bubble:user]] 标记驱动，由卡的正则脚本包在消息开头）：
+   参照业主参考图 —— AI=白底深描边圆角矩形，用户=白底浅描边胶囊 */
+.bubble.rbx-ai {
+  background: #ffffff; border: 2px solid #2c2c54; border-radius: 14px;
+  padding: 12px 15px; color: #1c1c2e; box-shadow: none;
+}
+.bubble.rbx-user {
+  background: #ffffff; border: 1px solid #e4e4ee; border-radius: 22px;
+  padding: 11px 17px; color: #14141c; box-shadow: 0 1px 5px rgba(30, 30, 60, 0.10);
+}
 .bubble { position: relative; }
 /* 设置 → 字体设置：预览气泡（跟着 --chat-font-size 变，所见即所得） */
 .chat-font-preview { max-width: none; margin: 2px 0 4px; }

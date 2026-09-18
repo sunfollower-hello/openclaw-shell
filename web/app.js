@@ -6499,11 +6499,16 @@ function curCard() { return wbCardObj || editingCard; }
  * 之前这些脚本只存不用，用户填了完全不生效。
  * findRegex 支持酒馆的 /pattern/flags 写法；替换串里的 $1 等分组照常可用。
  */
-function applyRegexScripts(text) {
+function applyRegexScripts(text, placement = "ai") {
   const scripts = curCard()?.sillytavern_v2?.regex_scripts ?? [];
   let out = String(text);
   for (const s of scripts) {
     if (!s || s.enabled === false || s.disabled === true) continue;
+    // 作用域（2026-09-18）：placement "ai"（默认，兼容旧脚本）| "user" | "both"。
+    // 用户气泡默认不套 bot 正则（防误伤）；气泡皮肤类脚本用 placement 区分两端。
+    const pl = String(s.placement ?? "ai");
+    if (placement === "user" && pl !== "user" && pl !== "both") continue;
+    if (placement === "ai" && pl === "user") continue;
     const raw = String(s.findRegex ?? "").trim();
     if (!raw) continue;
     try {
@@ -6636,6 +6641,9 @@ function addChatBubble(role, text, convId, logEl, t) {
   // 卡片正则（酒馆 regex_scripts）统一在气泡层套用：新回复与历史记录口径一致，
   // 刷新/翻旧消息显示不会变回原文。只改显示，不改会话数据与上下文。
   if (role === "bot") text = applyRegexScripts(text);
+  // 用户气泡也走正则（2026-09-18）：只有 placement="user"/"both" 的脚本生效（见 applyRegexScripts），
+  // 用于气泡皮肤类脚本（[[bubble:user]] 标记）
+  else if (role === "user") text = applyRegexScripts(text, "user");
   // bot 消息里含 [表情:名] 标签时，表情独立成气泡（文本一个、每个表情一个），
   // 不再让图片挤在文本气泡里；未命中的表情名按原文显示（appendChatContent 兜底）
   if (role === "bot" && /\[表情:/.test(String(text ?? ""))) {
@@ -6687,6 +6695,13 @@ function renderBubbleRow(role, text, convId, logEl, t) {
   row.appendChild(av);
   const div = document.createElement("div");
   div.className = "bubble " + (role === "user" ? "me" : "bot");
+  // 卡片正则气泡皮肤：文本里带 [[bubble:ai]] / [[bubble:user]] 标记（由卡的正则脚本包在消息开头，
+  // placement ai/user 区分两端）→ 气泡挂对应皮肤类（style.css 的 .bubble.rbx-*），标记本身不显示
+  const rbxSkin = (String(text).match(/\[\[bubble:(ai|user)\]\]/) || [])[1];
+  if (rbxSkin) {
+    div.classList.add("rbx-" + rbxSkin);
+    text = String(text).replace(/\[\[bubble:(?:ai|user)\]\]/g, "");
+  }
   appendChatContent(div, String(text));
   // 朗读喇叭已按用户要求移除（原 bot 气泡右上角 hover 出现的 tts-speak-btn）
   row.appendChild(div);
