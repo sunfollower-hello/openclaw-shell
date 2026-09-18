@@ -4,7 +4,7 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { dataDir } from "./cardStore.js";
-import { devicePrefix } from "./dataRoot.js";
+import { currentDeviceId, devicePrefix } from "./dataRoot.js";
 import { ensureGatewayToolPolicy } from "./gatewayToolPolicy.js";
 
 // ---------- 两套上限，别混用（2026-09-08 用户拍板） ----------
@@ -248,23 +248,25 @@ export async function applyAgentBlockStreaming(
   accountId: string,
   cfg: { style?: "chat" | "rich"; enabled?: boolean }
 ): Promise<void> {
-  const cfgPath = path.join(os.homedir(), ".openclaw", "openclaw.json");
-  let conf: Record<string, any>;
-  try {
-    conf = JSON.parse(await fs.readFile(cfgPath, "utf8"));
-  } catch {
-    return; // 没有配置文件就不动（网关首启会生成）
-  }
+  // 走 readOpenclawConfig/writeOpenclawConfig：原子写 + 顺带过 ensureGatewayToolPolicy
+  //（此前直写 fs，是绕过工具策略与防撕裂写法的口子）
+  const conf = await readOpenclawConfig();
+  if (!conf) return; // 没有配置文件就不动（网关首启会生成）
   const enabled = cfg?.enabled !== false;
   // 安全值（2026-09-07 v7）：插件侧做语义拆条，网关只负责完整送达
   const chunk = { minChars: 1, maxChars: 500, breakPreference: "newline" as const };
-  conf.agents ??= {};
-  conf.agents.defaults ??= {};
-  conf.agents.defaults.blockStreamingDefault = enabled ? "on" : "off";
-  conf.agents.defaults.blockStreamingChunk = chunk;
-  // coalesce 调小：微信插件自带 blockStreamingCoalesceDefaults(200/3000)，不覆盖会被它并回大块
-  conf.agents.defaults.blockStreamingCoalesce = { minChars: 1, maxChars: 500, idleMs: 250 };
-  // qqbot / openclaw-weixin：编辑式流式必须 off，否则 block 文本块被吞（见函数头注释）
+  // 全局 defaults 只允许运营者作用域写（2026-09-18 P2：设备编卡不再改全服默认值，
+  // 免得设备一保存就把管理员/其他用户的拆条默认冲掉；服务器上 defaults 已初始化，跳过=现状不变）
+  if (!currentDeviceId()) {
+    conf.agents ??= {};
+    conf.agents.defaults ??= {};
+    conf.agents.defaults.blockStreamingDefault = enabled ? "on" : "off";
+    conf.agents.defaults.blockStreamingChunk = chunk;
+    // coalesce 调小：微信插件自带 blockStreamingCoalesceDefaults(200/3000)，不覆盖会被它并回大块
+    conf.agents.defaults.blockStreamingCoalesce = { minChars: 1, maxChars: 500, idleMs: 250 };
+  }
+  // qqbot / openclaw-weixin：编辑式流式必须 off，否则 block 文本块被吞（见函数头注释）。
+  // 账号级只动本次绑定的那个账号（上游已过归属校验），与其他用户无关。
   if ((channel === "qqbot" || channel === "openclaw-weixin") && accountId) {
     conf.channels ??= {};
     conf.channels[channel] ??= {};
@@ -273,7 +275,7 @@ export async function applyAgentBlockStreaming(
     // 整体覆盖 streaming 对象：顺带清掉旧版残留的死配置（微信 preview.chunk 只供 draft 流式）
     acc.streaming = { mode: "off", ...(enabled ? { block: { enabled: true } } : {}) };
   }
-  await fs.writeFile(cfgPath, JSON.stringify(conf, null, 2), "utf8");
+  await writeOpenclawConfig(conf);
 }
 
 /**

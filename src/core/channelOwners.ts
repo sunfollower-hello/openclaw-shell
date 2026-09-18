@@ -150,3 +150,44 @@ export function listOwnedAccounts(deviceId: string): string[] {
     .filter(([, dev]) => dev === deviceId)
     .map(([k]) => k);
 }
+
+/** 活跃的扫码认领会话（设备匹配 + 未超时）；没有返回 null */
+export function activeLoginClaim(channel: string, deviceId: string): { known: string[]; at: number } | null {
+  const c = load().claims[channel];
+  if (!c || c.deviceId !== deviceId) return null;
+  if (Date.now() - c.at > CLAIM_TTL_MS) return null;
+  return { known: c.known, at: c.at };
+}
+
+/**
+ * 微信顶掉式归属（2026-09-18 业主拍板）：**谁扫码登录谁就是主，后扫顶前扫**——与 QQ 的
+ * attributeQqLoginToDevice 同语义。此前的锁（快照老账号不认领 + 已有归属不认领）只保留
+ * "新账号认领"的兜底，登录成功瞬间的归属改判走这里。
+ *
+ * 判定"这次登录摸过哪个账号"（两条满足其一）：
+ *   - 不在扫码起点快照里 → 本次新出现的账号；
+ *   - 在快照里、但凭证文件 mtime 晚于扫码起点 → 本次重扫刷新了凭证（= 登录的就是它）。
+ * 命中的账号一律无条件 setAccountOwner 改判给该设备；纯数据操作，不动 bot/路由
+ * （旧主的僵尸 bot 清理由调用方按 needBotCleanup 执行）。
+ * 微信登录成功后真实账号可能晚几秒才落盘，由调用方轮询重入本函数。
+ */
+export function attributeWeChatLogin(
+  deviceId: string,
+  listAccountIds: string[],
+  credMtimeMs: (accountId: string) => number
+): { attributed: { accountId: string; prevOwner: string | null }[]; needBotCleanup: string[] } {
+  const claim = activeLoginClaim("openclaw-weixin", deviceId);
+  if (!claim) return { attributed: [], needBotCleanup: [] };
+  const attributed: { accountId: string; prevOwner: string | null }[] = [];
+  const needBotCleanup: string[] = [];
+  for (const id of listAccountIds) {
+    const isNew = !claim.known.includes(id);
+    if (!isNew && credMtimeMs(id) < claim.at - 5000) continue; // 5s 容差：快照先于凭证落盘
+    const prev = accountOwner("openclaw-weixin", id);
+    if (prev === deviceId) continue; // 已归自己，幂等
+    setAccountOwner("openclaw-weixin", id, deviceId);
+    attributed.push({ accountId: id, prevOwner: prev });
+    if (prev) needBotCleanup.push(id); // 有旧主才需要清旧主的僵尸 bot/路由
+  }
+  return { attributed, needBotCleanup };
+}

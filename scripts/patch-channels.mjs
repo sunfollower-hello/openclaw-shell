@@ -557,10 +557,14 @@ function __ocsDropPendingMedia(paths) {
   } catch (e) { /* 无队列文件 */ }
 }
 // [openclaw-shell patch v9] 表情指令解析：一次生成内 [表情:名] 直接发图（爱语式，不走工具/保险丝）
+// [openclaw-shell patch v15] 表情按设备目录查图（隔离）：u<prefix> 设备 agent 只查自己的子目录，绝不回退全局
+// v9.1：未命中的 [表情:名] 标签一律剔除（模型幻觉不发给用户）；过滤核心层媒体失败警告文本
 function __ocsEmojiDir() { return require("path").join(require("os").homedir(), ".openclaw", "media", "emojis"); }
-function __ocsFindEmojiFile(name) {
+function __ocsFindEmojiFile(name, agentId) {
   try {
-    var dir = __ocsEmojiDir();
+    // 设备 agent（u<8hex>-slug）→ 只查该设备自己的子目录；全局 agent（管理员的卡）→ 全局目录。互不交叉、零兜底。
+    var m = /^u([0-9a-f]{8})-/.exec(String(agentId || ""));
+    var dir = m ? require("path").join(__ocsEmojiDir(), "u" + m[1]) : __ocsEmojiDir();
     var safe = String(name).replace(/[\\/:*?"<>|\s]+/g, "_");
     var files = require("fs").readdirSync(dir);
     for (var i = 0; i < files.length; i++) {
@@ -571,14 +575,16 @@ function __ocsFindEmojiFile(name) {
   } catch (e) { /* 目录不存在/读失败 → 未命中 */ }
   return null;
 }
-function __ocsExtractEmojiTags(text) {
+function __ocsExtractEmojiTags(text, agentId) {
   var rest = String(text || "");
-  var re = /\[表情:([^\]]+)\]/g, m, file, paths = [];
+  // v11：兼容全角方括号【表情:名】（模型常把 [表情:名] 写成全角）
+  var re = /\[表情:([^\]]+)\]|【表情:([^】]+)】/g, m, file, paths = [];
   while ((m = re.exec(rest))) {
-    file = __ocsFindEmojiFile(m[1].trim());
-    if (file) paths.push(file);
+    file = __ocsFindEmojiFile((m[1] || m[2] || "").trim(), agentId);
+    if (file && paths.length === 0) paths.push(file); // 一次回复最多 1 个表情
   }
-  if (paths.length) rest = rest.replace(/\[表情:[^\]]+\]/g, "");
+  // 无论命中与否都剔除标签：表情名是封闭集合，查不到就是模型幻觉，不该外泄成乱码
+  if (rest.includes("[表情:") || rest.includes("【表情:")) rest = rest.replace(/\[表情:[^\]]+\]|【表情:[^】]+】/g, "");
   return { paths: paths, rest: rest.trim() };
 }
 // [openclaw-shell patch v12] 生图指令解析：一次生成内 <生图:描述> 直接出图（独立生图接口，无第二次聊天模型调用）
@@ -756,10 +762,14 @@ function __ocsWxIsDuplicate(accountId, text, windowMs) {
   return false;
 }
 // [openclaw-shell patch v9] 表情指令解析：一次生成内 [表情:名] 直接发图（爱语式，不走工具/保险丝）
+// [openclaw-shell patch v15] 表情按设备目录查图（隔离）：u<prefix> 设备 agent 只查自己的子目录，绝不回退全局
+// v9.1：未命中的 [表情:名] 标签一律剔除（模型幻觉不发给用户）；过滤核心层媒体失败警告文本
 function __ocsWxEmojiDir() { return path.join(os.homedir(), ".openclaw", "media", "emojis"); }
-function __ocsWxFindEmojiFile(name) {
+function __ocsWxFindEmojiFile(name, agentId) {
   try {
-    const dir = __ocsWxEmojiDir();
+    // 设备 agent（u<8hex>-slug）→ 只查该设备自己的子目录；全局 agent（管理员的卡）→ 全局目录。互不交叉、零兜底。
+    const m = /^u([0-9a-f]{8})-/.exec(String(agentId || ""));
+    const dir = m ? path.join(__ocsWxEmojiDir(), "u" + m[1]) : __ocsWxEmojiDir();
     const safe = String(name).replace(/[\\/:*?"<>|\s]+/g, "_");
     const files = fs.readdirSync(dir);
     for (const f of files) {
@@ -770,16 +780,18 @@ function __ocsWxFindEmojiFile(name) {
   } catch (e) { /* 目录不存在/读失败 → 未命中 */ }
   return null;
 }
-function __ocsWxExtractEmojiTags(text) {
+function __ocsWxExtractEmojiTags(text, agentId) {
   let rest = String(text || "");
-  const re = /\[表情:([^\]]+)\]/g;
+  // v11：兼容全角方括号【表情:名】（模型常把 [表情:名] 写成全角）
+  const re = /\[表情:([^\]]+)\]|【表情:([^】]+)】/g;
   let m, file;
   const paths = [];
   while ((m = re.exec(rest))) {
-    file = __ocsWxFindEmojiFile(m[1].trim());
-    if (file) paths.push(file);
+    file = __ocsWxFindEmojiFile((m[1] || m[2] || "").trim(), agentId);
+    if (file && paths.length === 0) paths.push(file); // 一次回复最多 1 个表情
   }
-  if (paths.length) rest = rest.replace(/\[表情:[^\]]+\]/g, "");
+  // 无论命中与否都剔除标签：表情名是封闭集合，查不到就是模型幻觉，不该外泄成乱码
+  if (rest.includes("[表情:") || rest.includes("【表情:")) rest = rest.replace(/\[表情:[^\]]+\]|【表情:[^】]+】/g, "");
   return { paths, rest: rest.trim() };
 }
 // [openclaw-shell patch v12] 生图指令解析：一次生成内 <生图:描述> 直接出图（独立生图接口，无第二次聊天模型调用）
@@ -835,7 +847,7 @@ const QQ_BRANCH_FULL = `                      } else if (text) {
                           ]);
                         }
                         // [openclaw-shell patch v9] [表情:名] 指令直接发图（核心层不会为指令投递媒体，无双发风险）
-                        const ocsEmoji = __ocsExtractEmojiTags(ocsMedia.rest);
+                        const ocsEmoji = __ocsExtractEmojiTags(ocsMedia.rest, deliverCtx.agentId);
                         if (ocsEmoji.paths.length) {
                           await forwardMediaUrls({ mediaUrls: ocsEmoji.paths }, deliverCtx, deliveredMediaUrls, dlog);
                         }
@@ -891,7 +903,7 @@ const WX_BRANCH_FULL = `                else {
                         }
                     }
                     // [openclaw-shell patch v9] [表情:名] 指令直接发图（核心层不会为指令投递媒体，无双发风险）
-                    const ocsEmoji = __ocsWxExtractEmojiTags(ocsMedia.rest);
+                    const ocsEmoji = __ocsWxExtractEmojiTags(ocsMedia.rest, route.agentId);
                     for (const ocsEmojiPath of ocsEmoji.paths) {
                         await sendWeixinMediaFile({
                             filePath: ocsEmojiPath,

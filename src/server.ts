@@ -5,7 +5,7 @@ import path from "node:path";
 import os from "node:os";
 import dns from "node:dns";
 import crypto from "node:crypto";
-import { promises as fs, existsSync } from "node:fs";
+import { promises as fs, existsSync, statSync } from "node:fs";
 
 // 出站请求一律优先 IPv4。本机（以及部分国内网络）IPv6 路由不通，而 Node 默认按 DNS
 // 返回顺序尝试，解析结果里 IPv6 排前时会连接超时（实测：fetch 报 UND_ERR_CONNECT_TIMEOUT
@@ -81,6 +81,7 @@ import {
   beginLoginClaim,
   endLoginClaim,
   claimNewAccounts,
+  attributeWeChatLogin,
 } from "./core/channelOwners.js";
 import { runRetention, runRetentionForDevice, RETENTION_DAYS } from "./core/retention.js";
 import { runMediaSweep } from "./core/mediaSweep.js";
@@ -1185,23 +1186,23 @@ async function beginClaimForDevice(channel: BotChannel, res: express.Response): 
  */
 async function attributeQqLoginToDevice(deviceId: string): Promise<void> {
   setAccountOwner("qqbot", "default", deviceId);
-  const cleaned = await cleanupForeignQqBots("default", deviceId);
+  const cleaned = await cleanupForeignBots("qqbot", "default", deviceId);
   invalidateChannelStatus();
   logInfo("通道", `QQ 登录归属完成：default → 设备 ${deviceId.slice(0, 8)}…${cleaned.length ? `；清理他人残留 bot ${cleaned.length} 个` : ""}`);
 }
 
 /**
- * 清理其他设备/管理员名下绑在 qqbot:<accountId> 上的僵尸 bot 并解除路由：
- * 设备重新扫码会覆盖根槽位凭证，旧主人的 bot 记录与路由若不清理，
+ * 清理其他设备/管理员名下绑在 <channel>:<accountId> 上的僵尸 bot 并解除路由：
+ * 设备重新扫码会覆盖槽位凭证，旧主人的 bot 记录与路由若不清理，
  * 新用户的私聊会被路由进旧主人的卡（跨用户串话）。
  * 只动 bot 记录与路由绑定（直写 openclaw.json，毫秒级），不删对方 agent（卡的运行时保留）。
  */
-async function cleanupForeignQqBots(accountId: string, newOwnerId: string): Promise<string[]> {
+async function cleanupForeignBots(channel: BotChannel, accountId: string, newOwnerId: string): Promise<string[]> {
   const removed: string[] = [];
   const cleanScope = async (label: string, remove: (id: string) => Promise<unknown>) => {
     for (const b of await listBots().catch(() => [])) {
-      if (b.channel !== "qqbot" || b.accountId !== accountId) continue;
-      await unbindAccountDirect("qqbot", accountId).catch(() => null);
+      if (b.channel !== channel || b.accountId !== accountId) continue;
+      await unbindAccountDirect(channel, accountId).catch(() => null);
       await remove(b.id).catch(() => null);
       removed.push(`${label}:${b.agentId}`);
     }
@@ -1216,6 +1217,44 @@ async function cleanupForeignQqBots(accountId: string, newOwnerId: string): Prom
   }
   invalidateBindingsCache();
   return removed;
+}
+
+/**
+ * 微信顶掉式归属（2026-09-18 业主拍板，与 QQ 同语义）：登录成功后真实账号可能晚几秒才落盘，
+ * 轮询重入 attributeWeChatLogin（判定规则见 channelOwners.ts），命中即无条件改判给发起设备，
+ * 有旧主的连旧主僵尸 bot 一起清。判定不到（账号一直没落盘）只告警不报错。
+ */
+async function attributeWeChatLoginWithCleanup(deviceId: string): Promise<void> {
+  const credMtime = (id: string): number => {
+    try {
+      return statSync(path.join(os.homedir(), ".openclaw", "openclaw-weixin", "accounts", `${id}.json`)).mtimeMs;
+    } catch {
+      return 0;
+    }
+  };
+  for (let attempt = 0; attempt < 6; attempt++) {
+    const ids = (await scanAllAccounts().catch(() => []))
+      .filter((a) => a.channel === "openclaw-weixin")
+      .map((a) => a.accountId);
+    const { attributed, needBotCleanup } = attributeWeChatLogin(deviceId, ids, credMtime);
+    if (attributed.length) {
+      const cleaned: string[] = [];
+      for (const accountId of needBotCleanup) {
+        cleaned.push(...(await cleanupForeignBots("openclaw-weixin", accountId, deviceId).catch(() => [] as string[])));
+      }
+      invalidateChannelStatus();
+      invalidateBindingsCache();
+      logInfo(
+        "通道",
+        `微信登录归属完成（顶掉式）：→ 设备 ${deviceId.slice(0, 8)}…：${attributed
+          .map((a) => `${a.accountId}${a.prevOwner ? `（顶掉 ${a.prevOwner.slice(0, 8)}…）` : "（新认领）"}`)
+          .join("、")}${cleaned.length ? `；清理他人残留 bot ${cleaned.length} 个` : ""}`
+      );
+      return;
+    }
+    await new Promise((r) => setTimeout(r, 2500));
+  }
+  logWarn("通道", `微信登录归属：登录成功但 15s 内没有扫到可归属的账号变化（账号未落盘或已归自己）`);
 }
 
 // ---------- 通道：微信 ----------
@@ -1254,8 +1293,15 @@ app.post("/api/channels/wechat/login", async (_req, res) => {
   res.json(
     startChannelLogin("openclaw-weixin", {
       cliAccount: dev ? crypto.randomUUID() : undefined,
-      onDone: ({ ok, note, elapsedMs }) =>
-        logInfo("通道", `扫码登录[微信]：${ok ? "成功" : "失败"}（${devLabel}，耗时 ${(elapsedMs / 1000).toFixed(0)}s${note ? `，${note}` : ""}）`),
+      onDone: ({ ok, note, elapsedMs }) => {
+        logInfo("通道", `扫码登录[微信]：${ok ? "成功" : "失败"}（${devLabel}，耗时 ${(elapsedMs / 1000).toFixed(0)}s${note ? `，${note}` : ""}）`);
+        // 微信顶掉式归属（2026-09-18）：登录成功 → 无条件把摸过的账号改判给发起设备（后扫顶前扫），
+        // 与 QQ 的 attributeQqLoginToDevice 同语义；真实账号晚几秒落盘，函数内部轮询重入。
+        if (ok && dev) {
+          const devId = dev;
+          void attributeWeChatLoginWithCleanup(devId).catch((e) => logWarn("通道", `微信归属判定异常`, e));
+        }
+      },
     })
   );
 });

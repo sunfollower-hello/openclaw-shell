@@ -42,7 +42,7 @@ function ocIsDevice() {
  *  ⚠️ **通道连接不在里面**：QQ/微信 是用户的核心体验，普通用户照旧能扫码绑自己的机器人
  *  （隔离靠后端的"账号归属"：用户只看得到、也只能动自己名下的账号）。
  *  预设页也不在这里 —— 只有内置档位组「默认」不给用户打开，见 presetGroupLocked()。 */
-const OC_DEVICE_HIDDEN_ROUTES = ["plugins", "logs"];
+const OC_DEVICE_HIDDEN_ROUTES = ["plugins", "logs", "users", "usercards", "userchats"];
 
 /**
  * 这个预设组对当前身份是不是"锁住的"：
