@@ -5,12 +5,15 @@
 // 工具，其余内建常驻工具以网关版本行为为准——deny 命中即拦，宁可多写）。
 // botStore 与 providers 两处 openclaw.json 写入都必须经过 ensureGatewayToolPolicy，保证名单在场。
 // 只保留 memory_search / memory_get（记忆召回）。
+// ⚠️ web_search 有意不在名单里（2026-09-18 业主拍板恢复）：通道联网搜索走网关内建 web_search，
+//    开关节流在卡片高级配置「联网搜索」开关 → compiler 的通道 SKILL 只对开了的卡教这个工具。
+//    web_fetch（抓网页正文）继续禁用，业主要时再摘。
 export const GATEWAY_TOOL_DENY = [
   "tts", "image_generate", "music_generate", "video_generate", "pdf",
   "exec", "write", "edit", "read", "apply_patch", "process",
   "cron", "gateway", "nodes", "tmux", "subagents",
   "sessions_spawn", "sessions_send", "sessions_yield", "sessions_list", "sessions_history", "session_status",
-  "agents_list", "web_search", "web_fetch", "weather", "message",
+  "agents_list", "web_fetch", "weather", "message",
   "update_goal", "create_goal", "get_goal", "healthcheck",
   "meme-maker", "diagram-maker", "clawhub", "spike", "skill_workshop", "skill-creator",
   "taskflow", "taskflow-inbox-triage", "notion",

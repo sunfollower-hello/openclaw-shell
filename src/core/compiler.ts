@@ -239,14 +239,19 @@ async function renderSkill(card: PersonaCard, presetBlocks: string[] = [], emoji
   lines.push(`- 触发：私聊 ${chat.trigger.dm}，群聊 ${chat.trigger.group === "@" ? "仅 @ 机器人" : chat.trigger.group}`);
 
   const tools = card.tools?.enabled ?? [];
-  // 通道侧不教任何 shell 工具（2026-09-18）：网关侧真实工具面由 openclaw.json 的 tools.deny
-  // 统一裁剪（只留 memory_search/memory_get）；SKILL 若教 web_search/memory_save，
-  // 只会诱导模型去调网关上不存在/被禁的工具，白烧一次工具回合。生图/表情/语音
-  // 一律走本文件相应小节的指令标签（通道没有工具回合，一次模型调用完成）。
+  // 通道侧工具面与 openclaw.json 的 tools.deny 同源（gatewayToolPolicy.ts）：只放行
+  // memory_search（记忆召回）与 web_search（联网搜索，2026-09-18 业主拍板恢复）。
+  // web_search 的开关节流在卡片高级配置：开了才教，没开明确说不可用。
+  // 生图/表情/语音一律走本文件相应小节的指令标签（通道没有工具回合，一次模型调用完成）。
   if (tools.length > 0) {
     lines.push("");
     lines.push("## 可用工具");
     lines.push("- 允许：memory_search（检索本角色的长期记忆）");
+    if (tools.includes("web_search")) {
+      lines.push("- 允许：web_search（联网搜索）：只在用户要查你答不了的实时信息（新闻/资料/价格/赛事/天气等）时用，搜索词用简短关键词，把结果融进回复自然说出来，不要大段照搬，也不要在回复里提这是搜索得来的。");
+    } else {
+      lines.push("- 联网搜索未开启：遇到不知道的实时信息就按人设自然带过，不要编造具体新闻/数据。");
+    }
     lines.push("- 其余工具均不可用：需要生图/发表情/发语音时，按本文件对应小节的指令标签写在回复正文里，绝不调用工具。");
   }
 

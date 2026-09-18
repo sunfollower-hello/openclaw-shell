@@ -1101,3 +1101,10 @@ QQ 通道级还留着迁移过来的 `allowFrom: ["F5D0…"]` + `dmPolicy: "allo
 - **微信账号仍是"锁死设备 ID"语义**（`claimNewAccounts` 跳过已有归属+快照老账号）：业主拍板要**顶掉式**（谁扫归谁、后扫顶前扫，QQ 的 `attributeQqLoginToDevice` 已是此语义）——待实施：微信登录成功落定真实 accountId 后无条件 `setAccountOwner` + 清旧主绑定。
 - 测试期间在沈青梧网页聊天留了 2 条"（链路测试）"消息，可在 App 里删。
 - 其余待办不变：main 分支同步（按 hunk）、`#(users|usercards|userchats)` 加进 OC_DEVICE_HIDDEN_ROUTES、web/app.js:25 过时注释、lifeScheduler 设备化、applyAgentBlockStreaming 局部化。
+
+### §61 追记（09-18 晚）：通道联网搜索恢复（业主拍板）
+
+- **业主澄清**：要的就是"服务器直接能搜、QQ/微信上模型拿结果组织成对话"，不要额外装东西。恢复 `web_search`（摘出 `GATEWAY_TOOL_DENY`，`web_fetch` 仍禁）；`compiler.ts` 通道 SKILL 改为：卡高级配置**开了「联网搜索」才教** web_search（含使用教学），没开则明确写"联网搜索未开启"。
+- **搜索后端**：网关 `web_search` 需要 provider——服务器已启用 OpenClaw **自带的 duckduckgo 扩展**（`plugins.entries.duckduckgo={enabled:true}`，免密钥）+ 显式选择 `tools.web.search={enabled:true,provider:"duckduckgo"}`（不显式选会报 "no provider is available"，这是工具运行时 `resolveWebSearchCandidates` 的要求）。两处都在 openclaw.json，`ensureGatewayToolPolicy` 的展开写法会保留。
+- **验证**：CLI 实测模型发起 web_search → DuckDuckGo 返回 5 条真实结果（title 带 `<<<EXTERNAL_UNTRUSTED_CONTENT` 安全包装属正常）。**回合级"搜索→美化对话"暂无法完整演示：四家模型上游同时出问题**——agnes 免费额度 429、jiyuan 402 欠费、老黄/meta/muse-glimmer-30b 90s 挂起、s3 的 autoroute/gemini-3.7-flash"可用渠道不存在"。工具链路已实锤，模型侧恢复任一家即全通。
+- 提交：本次恢复改动随 §61 后续提交入库。
