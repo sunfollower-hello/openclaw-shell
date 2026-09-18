@@ -1667,6 +1667,18 @@ body.lc-fullscreen .lc-root { height: var(--app-h, 100dvh); }
 .lc-pill.on { background: var(--accent); border-color: var(--accent); color: #ffffff; }
 .lc-pill.on:hover { background: var(--accent); border-color: var(--accent); color: #ffffff; }
 .lc-pill-caret { font-size: 9px; color: var(--muted); }
+/* 圆形图标按键（「必须生成」，2026-09-18）：与胶囊同高的圆钮，中间一枚图片线性图标 */
+.lc-round-btn {
+  width: 28px; height: 28px; padding: 0; flex: none;
+  display: inline-flex; align-items: center; justify-content: center;
+  border: 1px solid var(--border); border-radius: 50%;
+  background: var(--bg); color: var(--text);
+  cursor: pointer;
+}
+.lc-round-btn .ic { width: 15px; height: 15px; }
+.lc-round-btn:hover { border-color: var(--accent); color: var(--accent); }
+.lc-round-btn.on { background: var(--accent); border-color: var(--accent); color: #ffffff; }
+.lc-round-btn.on:hover { background: var(--accent); border-color: var(--accent); color: #ffffff; }
 
 /* =====「模型」按键弹出的大面板：三栏竖线分隔（模型商 ｜ 模型 ｜ 思考深度）======
    宽度 = 整个输入岛（left/right:0 挂在 .lc-island 上）；占比 模型 > 模型商 > 思考深度；

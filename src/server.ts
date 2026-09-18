@@ -5964,33 +5964,53 @@ async function lifeTrigger(
   return false;
 }
 
+let lifeTicking = false;
+
 /** 启动心跳循环（每分钟检查；只在有配置的卡时才真正调 CLI） */
 function startLifeScheduler(): void {
   if (lifeTimer) return;
   lifeTimer = setInterval(async () => {
+    // 防重入：触发走 CLI（最多 90s/条），设备化后一轮可能更久，叠跑会双发
+    if (lifeTicking) return;
+    lifeTicking = true;
     try {
-      const bots = await listBots();
-      if (bots.length === 0) return;
-      const cards = [];
-      for (const b of bots) {
-        const c = await store.get(b.cardSlug).catch(() => null);
-        if (c?.life?.intervalHours && c.life.intervalHours > 0) cards.push({ slug: c.slug, life: c.life });
+      // 主动消息对全部作用域生效（2026-09-18 设备化，修复用户反馈"主动发消息开了却永远不发"）：
+      // 调度器原先只读全局 data/（运行在设备作用域之外）→ 设备名下的 bot 永远不被调度。
+      // 现在 = 全局（运营者）+ 每台注册设备各扫一遍；每个作用域在自己的命名空间里收集到期卡、
+      // loadLife/读会话/触发全部落在该作用域（整个 runLifeTick 包进 runAsUser）。disabled 设备跳过。
+      const scopes: (string | null)[] = [null];
+      for (const d of listDevices()) {
+        const devId = String(d?.id ?? "");
+        if (DEVICE_ID_RE.test(devId) && !d.disabled) scopes.push(devId);
       }
-      if (cards.length === 0) return;
-      // lastMsgOf：该卡最后一条消息的时间 → 主动消息的 prompt 里注入"冷场了多久"
-      const fired = await runLifeTick(
-        cards,
-        lifeTrigger,
-        lifeKnownUsersOf,
-        lifeAgentOf,
-        async (slug) => {
-          const tail = await readConv(slug, 1).catch(() => []);
-          return tail.at(-1)?.t ?? "";
-        }
-      );
-      if (fired.length) logInfo("AI生命", `本轮主动消息 ${fired.length} 条`);
+      const fired: { slug: string; openid: string }[] = [];
+      const scopeCtx = (dev: string | null) => ({ deviceId: dev!, root: userRoot(dev!) });
+      for (const dev of scopes) {
+        const collect = async (): Promise<{ slug: string; life: { intervalHours?: number } }[]> => {
+          const out: { slug: string; life: { intervalHours?: number } }[] = [];
+          for (const b of await listBots().catch(() => [])) {
+            const c = await store.get(b.cardSlug).catch(() => null);
+            if (c?.life?.intervalHours && c.life.intervalHours > 0) out.push({ slug: c.slug, life: c.life });
+          }
+          return out;
+        };
+        const cards = dev ? await runAsUser(scopeCtx(dev), collect).catch(() => []) : await collect();
+        if (cards.length === 0) continue;
+        // lastMsgOf：该卡最后一条消息的时间 → 主动消息的 prompt 里注入"冷场了多久"
+        const lastMsgOf = async (slug: string): Promise<string> => {
+          const read = async () => (await readConv(slug, 1).catch(() => [])).at(-1)?.t ?? "";
+          return dev ? runAsUser(scopeCtx(dev), read) : read();
+        };
+        const part = dev
+          ? await runAsUser(scopeCtx(dev), () => runLifeTick(cards, lifeTrigger, lifeKnownUsersOf, lifeAgentOf, lastMsgOf)).catch(() => [])
+          : await runLifeTick(cards, lifeTrigger, lifeKnownUsersOf, lifeAgentOf, lastMsgOf);
+        fired.push(...part);
+      }
+      if (fired.length) logInfo("AI生命", `本轮主动消息 ${fired.length} 条（含设备作用域）`);
     } catch (e) {
       logWarn("AI生命", `调度异常：${String(e).slice(0, 300)}`);
+    } finally {
+      lifeTicking = false;
     }
   }, 60 * 1000);
   logInfo("AI生命", "调度器已启动（每分钟检查一次主动消息）");

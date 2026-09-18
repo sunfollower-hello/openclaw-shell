@@ -1253,8 +1253,9 @@ function renderWorkbench() {
           <button type="button" class="lc-pill" id="lc-opt-pill" title="模型"><span id="lc-opt-label">模型</span><span class="lc-pill-caret">▾</span></button>
           <!-- 撤销：原来在顶栏叫「撤掉上一轮」，2026-09-17 挪到输入区模型右边并改名 -->
           <button type="button" class="lc-pill" id="wb-undo-round" title="撤销最近一问一答（网页与 QQ/微信 上下文一起摘，破甲被拒时用）">撤销</button>
-          <!-- 「必须生成」：一次性——点一次只管下一轮，发出即自动熄灭。只在当前卡开了生图能力时出现 -->
-          <button type="button" class="lc-pill" id="wb-force-image" title="本轮必须生成一张图（点一次管一轮）" hidden>必须生成</button>
+          <!-- 「必须生成」：一次性——点一次只管下一轮，发出即自动熄灭。只在当前卡开了生图能力时出现。
+               2026-09-18 业主要求：汉字标识改圆形图片图标（简约） -->
+          <button type="button" class="lc-round-btn" id="wb-force-image" title="本轮必须生成一张图（点一次管一轮）" hidden><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="2.5"/><circle cx="8.5" cy="8.5" r="1.6"/><path d="M21 15.5 16 10.5 5 21"/></svg></button>
         </div>
         <!-- 一个「模型」按键管三件事：模型商 ｜ 模型 ｜ 思考深度（蓝色面板宽度 = 整个输入岛） -->
         <div class="lc-opt-panel" id="lc-opt-pop" hidden>
