@@ -82,6 +82,7 @@ import {
   endLoginClaim,
   claimNewAccounts,
   attributeWeChatLogin,
+  listOwnedAccounts,
 } from "./core/channelOwners.js";
 import { runRetention, runRetentionForDevice, RETENTION_DAYS } from "./core/retention.js";
 import { runMediaSweep } from "./core/mediaSweep.js";
@@ -1184,11 +1185,11 @@ async function beginClaimForDevice(channel: BotChannel, res: express.Response): 
  * 快照差集在这个槽位上失效（重扫覆盖同一个槽位名，永远不算"新账号"→ 之前"App 提示成功但列表空"的根源），
  * 所以登录成功（凭证已落盘）时直接把槽位判给发起设备。
  */
-async function attributeQqLoginToDevice(deviceId: string): Promise<void> {
-  setAccountOwner("qqbot", "default", deviceId);
-  const cleaned = await cleanupForeignBots("qqbot", "default", deviceId);
+async function attributeQqLogin(accountId: string, deviceId: string | null): Promise<void> {
+  setAccountOwner("qqbot", accountId, deviceId);
+  const cleaned = deviceId ? await cleanupForeignBots("qqbot", accountId, deviceId) : [];
   invalidateChannelStatus();
-  logInfo("通道", `QQ 登录归属完成：default → 设备 ${deviceId.slice(0, 8)}…${cleaned.length ? `；清理他人残留 bot ${cleaned.length} 个` : ""}`);
+  logInfo("通道", `QQ 登录归属完成：${accountId} → ${deviceId ? `设备 ${deviceId.slice(0, 8)}…` : "运营者"}${cleaned.length ? `；清理他人残留 bot ${cleaned.length} 个` : ""}`);
 }
 
 /**
@@ -1310,14 +1311,16 @@ app.get("/api/channels/wechat/status", async (req, res) => {
 });
 
 app.post("/api/channels/wechat/login", async (_req, res) => {
-  // 槽位满了就不生成二维码：必须先彻底删掉一个账号（用户拍板的语义）
+  // 槽位满了就不生成二维码：必须先彻底删掉一个账号（用户拍板的语义）。
+  // 配额按设备名下计（2026-09-18 多账号化，每人 1 个微信号互不影响）；管理员/单用户按全局算
+  const dev0 = res.locals.ocDevice as string | null | undefined;
   const slot = await accountSlotState("openclaw-weixin").catch(() => null);
   if (slot?.full) {
     // 槽满时点名已掉线的账号（业主 09-18 实测痛点：死账号占着名额，用户不知道该删谁）
-    const dead = wechatStaleIds();
-    const hint = dead.length ? `看起来「${dead.join("」「")}」已经掉线，删除它可以腾出名额。` : "";
+    const dead = (wechatStaleIds() as string[]).filter((id) => !dev0 || accountOwner("openclaw-weixin", id) === dev0);
+    const mine = dead.length ? `看起来「${dead.join("」「")}」已经掉线，删除它可以腾出名额。` : "先删除一个你名下不用的账号再试。";
     return res.status(400).json({
-      error: `微信账号已存满（${slot.used}/${slot.max}）。请先在下方账号列表里彻底删除一个，再扫码添加新的。${hint}`,
+      error: `你名下的微信账号已存满（${slot.used}/${slot.max}）。请先在下方账号列表里彻底删除一个，再扫码添加新的。${mine}`,
       accountSlotFull: true,
       slot,
     });
@@ -1425,22 +1428,37 @@ app.post("/api/channels/qq/login", async (_req, res) => {
   const devLabel = dev ? `设备 ${dev.slice(0, 8)}…` : "管理员";
   await beginClaimForDevice("qqbot", res);
   logInfo("通道", `扫码登录[QQ]：发起（${devLabel}）`);
+  // 配额按设备名下账号数（2026-09-18 多账号化，业主拍板「每人独立 5QQ 互不影响」）：
+  // 管理员/单用户按全局 default 槽算（历史行为不变）
   const slot = await accountSlotState("qqbot").catch(() => null);
   if (slot?.full) {
     return res.status(400).json({
-      error: `QQ 账号已存满（${slot.used}/${slot.max}）。请先在下方账号列表里彻底删除一个，再扫码添加新的。`,
+      error: `你名下的 QQ 账号已存满（${slot.used}/${slot.max}）。请先在下方账号列表里彻底删除一个，再扫码添加新的。`,
       accountSlotFull: true,
       slot,
     });
   }
-  // 设备作用域：登录成功（CLI exit 0，appId 已写入根槽位）后把槽位判给发起设备，并清理他人残留绑定。
-  // 快照差集对 QQ 单槽位是失效的（重扫永远覆盖同一个槽位名 "default"，不算"新账号"）→ 假成功的根源。
+  // 账号位：设备 = u<前8位>-qq<n>（n 取名下最小空号，凭证写进 channels.qqbot.accounts.<id>），
+  // 各写各的凭证互不覆盖——旧实现全挤公共 default 槽，后扫覆盖前扫（用户实测互相踢下线）。
+  // 管理员/单用户 = 公共 default 槽（单用户形态没有"别人"，保持历史行为）。
+  let qqAccount = "";
+  if (dev) {
+    const prefix = `u${dev.slice(0, 8)}-qq`;
+    const owned = listOwnedAccounts(dev)
+      .filter((k) => k.startsWith("qqbot:"))
+      .map((k) => k.slice("qqbot:".length));
+    let n = 1;
+    while (owned.includes(prefix + n) && n <= MAX_QQ_ACCOUNTS) n++;
+    qqAccount = prefix + n;
+  }
   if (dev) {
     const d: string = dev;
+    const accId = qqAccount;
     res.json(
       startChannelLogin("qqbot", {
         deviceId: d,
-        onOk: () => attributeQqLoginToDevice(d),
+        cliAccount: accId,
+        onOk: () => attributeQqLogin(accId, d),
         onDone: ({ ok, note, elapsedMs }) =>
           logInfo("通道", `扫码登录[QQ]：${ok ? "成功" : "失败"}（${devLabel}，耗时 ${(elapsedMs / 1000).toFixed(0)}s${note ? `，${note}` : ""}）`),
       })
@@ -1448,6 +1466,7 @@ app.post("/api/channels/qq/login", async (_req, res) => {
   } else {
     res.json(
       startChannelLogin("qqbot", {
+        onOk: () => attributeQqLogin("default", null),
         onDone: ({ ok, note, elapsedMs }) =>
           logInfo("通道", `扫码登录[QQ]：${ok ? "成功" : "失败"}（${devLabel}，耗时 ${(elapsedMs / 1000).toFixed(0)}s${note ? `，${note}` : ""}）`),
       })
@@ -1522,6 +1541,8 @@ interface KnownAccount {
  * 本机最多保存 QQ 5 / 微信 2 个已认证账号；满了就不再生成二维码，
  * 必须先在通道连接页「彻底删除」一个账号（连凭证一起删）才能扫新的。
  */
+/** 账号槽位：调用处于设备请求作用域时 scanKnownAccounts 只返回名下账号 → used 即"名下账号数"
+ *  （2026-09-18 多账号化：配额按人 QQ5/微信1）；管理员/单用户作用域 = 全局数 */
 async function accountSlotState(channel: BotChannel): Promise<{ used: number; max: number; full: boolean }> {
   const all = await scanKnownAccounts();
   const used = all.filter((a) => a.channel === channel).length;

@@ -14,8 +14,10 @@ export const MAX_QQ_BOTS = 5;
 export const MAX_WEIXIN_BOTS = 1;
 // ② 账号槽位上限：本机最多保存几个已认证账号（凭证数，与绑卡无关）
 //    达上限后二维码不再生成，必须先「彻底删除」一个账号才能扫新的。
+/** 账号槽位按设备名下计（2026-09-18 业主拍板「每人独立 5QQ+1 微信，互不影响」）：
+ *  QQ 登录写进设备专属账号位 u<前8位>-qq<n>（不再共用 default 槽互顶），配额=名下账号数 */
 export const MAX_QQ_ACCOUNTS = 5;
-export const MAX_WEIXIN_ACCOUNTS = 2;
+export const MAX_WEIXIN_ACCOUNTS = 1;
 
 export type BotChannel = "qqbot" | "openclaw-weixin";
 
