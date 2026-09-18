@@ -7340,11 +7340,15 @@ async function refreshWechat(force = false) {
     const s = await api.get("/api/channels/wechat/status" + (force ? "?refresh=1" : ""));
     const el = $("#wx-status");
     const accs = s.accounts ?? [];
+    const stale = s.stale ?? [];
+    const dead = accs.filter((a) => stale.includes(a));
     el.textContent = s.connected ? (accs.length ? `已连接 ✓（${accs.length} 个账号）` : "已连接 ✓") : "未连接";
     el.className = "chip " + (s.connected ? "ok" : "");
-    // 和 QQ 一样把账号列出来：让用户知道扫的码落到哪个号，以及是否还没绑卡
+    // 和 QQ 一样把账号列出来：让用户知道扫的码落到哪个号，以及是否还没绑卡。
+    // 只在掉线时点名（平常不加任何显示）：凭证超过 24h 没续期 = 微信侧会话已失效
+    const deadLine = dead.length ? "\n⚠️ 已掉线，请删除后重新扫码：" + dead.join("、") : "";
     const out = $("#wx-out");
-    if (out) out.textContent = accs.length ? "已绑定账号：" + accs.join("、") + "\n（在下方「机器人连接」给账号选一张卡即可聊天）" : "还没有绑定账号，点上方按钮扫码";
+    if (out) out.textContent = accs.length ? "已绑定账号：" + accs.join("、") + deadLine + "\n（在下方「机器人连接」给账号选一张卡即可聊天）" : "还没有绑定账号，点上方按钮扫码";
   } catch { $("#wx-status").textContent = "检测失败"; }
 }
 async function refreshPairing() {

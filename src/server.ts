@@ -5,7 +5,7 @@ import path from "node:path";
 import os from "node:os";
 import dns from "node:dns";
 import crypto from "node:crypto";
-import { promises as fs, existsSync, statSync } from "node:fs";
+import { promises as fs, existsSync, statSync, readFileSync } from "node:fs";
 
 // 出站请求一律优先 IPv4。本机（以及部分国内网络）IPv6 路由不通，而 Node 默认按 DNS
 // 返回顺序尝试，解析结果里 IPv6 排前时会连接超时（实测：fetch 报 UND_ERR_CONNECT_TIMEOUT
@@ -1258,13 +1258,50 @@ async function attributeWeChatLoginWithCleanup(deviceId: string): Promise<void> 
 }
 
 // ---------- 通道：微信 ----------
+/**
+ * 微信账号掉线侦测（2026-09-18）：个人号会话失效是**静默**的——插件 running 只代表在空转，
+ * 无报错无断连事件，通道页会一直显示"已连接 ✓"。唯一免费的存活信号是**续期令牌**文件的
+ * mtime（活账号持续续期刷新，死账号永远停摆）。⚠️ 只看 context-tokens：sync.json 是插件
+ * 簿记文件，死账号也在刷，会污染信号。超过 12h 没续期 = 微信侧会话已死。
+ * QQ 不需要（官方连接器的 connected 是真状态）。只在通道页/槽满提示里点名死账号，平常不显示。
+ */
+const WECHAT_STALE_MS = 12 * 3600 * 1000;
+
+function wechatStaleIds(): string[] {
+  const base = path.join(os.homedir(), ".openclaw", "openclaw-weixin");
+  let list: string[] = [];
+  try {
+    const idx = JSON.parse(readFileSync(path.join(base, "accounts.json"), "utf8")) as unknown[];
+    list = idx.filter((x): x is string => typeof x === "string" && !!x);
+  } catch {
+    return []; // 索引读不到就不报警（宁可漏报不误报）
+  }
+  const out: string[] = [];
+  const now = Date.now();
+  for (const id of list) {
+    // 存活信号只认续期令牌；令牌缺失时退回登录凭证本体
+    let mtimeMs = 0;
+    for (const suffix of [".context-tokens.json", ".json"]) {
+      try {
+        mtimeMs = statSync(path.join(base, "accounts", `${id}${suffix}`)).mtimeMs;
+        break;
+      } catch { /* 该文件不存在，试下一个 */ }
+    }
+    if (mtimeMs && now - mtimeMs > WECHAT_STALE_MS) out.push(id);
+  }
+  return out;
+}
+
 app.get("/api/channels/wechat/status", async (req, res) => {
   try {
     const all = await getChannelStatuses(req.query.refresh === "1");
     const st = filterChannelStatus("openclaw-weixin", all["openclaw-weixin"], res.locals.ocDevice);
+    const staleAll = wechatStaleIds();
     res.json({
       connected: channelUsable(st),
       accounts: st?.accounts ?? [],
+      // 只报请求者可见账号里已掉线的；前端仅在其中有死账号时点名，平常不加显示
+      stale: (st?.accounts ?? []).filter((id) => staleAll.includes(id)),
       detail: st ?? null,
     });
   } catch (e) {
@@ -1276,8 +1313,11 @@ app.post("/api/channels/wechat/login", async (_req, res) => {
   // 槽位满了就不生成二维码：必须先彻底删掉一个账号（用户拍板的语义）
   const slot = await accountSlotState("openclaw-weixin").catch(() => null);
   if (slot?.full) {
+    // 槽满时点名已掉线的账号（业主 09-18 实测痛点：死账号占着名额，用户不知道该删谁）
+    const dead = wechatStaleIds();
+    const hint = dead.length ? `看起来「${dead.join("」「")}」已经掉线，删除它可以腾出名额。` : "";
     return res.status(400).json({
-      error: `微信账号已存满（${slot.used}/${slot.max}）。请先在下方账号列表里彻底删除一个，再扫码添加新的。`,
+      error: `微信账号已存满（${slot.used}/${slot.max}）。请先在下方账号列表里彻底删除一个，再扫码添加新的。${hint}`,
       accountSlotFull: true,
       slot,
     });
