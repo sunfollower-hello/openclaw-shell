@@ -3496,7 +3496,9 @@ async function openAdvConfig() {
       editingCard.tools = editingCard.tools ?? { enabled: [], policy: "auto", deny: [] };
       const memRounds = Math.min(20, Math.max(0, Number($("#adv-mem-rounds").value) || 0));
       // 滑杆归零 = 记忆整体关闭（memory_save 工具一并摘掉）；>0 时自动带上
-      editingCard.tools.enabled = onCaps.filter((c) => c !== "tts" && c !== "emoji" && c !== "memory_save");
+      // life（主动发消息）不是工具：配置在 editingCard.life 里随卡保存，混进 tools.enabled
+      // 会被后端 schema 的工具白名单拒掉（用户实测报错「工具·enabled·第2条：格式不对」）
+      editingCard.tools.enabled = onCaps.filter((c) => c !== "tts" && c !== "emoji" && c !== "memory_save" && c !== "life");
       if (memRounds > 0) editingCard.tools.enabled.push("memory_save");
       editingCard.abilities = { ...(editingCard.abilities ?? {}), tts: onCaps.includes("tts") };
       editingCard.memoryConfig = { auto_rounds: memRounds };
