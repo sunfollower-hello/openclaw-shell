@@ -108,14 +108,26 @@ export function buildChatSystem(card: PersonaCard, presetBlocks: string[] = [], 
     const title = e.comment || e.name || "世界书条目";
     lines.push(`【${title}】${String(e.content ?? "").trim()}`);
   }
-  if (card.voice.tone_rules.length > 0) {
+  // 防御式读取（2026-09-18）：AI 草稿/API 直建的卡可能缺 message_style/emotion_patterns/memory/
+  // knowledge 这些可选块（做卡页手动填的卡才有全套）——之前裸读一缺就是 500（实测泡泡卡）。
+  const voice = card.voice ?? ({} as PersonaCard["voice"]);
+  const toneRules = voice.tone_rules ?? [];
+  const catchphrases = voice.catchphrases ?? [];
+  const style = voice.message_style ?? { length: "medium", emoji: "克制", multi_send: false };
+  const persona = card.personality ?? ({} as PersonaCard["personality"]);
+  const traits = persona.traits ?? [];
+  const values = persona.values ?? [];
+  const emotionPatterns = persona.emotion_patterns ?? [];
+  const boundaries = persona.boundaries ?? [];
+  const memory = card.memory ?? ({ facts: [], timeline: [], relationships: [] } as PersonaCard["memory"]);
+  const knowledge = card.knowledge ?? ({ known: [], unknown: [], no_evidence_policy: "" } as PersonaCard["knowledge"]);
+  if (toneRules.length > 0) {
     lines.push("【说话方式】");
-    for (const t of card.voice.tone_rules) lines.push(`- ${t}`);
+    for (const t of toneRules) lines.push(`- ${t}`);
   }
-  if (card.voice.catchphrases.length > 0) {
-    lines.push(`【口头禅】${card.voice.catchphrases.join("、")}（可自然使用）`);
+  if (catchphrases.length > 0) {
+    lines.push(`【口头禅】${catchphrases.join("、")}（可自然使用）`);
   }
-  const style = card.voice.message_style;
   lines.push(
     `【消息风格】单条长度倾向：${style.length === "short" ? "短句" : style.length === "long" ? "长句" : "中等"}` +
       `；表情使用：${style.emoji}`
@@ -126,28 +138,28 @@ export function buildChatSystem(card: PersonaCard, presetBlocks: string[] = [], 
       "【拆条发送】像真人发消息那样，把一次要说的话拆成 2-4 条短消息，每条之间空一行；每条只说一个意思，最短可以只有几个字。不要写成一大段。"
     );
   }
-  if (card.personality.traits.length > 0) lines.push(`【性格】${card.personality.traits.join("、")}`);
-  if (card.personality.values.length > 0) lines.push(`【价值观】${card.personality.values.join("、")}`);
-  if (card.personality.emotion_patterns.length > 0) {
+  if (traits.length > 0) lines.push(`【性格】${traits.join("、")}`);
+  if (values.length > 0) lines.push(`【价值观】${values.join("、")}`);
+  if (emotionPatterns.length > 0) {
     lines.push("【情绪反应】");
-    for (const p of card.personality.emotion_patterns) lines.push(`- 触发「${p.trigger}」→ ${p.response}`);
+    for (const p of emotionPatterns) lines.push(`- 触发「${p.trigger}」→ ${p.response}`);
   }
-  if (card.personality.boundaries.length > 0) {
-    lines.push(`【禁区（不可逾越）】${card.personality.boundaries.join("；")}`);
+  if (boundaries.length > 0) {
+    lines.push(`【禁区（不可逾越）】${boundaries.join("；")}`);
   }
-  if (card.memory.facts.length > 0) {
+  if (memory.facts.length > 0) {
     lines.push("【已知事实（仅在相关时使用，无证据不要编造）】");
-    for (const f of card.memory.facts.slice(0, 20)) lines.push(`- ${f.fact}`);
+    for (const f of memory.facts.slice(0, 20)) lines.push(`- ${f.fact}`);
   }
-  if (card.memory.relationships.length > 0) {
+  if (memory.relationships.length > 0) {
     lines.push("【人际关系】");
-    for (const r of card.memory.relationships.slice(0, 10)) lines.push(`- ${r.who}：${r.how}`);
+    for (const r of memory.relationships.slice(0, 10)) lines.push(`- ${r.who}：${r.how}`);
   }
-  if (card.knowledge.known.length > 0 || card.knowledge.unknown.length > 0) {
+  if (knowledge.known.length > 0 || knowledge.unknown.length > 0) {
     lines.push("【知识边界】");
-    if (card.knowledge.known.length > 0) lines.push(`- 知道：${card.knowledge.known.join("、")}`);
-    if (card.knowledge.unknown.length > 0) lines.push(`- 不知道：${card.knowledge.unknown.join("、")}`);
-    lines.push(`- 无证据时：${card.knowledge.no_evidence_policy}`);
+    if (knowledge.known.length > 0) lines.push(`- 知道：${knowledge.known.join("、")}`);
+    if (knowledge.unknown.length > 0) lines.push(`- 不知道：${knowledge.unknown.join("、")}`);
+    if (knowledge.no_evidence_policy) lines.push(`- 无证据时：${knowledge.no_evidence_policy}`);
   }
   for (const block of presetBlocks) {
     lines.push("");

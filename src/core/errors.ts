@@ -5,8 +5,10 @@ import { logError } from "./logger.js";
 export function toUserError(e: unknown, fallback = "操作没成功，请再试一次", tag = "系统"): string {
   const raw = e instanceof Error ? e.message : String(e ?? "");
   if (!raw) return fallback;
-  // 原文进日志（设置页能直接看），返回给用户的是翻译后的人话
-  logError(tag, raw.split("\n")[0].slice(0, 200), raw);
+  // 原文进日志（设置页能直接看），返回给用户的是翻译后的人话；
+  // Error 时把堆栈前几行也带上（2026-09-18）：光有 message 定位不了是哪一行读的 undefined
+  const stack = e instanceof Error ? (e.stack ?? "").split("\n").slice(1, 5).join(" | ").slice(0, 400) : "";
+  logError(tag, raw.split("\n")[0].slice(0, 200), stack ? `${raw}\n${stack}` : raw);
 
   const code = (e as { cause?: { code?: string }; code?: string })?.cause?.code ?? (e as { code?: string })?.code ?? "";
 
