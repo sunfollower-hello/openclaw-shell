@@ -5,6 +5,7 @@ import path from "node:path";
 import os from "node:os";
 import { dataDir } from "./cardStore.js";
 import { devicePrefix } from "./dataRoot.js";
+import { ensureGatewayToolPolicy } from "./gatewayToolPolicy.js";
 
 // ---------- 两套上限，别混用（2026-09-08 用户拍板） ----------
 // ① 绑卡上限：同时能有几个机器人在跑（bots.json 里的实例数）
@@ -343,7 +344,9 @@ async function readOpenclawConfig(): Promise<Record<string, any> | null> {
   }
 }
 
+/** 工具面裁剪名单与合并逻辑见 gatewayToolPolicy.ts（botStore/providers 共用） */
 async function writeOpenclawConfig(cfg: Record<string, any>): Promise<void> {
+  ensureGatewayToolPolicy(cfg);
   const p = openclawConfigPath();
   // 先写临时文件再改名：避免网关正好读到写了一半的配置
   const tmp = p + ".tmp";

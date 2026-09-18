@@ -1062,3 +1062,42 @@ QQ 通道级还留着迁移过来的 `allowFrom: ["F5D0…"]` + `dmPolicy: "allo
 3. **插件补丁 v15**（patch-channels.mjs）：`EMOJI_HELPER_CJS/ESM` 的 `__ocsFindEmojiFile(name, agentId)`/`__ocsExtractEmojiTags(text, agentId)` 按 agentId 推导目录（`^u([0-9a-f]{8})-` → `u<8hex>/` 子目录**只查它**；无 u 前缀 = 管理员/全局 agent → 全局目录）；调用点带 agentId（QQ `deliverCtx.agentId`、WX `route.agentId`）；升级分支含**存量调用点升级**（split/join 旧调用文本 → 新带 agentId 文本，幂等）+ skip 判定加 v15 标记（`表情按设备目录查图`）。注意 v15 的 replaceAll 必须放在 emoji 块替换与 gen 重插之后（顺序：emoji 块替换 → v15 调用点升级 → v10 → gen 重插 → …，实测顺序无碍：gen 模板已带新调用点）。
 4. **部署实测**：两份活插件 v15 标记=1、agentId 调用点=1、旧调用点残留=0；隔离子目录 `u1ba5242d/震惊.webp`、`u543987ae/兴奋.gif`、`uee9c5d59/猛.jpg` 回填实锤；设备管理端点仍 403、站点 200。**踩坑一次：部署漏传 emojiStore.ts**（sync 仍写全局 → 全部"已存在跳过"→ 产物空）——多文件改动部署时逐文件核对清单。
 5. **用户侧须知**：表情发图查的是设备子目录，App 里新加表情后需**重存一次卡**（SKILL 清单是编译时固化）才会被模型使用；管理员"小小"的卡用管理员全局池，两池互不可见。
+
+---
+
+## §61 六项体检落地：P0 工具面收口 + 网页生图指令式 + P1 媒体清理（2026-09-18，已上线验证）
+
+**背景**：应业主要求对线上部署做六项只读体检（媒体留存 / App 表情渲染 / 表情隔离 / 分发隔离 / 其他隐患 / 生图语音表情是否工具调用），结论=通道端早已是爱语式一次调用（trajectory 实锤 0 次工具调用），**真正在调工具的是网页端（设计内双回合）**；另发现**网关 46 个工具对通道 agent 全裸**（tts 无条件注册、exec/write 全在）。业主拍板后本轮实施 P0+P1。全部改动文件旧版备份在 `/data/backups/pre-p0p1-20260918/`。
+
+**① P0-① 工具面收口（核心成果：agent 可见工具 46 → 2）**
+- `src/core/gatewayToolPolicy.ts`（新）：`GATEWAY_TOOL_DENY`（48 项：tts/image_generate/music/video/pdf/exec/write/edit/read/apply_patch/process/cron/gateway/nodes/tmux/subagents/sessions_*/agents_list/web_search/web_fetch/weather/message/goal 系列/healthcheck/meme-maker/diagram-maker/clawhub/spike/skill 系列/taskflow/notion/调试系列/qqbot 系列）+ `ensureGatewayToolPolicy(cfg)`（合并进 openclaw.json 顶层 `tools.deny`）。**botStore.writeOpenclawConfig 与 providers.ts:327 两条 openclaw.json 写入路径都过它**——配置重生成也丢不了。
+- `agents.defaults.skills = []`（实测生效：空数组=显式空白名单=全关）：clawhub/taskflow/notion/tmux/spike/skill 系列/qqbot-* 等 20+ 个技能包全是提示词注入，对人格 bot 是纯噪音；此设置也并入 ensureGatewayToolPolicy 持久化。
+- 禁用内置 `openai` 扩展（plugins.entries.openai.enabled=false，绝 image_generate 的物化信号源）；tts 插件 manifest 删掉 `contracts.tools:["speak"]`（代码本就是空壳，声明与实现对齐）。
+- **实测（openclaw agent CLI 跑真实回合 + trajectory 普查）**：tts/exec/write/web_search/process/cron/gateway/image_generate/clawhub/taskflow/notion/tmux… **全部 0**；`memory_search`/`memory_get` 保留（记忆召回）。
+- **机制认知（网关 2026.6.34）**：`config.tools.deny` 实测**确定生效**于内建常驻工具与媒体工厂（image_generate 等）；**skills 是另一套体系**，靠 `agents.defaults.skills` 白名单关，`[]` 合法。`includeMessageTool` 在非 embedded 恒 true 的代码分支实测也被 deny 拦掉了（message 归零）。
+
+**② P0-③ 网页生图改指令式一次调用（对齐爱语：`MainActivity.java:1510` 指令回复直接收尾、零 function calling）**
+- `presets.ts`：`IMAGE_EXEC.web` 改指令文案；网页/通道共用 `IMAGE_DIRECTIVE_HOW`；`imageHowto` 两端都教 `<生图:...>`（NAI 档例子里直接含标签）；CoT 的 [格式确认] 两端统一指令式。「必须生成」按键行为不变（注入强制版文案）。
+- `server.ts /api/chat`：`imageGenEnabled`/`loopToolDefs`（image_gen 不再下发为工具）；**剥完 <cot> 后解析 `<生图:提示词>`（含全角）→ 直接调 TOOL_REGISTRY 里 image_gen 的 run()（复用生图配置/内存图库/URL 形态，web 模式不落盘）→ 结果并入 toolImages/imageMeta，展示/落盘/拆条链路原样复用**；失败在回复尾追加「（生图失败）」。**「必须生成」兜底**：模型没写指令时用用户这条消息当提示词（按键语义=这轮必须出图）。`/api/chat/approve` 同样不下发 image_gen（pending 遗留调用仍可执行）。
+- **runToolLoop 幻觉工具防护**：模型调用未注册工具→不进工具回合直接收尾（省一次模型调用）+日志。
+- **e2e 实录**（真实卡 shenqingwu + forceImage）：agnes 回复→`[清洗] 剥离思维链`→`[生图] 指令生图失败：还没选生图模型（服务器 imageConfig 无 NAI key，符合预期；generateImage 本身已被 QQ 通道生产验证）`→回复「（生图失败）」→**单次模型调用零工具回合**。日志行补了 `· 生图走指令` 标记。
+
+**③ P0-② SKILL 与 P0-④**：`compiler.ts` 通道 SKILL「可用工具」不再教 shell 工具 id（只写 `memory_search 可用 + 其余不可用、走指令标签`）——此前教 web_search/memory_save，前者是网关工具会多烧回合、后者网关根本没有。
+
+**④ P1 媒体清理：`src/core/mediaSweep.ts`（新，启动+每 6h 与 retention 同节奏）**
+- 通道生图 `gen-*` 2h 删；测试生图 `images/_test`（全局+各设备）7 天删；**表情通道孤儿对账**（全局池+各 `u<8>/` 对应各自 library.json，词干不在库即删；库文件不存在=跳过绝不误清）；history-export/memory-export 过期（15 天）删；**孤儿用户目录**（不在注册表且 30 天无文件动静）→ `fsp.cp` 整目录备份到 `<app>/backups/orphan-users-<时间戳>/` 后删除（不用 tar：Windows GNU tar 把 `C:\` 当远程主机名）。
+- **首跑战果**：表情孤儿副本 -9、孤儿用户目录回收 11（30 天门槛，备份留存）；`retention` 每次巡检固定留一行日志（P1-⑨，此前 0 痕迹无法确认在跑）。
+- 顺带加固：`syncEmojisToChannelMedia` 跳过缺 name/file 的坏条目（此前一条坏数据会让整库同步静默哑掉）。
+- 自测：`scripts/test-media-sweep.mjs`（临时 HOME+临时数据，16 断言全过：旧删新留/孤儿对账/备份后删/删表情同步删通道副本）。
+- `emojiStore.removeEmoji/updateEmoji(改名)` 现在同步删通道侧副本（此前只删 data 侧，插件目录只加不删）。
+
+**⑤ 删卡清封面**：DELETE /api/cards/:slug 现在按前缀清 `covers/<slug>.*`（此前删卡留孤儿封面）。
+
+**⑥ 部署/验证清单**：10 文件 tar+md5 双端一致 → 备份 → 落位 → build → 重启 shell；网关配置（tools.deny+skills+openai 禁用）经 dist `ensureGatewayToolPolicy` 落盘后重启网关；5 插件加载正常；站点 200；巡检日志实锤。备份：`/data/backups/pre-p0p1-20260918/`（含 openclaw.json.bak-20260918）。
+
+**⑦ 体检新发现 / 遗留（待业主拍板或顺手处理）**
+- **模型上游现状**：`老黄/meta/muse-glimmer-30b` 90s 无响应被中止（沈青梧卡的默认模型）；`jiyuan/deepseek-flash` **402 余额不足**；agnes 可用。→ 建议给沈青梧等卡换 agnes 或给 jiyuan 充值。
+- **服务器 imageConfig 没配 NAI key**（生图配置页拉一次模型即可用）。
+- **微信账号仍是"锁死设备 ID"语义**（`claimNewAccounts` 跳过已有归属+快照老账号）：业主拍板要**顶掉式**（谁扫归谁、后扫顶前扫，QQ 的 `attributeQqLoginToDevice` 已是此语义）——待实施：微信登录成功落定真实 accountId 后无条件 `setAccountOwner` + 清旧主绑定。
+- 测试期间在沈青梧网页聊天留了 2 条"（链路测试）"消息，可在 App 里删。
+- 其余待办不变：main 分支同步（按 hunk）、`#(users|usercards|userchats)` 加进 OC_DEVICE_HIDDEN_ROUTES、web/app.js:25 过时注释、lifeScheduler 设备化、applyAgentBlockStreaming 局部化。

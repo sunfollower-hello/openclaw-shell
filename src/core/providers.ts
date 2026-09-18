@@ -5,6 +5,7 @@ import path from "node:path";
 import os from "node:os";
 import { dataDir } from "./cardStore.js";
 import { currentDeviceId, devicePrefix } from "./dataRoot.js";
+import { ensureGatewayToolPolicy } from "./gatewayToolPolicy.js";
 
 export type ProviderType = "chat" | "image";
 
@@ -324,7 +325,7 @@ export async function syncToOpenclaw(data?: ProvidersFile): Promise<void> {
       cfg.agents.defaults.model = { primary: `${first.name}/${firstModel}` };
     }
   }
-  await fs.writeFile(openclawConfigPath(), JSON.stringify(cfg, null, 2), "utf8");
+  await fs.writeFile(openclawConfigPath(), JSON.stringify(ensureGatewayToolPolicy(cfg), null, 2), "utf8");
 }
 
 /**

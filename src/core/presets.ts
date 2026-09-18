@@ -296,21 +296,21 @@ const IMAGE_OPENAI_EXAMPLE = `A girl with long black hair wearing a cat-ear head
 // ---------- 生图规则的组装（网页/通道 × NAI/OpenAI × 常规/「必须生成」） ----------
 // 为什么要 builder：同一段规则有 6 种组合，手写 6 份必然改漏；而且「必须生成」按下后
 // 是**整段替换**（不是末尾加一句），所以按参数生成。
-/** 执行动作：网页 = 调工具；通道 = 写指令（通道没有工具回合） */
+/** 执行动作：网页/通道统一 = 写指令（2026-09-18 起网页也走指令式：服务端解析 <生图:> 后直接生成，一次模型调用，不再有工具双回合） */
 const IMAGE_EXEC = {
-  web: "调用 `image_gen` 工具真实生成（提示词放 prompt 参数）",
+  web: "在回复正文里插入生图指令 `<生图:提示词>`（系统会自动生成并把图片附在回复里）",
   channel: "在回复正文里插入生图指令 `<生图:提示词>`",
 } as const;
 
-/** 通道侧的「怎么写指令」教学 */
-const IMAGE_CHANNEL_HOW = `一旦同意，就在回复正文中插入生图指令 \`<生图:提示词>\`（尖括号内直接写提示词，系统会自动生成并发送图片）。
+/** 「回复里怎么写指令」教学（网页/通道同一份，措辞对两端都成立） */
+const IMAGE_DIRECTIVE_HOW = `一旦同意，就在回复正文中插入生图指令 \`<生图:提示词>\`（尖括号内直接写提示词，系统会自动生成图片）。
 - 【不要调用任何工具】生图由系统解析指令自动完成，不要为生图调用 image_gen 或任何工具，也不要写图片地址/路径。
 - 每次回复最多插入 1 个生图指令。`;
 
 /** 提示词写法教学（NAI 标签 / OpenAI 自然语言两套，绝不让模型自己判断） */
-function imageHowto(where: "web" | "channel", provider: "nai" | "openai"): string {
+function imageHowto(_where: "web" | "channel", provider: "nai" | "openai"): string {
   if (provider === "nai") return IMAGE_NAI_HOWTO;
-  const ex = where === "channel" ? `<生图:${IMAGE_OPENAI_EXAMPLE}>` : IMAGE_OPENAI_EXAMPLE;
+  const ex = `<生图:${IMAGE_OPENAI_EXAMPLE}>`;
   return `${IMAGE_OPENAI_HOWTO_BODY}\n- 一个完整例子（雨夜等人）：\`${ex}\``;
 }
 
@@ -320,7 +320,7 @@ function imageRule(opts: { where: "web" | "channel"; provider: "nai" | "openai";
   const lines = [
     `# 能力触发（生图 · 当前为 ${title}）`,
     opts.forced ? IMAGE_WHEN_FORCED : IMAGE_WHEN,
-    opts.where === "web" ? `同意后${IMAGE_EXEC.web}。` : IMAGE_CHANNEL_HOW,
+    IMAGE_DIRECTIVE_HOW,
     IMAGE_CONTENT_RULE,
     imageHowto(opts.where, opts.provider),
   ];

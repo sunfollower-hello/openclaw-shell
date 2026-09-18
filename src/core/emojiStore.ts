@@ -125,8 +125,20 @@ export async function listEmojis(): Promise<EmojiItem[]> {
 // 改为表情库管理时自动同步，保证通道侧随时拿得到图。
 
 /** 与插件补丁/旧工具一致的文件名安全化 */
-function safeEmojiName(name: string): string {
+export function safeEmojiName(name: string): string {
   return String(name).replace(/[\\/:*?"<>|\s]+/g, "_");
+}
+
+/** 当前作用域对应的通道表情目录（设备 → 自己的 u<前8位>/；管理员/单用户 → 全局池） */
+function channelMediaDirForCurrentScope(): string {
+  const deviceId = currentDeviceId();
+  return deviceId ? channelMediaDirForDevice(deviceId) : channelMediaDir();
+}
+
+/** 删通道侧副本（删除/改名表情后调用；不删就成了插件目录里的孤儿文件） */
+async function removeChannelCopy(name: string, file: string): Promise<void> {
+  const ext = path.extname(file).toLowerCase() || ".png";
+  await fs.rm(path.join(channelMediaDirForCurrentScope(), `${safeEmojiName(name)}${ext}`), { force: true }).catch(() => {});
 }
 
 export function channelMediaDir(): string {
@@ -151,6 +163,8 @@ export async function syncEmojisToChannelMedia(): Promise<string[]> {
   const targetDir = deviceId ? channelMediaDirForDevice(deviceId) : channelMediaDir();
   await fs.mkdir(targetDir, { recursive: true }).catch(() => {});
   for (const e of emojis) {
+    // 坏条目（手改库文件缺 name/file）跳过——不能让一条坏数据把整库的通道同步搞哑
+    if (!e || typeof e.name !== "string" || !e.name || typeof e.file !== "string" || !e.file) continue;
     const src = path.join(emojiDir(), e.file);
     const ext = path.extname(e.file).toLowerCase() || ".png";
     const dst = path.join(targetDir, `${safeEmojiName(e.name)}${ext}`);
@@ -220,6 +234,7 @@ export async function updateEmoji(id: string, patch: { name?: string; explanatio
   const emojis = await listEmojis();
   const item = emojis.find((e) => e.id === id);
   if (!item) return null;
+  const oldName = item.name;
   if (typeof patch.name === "string" && patch.name.trim()) {
     const name = patch.name.trim().slice(0, 40);
     if (emojis.some((e) => e.id !== id && e.name === name)) throw new Error(`表情名「${name}」已存在`);
@@ -228,7 +243,9 @@ export async function updateEmoji(id: string, patch: { name?: string; explanatio
   if (typeof patch.explanation === "string") item.explanation = patch.explanation.trim().slice(0, 200);
   if (typeof patch.group === "string" && patch.group) item.group = patch.group;
   await saveLibrary(emojis);
-    scheduleChannelSync();
+  // 改名后旧通道副本成了孤儿（新名字由 sync 拷新文件），同步清掉
+  if (oldName !== item.name) await removeChannelCopy(oldName, item.file);
+  scheduleChannelSync();
   return item;
 }
 
@@ -240,7 +257,11 @@ export async function removeEmoji(id: string): Promise<boolean> {
   await saveLibrary(rest);
   // 路径复用的导入条目共享同一文件：还有其他条目引用时不删文件
   const stillReferenced = rest.some((e) => e.file === item.file);
-  if (!stillReferenced) await fs.rm(path.join(emojiDir(), item.file), { force: true }).catch(() => {});
+  if (!stillReferenced) {
+    await fs.rm(path.join(emojiDir(), item.file), { force: true }).catch(() => {});
+    // 通道侧副本一并删（2026-09-18 P1：此前只删 data 侧，插件目录只加不删、孤儿无限积累）
+    await removeChannelCopy(item.name, item.file);
+  }
   return true;
 }
 

@@ -10,10 +10,5 @@
   },
   "activation": {
     "onStartup": true
-  },
-  "contracts": {
-    "tools": [
-      "speak"
-    ]
   }
 }

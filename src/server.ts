@@ -83,6 +83,7 @@ import {
   claimNewAccounts,
 } from "./core/channelOwners.js";
 import { runRetention, runRetentionForDevice, RETENTION_DAYS } from "./core/retention.js";
+import { runMediaSweep } from "./core/mediaSweep.js";
 import { getMemImage } from "./core/memImages.js";
 import { toUserError } from "./core/errors.js";
 import { queryLogs, clearLogs, logInfo, logWarn, logError } from "./core/logger.js";
@@ -981,6 +982,12 @@ app.delete("/api/cards/:slug", async (req, res) => {
         fs.rm(path.join(root, sub, slug), { recursive: true, force: true }).catch(() => {})
       )
     );
+    // 封面也按卡存（covers/<slug>.<ext>，扩展名不定 → 按前缀清；漏掉会留孤儿封面）
+    for (const f of await fs.readdir(path.join(root, "covers")).catch(() => [] as string[])) {
+      if (f === slug || f.startsWith(`${slug}.`)) {
+        await fs.rm(path.join(root, "covers", f), { force: true }).catch(() => {});
+      }
+    }
     // 共享 workspace 里的人设产物（漏掉会留下"幽灵人格"，模型仍可能读到已删卡的 SKILL.md）
     await fs.rm(path.join(root, "workspace", "skills", "personas", slug), { recursive: true, force: true }).catch(() => {});
     // 绑定这张卡的机器人实例（卡没了 bot 就是死记录，还会占用"每卡一个"的名额）
@@ -2938,7 +2945,14 @@ async function runToolLoop(
     if (externalSignal?.aborted) return { type: "reply", reply: "（已截断）" };
     const data = await chatCompletions(llm, messages, tools.length ? toolsToOpenAI(tools) : undefined, reasoning, externalSignal, meta);
     const msg = data.choices?.[0]?.message;
-    const toolCalls = ((msg?.tool_calls ?? []) as ToolCallMsg[]).filter((tc) => tc.function?.name);
+    const allCalls = ((msg?.tool_calls ?? []) as ToolCallMsg[]).filter((tc) => tc.function?.name);
+    // 幻觉工具防护（2026-09-18）：模型调了没注册的工具（如已下线的 image_gen）→ 不进工具回合
+    // （省一次模型调用），正文直接当回复；日志记一笔便于发现还在教模型调工具的文案残留
+    const toolCalls = allCalls.filter((tc) => tools.some((t) => t.id === tc.function?.name));
+    if (allCalls.length > 0 && toolCalls.length === 0) {
+      logWarn("工具", `模型调用了未注册工具（${allCalls.map((t) => t.function?.name).join("、")}），已忽略并直接收尾`);
+      return { type: "reply", reply: msg?.content ?? "（空回复）", toolImages, imageMeta };
+    }
     if (toolCalls.length === 0) {
       return { type: "reply", reply: msg?.content ?? "（空回复）", toolImages, imageMeta };
     }
@@ -3013,6 +3027,10 @@ app.post("/api/chat", async (req, res) => {
     if (!llm || !llm.apiKey) return res.status(400).json({ error: "未配置模型 API（API 页）" });
     const enabledTools = Array.isArray(tools) ? (tools as string[]) : [];
     const { defs: toolDefs } = await resolveChatTools(enabledTools);
+    // 生图改指令式（2026-09-18，对齐通道与爱语）：image_gen 不再作为工具下发，模型在正文里写
+    // <生图:提示词>，回复后由服务端解析并直接生成——一次模型调用完成，不再有工具双回合。
+    const imageGenEnabled = toolDefs.some((t) => t.id === "image_gen");
+    const loopToolDefs = toolDefs.filter((t) => t.id !== "image_gen");
 
     // 【上下文缓存优化（2026-09-11）】system prompt 必须是**逐字节稳定的前缀**。
     // 长期记忆改为全量注入（不再按当前消息检索），这样同一张卡的 system 在记忆没新增时
@@ -3065,8 +3083,11 @@ app.post("/api/chat", async (req, res) => {
     let system =
       (await buildChatSystemAsync(card, await resolveCardPresetBlocks(card, { forceImage: forceImage === true }), "")) +
       userBlock +
-      (toolDefs.length
-        ? `\n\n你可以使用以下工具完成任务：${toolDefs.map((t) => t.name).join("、")}。用户请求适合用工具完成时，调用工具而不是凭空编造；危险工具会先征得用户同意。${toolDefs.some((t) => t.id === "image_gen") ? "\n【生图强约束】如果角色设定/剧情让你拒绝用户的图片请求，可以直接拒绝（符合人设）；但只要你【同意】生成图片，就必须立即调用 image_gen 工具真实生成——绝不能只口头描述画面、编造图片地址或假装已生成（那样用户什么也收不到）。图片生成后系统会自动附带在回复末尾，你【不要】在回复正文里写图片地址/路径。" : ""}`
+      (loopToolDefs.length
+        ? `\n\n你可以使用以下工具完成任务：${loopToolDefs.map((t) => t.name).join("、")}。用户请求适合用工具完成时，调用工具而不是凭空编造；危险工具会先征得用户同意。`
+        : "") +
+      (imageGenEnabled
+        ? "\n【生图强约束】如果角色设定/剧情让你拒绝用户的图片请求，可以直接拒绝（符合人设）；但只要你【同意】生成图片，就必须在回复正文里插入 <生图:提示词> 指令真实生成——绝不能只口头描述画面、编造图片地址或假装已生成（那样用户什么也收不到）。图片生成后系统会自动附带在回复末尾，你【不要】在回复正文里写图片地址/路径，也【不要】为生图调用任何工具。"
         : "") +
       rememberRule +
       // 记忆放 system 末尾（全量、稳定）：新增记忆时才变一次，其余轮次完全命中缓存
@@ -3126,7 +3147,7 @@ app.post("/api/chat", async (req, res) => {
       ...(dynamicBlock ? [{ role: "system", content: dynamicBlock }] : []),
       { role: "user", content: message },
     ];
-    logInfo("聊天", `${card.name} 用 ${llm.provider}/${llm.model}` + (toolDefs.length ? ` · 工具 ${toolDefs.length} 个` : "") + (presetExamples.length ? " · 破甲示范注入" : ""));
+    logInfo("聊天", `${card.name} 用 ${llm.provider}/${llm.model}` + (loopToolDefs.length ? ` · 工具 ${loopToolDefs.length} 个` : "") + (imageGenEnabled ? " · 生图走指令" : "") + (presetExamples.length ? " · 破甲示范注入" : ""));
     // 记录用户活跃（AI 生命调度用：重置该用户 missedBeats）
     void recordUserContact(card.slug, "local").catch(() => {});
     // 统一会话日志：网页聊天轮次也落盘（通道消息由观察器同步进来；本地聊天不发送到通道）
@@ -3134,13 +3155,46 @@ app.post("/api/chat", async (req, res) => {
     // 客户端断开（截断）→ 中止模型请求，省 API
     const chatCtrl = new AbortController();
     req.on("close", () => { if (!res.writableEnded) chatCtrl.abort(); });
-    const result = await runToolLoop(llm, messages, toolDefs, chatCtx(slug, ns), card.tools?.policy === "ask", reasoning, chatCtrl.signal, { kind: "web", slug });
+    const chatCtxOpts = chatCtx(slug, ns);
+    const result = await runToolLoop(llm, messages, loopToolDefs, chatCtxOpts, card.tools?.policy === "ask", reasoning, chatCtrl.signal, { kind: "web", slug });
     // 出站清理：剥离低级模型泄漏的纯文本思维链（「分析：」「（思考）」等前缀行）
     if (result.type === "reply" && typeof result.reply === "string") {
       const cleaned = sanitizeChatReply(card, result.reply);
       if (cleaned !== result.reply) {
         logWarn("清洗", `${card.name} 回复剥离了思维链残留`);
         result.reply = cleaned;
+      }
+    }
+    // 生图指令落地（网页指令式，2026-09-18）：剥完 <cot> 后解析 <生图:提示词>，服务端直接调
+    // image_gen 的 run() 生成（复用生图配置/内存图库/URL 形态），结果并入 toolImages/imageMeta，
+    // 后续展示/落盘/拆条链路原样复用。全程一次模型调用，无工具回合。
+    // 「必须生成」按下但模型没写指令时，兜底用用户这条消息当提示词——按键语义就是"这一轮必须出图"。
+    if (result.type === "reply" && imageGenEnabled) {
+      const m = String(result.reply ?? "").match(/<生图:([^<>]+)>|＜生图:([^＜＞]+)＞/);
+      const prompt = (m ? (m[1] ?? m[2]) : "").trim() || (forceImage ? String(message ?? "").trim().slice(0, 400) : "");
+      if (prompt) {
+        if (m) result.reply = String(result.reply ?? "").replace(/<生图:[^<>]*>|＜生图:[^＜＞]*＞/, "").trim();
+        const imgTool = TOOL_REGISTRY.find((t) => t.id === "image_gen");
+        try {
+          const out = imgTool ? await imgTool.run({ prompt }, chatCtxOpts) : "生图失败";
+          const gen = out.match(/已生成图片：(\S+)\n提示词：([\s\S]*)/);
+          if (gen) {
+            result.toolImages ??= [];
+            result.imageMeta ??= [];
+            if (!result.toolImages.includes(gen[1])) result.toolImages.push(gen[1]);
+            if (!result.imageMeta.some((x) => x.url === gen[1])) result.imageMeta.push({ url: gen[1], prompt: gen[2].trim() });
+            logInfo("生图", `${card.name} 指令生图完成（单次模型调用，未走工具回合）`);
+          } else {
+            result.reply = `${String(result.reply ?? "").trim()}\n（生图失败）`.trim();
+            logWarn("生图", `${card.name} 指令生图失败：${out.slice(0, 160)}`);
+          }
+        } catch (e) {
+          result.reply = `${String(result.reply ?? "").trim()}\n（生图失败）`.trim();
+          logWarn("生图", `${card.name} 指令生图异常`, e);
+        }
+      } else if (forceImage) {
+        result.reply = `${String(result.reply ?? "").trim()}\n（生图失败）`.trim();
+        logWarn("生图", `${card.name} 「必须生成」未落地：模型既没写指令、用户消息也没法当提示词`);
       }
     }
     let convIds: string[] = userEntry ? [userEntry.id] : [];
@@ -3334,6 +3388,9 @@ app.post("/api/chat/approve", async (req, res) => {
     if (!llm || !llm.apiKey) return res.status(400).json({ error: "未配置模型 API（API 页）" });
     const enabledTools = Array.isArray(tools) ? (tools as string[]) : [];
     const { defs: toolDefs } = await resolveChatTools(enabledTools);
+    // 生图已改指令式（2026-09-18）：审批续聊同样不下发 image_gen 工具
+    //（pending 队列里升级前遗留的 image_gen 调用仍按原样执行，用的是完整 toolDefs）
+    const loopToolDefs = toolDefs.filter((t) => t.id !== "image_gen");
     const last = messages[messages.length - 1] as { tool_calls?: ToolCallMsg[] };
     const toolCalls = (last?.tool_calls ?? []).filter((tc) => tc.function?.name);
     if (approve) {
@@ -3346,7 +3403,7 @@ app.post("/api/chat/approve", async (req, res) => {
     // 客户端断开（截断）→ 中止模型请求，省 API
     const chatCtrl = new AbortController();
     req.on("close", () => { if (!res.writableEnded) chatCtrl.abort(); });
-    const result = await runToolLoop(llm, messages, toolDefs, chatCtx(slug, ns), card.tools?.policy === "ask", undefined, chatCtrl.signal, { kind: "approve", slug });
+    const result = await runToolLoop(llm, messages, loopToolDefs, chatCtx(slug, ns), card.tools?.policy === "ask", undefined, chatCtrl.signal, { kind: "approve", slug });
     if (result.type === "reply") {
       // 与 /api/chat 一致：审批续聊后的回复同样计入自动记忆（用户消息取 messages 里最后一条 user）
       const lastUser = [...messages].reverse().find((m) => (m as { role?: string }).role === "user");
@@ -5722,14 +5779,22 @@ await ensureMemorySearchExtraPaths().then((changed) => {
 app.listen(PORT, HOST, () => {
   logInfo("启动", `服务已启动 http://${HOST}:${PORT}`);
   console.log(`卡片目录: ${store["dir"]}`);
-  // 用户数据保留策略（15 天，只作用于设备命名空间）：启动跑一次 + 每 6 小时一次
-  void runRetention()
-    .then((rows) => {
-      const removed = rows.reduce((a, r) => a + r.conversationsRemoved + r.chatlogRemoved + r.memoryRemoved, 0);
-      if (removed) logInfo("保留", `已按 ${RETENTION_DAYS} 天策略清理 ${removed} 条过期用户记录`);
-    })
-    .catch(() => {});
-  setInterval(() => void runRetention().catch(() => {}), 6 * 3600 * 1000);
+  // 用户数据保留策略（15 天，只作用于设备命名空间）：启动跑一次 + 每 6 小时一次。
+  // 每次都留一行巡检日志（P1-⑨）：之前从未留痕，无法确认 15 天清理真的在跑。
+  const retentionSweep = () =>
+    runRetention()
+      .then((rows) => {
+        const removed = rows.reduce((a, r) => a + r.conversationsRemoved + r.chatlogRemoved + r.memoryRemoved, 0);
+        const rewritten = rows.reduce((a, r) => a + r.imagesRewritten, 0);
+        logInfo("保留", `保留策略巡检：设备 ${rows.length} 台 · 清理过期记录 ${removed} 条 · 图链改写 ${rewritten} 处（${RETENTION_DAYS} 天）`);
+      })
+      .catch((e) => logWarn("保留", `保留策略巡检失败`, e));
+  void retentionSweep();
+  setInterval(retentionSweep, 6 * 3600 * 1000);
+  // 媒体与临时文件巡检（P1，2026-09-18）：retention 只管聊天记录/记忆，这里管"没人清就无限涨"的
+  // 媒体——通道生图 gen-* 残留 / 测试生图 / 表情通道孤儿副本 / 过期导出 md / 孤儿用户目录（先备份再删）。
+  void runMediaSweep().catch((e) => logWarn("清理", `媒体巡检失败`, e));
+  setInterval(() => void runMediaSweep().catch((e) => logWarn("清理", `媒体巡检失败`, e)), 6 * 3600 * 1000);
   // 记忆导出：启动时同步全部卡的记忆到 md（供 OpenClaw memorySearch.extraPaths 索引）
   void exportAllMemoriesToMarkdown().then((slugs) => {
     if (slugs.length) logInfo("记忆", `已导出 ${slugs.length} 张卡的记忆`);

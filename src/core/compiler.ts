@@ -239,15 +239,15 @@ async function renderSkill(card: PersonaCard, presetBlocks: string[] = [], emoji
   lines.push(`- 触发：私聊 ${chat.trigger.dm}，群聊 ${chat.trigger.group === "@" ? "仅 @ 机器人" : chat.trigger.group}`);
 
   const tools = card.tools?.enabled ?? [];
-  // 通道侧不引导 image_gen 工具：生图走 <生图:描述> 指令（v10），工具留着但不在 SKILL 里教
-  const channelTools = tools.filter((t) => t !== "image_gen");
-  if (channelTools.length > 0) {
+  // 通道侧不教任何 shell 工具（2026-09-18）：网关侧真实工具面由 openclaw.json 的 tools.deny
+  // 统一裁剪（只留 memory_search/memory_get）；SKILL 若教 web_search/memory_save，
+  // 只会诱导模型去调网关上不存在/被禁的工具，白烧一次工具回合。生图/表情/语音
+  // 一律走本文件相应小节的指令标签（通道没有工具回合，一次模型调用完成）。
+  if (tools.length > 0) {
     lines.push("");
     lines.push("## 可用工具");
-    lines.push(`- 允许：${channelTools.join("、")}`);
-    lines.push(`- 使用策略：${card.tools?.policy === "ask" ? "调用前先征得用户同意" : "自动调用（适合时直接使用）"}`);
-    if (card.tools?.deny?.length) lines.push(`- 禁止：${card.tools.deny.join("、")}`);
-    lines.push("- 用户请求适合用工具完成时（写代码、搜索、查天气等），调用工具而不是凭空编造结果");
+    lines.push("- 允许：memory_search（检索本角色的长期记忆）");
+    lines.push("- 其余工具均不可用：需要生图/发表情/发语音时，按本文件对应小节的指令标签写在回复正文里，绝不调用工具。");
   }
 
   // 人物档案：酒馆卡/手工卡的完整角色描述（可能很长，独立成节）
